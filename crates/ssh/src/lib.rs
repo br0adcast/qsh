@@ -12,6 +12,7 @@ mod auth;
 mod crypto_worker;
 mod host_key;
 mod keyfile;
+mod server_info;
 mod session;
 mod sftp;
 mod write_budget;
@@ -28,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub use host_key::host_key_info;
+pub use server_info::{discover_server_info, VerifiedSshServerInfo};
 pub use session::{connect, SshConnection, SshSubstrate};
 pub use sftp::{TransferLimits, UploadProgress};
 pub use zeroize::Zeroizing;

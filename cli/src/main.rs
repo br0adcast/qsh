@@ -224,8 +224,33 @@ fn run(a: args::Args) -> i32 {
         for (id, endpoint) in links.catalog.endpoints() {
             catalog.seed(id, endpoint);
         }
+        let pending_update = links.pending_update.clone();
+        let terminal_restored = links.terminal_restored;
         // Cancels workers and invalidates their authorization before any question.
         resolver = links.leave();
+        if !terminal_restored {
+            return 1;
+        }
+        if let Some(version) = pending_update {
+            match confirmed_terminal_action(terminal_restored, || {
+                qsh::upgrade_offer::install_approved(&version)
+            })
+            .expect("confirmed terminal restoration")
+            {
+                Ok(message) => {
+                    best_effort_line(&message);
+                    best_effort_line("Relaunch qsh explicitly to use the installed client.");
+                    return 0;
+                }
+                Err(error) => {
+                    best_effort_line(&format!(
+                        "qsh: client update unavailable: {}",
+                        qsh::report::printable(&error)
+                    ));
+                    return 1;
+                }
+            }
+        }
         if inbox.failed() || signals::notification_failure().is_some() {
             return 1;
         }
@@ -388,8 +413,12 @@ fn connected_session(
         ..
     } = trial;
     let links = Links {
+        terminal_restored: true,
+        metadata_failure: false,
+        pending_update: None,
         setup: setup.clone(),
         live: Some(Live {
+            restart_advisory: Default::default(),
             attempt,
             channel_session,
             link: 0,
@@ -421,11 +450,18 @@ fn connected_session(
         replacement_at: None,
         tx: tx.clone(),
     };
-    let result = interactive(setup, links, display, tx, inbox);
+    let (mut code, mut links) = interactive(setup, links, display, tx, inbox);
+    if links.metadata_failure
+        && confirmed_terminal_action(links.terminal_restored, || links.finish_startup_discovery())
+            .unwrap_or(false)
+    {
+        code = 0;
+        links.replacement_at = None;
+    }
     // InputReader is joined (or was never started) before old producers lose
     // their receiver. The same wake/pool survive the cooked replacement phase.
     inbox.retire();
-    result
+    (code, links)
 }
 
 /// Keep the same bounded resolver pool across shell lifetimes, including the
@@ -583,6 +619,7 @@ fn flush_shell_boundary(shell_bytes: &mut Vec<u8>, sess: &mut Session, now_ms: i
 
 /// The connection a session is running on.
 struct Live {
+    restart_advisory: qsh::server_discovery::RestartAdvisory,
     attempt: connect::Attempt,
     /// The one substrate instance of this connection: incoming bytes go
     /// through `channel_session.on_bytes`, which hands them to the substrate
@@ -600,6 +637,10 @@ struct Live {
 /// §5.2) -- the reconnect automaton, the round under way, the addresses as
 /// this run knows them.
 struct Links {
+    /// True only in known cooked startup or after an explicitly successful restore.
+    terminal_restored: bool,
+    metadata_failure: bool,
+    pending_update: Option<String>,
     setup: Arc<Setup>,
     /// `None` from the moment a link is let go until a round brings one back.
     live: Option<Live>,
@@ -663,6 +704,91 @@ struct Links {
 }
 
 impl Links {
+    fn complete_terminal_restore(&mut self, result: &Result<(), nix::Error>) {
+        self.terminal_restored = result.is_ok();
+        if result.is_err() {
+            self.pending_update = None;
+            self.metadata_failure = false;
+            self.keep = true;
+        }
+    }
+    /// Raw mode and the input reader are already gone. A refused shell may
+    /// retire its transport locally while the original metadata round finishes.
+    fn finish_startup_discovery(&mut self) -> bool {
+        if !self.terminal_restored {
+            return false;
+        }
+        let Some(client) = self.live.as_ref().map(|live| live.attempt.client.clone()) else {
+            return false;
+        };
+        if let Some(live) = &self.live {
+            live.attempt.retire_for_discovery();
+        }
+        while !signals::termination_requested()
+            && !client.discovery_complete()
+            && client
+                .discovery_deadline()
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let proof = self
+            .live
+            .as_ref()
+            .and_then(|live| live.attempt.authenticated_server_info());
+        let Some(proof) = proof else {
+            return false;
+        };
+        let policy = qsh::server_discovery::decision(Some(proof.info()));
+        if policy.compatibility == ::connect::upgrade::Compatibility::Incompatible {
+            best_effort_line(&format!("qsh: authenticated qshd {} does not support this client's session profile (wire {}, handshake {}, channel {})",
+                qsh::report::printable(&proof.info().core_version),transport::wire::VERSION,
+                transport::handshake_payload::HS_VERSION,transport::channel::PROTOCOL_VERSION));
+        }
+        let view = qsh::upgrade_offer::presentation(
+            qsh::client_install::update_eligibility()
+                .unwrap_or(qsh::client_install::UpdateEligibility::Unmanaged),
+            policy.compatibility == ::connect::upgrade::Compatibility::Incompatible,
+            policy.offer.as_ref().map(|offer| offer.version.as_str()),
+        );
+        qsh::upgrade_offer::present(&prompt::Tty::new(), &view, || {
+            !signals::termination_requested()
+                && client.server_generation() == Some(proof.info().generation)
+        })
+    }
+    fn approve_client_update(&mut self, version: String) {
+        self.pending_update = Some(version);
+        self.keep = true;
+    }
+    fn upgrade_evidence(&self) -> Option<qsh::server_discovery::AuthenticatedServerInfo> {
+        if let Some(live) = &self.live {
+            return (!live.attempt.is_closed())
+                .then(|| live.attempt.authenticated_server_info())
+                .flatten();
+        }
+        self.round
+            .as_ref()
+            .and_then(|round| round.display_server_info())
+            .filter(|proof| {
+                qsh::server_discovery::decision(Some(proof.info())).compatibility
+                    == ::connect::upgrade::Compatibility::Incompatible
+            })
+    }
+
+    fn upgrade_authority(&self) -> Option<qsh::server_discovery::AuthenticatedServerInfo> {
+        if let Some(live) = &self.live {
+            return (!live.attempt.is_closed())
+                .then(|| live.attempt.authenticated_server_info())
+                .flatten();
+        }
+        self.round
+            .as_ref()
+            .and_then(|round| round.discovered_server_info())
+            .filter(|proof| {
+                qsh::server_discovery::decision(Some(proof.info())).compatibility
+                    == ::connect::upgrade::Compatibility::Incompatible
+            })
+    }
     /// `ev` as the main loop should see it: a connection's event unwrapped
     /// when it is the live connection's, and `None` for anything from a
     /// connection already let go -- an old link's late `Closed` must not end
@@ -911,6 +1037,7 @@ impl Links {
         background::forward(link, events, self.tx.clone());
         self.shell_channel = trial.opened_ch.or(self.shell_channel);
         self.live = Some(Live {
+            restart_advisory: Default::default(),
             attempt,
             channel_session: trial.channel_session,
             link,
@@ -1269,7 +1396,11 @@ impl Links {
                 let graceful = live.attempt.client.closed_gracefully();
                 // A peer that already said `Close` has dropped the session:
                 // there is nothing kept to tell the person about.
-                if self.keep && !graceful {
+                if self.metadata_failure {
+                    // Discovery retirement is local and makes no promise about
+                    // a refused shell or the next daemon generation.
+                    live.attempt.detach();
+                } else if self.keep && !graceful {
                     log::log("leaving; letting the link go, the session stays");
                     live.attempt.detach();
                     lines.push(status::left_kept_notice(host, self.persisted));
@@ -1496,6 +1627,34 @@ fn apply_actions(
                 let _ = stdout.flush();
             }
             Action::Exit(c) => return Some(c),
+            Action::RefreshClientDiscovery => {
+                if let Some(round) = &links.round {
+                    round.retry_now();
+                } else if let Some(live) = &links.live {
+                    live.attempt.client.refresh_server_info();
+                }
+            }
+            Action::UpdateClient {
+                generation,
+                version,
+            } => {
+                let current = links
+                    .upgrade_authority()
+                    .filter(|proof| proof.info().generation == generation);
+                if current
+                    .as_ref()
+                    .and_then(|proof| qsh::server_discovery::decision(Some(proof.info())).offer)
+                    .is_some_and(|offer| offer.version == version)
+                {
+                    links.approve_client_update(version);
+                    return Some(0);
+                }
+                if let Some(round) = &links.round {
+                    round.retry_now();
+                }
+                queue.extend(sess.handle(UiEvent::DiagnosticWarning(
+                    "Server information expired; refreshing discovery. No client update was started.".into()),now_ms));
+            }
             // Printed after the terminal is restored, not here in raw mode.
             Action::Notice(text) => notices.push(text),
             Action::ShellUnavailable => {
@@ -1583,13 +1742,23 @@ fn on_wire(
     let Some(live) = links.live.as_mut() else {
         return actions;
     };
-    channel_events(
-        live.channel_session.on_bytes(stream, bytes),
-        &mut links.shell_channel,
-        sess,
-        shell_bytes,
-        now_ms,
-    )
+    let events = live.channel_session.on_bytes(stream, bytes);
+    for event in &events {
+        if matches!(event,SessionEvent::Refused {ch,..} if links.shell_channel.is_none_or(|shell|shell==*ch))
+        {
+            links.metadata_failure = true;
+        }
+        if matches!(
+            event,
+            SessionEvent::Daemon(transport::channel::ServerRecord::Restarting)
+        ) && !live.attempt.is_closed()
+            && live.restart_advisory.observe()
+        {
+            live.attempt.client.refresh_server_info();
+            log::log("authenticated server restart intent; refreshing discovery without interrupting the working path");
+        }
+    }
+    channel_events(events, &mut links.shell_channel, sess, shell_bytes, now_ms)
 }
 
 /// Apply a selected stream reset through the same ordered CLI boundary as Wire.
@@ -1721,9 +1890,8 @@ fn channel_events(
                 ));
                 actions.extend(sess.on_channel_exit(ch, 1, now_ms()));
             }
-            // This client carries no daemon images and never asks the
-            // daemon about itself; a `Restarting` it did not ask for is
-            // followed by the connection ending the ordinary way.
+            // Restarting is recorded per live transport by on_wire. It never
+            // interrupts a working path or proves a replacement generation.
             SessionEvent::Daemon(_) => {}
             // The far side's own record already stripped the framing;
             // re-frame it as the one record it came from so it reaches
@@ -1756,6 +1924,10 @@ fn channel_events(
     actions
 }
 
+fn confirmed_terminal_action<T>(restored: bool, action: impl FnOnce() -> T) -> Option<T> {
+    restored.then(action)
+}
+
 fn interactive(
     setup: Arc<Setup>,
     mut links: Links,
@@ -1772,6 +1944,7 @@ fn interactive(
             return leave_failed_setup(links);
         }
     };
+    links.terminal_restored = false;
     // From here until `restore` nothing may write to the terminal but the
     // renderer: a library's own line on stderr would land over the frame.
     // So stderr goes into the log, a record per line.
@@ -1838,6 +2011,7 @@ fn interactive(
             // Restore before displaying an initialization failure, as on the
             // normal exit path. No reader thread survived a failed start.
             let restored = raw.restore();
+            links.complete_terminal_restore(&restored);
             best_effort_line(&format!("qsh: could not start keyboard input: {error}"));
             if let Err(error) = restored {
                 best_effort_line(&format!("qsh: could not restore terminal: {error}"));
@@ -1861,7 +2035,73 @@ fn interactive(
     // the loop's only way out sets the real code right before leaving, so a
     // placeholder initial value would never be read.
     let mut notices: Vec<String> = Vec::new();
+    let mut offered = std::collections::HashSet::new();
+    let mut shown_offer = None;
     let code = loop {
+        let evidence = links.upgrade_evidence();
+        let stamp = evidence
+            .as_ref()
+            .map(|proof| (proof.info().generation, proof.info().core_version.clone()));
+        let actionable = links.upgrade_authority().as_ref().is_some_and(|proof| {
+            Some((proof.info().generation, proof.info().core_version.clone())) == stamp
+        });
+        if shown_offer
+            .as_ref()
+            .is_some_and(|shown| Some(shown) != stamp.as_ref() || !actionable)
+        {
+            let actions = sess.handle(UiEvent::ClientUpgradeInvalidated, now_ms());
+            let _ = apply_actions(
+                actions,
+                &mut stdout,
+                &mut links,
+                &mut sess,
+                &mut notices,
+                now_ms(),
+            );
+            shown_offer = None;
+        }
+        if let Some(proof) = evidence {
+            let info = proof.info();
+            if !sess.upgrade_offer_open()
+                && offered.insert((info.generation, info.core_version.clone(), actionable))
+            {
+                let policy = qsh::server_discovery::decision(Some(info));
+                let eligibility = qsh::client_install::update_eligibility()
+                    .unwrap_or(qsh::client_install::UpdateEligibility::Unmanaged);
+                let view = qsh::upgrade_offer::presentation(
+                    eligibility,
+                    policy.compatibility == ::connect::upgrade::Compatibility::Incompatible,
+                    policy.offer.as_ref().map(|offer| offer.version.as_str()),
+                );
+                let view = qsh::upgrade_offer::with_authority(view, &info.core_version, actionable);
+                let actions = match view {
+                    qsh::upgrade_offer::Presentation::Offer(version) => {
+                        shown_offer = stamp;
+                        sess.handle(
+                            UiEvent::ClientUpgrade {
+                                generation: info.generation,
+                                version,
+                            },
+                            now_ms(),
+                        )
+                    }
+                    qsh::upgrade_offer::Presentation::Guidance(line) => {
+                        sess.handle(UiEvent::DiagnosticWarning(line), now_ms())
+                    }
+                    qsh::upgrade_offer::Presentation::Silent => Vec::new(),
+                };
+                if let Some(code) = apply_actions(
+                    actions,
+                    &mut stdout,
+                    &mut links,
+                    &mut sess,
+                    &mut notices,
+                    now_ms(),
+                ) {
+                    break code;
+                }
+            }
+        }
         let now = Instant::now();
         followup.observe(
             sess.ui_deadlines().shell.prediction_refresh,
@@ -2060,7 +2300,9 @@ fn interactive(
     // driver cleanup still follows. It switches back to the terminal's
     // own screen, so every line printed from here on stays there.
     input.stop();
-    let code = match raw.restore() {
+    let restored = raw.restore();
+    links.complete_terminal_restore(&restored);
+    let code = match restored {
         Ok(()) => code,
         Err(error) => {
             best_effort_line(&format!("qsh: could not restore terminal: {error}"));
@@ -2153,7 +2395,7 @@ fn set_stderr_aside(raw: &tty::RawMode) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     include!("async_open_tests.rs");
     include!("input_reader_tests.rs");
@@ -2540,6 +2782,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         // No live link, recovery round, DNS request or terminal reader is started.
         let mut links = Links {
+            terminal_restored: true,
+            metadata_failure: false,
+            pending_update: None,
             setup,
             live: None,
             shell_channel: None,

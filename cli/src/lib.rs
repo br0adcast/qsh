@@ -31,6 +31,7 @@ pub mod recovery_status;
 pub mod releases;
 pub mod report;
 pub mod road_catalog;
+pub mod server_discovery;
 pub mod session;
 pub mod sessions;
 mod sessions_store;
@@ -44,6 +45,7 @@ pub mod trust;
 pub mod tty;
 #[doc(hidden)]
 pub mod ui_wait;
+pub mod upgrade_offer;
 pub mod viewport;
 pub mod window;
 
@@ -53,6 +55,26 @@ extern crate self as qsh;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "main.rs"]
 mod cli_entry;
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn approved_client_update_dispatches_detach_without_close_session() {
+    let events = cli_entry::tests::update_exit_custody_check();
+    assert_eq!(
+        *events.teardowns.lock().unwrap(),
+        vec![connect::Teardown::Detach]
+    );
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn refused_shell_discovery_dispatches_detach_without_close_session() {
+    let events = cli_entry::tests::refused_shell_discovery_custody_check();
+    assert_eq!(
+        *events.teardowns.lock().unwrap(),
+        vec![connect::Teardown::Detach]
+    );
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod install_fixture_tests;

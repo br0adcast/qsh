@@ -1923,6 +1923,8 @@ struct ProbationSeat {
 /// The router's session table, owned solely by the `serve` loop (no shared
 /// lock on the datagram path).
 struct Router {
+    bootstrap: Option<crate::bootstrap::BootstrapResponder>,
+    server_generation: Option<[u8; 16]>,
     revisions: BindingRevisions,
     /// `session_id` -> router->task datagram sender, for demuxing `Transport`
     /// frames to the owning session task. Holds both bound sessions and the
@@ -1958,6 +1960,8 @@ struct Router {
 impl Router {
     fn new() -> Self {
         Router {
+            bootstrap: None,
+            server_generation: None,
             revisions: BindingRevisions::new(MAX_SESSIONS_TOTAL + MAX_PROBATION),
             sessions: HashMap::new(),
             backends: HashMap::new(),
@@ -2747,6 +2751,30 @@ impl SessionManager {
         login_ends: LoginEndedReports,
         shutdown: Shutdown,
     ) -> impl Future<Output = Result<(), ShutdownError>> + Send {
+        Self::serve_with_server_info(
+            socket,
+            server_priv,
+            auth,
+            factory,
+            active_count,
+            login_ends,
+            shutdown,
+            None,
+        )
+    }
+
+    /// Enable independent authenticated metadata on this daemon listener.
+    #[allow(clippy::too_many_arguments)]
+    pub fn serve_with_server_info(
+        socket: Arc<UdpSocket>,
+        server_priv: [u8; 32],
+        auth: ServerAuth,
+        factory: BackendFactory,
+        active_count: Arc<AtomicUsize>,
+        login_ends: LoginEndedReports,
+        shutdown: Shutdown,
+        info: Option<crate::bootstrap::ServerInfo>,
+    ) -> impl Future<Output = Result<(), ShutdownError>> + Send {
         with_owned_secret(server_priv, move |server_priv| {
             Self::serve_with_secret(
                 socket,
@@ -2756,10 +2784,12 @@ impl SessionManager {
                 active_count,
                 login_ends,
                 shutdown,
+                info,
             )
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn serve_with_secret(
         socket: Arc<UdpSocket>,
         server_priv: Zeroizing<[u8; 32]>,
@@ -2768,10 +2798,15 @@ impl SessionManager {
         active_count: Arc<AtomicUsize>,
         mut login_ends: LoginEndedReports,
         shutdown: Shutdown,
+        info: Option<crate::bootstrap::ServerInfo>,
     ) -> Result<(), ShutdownError> {
         let lifecycle = Lifecycle::new(shutdown.clone());
         let mut buf = vec![0u8; RECV_BUF_LEN];
         let mut router = Router::new();
+        if let Some(info) = info {
+            router.server_generation = Some(info.generation);
+            router.bootstrap = crate::bootstrap::BootstrapResponder::new(*server_priv, info).ok();
+        }
         // Per-session tasks signal their end here; the router holds `done_tx`
         // for the whole loop (cloned into each task), so `done_rx` never
         // completes with `None` and its select arm always matches `Some`.
@@ -2877,6 +2912,14 @@ impl SessionManager {
         src: SocketAddr,
         buf: &[u8],
     ) {
+        if crate::bootstrap::is_bootstrap(&buf[..len]) {
+            if let Some(responder) = &mut router.bootstrap {
+                if let Some(reply) = responder.on_datagram(Instant::now(), src, &buf[..len]) {
+                    let _ = ctx.socket.send_to(&reply, src).await;
+                }
+            }
+            return;
+        }
         match parse(&buf[..len]) {
             Ok(Frame::Handshake {
                 kind: Kind::KeyRequest,
@@ -2981,6 +3024,7 @@ impl SessionManager {
                 // other rejection reason (bad Noise, wrong method, unknown
                 // key), which must stay silent as they always have.
                 let mut nonce_failure: Option<String> = None;
+                let server_generation = router.server_generation;
                 let mut resolve_for_msg2 = |msg1: &Msg1Payload| -> Option<Msg2Resolution> {
                     let d = router.resolve(&msg1.token, body, msg1.start_kind);
                     if matches!(d, AcceptDecision::ResendMsg2) {
@@ -3013,7 +3057,7 @@ impl SessionManager {
                 } else {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
-                    Connection::accept_resolved(
+                    Connection::accept_resolved_with_generation(
                         ConnectionConfig {
                             required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
@@ -3026,12 +3070,13 @@ impl SessionManager {
                         src,
                         body,
                         &mut resolve_for_msg2,
+                        server_generation,
                     )
                 };
                 if matches!(outcome, ResolvedAccept::Rejected) && ctx.auth.verifier.is_some() {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
-                    outcome = Connection::accept_resolved(
+                    outcome = Connection::accept_resolved_with_generation(
                         ConnectionConfig {
                             required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
@@ -3044,6 +3089,7 @@ impl SessionManager {
                         src,
                         body,
                         &mut resolve_for_msg2,
+                        server_generation,
                     );
                 }
                 match outcome {

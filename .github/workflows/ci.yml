@@ -107,6 +107,55 @@ jobs:
           grep -F 'test managed_help_capability_pty_has_no_state ... ok' "$runtime/command.log"
           grep -F 'test development_managed_commands_pty_refuse_without_state ... ok' "$runtime/command.log"
           grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$runtime/command.log"
+      - name: Test authenticated server discovery and upgrade policy on macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-server-discovery.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
+          unset SSH_AUTH_SOCK
+          focused_lib() {
+            local package=$1 filter=$2
+            shift 2
+            local output="$runtime/$package-$filter.log"
+            cargo test -p "$package" --lib --locked "$@" "$filter" -- --color never \
+              2>&1 | tee "$output"
+            grep -E '^test .+ \.\.\. ok$' "$output"
+            grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$output"
+            if grep -F 'SKIPPED' "$output"; then exit 1; fi
+          }
+          # These tests use authenticated in-process peers or pure decisions;
+          # no installed daemon, SSH agent or retained release artifact is used.
+          focused_lib transport bootstrap --features tokio-driver
+          grep -E '^test bootstrap_client::tests::.* \.\.\. ok$' "$runtime/transport-bootstrap.log"
+          focused_lib transport generation --features tokio-driver
+          focused_lib qshd server_info
+          grep -F 'test server_info::tests::server_info_generation_is_shared_and_control_echoes_live_values ... ok' "$runtime/qshd-server_info.log"
+          grep -F 'test transport_daemon::server_info_tests::server_info_control_reads_running_owner_without_authorization_mutation ... ok' "$runtime/qshd-server_info.log"
+          focused_lib connect upgrade
+          focused_lib qsh server_discovery
+          focused_lib qsh recovery::discovery_tests
+          focused_lib qsh recovery::pending_tests
+          focused_lib qsh upgrade_offer
+          focused_lib qsh authenticated_upgrade_overlay_defaults_to_postpone_and_requires_explicit_choice
+          focused_lib qsh expired_upgrade_choice_neither_installs_nor_types_into_the_shell
+          focused_lib qsh released_attempt_delivers_only_metadata_wakes_to_the_next_receiver
+          focused_lib ssh server_info
+          # This integration target owns its authenticated loopback peer and PTY;
+          # it does not infer a daemon path from a Cargo sibling executable.
+          cargo test -p qsh --test server_discovery --locked -- --color never \
+            2>&1 | tee "$runtime/discovery-pty.log"
+          grep -F 'test source_incompatible_initial_discovery_pty_shows_manual_rebuild_without_download_offer ... ok' "$runtime/discovery-pty.log"
+          grep -F 'test legacy_unknown_initial_discovery_pty_keeps_ordinary_timeout_and_no_release_claim ... ok' "$runtime/discovery-pty.log"
+          grep -F 'test authenticated_ordinary_rejection_cannot_cancel_initial_discovery_pty ... ok' "$runtime/discovery-pty.log"
+          grep -F 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$runtime/discovery-pty.log"
+          if grep -F 'SKIPPED' "$runtime/discovery-pty.log"; then exit 1; fi
       - name: Qualify the production Darwin process owner
         shell: bash
         run: |

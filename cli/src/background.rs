@@ -89,6 +89,16 @@ impl RoundTask {
         self.recovery.take_warning()
     }
 
+    pub fn display_server_info(&self) -> Option<crate::server_discovery::AuthenticatedServerInfo> {
+        self.recovery.display_server_info()
+    }
+
+    pub fn discovered_server_info(
+        &self,
+    ) -> Option<crate::server_discovery::AuthenticatedServerInfo> {
+        self.recovery.discovered_server_info()
+    }
+
     pub fn activity(&self) -> crate::recovery::Activity {
         self.recovery.activity()
     }

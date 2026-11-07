@@ -74,10 +74,20 @@ type TrialFailure = (::connect::reconnect::RoundEnd, Option<String>);
 
 impl Climb<'_> {
     /// The accepted shared attempt uses the same startup admission as direct QSH.
+    #[cfg(test)]
     pub(super) fn shared_trial(
         &self,
         att: attempt::Attempt,
         addr: usize,
+    ) -> Result<(attempt::Attempt, Trial), TrialFailure> {
+        self.shared_trial_observed(att, addr, None)
+    }
+
+    fn shared_trial_observed(
+        &self,
+        att: attempt::Attempt,
+        addr: usize,
+        observation: Option<&crate::recovery::MetadataQuery>,
     ) -> Result<(attempt::Attempt, Trial), TrialFailure> {
         let (verdict, att, trial) = self.trial_for_attempt(att);
         if let Verdict::LocalSendFailure(error) = verdict {
@@ -91,6 +101,43 @@ impl Climb<'_> {
                     "qsh: local startup write was not accepted ({error:?})"
                 )),
             ));
+        }
+        if let Verdict::ServerIncompatible(info) = &verdict {
+            if let (Some(recovery), Some((epoch, sweep))) = (self.recovery, self.recovery_attempt) {
+                for (source, proof) in att.client.discovered_server_info_by_endpoint() {
+                    if Some(source) == att.client.active_path()
+                        && proof.info().generation == info.generation
+                    {
+                        if let Some(query) = observation {
+                            recovery.complete_qsh_metadata(
+                                query,
+                                AddressId(addr),
+                                Some(crate::server_discovery::AuthenticatedServerInfo::Bootstrap(
+                                    proof,
+                                )),
+                            );
+                        } else {
+                            recovery.publish_qsh_server_info(
+                                self.revision,
+                                epoch,
+                                sweep,
+                                addr,
+                                crate::server_discovery::AuthenticatedServerInfo::Bootstrap(proof),
+                            );
+                        }
+                    }
+                }
+            }
+            let why = crate::server_discovery::incompatibility(info);
+            let line = report::no_answer(&self.addrs[addr].host, self.addrs[addr].qsh_port, &why);
+            self.say(&line);
+            if let (Some(recovery), Some(query)) = (self.recovery, observation) {
+                recovery.retain_failed_discovery(att, query.clone());
+                self.drain();
+            } else {
+                self.forget(&att);
+            }
+            return Err((::connect::reconnect::RoundEnd::AllFailed, Some(line)));
         }
         if verdict != Verdict::Working {
             self.forget(&att);
@@ -226,6 +273,7 @@ impl Climb<'_> {
         }
         let mut sweep = RecoverySweep::new(epoch, sweep_id, self.revision, memberships.clone());
         while let Some(plan) = sweep.next_attempt() {
+            recovery.poll_pending_discovery();
             if self.interrupted() || cancel.is_cancelled() {
                 return failed();
             }
@@ -238,6 +286,17 @@ impl Climb<'_> {
             };
             let progress = Arc::new(Mutex::new(Progress::new(&plan.endpoints)));
             let observer = progress.clone();
+            let targets = memberships
+                .iter()
+                .filter(|m| m.method == plan.id.method && plan.endpoints.contains(&m.endpoint))
+                .map(|m| (m.address, m.endpoint))
+                .collect();
+            let Some(observation) =
+                recovery.begin_qsh_metadata(self.revision, epoch, sweep_id, targets)
+            else {
+                return failed();
+            };
+            let mut metadata_reported = HashSet::new();
             let mut owned = OwnedAttempt(Some(attempt::Attempt::open_recovery(
                 memberships
                     .iter()
@@ -267,6 +326,13 @@ impl Climb<'_> {
             let mut refused = HashSet::new();
             let mut terminal = None;
             loop {
+                recovery.poll_pending_discovery();
+                recovery.harvest_metadata(
+                    &observation,
+                    &att.client,
+                    att.client.discovery_complete(),
+                    &mut metadata_reported,
+                );
                 if self.interrupted() || cancel.is_cancelled() {
                     return failed();
                 }
@@ -356,11 +422,32 @@ impl Climb<'_> {
                     // A local driver failure before dispatch is not evidence that
                     // unsent addresses failed. Retry another sweep without SSH credit.
                     if att.events.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                        // Selected is published before Closed, but may have
+                        // arrived after this turn drained progress. Consume it
+                        // before deciding that the driver had no source.
+                        let queued_progress = {
+                            let observed = progress.lock().unwrap_or_else(|e| e.into_inner());
+                            !observed.pending.is_empty()
+                        };
+                        if queued_progress {
+                            continue;
+                        }
+                        // A genuine local failure earns no ordinary-path SSH
+                        // credit; its already-active metadata still has custody.
+                        let failed_attempt = owned.0.take().expect("closed shared attempt");
+                        recovery.retain_failed_discovery(failed_attempt, observation);
+                        self.drain();
                         return failed();
                     }
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
+            recovery.harvest_metadata(
+                &observation,
+                &att.client,
+                att.client.discovery_complete(),
+                &mut metadata_reported,
+            );
             if let Some((endpoint, Verdict::Working)) = terminal {
                 let i = memberships
                     .iter()
@@ -369,8 +456,23 @@ impl Climb<'_> {
                     .address
                     .0;
                 let att = owned.0.take().expect("accepted attempt");
-                let (att, trial) = match self.shared_trial(att, i) {
+                let (att, trial) = match self.shared_trial_observed(att, i, Some(&observation)) {
                     Ok(ready) => ready,
+                    Err((RoundEnd::AllFailed, _)) => {
+                        // A generation-bound profile rejection is terminal for
+                        // this endpoint, not for other configured addresses.
+                        for completion in sweep.finish_protocol_failure(plan.id, endpoint) {
+                            recovery.finish(
+                                self.revision,
+                                epoch,
+                                sweep_id,
+                                completion.address,
+                                completion.outcome,
+                            );
+                        }
+                        sweep.retire(plan.id);
+                        continue;
+                    }
                     Err((end, line)) => return Climbed::Failed { end, line },
                 };
                 let (outcome, _) = self.logged_in(att, trial, endpoint, identity.qsh_key);
@@ -406,7 +508,9 @@ impl Climb<'_> {
             // Stop/join the sole network proof owner before terminal accounting
             // or another initiator. A source selected during cancellation keeps
             // its unfinished obligation; cancellation itself is not refusal.
-            self.forget(att);
+            let failed_attempt = owned.0.take().expect("failed shared attempt");
+            recovery.retain_failed_discovery(failed_attempt, observation);
+            self.drain();
             recovery.clear_qsh_attempt(self.revision, sweep_id);
             let late_selection = progress.lock().unwrap_or_else(|e| e.into_inner()).selected;
             let completed: Vec<_> = if let Some((endpoint, verdict)) = terminal {
@@ -430,7 +534,13 @@ impl Climb<'_> {
                 for i in aliases {
                     let host = self.addrs[i].host.clone();
                     let port = self.addrs[i].qsh_port;
-                    if let Verdict::ProtocolFailure(failure) = verdict {
+                    if let Verdict::ServerIncompatible(ref info) = verdict {
+                        self.say(&report::no_answer(
+                            &host,
+                            port,
+                            &crate::server_discovery::incompatibility(info),
+                        ));
+                    } else if let Verdict::ProtocolFailure(failure) = verdict {
                         self.say(&report::no_answer(&host, port, &protocol_why(failure)));
                     } else if matches!(verdict, Verdict::Unreachable(_)) {
                         let send = refused.contains(&endpoint).then(|| {
@@ -451,7 +561,10 @@ impl Climb<'_> {
                         }
                     }
                 }
-                let completions = if matches!(verdict, Verdict::ProtocolFailure(_)) {
+                let completions = if matches!(
+                    verdict,
+                    Verdict::ProtocolFailure(_) | Verdict::ServerIncompatible(_)
+                ) {
                     sweep.finish_protocol_failure(plan.id, endpoint)
                 } else {
                     sweep.finish_checked(plan.id, endpoint, outcome)
@@ -471,6 +584,7 @@ impl Climb<'_> {
         // DNS resolution runs in the retained catalog owner. A late DNS result
         // changes the revision and restarts this sweep, never completes this one.
         while !unresolved.is_empty() && dns_started.elapsed() < crate::road_catalog::DNS_TIMEOUT {
+            recovery.poll_pending_discovery();
             if self.interrupted() || cancel.is_cancelled() {
                 return failed();
             }

@@ -92,7 +92,8 @@ fn each_pair_agrees_on_what_both_sides_can_do() {
 /// agreement alone could not tell from it.
 #[test]
 fn an_old_client_sends_the_19_byte_msg1() {
-    for (pair, payload) in [(Pair::BothNew, 23), (Pair::OldClient, 19)] {
+    // New clients append the five-byte process-generation awareness marker.
+    for (pair, payload) in [(Pair::BothNew, 28), (Pair::OldClient, 19)] {
         let sim = live(pair, 6, vec![road()]);
         // IK's msg1: the initiator's ephemeral key, its sealed static key
         // and the sealed payload.

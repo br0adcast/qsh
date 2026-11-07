@@ -62,6 +62,12 @@ pub enum LocalInputFailure {
 pub enum UiEvent {
     /// Owner-polled startup diagnostic from generation-valid SSH recovery.
     DiagnosticWarning(String),
+    /// Owner-validated release offer; rendered without taking terminal ownership.
+    ClientUpgrade {
+        generation: [u8; 16],
+        version: String,
+    },
+    ClientUpgradeInvalidated,
     /// Authenticated terminal failure for the exact stamped live link.
     SessionAborted(transport::SessionAbortReason),
     /// Explicit synchronous rejection or accepted-input failure; never replay it.
@@ -82,7 +88,10 @@ pub enum UiEvent {
     /// Fresh transport statistics (the round trip drives prediction).
     Stats(Stats),
     /// The local terminal changed size (SIGWINCH, already measured).
-    Resized { cols: u16, rows: u16 },
+    Resized {
+        cols: u16,
+        rows: u16,
+    },
     /// Returned from the background (SIGCONT).
     Resumed,
     /// A signal asking us to stop -- SIGTERM, SIGINT or SIGQUIT: close down
@@ -101,7 +110,10 @@ pub enum UiEvent {
     /// shell channel's own output, so this variant only crosses the
     /// mpsc channel the driver thread and the main loop share -- `handle`
     /// itself never does anything with it.
-    Wire { stream: u8, bytes: Vec<u8> },
+    Wire {
+        stream: u8,
+        bytes: Vec<u8>,
+    },
     /// The peer dropped its backlog on a wire stream. Same reasoning as
     /// `Wire`: `main` decides whether the stream is the shell channel's own
     /// before this ever becomes a `StreamReset`.
@@ -109,38 +121,70 @@ pub enum UiEvent {
     /// Reconnect round number `round` is trying `to` (a host). Shown only
     /// while the link is gone; `main` lets it through only while that round
     /// is the one under way.
-    Reconnecting { round: u64, to: String },
+    Reconnecting {
+        round: u64,
+        to: String,
+    },
     /// No round now; the next one starts at `until_ms` (on the session's
     /// clock). `hint`, when there is one, says what to do about it.
-    ReconnectWaiting { until_ms: i64, hint: Option<String> },
+    ReconnectWaiting {
+        until_ms: i64,
+        hint: Option<String>,
+    },
     /// Owner-polled recovery activity; no worker may enqueue this event.
     RecoveryStatus {
         view: Option<crate::recovery_status::View>,
     },
     /// Roads as `main` sees them now, in command-line order; the one in use
     /// has `in_use` set.
-    Roads { roads: Vec<window::Road> },
+    Roads {
+        roads: Vec<window::Road>,
+    },
     /// The switch the window asked for is over.
-    RoadSwitched { ok: bool },
+    RoadSwitched {
+        ok: bool,
+    },
     /// An event of connection number `link`, forwarded (see `background::forward`).
     /// `main` unwraps it; `Session::handle` ignores it.
-    FromLink { link: u64, event: Box<UiEvent> },
+    FromLink {
+        link: u64,
+        event: Box<UiEvent>,
+    },
 }
 
 /// What the caller must do. The session never performs an effect itself.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Action {
+    RefreshClientDiscovery,
+    /// Explicit consent, executed only after restoring the terminal.
+    UpdateClient {
+        generation: [u8; 16],
+        version: String,
+    },
     /// Bytes for the local terminal.
     Write(Vec<u8>),
     /// Open the shell channel at this size. Emitted once, on the first
     /// `Live`.
-    OpenShell { cols: u16, rows: u16 },
+    OpenShell {
+        cols: u16,
+        rows: u16,
+    },
     /// Bytes for a channel.
-    SendChannel { ch: ChannelId, bytes: InputBytes },
+    SendChannel {
+        ch: ChannelId,
+        bytes: InputBytes,
+    },
     /// Latest physical intent; hold wire submission until the debounce expires.
-    DeferResize { cols: u16, rows: u16 },
+    DeferResize {
+        cols: u16,
+        rows: u16,
+    },
     /// A new size for a channel.
-    ResizeChannel { ch: ChannelId, cols: u16, rows: u16 },
+    ResizeChannel {
+        ch: ChannelId,
+        cols: u16,
+        rows: u16,
+    },
     /// The authenticated resumed inventory no longer contains the tracked shell.
     /// The owner may offer replacement after restoring the terminal.
     ShellUnavailable,
@@ -182,6 +226,12 @@ pub fn shell_size(cols: u16, rows: u16, line: bool) -> (u16, u16) {
 /// A window over the frame.
 #[derive(Clone, Debug)]
 enum Open {
+    UpgradeExpired,
+    Upgrade {
+        generation: [u8; 16],
+        version: String,
+        rendered: bool,
+    },
     /// The connection-state window (`Ctrl-] s`).
     Roads(Roads),
     /// The key help (`Ctrl-] ?`).
@@ -363,6 +413,7 @@ pub struct Session {
     line_shown: bool,
     /// The window over the frame, if one is open.
     window: Option<Open>,
+    pending_upgrade: Option<([u8; 16], String)>,
     /// The unfinished end of the last read while a window was open, read
     /// again in front of the next one: a key sequence cut in two (an arrow,
     /// `ESC [ 1 5 ~`) here, and after it, in `window_tail`, what
@@ -392,6 +443,44 @@ pub struct Session {
 }
 
 impl Session {
+    fn show_pending_upgrade(&mut self, now_ms: i64) -> Vec<Action> {
+        let Some((generation, version)) = self.pending_upgrade.clone() else {
+            return Vec::new();
+        };
+        if self.raw_cols == 0
+            || self.raw_rows == 0
+            || window::upgrade_box(&version, self.cols, self.rows, self.chrome.glyphs).is_none()
+        {
+            if matches!(self.window, Some(Open::Upgrade { .. })) {
+                self.close_window();
+            }
+            return Vec::new();
+        }
+        if let Some(Open::Upgrade {
+            generation: current,
+            version: current_version,
+            ..
+        }) = &self.window
+        {
+            if *current == generation && current_version == &version {
+                return Vec::new();
+            }
+        }
+        self.set_window(
+            Some(Open::Upgrade {
+                generation,
+                version,
+                rendered: false,
+            }),
+            now_ms,
+        )
+    }
+    pub fn upgrade_offer_open(&self) -> bool {
+        matches!(
+            self.window,
+            Some(Open::Upgrade { .. } | Open::UpgradeExpired)
+        )
+    }
     pub fn new(
         cols: u16,
         rows: u16,
@@ -468,6 +557,7 @@ impl Session {
             mouse: MouseShift::new(),
             line_shown: chrome.line,
             window: None,
+            pending_upgrade: None,
             window_held: InputBytes::default(),
             window_tail: InputBytes::default(),
             roads: Vec::new(),
@@ -484,6 +574,21 @@ impl Session {
 
     pub fn handle(&mut self, ev: UiEvent, now_ms: i64) -> Vec<Action> {
         match ev {
+            UiEvent::ClientUpgrade {
+                generation,
+                version,
+            } => {
+                self.pending_upgrade = Some((generation, version));
+                self.show_pending_upgrade(now_ms)
+            }
+            UiEvent::ClientUpgradeInvalidated => {
+                self.pending_upgrade = None;
+                if matches!(self.window, Some(Open::Upgrade { .. })) {
+                    self.set_window(Some(Open::UpgradeExpired), now_ms)
+                } else {
+                    Vec::new()
+                }
+            }
             UiEvent::DiagnosticWarning(message) => {
                 let message = logging::diagnostic(&message);
                 if self.diagnostic_notice.as_ref() == Some(&message) {
@@ -572,7 +677,14 @@ impl Session {
                 self.silent_secs = u64::from(stats.silent_secs);
                 Vec::new()
             }
-            UiEvent::Resized { cols, rows } => self.on_resize(cols, rows, now_ms),
+            UiEvent::Resized { cols, rows } => {
+                if let Some(Open::Upgrade { rendered, .. }) = &mut self.window {
+                    *rendered = false;
+                }
+                let mut actions = self.on_resize(cols, rows, now_ms);
+                actions.extend(self.show_pending_upgrade(now_ms));
+                actions
+            }
             UiEvent::Resumed => {
                 // Job control typically clears bracketed paste and mouse
                 // tracking, and something else has been drawing on this
@@ -1255,6 +1367,19 @@ impl Session {
     /// `Enter`, `Esc` and `q`. What follows a key that closes the window in
     /// the same read goes nowhere either.
     fn on_window_input(&mut self, input: InputBytes, now_ms: i64) -> Vec<Action> {
+        if let Some(Open::Upgrade {
+            version, rendered, ..
+        }) = &self.window
+        {
+            if self.raw_cols == 0
+                || self.raw_rows == 0
+                || !*rendered
+                || window::upgrade_box(version, self.cols, self.rows, self.chrome.glyphs).is_none()
+            {
+                self.close_window();
+                return self.on_input(input, now_ms);
+            }
+        }
         let mut held = std::mem::take(&mut self.window_held);
         held.append(std::mem::take(&mut self.window_tail));
         held.append(input);
@@ -1269,8 +1394,34 @@ impl Session {
         if bytes.is_empty() {
             return Vec::new();
         }
+        if matches!(self.window, Some(Open::UpgradeExpired)) {
+            let mut actions = self.set_window(None, now_ms);
+            if keys.first() == Some(&window::Key::Pick(1)) {
+                actions.push(Action::RefreshClientDiscovery);
+            }
+            return actions;
+        }
         if matches!(self.window, Some(Open::Help)) {
             return self.set_window(None, now_ms);
+        }
+        if let Some(Open::Upgrade {
+            generation,
+            version,
+            ..
+        }) = &self.window
+        {
+            let generation = *generation;
+            let version = version.clone();
+            self.pending_upgrade = None;
+            let mut actions = self.set_window(None, now_ms);
+            // Only an explicit 2 consents. Enter, Escape and every other key postpone.
+            if keys.first() == Some(&window::Key::Pick(1)) {
+                actions.push(Action::UpdateClient {
+                    generation,
+                    version,
+                });
+            }
+            return actions;
         }
         if self.recovery_view.is_some() {
             let count = window::recovery_lines(
@@ -1345,6 +1496,11 @@ impl Session {
     /// left open out of sight, where it would swallow every key typed.
     fn window_box(&mut self) -> Option<Boxed> {
         let boxed = self.draw_window();
+        if boxed.is_some() {
+            if let Some(Open::Upgrade { rendered, .. }) = &mut self.window {
+                *rendered = true;
+            }
+        }
         if boxed.is_none() {
             self.close_window();
         }
@@ -1355,6 +1511,8 @@ impl Session {
         let (cols, rows, glyphs) = (self.cols, self.rows, self.chrome.glyphs);
         match &self.window {
             None => None,
+            Some(Open::UpgradeExpired) => window::upgrade_expired_box(cols, rows, glyphs),
+            Some(Open::Upgrade { version, .. }) => window::upgrade_box(version, cols, rows, glyphs),
             Some(Open::Help) => {
                 let name = self.chrome.prefix.name().unwrap_or_default();
                 window::help_box(&name, cols, rows, glyphs)
@@ -2012,6 +2170,105 @@ fn seconds_until(until_ms: i64, now_ms: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invisible_upgrade_never_consents_initially_or_after_resize() {
+        use super::*;
+        for (cols, rows, initially_visible) in [
+            (0, 0, false),
+            (1, 1, false),
+            (7, 2, false),
+            (1, 1, true),
+            (0, 0, true),
+        ] {
+            let mut state = Session::new(
+                if initially_visible { 80 } else { cols },
+                if initially_visible { 24 } else { rows },
+                TermCaps::truecolor(),
+                PredictMode::Never,
+                plain(),
+            );
+            state.on_link(LinkState::Live, 0);
+            state.on_channel_ready(16, 0);
+            state.handle(
+                UiEvent::ClientUpgrade {
+                    generation: [1; 16],
+                    version: "1.2.3".into(),
+                },
+                0,
+            );
+            if initially_visible {
+                state.handle(UiEvent::Resized { cols, rows }, 1);
+            }
+            let actions = state.handle(UiEvent::Stdin(ingress_input(b"2".to_vec())), 2);
+            assert!(!actions.iter().any(|a|matches!(a,Action::UpdateClient {..})),"invisible offer accepted at {cols}x{rows}, visible before resize={initially_visible}");
+            state.handle(UiEvent::Resized { cols: 80, rows: 24 }, 3);
+            assert!(
+                state.upgrade_offer_open(),
+                "pending offer should appear when the terminal fits"
+            );
+            let actions = state.handle(UiEvent::Stdin(ingress_input(b"2".to_vec())), 4);
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, Action::UpdateClient { .. })),
+                "visible offer must still support explicit consent from {cols}x{rows} previous_visible={initially_visible}; window={:?} actions={actions:?}", state.window
+            );
+        }
+    }
+    #[test]
+    fn authenticated_upgrade_overlay_defaults_to_postpone_and_requires_explicit_choice() {
+        use super::*;
+        for (input, consent) in [
+            (b"\r".as_slice(), false),
+            (b"\x1b".as_slice(), false),
+            (b"1".as_slice(), false),
+            (b"2".as_slice(), true),
+            (b"2\r".as_slice(), true),
+            (b"\x1b[200~2\x1b[201~".as_slice(), false),
+        ] {
+            let mut state =
+                Session::new(80, 24, TermCaps::truecolor(), PredictMode::Never, plain());
+            let painted = state.handle(
+                UiEvent::ClientUpgrade {
+                    generation: [1; 16],
+                    version: "1.2.3".into(),
+                },
+                0,
+            );
+            assert!(painted
+                .iter()
+                .any(|action| matches!(action, Action::Write(_))));
+            let actions = state.handle(UiEvent::Stdin(ingress_input(input.to_vec())), 1);
+            assert_eq!(
+                actions.iter().any(
+                    |action| matches!(action, Action::UpdateClient {version:v,..} if v == "1.2.3")
+                ),
+                consent
+            );
+            assert!(!actions
+                .iter()
+                .any(|action| matches!(action, Action::SendChannel { .. })));
+        }
+    }
+    #[test]
+    fn expired_upgrade_choice_neither_installs_nor_types_into_the_shell() {
+        use super::*;
+        let mut state = Session::new(80, 24, TermCaps::truecolor(), PredictMode::Never, plain());
+        state.handle(
+            UiEvent::ClientUpgrade {
+                generation: [1; 16],
+                version: "1.2.3".into(),
+            },
+            0,
+        );
+        state.handle(UiEvent::ClientUpgradeInvalidated, 1);
+        let actions = state.handle(UiEvent::Stdin(ingress_input(b"2".to_vec())), 2);
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            Action::UpdateClient { .. } | Action::SendChannel { .. }
+        )));
+        assert!(actions.contains(&Action::RefreshClientDiscovery));
+    }
     /// What [`Session::recycle`] does with storage, for tests that compare
     /// reused storage against none.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -256,6 +256,36 @@ impl Prompter {
 }
 
 impl SshStep<'_> {
+    /// Read-only fallback using the configured account and remembered host keys.
+    /// Discovery never broadens credentials or asks a background question.
+    pub fn discover_server_info(
+        &self,
+        addr: &::connect::Address,
+        route: &::connect::SshRoute,
+        expected: &::connect::server_identity::ServerIdentity,
+        cancel: &knock::Cancel,
+    ) -> Result<Option<ssh::VerifiedSshServerInfo>, SshStepError> {
+        if self.login != expected.username {
+            return Ok(None);
+        }
+        let keys = self
+            .known_hosts
+            .lookup(&addr.host, route.port)
+            .map_err(|e| plain(e.to_string()))?;
+        if keys.known.is_empty() {
+            return Ok(None);
+        }
+        let request = self.request(addr, route, [0; 32], &keys, Arc::new(ssh::NoPrompts));
+        ssh::discover_server_info(
+            request.ssh,
+            request.auth,
+            Arc::new(knock::NoBind),
+            expected.qsh_key,
+            cancel,
+        )
+        .map_err(|e| plain(e.to_string()))
+    }
+
     fn prompter(&self) -> Prompter {
         if self.no_password {
             // `--no-password` asks nothing anywhere: a login that needed an

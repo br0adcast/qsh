@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::climb::Setup;
+use crate::server_discovery::AuthenticatedServerInfo;
 use crate::{log, report};
 use ::connect::recovery_gate::{
     AddressId, AddressOutcome, GateDecision, RecoveryEpoch, RecoveryGate, SweepId,
@@ -12,6 +13,23 @@ use ::connect::recovery_gate::{
 
 pub const UDP_ROUND_INTERVAL: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(20);
+// Original discovery lasts two seconds and UDP sweeps retry no faster than
+// once per second. Keep older active exchanges; cancel redundant new retention.
+const METADATA_OVERLAP_PER_ENDPOINT: usize = 3;
+
+#[derive(Clone, Copy)]
+enum InfoAuthority {
+    Qsh(SweepId),
+    Ssh(u64),
+}
+
+#[derive(Clone)]
+struct ServerObservation {
+    proof: AuthenticatedServerInfo,
+    authority: Option<InfoAuthority>,
+    address: usize,
+    serial: u64,
+}
 
 struct State {
     gate: RecoveryGate,
@@ -27,6 +45,32 @@ struct State {
     ssh_retry_at: Option<Instant>,
     warning: Option<String>,
     last_warnings: Vec<Option<String>>,
+    server_info: Vec<Option<ServerObservation>>,
+    next_metadata: u64,
+    sweep_metadata: u64,
+    latest_metadata_completed: Vec<u64>,
+    pending_discovery: Vec<PendingDiscovery>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MetadataQuery {
+    epoch: RecoveryEpoch,
+    revision: u64,
+    sweep: SweepId,
+    serial: u64,
+    targets: Vec<(AddressId, SocketAddr)>,
+}
+
+struct PendingDiscovery {
+    attempt: crate::connect::Attempt,
+    query: MetadataQuery,
+    deadline: Instant,
+    reported: std::collections::HashSet<AddressId>,
+}
+impl Drop for PendingDiscovery {
+    fn drop(&mut self) {
+        self.attempt.detach();
+    }
 }
 
 struct SshAttempt {
@@ -34,6 +78,7 @@ struct SshAttempt {
     revision: u64,
     attempt: u64,
     cancel: knock::Cancel,
+    serial: u64,
 }
 
 /// Observation only: none of these fields participates in recovery decisions.
@@ -62,6 +107,55 @@ pub struct Recovery {
 }
 
 impl State {
+    fn current_observation(&self, observation: &ServerObservation) -> bool {
+        self.latest_metadata_completed[observation.address] == observation.serial
+            && observation.authority.is_some()
+    }
+
+    fn record_metadata(
+        &mut self,
+        addr: usize,
+        serial: u64,
+        proof: Option<AuthenticatedServerInfo>,
+        authority: InfoAuthority,
+    ) -> bool {
+        if serial < self.latest_metadata_completed[addr] {
+            return false;
+        }
+        self.latest_metadata_completed[addr] = serial;
+        if let Some(proof) = proof {
+            self.server_info[addr] = Some(ServerObservation {
+                proof,
+                authority: Some(authority),
+                address: addr,
+                serial,
+            });
+        } else if let Some(observation) = &mut self.server_info[addr] {
+            observation.authority = None;
+        }
+        true
+    }
+
+    fn retire_server_info_authority(&mut self) {
+        for observation in self.server_info.iter_mut().flatten() {
+            observation.authority = None;
+        }
+    }
+
+    fn owns_ssh(&self, epoch: RecoveryEpoch, attempt: &SshAttempt, addr: usize) -> bool {
+        !self.local_send_failure
+            && !attempt.cancel.is_cancelled()
+            && attempt.epoch == epoch
+            && self.revision == attempt.revision
+            && self.gate.ssh_allowed()
+            && addr < self.server_info.len()
+            && self
+                .ssh
+                .as_ref()
+                .is_some_and(|(id, _)| *id == attempt.attempt)
+            && self.ssh_activity == Some((attempt.attempt, AddressId(addr)))
+    }
+
     fn cancel_ssh(&mut self) {
         self.ssh_activity = None;
         if let Some((_, cancel)) = self.ssh.take() {
@@ -70,6 +164,8 @@ impl State {
     }
     fn changed(&mut self, epoch: RecoveryEpoch) {
         self.cancel_ssh();
+        self.pending_discovery.clear();
+        self.server_info.fill(None);
         self.revision += 1;
         self.local_send_failure = false;
         self.qsh_activity.clear();
@@ -105,6 +201,11 @@ impl Recovery {
                 ssh_retry_at: None,
                 warning: None,
                 last_warnings: vec![None; addresses],
+                server_info: vec![None; addresses],
+                next_metadata: 0,
+                sweep_metadata: 0,
+                latest_metadata_completed: vec![0; addresses],
+                pending_discovery: Vec::new(),
             }),
             retry_now: AtomicBool::new(false),
             notification: OnceLock::new(),
@@ -176,6 +277,8 @@ impl Recovery {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.cancel.cancel();
         state.qsh_activity.clear();
+        state.pending_discovery.clear();
+        state.server_info.fill(None);
         state.ssh_retry_at = None;
         state.cancel_ssh();
         for diagnostic in &self.diagnostics {
@@ -194,6 +297,8 @@ impl Recovery {
         }
         state.local_send_failure = true;
         state.qsh_activity.clear();
+        state.pending_discovery.clear();
+        state.server_info.fill(None);
         state.ssh_retry_at = None;
         state.cancel_ssh();
         drop(state);
@@ -216,6 +321,10 @@ impl Recovery {
             return;
         }
         state.gate.begin_sweep(sweep);
+        if state.observed_sweep != Some(sweep) {
+            state.next_metadata += 1;
+            state.sweep_metadata = state.next_metadata;
+        }
         state.observed_sweep = Some(sweep);
         state.qsh_activity.clear();
         drop(state);
@@ -244,7 +353,11 @@ impl Recovery {
         }
         match state.gate.finish(epoch, sweep, addr, outcome) {
             GateDecision::AllowSsh => log::log("recovery: full QSH sweep failed; SSH permitted"),
-            GateDecision::Recovered => state.cancel_ssh(),
+            GateDecision::Recovered => {
+                state.pending_discovery.clear();
+                state.server_info.fill(None);
+                state.cancel_ssh();
+            }
             _ => {}
         }
         drop(state);
@@ -261,6 +374,23 @@ impl Recovery {
                     .values()
                     .map(|(_, _, q)| q.clone())
                     .collect();
+                for pending in &state.pending_discovery {
+                    if pending.attempt.client.discovery_complete()
+                        || Instant::now() >= pending.deadline
+                    {
+                        continue;
+                    }
+                    for &(address, endpoint) in &pending.query.targets {
+                        if !pending.reported.contains(&address)
+                            && !paths.iter().any(|q| q.address == address)
+                        {
+                            paths.push(QshActivity {
+                                address,
+                                endpoint: Some(endpoint),
+                            });
+                        }
+                    }
+                }
                 paths.sort_by_key(|q| q.address.0);
                 paths
             } else {
@@ -343,6 +473,451 @@ impl Recovery {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         !self.cancel.is_cancelled() && !state.local_send_failure && state.gate.ssh_allowed()
     }
+    /// Cached presentation context; never sufficient to authorize an update.
+    pub fn display_server_info(&self) -> Option<AuthenticatedServerInfo> {
+        self.server_info_snapshot(false)
+    }
+
+    /// Only the latest completed authenticated observation may authorize a choice.
+    /// Admission separately
+    /// requires a generation match in the owning Attempt.
+    pub fn discovered_server_info(&self) -> Option<AuthenticatedServerInfo> {
+        self.server_info_snapshot(true)
+    }
+
+    pub(crate) fn server_info_for_generation(
+        &self,
+        generation: [u8; 16],
+    ) -> Option<AuthenticatedServerInfo> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled() || state.local_send_failure || !state.gate.ssh_allowed() {
+            return None;
+        }
+        state
+            .server_info
+            .iter()
+            .flatten()
+            .find(|observation| {
+                state.current_observation(observation)
+                    && observation.proof.info().generation == generation
+            })
+            .map(|observation| observation.proof.clone())
+    }
+
+    fn server_info_snapshot(&self, actionable: bool) -> Option<AuthenticatedServerInfo> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled() || state.local_send_failure || !state.gate.ssh_allowed() {
+            return None;
+        }
+        let eligible = |observation: &&ServerObservation| {
+            !actionable || state.current_observation(observation)
+        };
+        state
+            .server_info
+            .iter()
+            .flatten()
+            .filter(eligible)
+            .find(|observation| {
+                crate::server_discovery::decision(Some(observation.proof.info())).compatibility
+                    == ::connect::upgrade::Compatibility::Incompatible
+            })
+            .or_else(|| state.server_info.iter().flatten().find(eligible))
+            .map(|observation| observation.proof.clone())
+    }
+
+    pub(crate) fn harvest_metadata(
+        &self,
+        query: &MetadataQuery,
+        client: &transport::driver_std::StdClient,
+        complete: bool,
+        reported: &mut std::collections::HashSet<AddressId>,
+    ) {
+        for (source, proof) in client.discovered_server_info_by_endpoint() {
+            for &(address, endpoint) in &query.targets {
+                if endpoint == source && reported.insert(address) {
+                    self.complete_qsh_metadata(
+                        query,
+                        address,
+                        Some(AuthenticatedServerInfo::Bootstrap(proof.clone())),
+                    );
+                }
+            }
+        }
+        if complete {
+            for &(address, _) in &query.targets {
+                if reported.insert(address) {
+                    self.complete_qsh_metadata(query, address, None);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn retain_failed_discovery(
+        &self,
+        attempt: crate::connect::Attempt,
+        query: MetadataQuery,
+    ) -> bool {
+        self.poll_pending_discovery();
+        let Some(deadline) = attempt.client.discovery_deadline() else {
+            if attempt.client.discovery_complete() {
+                self.harvest_metadata(&query, &attempt.client, true, &mut Default::default());
+            }
+            attempt.detach();
+            return false;
+        };
+        // This is local ordinary-transport retirement, never peer CloseSession.
+        attempt.retire_for_discovery();
+        let mut pending = PendingDiscovery {
+            attempt,
+            query,
+            deadline,
+            reported: Default::default(),
+        };
+        let complete = pending.attempt.client.discovery_complete() || Instant::now() >= deadline;
+        self.harvest_metadata(
+            &pending.query,
+            &pending.attempt.client,
+            complete,
+            &mut pending.reported,
+        );
+        if complete {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled()
+            || state.local_send_failure
+            || pending.query.epoch != self.epoch
+            || state.revision != pending.query.revision
+        {
+            drop(state);
+            return false;
+        }
+        let redundant = pending.query.targets.iter().any(|(_, endpoint)| {
+            state
+                .pending_discovery
+                .iter()
+                .filter(|owner| owner.query.targets.iter().any(|(_, old)| old == endpoint))
+                .count()
+                >= METADATA_OVERLAP_PER_ENDPOINT
+        });
+        if redundant {
+            // No completed Unknown is manufactured for our own cancellation.
+            drop(state);
+            return false;
+        }
+        state.pending_discovery.push(pending);
+        drop(state);
+        self.notify();
+        true
+    }
+
+    pub(crate) fn poll_pending_discovery(&self) {
+        let snapshots: Vec<_> = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state
+                .pending_discovery
+                .iter()
+                .map(|owner| {
+                    (
+                        owner.query.clone(),
+                        owner.attempt.client.clone(),
+                        owner.deadline,
+                        owner.reported.clone(),
+                    )
+                })
+                .collect()
+        };
+        let mut retired = Vec::new();
+        for (query, client, deadline, mut reported) in snapshots {
+            let complete = client.discovery_complete() || Instant::now() >= deadline;
+            self.harvest_metadata(&query, &client, complete, &mut reported);
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(index) = state
+                .pending_discovery
+                .iter()
+                .position(|owner| owner.query.serial == query.serial)
+            {
+                state.pending_discovery[index].reported = reported;
+                if complete {
+                    retired.push(state.pending_discovery.swap_remove(index));
+                }
+            }
+        }
+        if !retired.is_empty() {
+            drop(retired); // Joins happen outside the recovery state lock.
+            self.notify();
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_discovery_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending_discovery
+            .len()
+    }
+
+    pub(crate) fn begin_qsh_metadata(
+        &self,
+        revision: u64,
+        epoch: RecoveryEpoch,
+        sweep: SweepId,
+        targets: Vec<(AddressId, SocketAddr)>,
+    ) -> Option<MetadataQuery> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled()
+            || state.local_send_failure
+            || epoch != self.epoch
+            || state.revision != revision
+            || state.observed_sweep != Some(sweep)
+            || targets.is_empty()
+            || targets
+                .iter()
+                .any(|(id, _)| id.0 >= state.server_info.len())
+        {
+            return None;
+        }
+        state.next_metadata += 1;
+        Some(MetadataQuery {
+            epoch,
+            revision,
+            sweep,
+            serial: state.next_metadata,
+            targets,
+        })
+    }
+
+    pub(crate) fn complete_qsh_metadata(
+        &self,
+        query: &MetadataQuery,
+        address: AddressId,
+        proof: Option<AuthenticatedServerInfo>,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled()
+            || state.local_send_failure
+            || query.epoch != self.epoch
+            || state.revision != query.revision
+            || !query.targets.iter().any(|(id, _)| *id == address)
+            || address.0 >= state.server_info.len()
+        {
+            return false;
+        }
+        if !state.record_metadata(
+            address.0,
+            query.serial,
+            proof,
+            InfoAuthority::Qsh(query.sweep),
+        ) {
+            return false;
+        }
+        drop(state);
+        self.notify();
+        true
+    }
+
+    pub(crate) fn publish_qsh_server_info(
+        &self,
+        revision: u64,
+        epoch: RecoveryEpoch,
+        sweep: SweepId,
+        addr: usize,
+        proof: AuthenticatedServerInfo,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled()
+            || state.local_send_failure
+            || state.revision != revision
+            || epoch != self.epoch
+            || state.observed_sweep != Some(sweep)
+            || addr >= state.server_info.len()
+            || !matches!(proof, AuthenticatedServerInfo::Bootstrap(_))
+        {
+            return false;
+        }
+        let serial = state.sweep_metadata;
+        if !state.record_metadata(addr, serial, Some(proof), InfoAuthority::Qsh(sweep)) {
+            return false;
+        }
+        drop(state);
+        self.notify();
+        true
+    }
+
+    fn current_ssh(&self, attempt: &SshAttempt, addr: usize) -> bool {
+        !self.cancel.is_cancelled()
+            && self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .owns_ssh(self.epoch, attempt, addr)
+    }
+
+    fn server_info_for(
+        &self,
+        attempt: &SshAttempt,
+        addr: usize,
+    ) -> Option<(AuthenticatedServerInfo, InfoAuthority)> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled() || !state.owns_ssh(self.epoch, attempt, addr) {
+            return None;
+        }
+        state.server_info[addr]
+            .as_ref()
+            .filter(|observation| {
+                state.current_observation(observation)
+                    && match observation.authority {
+                        Some(InfoAuthority::Qsh(sweep)) => state.observed_sweep == Some(sweep),
+                        Some(InfoAuthority::Ssh(id)) => id == attempt.attempt,
+                        None => false,
+                    }
+            })
+            .and_then(|observation| {
+                observation
+                    .authority
+                    .map(|authority| (observation.proof.clone(), authority))
+            })
+    }
+
+    fn next_ssh_metadata(&self, attempt: &SshAttempt, addr: usize) -> Option<SshAttempt> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled() || !state.owns_ssh(self.epoch, attempt, addr) {
+            return None;
+        }
+        state.next_metadata += 1;
+        Some(SshAttempt {
+            epoch: attempt.epoch,
+            revision: attempt.revision,
+            attempt: attempt.attempt,
+            cancel: attempt.cancel.clone(),
+            serial: state.next_metadata,
+        })
+    }
+
+    fn complete_ssh_unknown(&self, attempt: &SshAttempt, addr: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.cancel.is_cancelled() && state.owns_ssh(self.epoch, attempt, addr) {
+            state.record_metadata(
+                addr,
+                attempt.serial,
+                None,
+                InfoAuthority::Ssh(attempt.attempt),
+            );
+        }
+        drop(state);
+        self.notify();
+    }
+
+    fn publish_server_info(
+        &self,
+        attempt: &SshAttempt,
+        addr: usize,
+        proof: AuthenticatedServerInfo,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled() || !state.owns_ssh(self.epoch, attempt, addr) {
+            return false;
+        }
+        if !state.record_metadata(
+            addr,
+            attempt.serial,
+            Some(proof),
+            InfoAuthority::Ssh(attempt.attempt),
+        ) {
+            return false;
+        }
+        drop(state);
+        self.notify();
+        true
+    }
+
+    fn discovery_permits_recovery(
+        &self,
+        attempt: &SshAttempt,
+        addr: usize,
+        info: Option<AuthenticatedServerInfo>,
+    ) -> bool {
+        if let Some(proof) = info.as_ref() {
+            if crate::server_discovery::decision(Some(proof.info())).compatibility
+                == ::connect::upgrade::Compatibility::Incompatible
+            {
+                self.publish_server_info(attempt, addr, proof.clone());
+                return false;
+            }
+        }
+        // A normal recovery operation may start a different process. Its old
+        // metadata, and the on-disk Ready.version, cannot describe that process.
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled() || !state.owns_ssh(self.epoch, attempt, addr) {
+            return false;
+        }
+        state.record_metadata(
+            addr,
+            attempt.serial,
+            info,
+            InfoAuthority::Ssh(attempt.attempt),
+        );
+        state.retire_server_info_authority();
+        drop(state);
+        self.notify();
+        true
+    }
+
+    /// Querying metadata is read-only. RestartOnly is a distinct, existing
+    /// recovery phase and is never invoked for a proven incompatible peer.
+    fn recover_after_discovery(
+        &self,
+        attempt: &SshAttempt,
+        addr: usize,
+        query: impl FnOnce() -> Result<Option<AuthenticatedServerInfo>, crate::ssh_step::SshStepError>,
+        restart: impl FnOnce() -> Result<bringup::Ready, crate::ssh_step::SshStepError>,
+    ) -> Option<Result<bringup::Ready, crate::ssh_step::SshStepError>> {
+        if !self.current_ssh(attempt, addr) {
+            return None;
+        }
+        // Unsupported legacy queries and unavailable credentials leave metadata
+        // unknown; they do not add an admission denial or an installation path.
+        let queried = query().ok().flatten();
+        // QSH remains independent while SSH runs. A proof arriving during the
+        // query must be checked before the mutating recovery phase begins.
+        let current_incompatible = self
+            .server_info_for(attempt, addr)
+            .filter(|(proof, authority)| {
+                matches!(authority, InfoAuthority::Qsh(_))
+                    && crate::server_discovery::decision(Some(proof.info())).compatibility
+                        == ::connect::upgrade::Compatibility::Incompatible
+            })
+            .map(|(proof, _)| proof);
+        if current_incompatible.is_some() {
+            // Reusing a current QSH proof did not perform a new SSH query.
+            if matches!(queried, Some(AuthenticatedServerInfo::Bootstrap(_))) {
+                return None;
+            }
+            if queried.as_ref().is_some_and(|proof| {
+                crate::server_discovery::decision(Some(proof.info())).compatibility
+                    == ::connect::upgrade::Compatibility::Incompatible
+            }) {
+                self.discovery_permits_recovery(attempt, addr, queried);
+            } else {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if !self.cancel.is_cancelled() && state.owns_ssh(self.epoch, attempt, addr) {
+                    state.record_metadata(
+                        addr,
+                        attempt.serial,
+                        queried,
+                        InfoAuthority::Ssh(attempt.attempt),
+                    );
+                }
+            }
+            return None;
+        }
+        if !self.discovery_permits_recovery(attempt, addr, queried) {
+            return None;
+        }
+        Some(restart())
+    }
+
     pub fn retry_now(&self) {
         self.retry_now.store(true, Ordering::SeqCst);
     }
@@ -376,6 +951,8 @@ impl Recovery {
         }
         state.cancel_ssh();
         state.next_ssh += 1;
+        state.next_metadata += 1;
+        let serial = state.next_metadata;
         let attempt = state.next_ssh;
         let cancel = knock::Cancel::new();
         state.ssh = Some((attempt, cancel.clone()));
@@ -384,6 +961,7 @@ impl Recovery {
             revision: state.revision,
             attempt,
             cancel,
+            serial,
         };
         drop(state);
         self.notify();
@@ -475,9 +1053,12 @@ impl Recovery {
         self.cancel.is_cancelled() || self.revision() != revision
     }
     pub fn wait_udp(&self, started: Instant, _revision: u64) -> bool {
+        self.poll_pending_discovery();
         while started.elapsed() < UDP_ROUND_INTERVAL && !self.cancel.is_cancelled() {
+            self.poll_pending_discovery();
             std::thread::sleep(POLL);
         }
+        self.poll_pending_discovery();
         !self.cancel.is_cancelled()
     }
     fn wait_ssh(&self, failed: u32) -> bool {
@@ -535,9 +1116,23 @@ impl Recovery {
                         log::shown(&report::trying_ssh(&address.host, route));
                         // All SSH auth and remote exec operations use this generation's
                         // token. Reset, QSH success and owner cancellation revoke it.
-                        match setup.bring_up_observed(address, &attempt.cancel, || {
-                            recovery.observe_ssh(&attempt, AddressId(i))
-                        }) {
+                        recovery.observe_ssh(&attempt, AddressId(i));
+                        let result = recovery.recover_after_discovery(&attempt, i,
+                            || {
+                                if let Some((info, _)) = recovery.server_info_for(&attempt, i) {
+                                    return Ok(Some(info));
+                                }
+                                setup.discover_server_info(address, &attempt.cancel)
+                                    .map(|proof| proof.map(AuthenticatedServerInfo::Ssh))
+                            },
+                            || setup.bring_up_observed(address, &attempt.cancel, || {
+                                recovery.observe_ssh(&attempt, AddressId(i))
+                            }));
+                        let Some(result) = result else {
+                            recovery.finish_ssh(&attempt);
+                            continue;
+                        };
+                        match result {
                             Ok(ready) => {
                                 let port = ready.port_for(address.qsh_port);
                                 let warning = ready
@@ -550,6 +1145,12 @@ impl Recovery {
                                         address.qsh_port,
                                         port,
                                     ));
+                                    if let Some(query) = recovery.next_ssh_metadata(&attempt, i) {
+                                        match setup.discover_server_info(address, &query.cancel) {
+                                            Ok(Some(proof)) => { recovery.publish_server_info(&query, i, AuthenticatedServerInfo::Ssh(proof)); }
+                                            _ => recovery.complete_ssh_unknown(&query, i),
+                                        }
+                                    }
                                 }
                             }
                             Err(why) => {
@@ -1142,3 +1743,11 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "recovery_discovery_tests.rs"]
+mod discovery_tests;
+
+#[cfg(test)]
+#[path = "recovery_pending_tests.rs"]
+mod pending_tests;

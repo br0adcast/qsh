@@ -158,3 +158,5 @@ fn qualify_borrowed_fixture() {
 pub fn darwin_keeper_entry(args: &[std::ffi::OsString]) -> Option<std::io::Result<()>> {
     darwin_process_scope::keeper_helper_entry(args)
 }
+
+pub mod server_info;

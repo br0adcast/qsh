@@ -117,6 +117,8 @@ fn help_text() -> String {
         "                    Long-lived daemon for a service manager (systemd/launchd); \
          see docs/qshd-service.md."
             .to_string(),
+        "  server-info       --challenge <hex> [--socket <PATH>]  Query running daemon metadata."
+            .to_string(),
         "  helper-status     --socket <PATH>  Root-only local system-helper snapshot.".to_string(),
         "  self-check        Print this binary's build, architecture, protocol and handover \
          versions and transport features as JSON."
@@ -156,6 +158,7 @@ fn main() -> Result<()> {
         Some("transport-shell") => run_transport_shell_command(&args),
         Some("transport-ensure") => run_transport_ensure(&args),
         Some("serve") => serve::run_serve_command_os(&args),
+        Some("server-info") => qshd::server_info::run_command(&args),
         Some("helper-status") => qshd::helper_status::run_command(&args),
         Some("self-check") => {
             print!("{}", state::SelfCheck::current().to_line());

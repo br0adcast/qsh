@@ -563,3 +563,75 @@ mod tests {
         assert_eq!(parse_msg2(&short).expect("parses").nonce, None);
     }
 }
+
+/// Tagged process identity extension, independent of attachment generations.
+const GENERATION_TAG: &[u8; 4] = b"QGEN";
+pub fn append_generation(payload: &mut Vec<u8>, generation: Option<[u8; 16]>) {
+    if let Some(generation) = generation {
+        payload.extend_from_slice(GENERATION_TAG);
+        payload.extend_from_slice(&generation);
+    }
+}
+pub fn parse_generation(payload: &[u8], offset: usize) -> Result<Option<[u8; 16]>, HsPayloadError> {
+    let tail = payload.get(offset..).unwrap_or_default();
+    if tail.is_empty() || !GENERATION_TAG.starts_with(tail) && !tail.starts_with(GENERATION_TAG) {
+        return Ok(None);
+    }
+    if tail.len() < 20 {
+        return Err(HsPayloadError::TooShort);
+    }
+    Ok(Some(
+        tail[4..20]
+            .try_into()
+            .map_err(|_| HsPayloadError::TooShort)?,
+    ))
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    #[test]
+    fn generation_extension_preserves_absent_bytes_and_rejects_truncation() {
+        let mut payload = encode_msg2(7, false, &[0; 16], Features::NONE);
+        let old = payload.clone();
+        append_generation(&mut payload, None);
+        assert_eq!(payload, old);
+        append_generation(&mut payload, Some([9; 16]));
+        assert_eq!(parse_generation(&payload, 30), Ok(Some([9; 16])));
+        for end in 31..50 {
+            assert!(parse_generation(&payload[..end], 30).is_err());
+        }
+    }
+}
+
+/// New clients announce support even when discovery is still in flight.
+pub fn append_expected_generation(payload: &mut Vec<u8>, expected: Option<[u8; 16]>) {
+    payload.extend_from_slice(GENERATION_TAG);
+    payload.push(u8::from(expected.is_some()));
+    if let Some(generation) = expected {
+        payload.extend_from_slice(&generation);
+    }
+}
+pub fn parse_expected_generation(
+    payload: &[u8],
+) -> Result<(bool, Option<[u8; 16]>), HsPayloadError> {
+    let tail = payload.get(23..).unwrap_or_default();
+    if tail.is_empty() || (!GENERATION_TAG.starts_with(tail) && !tail.starts_with(GENERATION_TAG)) {
+        return Ok((false, None));
+    }
+    if tail.len() < 5 {
+        return Err(HsPayloadError::TooShort);
+    }
+    match tail[4] {
+        0 => Ok((true, None)),
+        1 if tail.len() >= 21 => Ok((
+            true,
+            Some(
+                tail[5..21]
+                    .try_into()
+                    .map_err(|_| HsPayloadError::TooShort)?,
+            ),
+        )),
+        _ => Err(HsPayloadError::TooShort),
+    }
+}

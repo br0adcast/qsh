@@ -817,7 +817,9 @@ fn handshake_retransmit_resends_identical_msg1() {
         loop {
             match server_sock.recv_from(&mut buf) {
                 Ok((len, _src)) => {
-                    if dg_tx.send(buf[..len].to_vec()).is_err() {
+                    if !crate::bootstrap::is_bootstrap(&buf[..len])
+                        && dg_tx.send(buf[..len].to_vec()).is_err()
+                    {
                         return;
                     }
                 }
@@ -1492,6 +1494,7 @@ fn dropping_the_command_channel_ends_the_driver_even_with_a_signer() {
             Arc::new(GateTable::new()),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(DiscoverySnapshot::default())),
         );
     });
 
@@ -2070,7 +2073,9 @@ fn the_handshake_is_retransmitted_while_junk_floods_the_socket() {
         });
         while Instant::now() < until && !stop.load(Ordering::SeqCst) {
             if let Ok((len, _)) = server_sock.recv_from(&mut buf) {
-                if dg_tx.send(buf[..len].to_vec()).is_err() {
+                if !crate::bootstrap::is_bootstrap(&buf[..len])
+                    && dg_tx.send(buf[..len].to_vec()).is_err()
+                {
                     return;
                 }
             }
@@ -3160,3 +3165,343 @@ include!("driver_std_input_bounds_tests.rs");
 
 #[path = "driver_std_wake_tests.rs"]
 mod wake_tests;
+
+#[test]
+fn bootstrap_driver_snapshot_requires_exact_generation_in_both_completion_orders() {
+    fn proof(generation: [u8; 16]) -> crate::bootstrap::VerifiedServerInfo {
+        let server = crate::handshake::generate_keypair();
+        let local = crate::handshake::generate_keypair();
+        let now = Instant::now();
+        let source = "192.0.2.7:5000".parse().unwrap();
+        let mut responder = crate::bootstrap::BootstrapResponder::new(
+            server.private,
+            crate::bootstrap::ServerInfo {
+                generation,
+                core_version: "0.6.0".into(),
+                session_protocols: vec![],
+            },
+        )
+        .unwrap();
+        let mut client =
+            crate::bootstrap::BootstrapClient::new(local.private, server.public, [1; 32]);
+        let cookie = responder
+            .on_datagram(now, source, &client.request())
+            .unwrap();
+        client.accept(&cookie).unwrap_err();
+        client
+            .accept(
+                &responder
+                    .on_datagram(now, source, &client.request())
+                    .unwrap(),
+            )
+            .unwrap()
+    }
+    let endpoint = "192.0.2.7:5000".parse().unwrap();
+    for metadata_first in [true, false] {
+        let client = StdClient::dead();
+        if metadata_first {
+            client
+                .discovery
+                .lock()
+                .unwrap()
+                .proofs
+                .push((endpoint, proof([7; 16])));
+            assert!(client.server_info().is_none());
+        }
+        client.discovery.lock().unwrap().generation = Some([7; 16]);
+        if !metadata_first {
+            assert!(client.server_info().is_none());
+            client
+                .discovery
+                .lock()
+                .unwrap()
+                .proofs
+                .push((endpoint, proof([7; 16])));
+        }
+        assert_eq!(client.server_info().unwrap().info().generation, [7; 16]);
+        client
+            .discovery
+            .lock()
+            .unwrap()
+            .proofs
+            .push((endpoint, proof([8; 16])));
+        assert_eq!(
+            client.server_info().unwrap().info().generation,
+            [7; 16],
+            "stale late proof cannot poison a matched route"
+        );
+        assert_eq!(client.discovered_server_info_by_endpoint().len(), 2);
+        for _ in 0..3 {
+            let mut snapshot = client.discovery.lock().unwrap();
+            snapshot.refresh();
+            assert_eq!(snapshot.proofs.len(), 1);
+            snapshot.record(endpoint, proof([8; 16]));
+            snapshot.record(endpoint, proof([8; 16]));
+            assert_eq!(
+                snapshot.proofs.len(),
+                2,
+                "refresh and duplicate replies stay catalog bounded"
+            );
+        }
+        assert_eq!(client.server_info().unwrap().info().generation, [7; 16]);
+        client.discovery.lock().unwrap().generation = None;
+        assert!(
+            client.server_info().is_none(),
+            "legacy msg2 gives no offer binding"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_refresh_sends_fresh_probe_without_restarting_working_connection() {
+    struct States(Sender<LinkState>);
+    impl ClientEvents for States {
+        fn on_state(&self, state: LinkState) {
+            let _ = self.0.send(state);
+        }
+        fn on_bytes(&self, _: u8, _: Vec<u8>) {}
+        fn on_stats(&self, _: Stats) {}
+        fn on_reset(&self, _: u8) {}
+        fn on_input_failure(&self, failure: InputFailure) {
+            panic!("unexpected input failure {failure:?}")
+        }
+    }
+    let server_key = crate::handshake::generate_keypair();
+    let client_key = crate::handshake::generate_keypair();
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let (probe_tx, probe_rx) = mpsc::channel();
+    let session = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed_session = session.clone();
+    let remote_closed = Arc::new(AtomicBool::new(false));
+    let observed_closed = remote_closed.clone();
+    let _server = StoppedOnDrop::spawn(move |stop| {
+        let mut conn = Connection::new(ConnectionConfig {
+            role: crate::Role::Server,
+            local_static_priv: server_key.private,
+            remote_static_pub: None,
+            auth: AuthPolicy::Allowlist(vec![client_key.public]),
+            features: Features::NONE,
+            required_features: Features::NONE,
+        });
+        let mut buf = [0; 2048];
+        while !stop.load(Ordering::SeqCst) {
+            let Ok((len, source)) = socket.recv_from(&mut buf) else {
+                continue;
+            };
+            if crate::bootstrap::is_bootstrap(&buf[..len]) {
+                let _ = probe_tx.send(buf[..len].to_vec());
+                continue;
+            }
+            for dg in conn.on_datagram(Instant::now(), source, &buf[..len]) {
+                let _ = socket.send_to(&dg.bytes, dg.to);
+            }
+            observed_session.store(conn.session_id(), Ordering::SeqCst);
+            observed_closed.store(conn.state() == LinkState::Closed, Ordering::SeqCst);
+        }
+    });
+    let (state_tx, state_rx) = mpsc::channel();
+    let client = StdClient::connect(
+        address,
+        ConnectionConfig {
+            role: crate::Role::Client,
+            local_static_priv: client_key.private,
+            remote_static_pub: Some(server_key.public),
+            auth: AuthPolicy::Allowlist(vec![]),
+            features: Features::NONE,
+            required_features: Features::NONE,
+        },
+        [9; 16],
+        StartKind::Cold,
+        Arc::new(OkBinder),
+        Arc::new(States(state_tx)),
+        None,
+    );
+    loop {
+        if state_rx.recv_timeout(Duration::from_secs(3)).unwrap() == LinkState::Live {
+            break;
+        }
+    }
+    let first = probe_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let original_session = session.load(Ordering::SeqCst);
+    assert_ne!(original_session, 0);
+    let original_path = client.active_path();
+    client.refresh_server_info();
+    loop {
+        let probe = probe_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        if probe[8..40] != first[8..40] {
+            break;
+        }
+    }
+    assert!(!client.is_gone());
+    assert_eq!(client.active_path(), original_path);
+    assert_eq!(session.load(Ordering::SeqCst), original_session);
+    assert_eq!(client.features(), Some(Features::NONE));
+    let original_deadline = client.discovery_deadline();
+    client.retire_for_discovery();
+    loop {
+        if state_rx.recv_timeout(Duration::from_secs(2)).unwrap() == LinkState::Closed {
+            break;
+        }
+    }
+    assert!(client.is_gone());
+    assert_eq!(
+        client.discovery_deadline(),
+        original_deadline,
+        "retirement keeps original budget"
+    );
+    // A subsequent metadata retry proves the server processed earlier packets;
+    // no Close was delivered while retiring the local data owner.
+    probe_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(!remote_closed.load(Ordering::SeqCst));
+    assert_eq!(session.load(Ordering::SeqCst), original_session);
+    client.detach();
+}
+
+#[test]
+fn bootstrap_finishes_after_unsupported_ordinary_handshake_without_admission() {
+    struct Events {
+        closed: Sender<()>,
+        info: Sender<()>,
+        complete: Sender<()>,
+    }
+    impl ClientEvents for Events {
+        fn on_state(&self, state: LinkState) {
+            if state == LinkState::Closed {
+                let _ = self.closed.send(());
+            }
+        }
+        fn on_bytes(&self, _: u8, _: Vec<u8>) {
+            panic!("incompatible session must deliver no data")
+        }
+        fn on_stats(&self, _: Stats) {}
+        fn on_reset(&self, _: u8) {}
+        fn on_input_failure(&self, _: InputFailure) {}
+        fn on_server_info(&self, _: crate::bootstrap::VerifiedServerInfo) {
+            let _ = self.info.send(());
+        }
+        fn on_discovery_complete(&self) {
+            let _ = self.complete.send(());
+        }
+        fn on_auth_accepted(&self, _: crate::AuthAcceptance) {
+            panic!("bootstrap must not admit client")
+        }
+    }
+    for cancel in [false, true] {
+        let server = crate::handshake::generate_keypair();
+        let local = crate::handshake::generate_keypair();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = release.clone();
+        let _server = StoppedOnDrop::spawn(move |stop| {
+            let mut bootstrap = crate::bootstrap::BootstrapResponder::new(
+                server.private,
+                crate::bootstrap::ServerInfo {
+                    generation: [7; 16],
+                    core_version: "0.6.0".into(),
+                    session_protocols: vec![crate::bootstrap::SessionProfile {
+                        wire: 99,
+                        handshake: 99,
+                        channel: 99,
+                    }],
+                },
+            )
+            .unwrap();
+            let mut buf = [0; 2048];
+            while !stop.load(Ordering::SeqCst) {
+                let Ok((len, source)) = socket.recv_from(&mut buf) else {
+                    continue;
+                };
+                if crate::bootstrap::is_bootstrap(&buf[..len]) {
+                    if let Some(response) =
+                        bootstrap.on_datagram(Instant::now(), source, &buf[..len])
+                    {
+                        if response[5] != 2 || gate.load(Ordering::SeqCst) {
+                            socket.send_to(&response, source).unwrap();
+                        }
+                    }
+                } else if let Ok(crate::wire::Frame::Handshake {
+                    kind: crate::wire::Kind::HandshakeInit,
+                    body,
+                }) = crate::wire::parse(&buf[..len])
+                {
+                    let mut hs = crate::handshake::Handshake::new_responder(&server.private);
+                    hs.read_msg(body).unwrap();
+                    let reply = crate::wire::encode_handshake(
+                        crate::wire::Kind::HandshakeResp,
+                        &hs.write_msg(&[0xff]),
+                    );
+                    socket.send_to(&reply, source).unwrap();
+                }
+            }
+        });
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let (info_tx, info_rx) = mpsc::channel();
+        let (complete_tx, complete_rx) = mpsc::channel();
+        let client = StdClient::connect(
+            address,
+            ConnectionConfig {
+                role: crate::Role::Client,
+                local_static_priv: local.private,
+                remote_static_pub: Some(server.public),
+                auth: AuthPolicy::Allowlist(vec![]),
+                features: Features::NONE,
+                required_features: Features::NONE,
+            },
+            [9; 16],
+            StartKind::Cold,
+            Arc::new(OkBinder),
+            Arc::new(Events {
+                closed: closed_tx,
+                info: info_tx,
+                complete: complete_tx,
+            }),
+            None,
+        );
+        closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            client.is_gone(),
+            "ordinary producer gates close immediately"
+        );
+        assert!(
+            !client.discovery_complete(),
+            "retained failed owner still owns independent discovery"
+        );
+        assert_eq!(
+            client.send_bytes(1, vec![1]).unwrap_err().reason,
+            SendBlocked::Gone
+        );
+        if cancel {
+            let deadline = client.discovery_deadline().unwrap();
+            client.detach();
+            assert!(
+                Instant::now() < deadline,
+                "cancel joins before the original pending discovery deadline"
+            );
+            assert!(client.discovery_complete());
+            release.store(true, Ordering::SeqCst);
+            assert!(
+                matches!(info_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+                "no proof callback survives joined cancellation"
+            );
+            continue;
+        }
+        release.store(true, Ordering::SeqCst);
+        info_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        complete_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(client.discovery_complete());
+        assert!(client.server_info().is_none());
+        let infos = client.discovered_server_info_by_endpoint();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].0, address);
+        assert_eq!(infos[0].1.info().core_version, "0.6.0");
+        client.detach();
+    }
+}

@@ -39,6 +39,8 @@ use serde::{Deserialize, Serialize};
 pub enum ControlRequest {
     /// Return the daemon's current state ([`StatusResponse`]).
     Status,
+    /// Read actual running process metadata with a fresh caller challenge.
+    ServerInfo([u8; 32]),
     /// Start listening on one more QUIC port (without restarting the daemon).
     AddPort(u16),
     /// Add a client Noise key (32-byte X25519) to a live transport daemon's
@@ -171,6 +173,17 @@ impl StatusResponse {
 pub fn parse_request(line: &str) -> Option<ControlRequest> {
     let mut parts = line.split(' ');
     match parts.next()? {
+        "SERVER-INFO" => {
+            let text = parts.next()?;
+            if text.len() != 64 {
+                return None;
+            }
+            let raw = hex::decode(text).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::ServerInfo(raw.try_into().ok()?))
+        }
         "STATUS" => {
             if parts.next().is_some() {
                 return None;
@@ -208,6 +221,9 @@ pub fn parse_request(line: &str) -> Option<ControlRequest> {
 pub fn format_request(req: &ControlRequest) -> String {
     match req {
         ControlRequest::Status => "STATUS\n".to_string(),
+        ControlRequest::ServerInfo(challenge) => {
+            format!("SERVER-INFO {}\n", hex::encode(challenge))
+        }
         ControlRequest::AddPort(port) => format!("ADD-PORT {port}\n"),
         ControlRequest::AddClient(key) => format!("ADD-CLIENT {}\n", BASE64.encode(key)),
         ControlRequest::Stop => "STOP\n".to_string(),
@@ -340,7 +356,15 @@ fn client_request_at(
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let reply = match reader.read_line(&mut line) {
+    let read_result = if matches!(req, ControlRequest::ServerInfo(_)) {
+        std::io::Read::take(&mut reader, 4097).read_line(&mut line)
+    } else {
+        reader.read_line(&mut line)
+    };
+    if matches!(req, ControlRequest::ServerInfo(_)) && line.len() > 4096 {
+        anyhow::bail!("server-info response exceeds limit");
+    }
+    let reply = match read_result {
         Ok(0) => Ok(ControlReply::NoDaemon), // closed with no response -- no one home
         Ok(_) => Ok(ControlReply::Answered(
             line.trim_end_matches('\n').to_string(),
@@ -1103,6 +1127,7 @@ mod tests {
     fn request_round_trips() {
         for req in [
             ControlRequest::Status,
+            ControlRequest::ServerInfo([5; 32]),
             ControlRequest::AddPort(60001),
             ControlRequest::AddClient([42u8; 32]),
             ControlRequest::Stop,

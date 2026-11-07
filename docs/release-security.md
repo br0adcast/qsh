@@ -33,6 +33,17 @@ published tags and assets must remain unchanged.
 
 ## Authority
 
+Authenticated running-server discovery selects an update candidate, not a
+release signing authority. The independent Noise bootstrap uses the pinned qsh
+identity and a fresh challenge; SSH fallback requires verified host keys,
+authentication, a fresh echoed challenge and the expected qsh public key. Only
+metadata matching an admitted process generation may describe an attached
+connection. Unknown or stale metadata supplies no age or compatibility claim.
+The selected exact SemVer release loses build metadata only when forming its
+artifact tag. Explicit user consent is required before the existing managed
+updater performs release I/O; receipt, ownership and signature verification are
+repeated at execution. Source builds never offer or download a replacement.
+
 The authority is the public `br0adcast/qsh` GitHub Actions release workflow. The
 compiled policy requires issuer `https://token.actions.githubusercontent.com`,
 SAN URI `https://github.com/br0adcast/qsh/.github/workflows/release.yml@refs/tags/v<VERSION>`,

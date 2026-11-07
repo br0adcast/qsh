@@ -15,3 +15,5 @@ pub mod recovery_sweep;
 pub mod server_identity;
 
 pub use ladder::*;
+
+pub mod upgrade;

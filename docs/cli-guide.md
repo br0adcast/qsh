@@ -314,6 +314,32 @@ binary elsewhere does not make it eligible. Source builds, including release
 profile builds, never download, install, or switch console clients. Manual,
 package-owned, modified and unregistered copies refuse self-update.
 
+On connection and reconnect, qsh independently asks the pinned server for its
+running daemon version and supported session protocols. This authenticated
+discovery runs alongside ordinary admission. A legacy daemon that does not
+answer remains unknown and adds no admission delay. On an attached connection,
+the discovery process generation must match the authenticated session reply.
+
+A newer eligible server release can offer a managed client update. Enter or
+Escape postpones; choose the explicit update option to consent. A compatible
+connection can continue after postponement. An authenticated incompatible server
+cannot open a shell. Source builds only show manual rebuild guidance for
+incompatibility, and package-owned copies use their package manager. The offer
+requests the exact eligible server release from the official release source;
+it never uses a server-supplied download location. After installation, relaunch
+qsh explicitly. Updating does not promise to preserve the remote terminal.
+Termination during an approved update cancels its network work and is checked
+again before atomic activation. Cancellation observed before activation leaves
+the previous active client in place. A signal after activation commits does not
+undo the installation; relaunch is still explicit.
+
+If UDP discovery is unavailable, an already configured and trusted SSH route
+may execute read-only `qshd server-info --challenge HEX64`. Its response must
+echo the fresh challenge and match the pinned qsh key. Discovery never accepts
+a new SSH host key, installs a daemon, or authorizes a client. Unsupported
+legacy commands and daemon modes without an available local control socket
+remain unknown; the executable's `--version` is not running-server evidence.
+
 Release authentication, destination validation or cancellation failures before
 publication leave the prior active generation in place. Updates retain the old
 generation and report the exact executable path to run next. They never replace

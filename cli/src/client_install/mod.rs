@@ -3,6 +3,44 @@ use std::{ffi::OsString, path::PathBuf};
 
 pub mod store;
 
+/// Network-free ownership check for presenting an automatic update offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateEligibility {
+    SourceBuild,
+    PackageOwned,
+    Managed,
+    Unmanaged,
+}
+
+pub fn update_eligibility() -> Result<UpdateEligibility, String> {
+    if env!("QSH_CLIENT_OFFICIAL") != "1" {
+        return Ok(UpdateEligibility::SourceBuild);
+    }
+    let executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| "could not resolve the actual running qsh executable")?;
+    if package_copy(&executable) {
+        return Ok(UpdateEligibility::PackageOwned);
+    }
+    let home = dirs::home_dir().ok_or("could not determine your home directory")?;
+    let platform = native_platform()?;
+    Ok(
+        if store::validate_running(
+            &home,
+            &executable,
+            env!("CARGO_PKG_VERSION"),
+            platform.target(),
+            env!("QSH_CLIENT_SOURCE"),
+        )
+        .is_ok()
+        {
+            UpdateEligibility::Managed
+        } else {
+            UpdateEligibility::Unmanaged
+        },
+    )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Command {
     pub update: bool,
@@ -114,6 +152,7 @@ fn collisions(path: Option<&std::ffi::OsStr>, destination: &std::path::Path) -> 
         .collect()
 }
 
+#[cfg(test)]
 fn execute(
     command: &Command,
     identity: BuildIdentity<'_>,
@@ -122,6 +161,38 @@ fn execute(
     path: Option<&std::ffi::OsStr>,
     images: &crate::releases::GitHubImages,
 ) -> Result<String, String> {
+    execute_with_cancel(
+        command,
+        identity,
+        home,
+        executable,
+        path,
+        images,
+        &knock::Cancel::new(),
+        &|| false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_with_cancel(
+    command: &Command,
+    identity: BuildIdentity<'_>,
+    home: &std::path::Path,
+    executable: &std::path::Path,
+    path: Option<&std::ffi::OsStr>,
+    images: &crate::releases::GitHubImages,
+    cancel: &knock::Cancel,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<String, String> {
+    let cancelled = || {
+        if should_cancel() {
+            cancel.cancel();
+        }
+        cancel.is_cancelled()
+    };
+    if cancelled() {
+        return Err("client update canceled".into());
+    }
     if !identity.official {
         return Err("development/source builds cannot download, install or update the client; update the source and rebuild a compatible client".into());
     }
@@ -173,9 +244,8 @@ fn execute(
         }
     }
     let timing = bringup::InstallTiming::default();
-    let cancel = knock::Cancel::new();
     let selected = images
-        .select_client_version(command.version.as_deref(), &timing, &cancel, &Quiet)
+        .select_client_version(command.version.as_deref(), &timing, cancel, &Quiet)
         .map_err(|e| e.to_string())?;
     if let Some(previous) = &previous {
         eprintln!(
@@ -209,10 +279,11 @@ fn execute(
     }
     let request = bringup::ImageRequest::new(platform, &selected).map_err(|e| e.to_string())?;
     let image = images
-        .load_client(&request, &timing, &cancel, &Quiet)
+        .load_client(&request, &timing, cancel, &Quiet)
         .map_err(|e| e.to_string())?;
     let installed =
-        store::publish(home, &prefix, &image, previous.as_ref()).map_err(|e| e.to_string())?;
+        store::publish_cancellable(home, &prefix, &image, previous.as_ref(), &cancelled)
+            .map_err(|e| e.to_string())?;
     let mut message = format!(
         "Installed qsh {}. Run {}",
         selected,
@@ -234,6 +305,25 @@ fn selected_order(current: &str, selected: &str) -> Result<std::cmp::Ordering, S
 
 /// Called before ordinary argument parsing, logging, settings or connection startup.
 pub fn run(command: &Command) -> Result<String, String> {
+    run_with_cancel(command, &knock::Cancel::new(), &|| false)
+}
+
+/// The consent owner supplies the token shared by network and publication.
+pub fn run_cancellable(command: &Command, cancel: &knock::Cancel) -> Result<String, String> {
+    run_with_cancel(command, cancel, &crate::signals::termination_requested)
+}
+
+fn run_with_cancel(
+    command: &Command,
+    cancel: &knock::Cancel,
+    should_cancel: &dyn Fn() -> bool,
+) -> Result<String, String> {
+    if should_cancel() {
+        cancel.cancel();
+    }
+    if cancel.is_cancelled() {
+        return Err("client update canceled".into());
+    }
     if command.help {
         return Ok(if command.update {
             "Usage: qsh --self-update [--version VERSION]"
@@ -254,19 +344,159 @@ pub fn run(command: &Command) -> Result<String, String> {
     let home = dirs::home_dir().ok_or("could not determine your home directory")?;
     let executable = std::env::current_exe()
         .map_err(|_| "could not resolve the actual running qsh executable")?;
-    execute(
+    execute_with_cancel(
         command,
         identity,
         &home,
         &executable,
         std::env::var_os("PATH").as_deref(),
         &crate::releases::GitHubImages::new(None),
+        cancel,
+        should_cancel,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn signal_during_client_fetch_cancels_before_publication() {
+        // Signal flags are process-wide; isolate the real SIGINT from other
+        // parallel connection tests that also observe foreground termination.
+        if std::env::var_os("QSH530_SIGNAL_FETCH_CHILD").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "client_install::tests::signal_during_client_fetch_cancels_before_publication",
+                    "--nocapture",
+                ])
+                .env("QSH530_SIGNAL_FETCH_CHILD", "1")
+                .env("HOME", home.path())
+                .env("XDG_CONFIG_HOME", home.path())
+                .env("XDG_CACHE_HOME", home.path())
+                .env("HISTFILE", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "signal-fetch child failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        let _serial = crate::tty::SIGNAL_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::signals::install().unwrap();
+        crate::signals::take_pending();
+        struct SignalFetch;
+        impl crate::releases::ReleaseTransport for SignalFetch {
+            fn fetch(
+                &self,
+                _: &str,
+                _: crate::releases::FetchLimits,
+                cancel: &knock::Cancel,
+                _: &dyn bringup::BringUpObserver,
+            ) -> Result<Vec<u8>, crate::releases::FetchError> {
+                nix::sys::signal::raise(nix::sys::signal::Signal::SIGINT).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !cancel.is_cancelled() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "foreground signal was not delivered to fetch cancellation"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(crate::releases::FetchError::Rejected(
+                    bringup::ImageError::Cancelled,
+                ))
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let executable = home.path().join("bootstrap");
+        std::fs::write(&executable, b"fixture").unwrap();
+        let images = crate::releases::GitHubImages::uncached(std::sync::Arc::new(SignalFetch));
+        let cancel = knock::Cancel::new();
+        let result = crate::signals::with_termination_cancel(&cancel, || {
+            execute_with_cancel(
+                &Command {
+                    update: false,
+                    version: Some("0.7.0".into()),
+                    prefix: None,
+                    help: false,
+                },
+                BuildIdentity {
+                    official: true,
+                    version: "0.6.0",
+                    source: "fixture",
+                },
+                home.path(),
+                &executable,
+                None,
+                &images,
+                &cancel,
+                &crate::signals::termination_requested,
+            )
+        });
+        let terminated = crate::signals::take_pending().terminate;
+        assert!(result.is_err() && cancel.is_cancelled() && terminated);
+        assert!(
+            !home.path().join(".local").exists(),
+            "SIGINT during fetch published a client"
+        );
+    }
+    #[test]
+    fn cancel_during_fetch_uses_the_owner_token_and_never_publishes() {
+        struct CancelFetch;
+        impl crate::releases::ReleaseTransport for CancelFetch {
+            fn fetch(
+                &self,
+                _: &str,
+                _: crate::releases::FetchLimits,
+                cancel: &knock::Cancel,
+                _: &dyn bringup::BringUpObserver,
+            ) -> Result<Vec<u8>, crate::releases::FetchError> {
+                cancel.cancel();
+                Err(crate::releases::FetchError::Rejected(
+                    bringup::ImageError::Cancelled,
+                ))
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let executable = home.path().join("bootstrap");
+        std::fs::write(&executable, b"fixture").unwrap();
+        let cancel = knock::Cancel::new();
+        let images = crate::releases::GitHubImages::uncached(std::sync::Arc::new(CancelFetch));
+        let result = execute_with_cancel(
+            &Command {
+                update: false,
+                version: Some("0.7.0".into()),
+                prefix: None,
+                help: false,
+            },
+            BuildIdentity {
+                official: true,
+                version: "0.6.0",
+                source: "fixture",
+            },
+            home.path(),
+            &executable,
+            None,
+            &images,
+            &cancel,
+            &|| false,
+        );
+        assert!(result.is_err());
+        assert!(
+            cancel.is_cancelled(),
+            "network must receive the owner's exact token"
+        );
+        assert!(
+            !home.path().join(".local").exists(),
+            "canceled fetch must not publish or stage a client"
+        );
+    }
     #[test]
     fn development_install_refuses_before_transport() {
         struct NeverFetch;

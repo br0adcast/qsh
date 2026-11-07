@@ -36,6 +36,75 @@ fn accepted_startup_attempt() -> StartupAdmissionAttempt {
 }
 
 #[test]
+fn bound_authenticated_incompatibility_blocks_fresh_open_but_unknown_metadata_does_not() {
+    use crate::server_discovery::AuthenticatedServerInfo;
+    use transport::bootstrap::{BootstrapClient, BootstrapResponder, ServerInfo, SessionProfile};
+    let local = transport::generate_keypair();
+    let server = transport::generate_keypair();
+    let mut responder = BootstrapResponder::new(
+        server.private,
+        ServerInfo {
+            generation: [7; 16],
+            core_version: "99.0.0".into(),
+            session_protocols: vec![SessionProfile {
+                wire: 99,
+                handshake: 99,
+                channel: 99,
+            }],
+        },
+    )
+    .unwrap();
+    let mut client = BootstrapClient::new(local.private, server.public, [5; 32]);
+    let source = "192.0.2.7:5000".parse().unwrap();
+    let now = std::time::Instant::now();
+    let cookie = responder
+        .on_datagram(now, source, &client.request())
+        .unwrap();
+    assert_eq!(
+        client.accept(&cookie),
+        Err(transport::bootstrap::BootstrapError::Retry)
+    );
+    let response = responder
+        .on_datagram(now, source, &client.request())
+        .unwrap();
+    let proof = AuthenticatedServerInfo::Bootstrap(client.accept(&response).unwrap());
+    // This component seam starts after generation binding. Driver regressions
+    // separately exercise actual msg2 binding and both completion orders.
+    for evidence in [Some(proof), None] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let sink: Sink = Box::new(move |stream, bytes| {
+            seen.lock().unwrap().push((stream, bytes));
+            Ok(())
+        });
+        let mut channels = ChannelSession::new(QshSubstrate::new(sink));
+        let fixture = accepted_startup_attempt();
+        let (verdict, opened) = settle_opening_with_observation(
+            &fixture.attempt,
+            &mut channels,
+            None,
+            80,
+            24,
+            true,
+            || false,
+            || evidence.clone(),
+        );
+        if evidence.is_some() {
+            assert!(matches!(verdict, Verdict::ServerIncompatible(_)));
+            assert!(opened.is_none());
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "incompatible peer must never open a shell"
+            );
+        } else {
+            assert_eq!(verdict, Verdict::Working);
+            assert!(opened.is_some());
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        }
+    }
+}
+
+#[test]
 fn client179_startup_term_and_open_refusals_are_local_terminal_outcomes() {
     use client::channel::ChannelSendError;
     for error in [ChannelSendError::Full, ChannelSendError::Gone] {
@@ -61,6 +130,7 @@ fn client179_startup_term_and_open_refusals_are_local_terminal_outcomes() {
                 80,
                 24,
                 true,
+                None,
                 || false,
             );
             drop(fixture); // real driver joined even if following assertions fail

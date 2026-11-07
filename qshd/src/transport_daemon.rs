@@ -321,7 +321,11 @@ async fn run_transport_daemon_with_acceptor(
     // per-session channel backend. It snapshots the allowlist fresh at every
     // handshake and scrubs an ended session's key off it.
     let shutdown = transport::Shutdown::default();
-    let manager_loop = SessionManager::serve_until_shutdown(
+    let running_info = Arc::new(crate::server_info::RunningServerInfo {
+        public_key: auth.server_pub,
+        info: crate::server_info::current(),
+    });
+    let manager_loop = SessionManager::serve_with_server_info(
         Arc::new(socket),
         server_priv,
         auth,
@@ -329,6 +333,7 @@ async fn run_transport_daemon_with_acceptor(
         active_count.clone(),
         LoginEndedReports::none(),
         shutdown.clone(),
+        Some(running_info.info.clone()),
     );
     tokio::pin!(manager_loop);
 
@@ -366,7 +371,7 @@ async fn run_transport_daemon_with_acceptor(
                     retry_delay = CONTROL_ACCEPT_RETRY_INITIAL;
                     spawn_control_handler(&mut handlers, stream,
                         shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                        active_count.clone(), control_gate.clone(), cleanup_registry.clone());
+                        active_count.clone(), control_gate.clone(), cleanup_registry.clone(), Some(running_info.clone()));
                 }
                 Err(error) if recoverable_control_accept(&error) => {
                     let now = tokio::time::Instant::now();
@@ -527,7 +532,7 @@ pub(crate) async fn run_serve_loop_until_shutdown(
     })?;
     // Retained by the caller until this real lifecycle drain returns. An error
     // is not a producer-fence receipt, even though sibling tasks were joined.
-    SessionManager::serve_until_shutdown(
+    SessionManager::serve_with_server_info(
         Arc::new(socket),
         server_priv,
         auth,
@@ -535,6 +540,7 @@ pub(crate) async fn run_serve_loop_until_shutdown(
         Arc::new(AtomicUsize::new(0)),
         login_ends,
         shutdown,
+        Some(crate::server_info::current()),
     )
     .await
     .map_err(ServeLoopError::Shutdown)
@@ -561,7 +567,7 @@ pub async fn serve_transport_control(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => spawn_control_handler(&mut handlers, stream,
                     shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                    active_count.clone(), control_gate.clone(), cleanup_registry.clone()),
+                    active_count.clone(), control_gate.clone(), cleanup_registry.clone(), None),
                 Err(error) => log::warn("qshd", &format!("error accepting transport control connection: {error}")),
             },
             result = handlers.join_next(), if !handlers.is_empty() => {
@@ -583,10 +589,11 @@ fn spawn_control_handler(
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
 ) {
     let deadline = tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT;
     handlers.spawn(async move {
-        if let Err(error) = handle_transport_control_connection(
+        if let Err(error) = handle_transport_control_connection_with_info(
             stream,
             shared_allowlist,
             ports,
@@ -595,6 +602,7 @@ fn spawn_control_handler(
             control_gate,
             cleanup_registry,
             deadline,
+            running_info,
         )
         .await
         {
@@ -647,6 +655,7 @@ async fn join_control_handlers(
 /// replacement waits for. Read, gate, delivery and reply share the original
 /// accepted deadline.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn handle_transport_control_connection(
     stream: tokio::net::UnixStream,
     shared_allowlist: SharedAllowlist,
@@ -657,7 +666,7 @@ async fn handle_transport_control_connection(
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
-    handle_transport_control_connection_with_peer_check(
+    handle_transport_control_connection_with_info(
         stream,
         shared_allowlist,
         ports,
@@ -666,6 +675,33 @@ async fn handle_transport_control_connection(
         control_gate,
         cleanup_registry,
         deadline,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_transport_control_connection_with_info(
+    stream: tokio::net::UnixStream,
+    shared_allowlist: SharedAllowlist,
+    ports: Vec<u16>,
+    stop_tx: mpsc::Sender<()>,
+    active_count: Arc<AtomicUsize>,
+    control_gate: Arc<tokio::sync::RwLock<()>>,
+    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    deadline: tokio::time::Instant,
+    running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
+) -> Result<()> {
+    handle_transport_control_connection_with_peer_check_and_info(
+        stream,
+        shared_allowlist,
+        ports,
+        stop_tx,
+        active_count,
+        control_gate,
+        cleanup_registry,
+        deadline,
+        running_info,
         |stream| {
             control::require_same_account(
                 control::peer_uid(stream),
@@ -677,6 +713,7 @@ async fn handle_transport_control_connection(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn handle_transport_control_connection_with_peer_check(
     stream: tokio::net::UnixStream,
     shared_allowlist: SharedAllowlist,
@@ -686,6 +723,34 @@ async fn handle_transport_control_connection_with_peer_check(
     control_gate: Arc<tokio::sync::RwLock<()>>,
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
     deadline: tokio::time::Instant,
+    check: impl FnOnce(&tokio::net::UnixStream) -> Result<()>,
+) -> Result<()> {
+    handle_transport_control_connection_with_peer_check_and_info(
+        stream,
+        shared_allowlist,
+        ports,
+        stop_tx,
+        active_count,
+        control_gate,
+        cleanup_registry,
+        deadline,
+        None,
+        check,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_transport_control_connection_with_peer_check_and_info(
+    stream: tokio::net::UnixStream,
+    shared_allowlist: SharedAllowlist,
+    ports: Vec<u16>,
+    stop_tx: mpsc::Sender<()>,
+    active_count: Arc<AtomicUsize>,
+    control_gate: Arc<tokio::sync::RwLock<()>>,
+    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    deadline: tokio::time::Instant,
+    running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
     check: impl FnOnce(&tokio::net::UnixStream) -> Result<()>,
 ) -> Result<()> {
     check(&stream)?;
@@ -712,6 +777,13 @@ async fn handle_transport_control_connection_with_peer_check(
         };
 
         match request {
+            ControlRequest::ServerInfo(challenge) => {
+                if let Some(info) = running_info {
+                    write_half
+                        .write_all(info.response(challenge)?.as_bytes())
+                        .await?;
+                }
+            }
             ControlRequest::Status => {
                 let response = transport_status_response(
                     &ports,
@@ -1221,3 +1293,50 @@ mod cleanup143_tests {
 #[cfg(test)]
 #[path = "transport_control_peer_tests.rs"]
 mod peer_tests;
+
+#[cfg(test)]
+mod server_info_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn server_info_control_reads_running_owner_without_authorization_mutation() {
+        let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let allowlist = Arc::new(std::sync::Mutex::new(vec![[2; 32]]));
+        let (stop, mut stop_rx) = mpsc::channel(1);
+        let active = Arc::new(AtomicUsize::new(9));
+        // A newly invoked query binary can differ from the process answering it.
+        let mut info = crate::server_info::current();
+        info.core_version = "0.5.0".into();
+        let expected_generation = hex::encode(info.generation);
+        client
+            .write_all(control::format_request(&ControlRequest::ServerInfo([8; 32])).as_bytes())
+            .await
+            .unwrap();
+        handle_transport_control_connection_with_info(
+            server,
+            allowlist.clone(),
+            vec![60000],
+            stop,
+            active.clone(),
+            Arc::new(tokio::sync::RwLock::new(())),
+            None,
+            tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT,
+            Some(Arc::new(crate::server_info::RunningServerInfo {
+                public_key: [4; 32],
+                info,
+            })),
+        )
+        .await
+        .unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        let response: crate::server_info::Response = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response.core_version, "0.5.0");
+        assert_eq!(response.generation, expected_generation);
+        assert_eq!(response.challenge, hex::encode([8; 32]));
+        assert_eq!(response.server_pubkey, hex::encode([4; 32]));
+        assert_eq!(*allowlist.lock().unwrap(), vec![[2; 32]]);
+        assert_eq!(active.load(Ordering::SeqCst), 9);
+        assert!(stop_rx.try_recv().is_err());
+    }
+}

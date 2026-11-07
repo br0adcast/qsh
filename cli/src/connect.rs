@@ -34,6 +34,8 @@ const UNREACHABLE_AFTER_MS: i64 = transport::HANDSHAKE_GIVE_UP_AFTER.as_millis()
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Verdict {
+    /// Authenticated, generation-bound metadata excludes this session profile.
+    ServerIncompatible(transport::bootstrap::ServerInfo),
     /// Local whole-write refusal; do not try another key or fallback.
     LocalSendFailure(client::channel::ChannelSendError),
     /// The server explicitly accepted this exact transport admission.
@@ -183,6 +185,7 @@ impl Events {
 
     /// Coalesce one terminal local input failure per exact stamped attempt.
     pub fn input_failed(&self, failure: crate::session::LocalInputFailure) {
+        let _delivery = self.queued.lock().expect("queue count");
         if !self.released.load(Ordering::SeqCst) && !self.input_failure.swap(true, Ordering::SeqCst)
         {
             let _ = self.tx.send(crate::session::UiEvent::InputFailure(failure));
@@ -199,14 +202,30 @@ impl Events {
     /// Nothing takes from the queue any more: wake a waiting delivery for
     /// good. Call before `StdClient::close`, which joins the driver thread
     /// such a delivery holds.
+    /// On return, ordinary callbacks cannot enqueue more UI records. Metadata
+    /// completion may still enqueue a harmless Tick for a retained owner.
     pub fn release(&self) {
         self.released.store(true, Ordering::SeqCst);
         let _queued = self.queued.lock().expect("queue count");
         self.room.notify_all();
     }
+
+    fn deliver_ordinary(&self, event: crate::session::UiEvent) {
+        let _delivery = self.queued.lock().expect("queue count");
+        if !self.released.load(Ordering::SeqCst) {
+            let _ = self.tx.send(event);
+        }
+    }
 }
 
 impl ClientEvents for Events {
+    fn on_discovery_complete(&self) {
+        let _ = self.tx.send(crate::session::UiEvent::Tick);
+    }
+    fn on_server_info(&self, _: transport::bootstrap::VerifiedServerInfo) {
+        let _ = self.tx.send(crate::session::UiEvent::Tick);
+    }
+
     fn on_input_failure(&self, failure: transport::driver_std::InputFailure) {
         self.input_failed(crate::session::LocalInputFailure::Accepted(failure));
     }
@@ -218,16 +237,17 @@ impl ClientEvents for Events {
     }
 
     fn on_bytes(&self, stream_id: u8, data: Vec<u8>) {
+        let mut queued = self.queued.lock().expect("queue count");
+        while !self.credits.load(Ordering::SeqCst)
+            && *queued > UNCREDITED_QUEUE_MAX
+            && !self.released.load(Ordering::SeqCst)
         {
-            let mut queued = self.queued.lock().expect("queue count");
-            while !self.credits.load(Ordering::SeqCst)
-                && *queued > UNCREDITED_QUEUE_MAX
-                && !self.released.load(Ordering::SeqCst)
-            {
-                queued = self.room.wait(queued).expect("queue count");
-            }
-            *queued += data.len();
+            queued = self.room.wait(queued).expect("queue count");
         }
+        if self.released.load(Ordering::SeqCst) {
+            return;
+        }
+        *queued += data.len();
         let _ = self.tx.send(crate::session::UiEvent::Wire {
             stream: stream_id,
             bytes: data,
@@ -235,6 +255,7 @@ impl ClientEvents for Events {
     }
 
     fn on_auth_accepted(&self, accepted: transport::AuthAcceptance) {
+        let _delivery = self.queued.lock().expect("queue count");
         if !self.released.load(Ordering::SeqCst) {
             self.acceptance
                 .lock()
@@ -260,9 +281,7 @@ impl ClientEvents for Events {
         }
         *saved = Some(reason);
         drop(saved);
-        let _ = self
-            .tx
-            .send(crate::session::UiEvent::SessionAborted(reason));
+        self.deliver_ordinary(crate::session::UiEvent::SessionAborted(reason));
     }
 
     fn on_features(&self, features: transport::Features) {
@@ -284,15 +303,15 @@ impl ClientEvents for Events {
             }
             LinkState::Connecting => {}
         }
-        let _ = self.tx.send(crate::session::UiEvent::Link(state));
+        self.deliver_ordinary(crate::session::UiEvent::Link(state));
     }
 
     fn on_stats(&self, stats: Stats) {
-        let _ = self.tx.send(crate::session::UiEvent::Stats(stats));
+        self.deliver_ordinary(crate::session::UiEvent::Stats(stats));
     }
 
     fn on_reset(&self, stream_id: u8) {
-        let _ = self.tx.send(crate::session::UiEvent::WireReset(stream_id));
+        self.deliver_ordinary(crate::session::UiEvent::WireReset(stream_id));
     }
 
     // Once per change of the error (the transport's promise), so a
@@ -361,6 +380,7 @@ impl Taken {
 /// live against the same server at once share nothing to tell their events
 /// apart by, so the wrong attempt's `Events` would end up mutated.
 pub struct Attempt {
+    ssh_server_info: Mutex<Option<ssh::VerifiedSshServerInfo>>,
     /// `Arc`-wrapped (per `StdClient`'s own doc: every method takes `&self`
     /// precisely so it can be shared this way) so a caller building a
     /// channel session's substrate around it -- see `climb::settle_opening`
@@ -412,6 +432,35 @@ enum AttemptTarget {
 }
 
 impl Attempt {
+    /// Retire ordinary deliveries before asynchronous metadata-only transport retirement.
+    pub fn retire_for_discovery(&self) {
+        self.events.release();
+        self.client.retire_for_discovery();
+    }
+    pub fn is_closed(&self) -> bool {
+        self.events.closed.load(Ordering::SeqCst)
+    }
+    pub fn authenticated_server_info(
+        &self,
+    ) -> Option<crate::server_discovery::AuthenticatedServerInfo> {
+        if let Some(proof) = self.client.server_info() {
+            return Some(crate::server_discovery::AuthenticatedServerInfo::Bootstrap(
+                proof,
+            ));
+        }
+        self.ssh_server_info
+            .lock()
+            .expect("SSH server info")
+            .as_ref()
+            .filter(|proof| Some(proof.info().generation) == self.client.server_generation())
+            .cloned()
+            .map(crate::server_discovery::AuthenticatedServerInfo::Ssh)
+    }
+
+    pub fn bind_ssh_server_info(&self, proof: ssh::VerifiedSshServerInfo) {
+        // Retain pending evidence, but the getter exposes it only after msg2 binding.
+        *self.ssh_server_info.lock().expect("SSH server info") = Some(proof);
+    }
     /// Opens a connection that logs in the way `login` says.
     ///
     /// `local_priv` is the process's one Noise static key (spec §4.2): every
@@ -498,6 +547,7 @@ impl Attempt {
         // the terminal (reported by `interactive`); the control stream
         // and the proof's stream on delivery.
         let setup = DriverSetup {
+            expected_generation: None,
             input_budget: Some(input_budget),
             default_consumption: transport::Consumption::Explicit,
             stream_consumption: vec![
@@ -531,6 +581,7 @@ impl Attempt {
             ),
         });
         Attempt {
+            ssh_server_info: Mutex::new(None),
             client,
             events,
             started: std::time::Instant::now(),
@@ -697,6 +748,24 @@ impl Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn released_attempt_delivers_only_metadata_wakes_to_the_next_receiver() {
+        let (events, rx) = events();
+        events.release();
+        events.on_bytes(16, b"old shell bytes".to_vec());
+        events.on_state(LinkState::Closed);
+        events.on_stats(Stats::default());
+        events.on_reset(16);
+        events.on_session_aborted(transport::SessionAbortReason::ResourceExhausted);
+        events.on_discovery_complete();
+        let delivered: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "retired ordinary transport poisoned the receiver: {delivered:?}"
+        );
+        assert!(matches!(delivered[0], crate::session::UiEvent::Tick));
+    }
     use std::sync::mpsc::channel;
     use std::time::Duration as StdDuration;
 
@@ -718,6 +787,7 @@ mod tests {
     fn unstarted_attempt() -> Attempt {
         let (events, _rx) = events();
         Attempt {
+            ssh_server_info: Mutex::new(None),
             client: Arc::new(StdClient::dead()),
             events,
             started: std::time::Instant::now(),
@@ -810,6 +880,7 @@ mod tests {
         let (events, _rx) = events();
         events.on_features(transport::Features::NONE);
         let attempt = Attempt {
+            ssh_server_info: Mutex::new(None),
             client: Arc::new(StdClient::dead()),
             events: Arc::clone(&events),
             started: std::time::Instant::now(),
