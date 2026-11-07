@@ -9,6 +9,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+
+
+RELEASE_VISIBILITY_DELAYS = (1, 2, 4, 8, 16, 32)
 
 
 class UploadError(Exception):
@@ -29,6 +33,34 @@ def pages(endpoint):
     if not isinstance(data, list) or any(not isinstance(page, list) for page in data):
         raise UploadError('Unexpected GitHub pagination response')
     return [item for page in data for item in page]
+
+
+def release_for_tag(endpoint, tag):
+    releases = pages(endpoint)
+    for release in releases:
+        if (not isinstance(release, dict)
+                or not isinstance(release.get('tag_name'), str)
+                or type(release.get('id')) is not int or release['id'] <= 0):
+            raise UploadError('Unexpected GitHub release record')
+    matches = [release for release in releases if release['tag_name'] == tag]
+    if len(matches) > 1:
+        raise UploadError('Multiple releases for the requested tag')
+    return matches[0] if matches else None
+
+
+def created_release(endpoint, tag, sleeper=None):
+    if sleeper is None:
+        sleeper = time.sleep
+    release = release_for_tag(endpoint, tag)
+    for delay in RELEASE_VISIBILITY_DELAYS:
+        if release is not None:
+            return release
+        sleeper(delay)
+        release = release_for_tag(endpoint, tag)
+    if release is None:
+        raise UploadError('Created release visibility timed out; retry publication '
+                          'to check the existing release before uploading')
+    return release
 
 
 def digest(path):
@@ -58,22 +90,16 @@ def publish(args):
             shutil.copyfile(path, snapshot)
             snapshots.append(snapshot)
         endpoint = f'repos/{args.repo}/releases'
-        releases = pages(endpoint)
-        matches = [release for release in releases if release['tag_name'] == args.tag]
-        if len(matches) > 1:
-            raise UploadError('Multiple releases for the requested tag')
-        if not matches:
+        release = release_for_tag(endpoint, args.tag)
+        if release is None:
             command = ['release', 'create', args.tag, '--repo', args.repo,
                        '--verify-tag', '--title', 'qsh ' + args.tag.removeprefix('v'),
                        '--notes-file', args.notes_file]
             if '-' in args.tag:
                 command.append('--prerelease')
             gh(*command)
-            matches = [release for release in pages(endpoint)
-                       if release['tag_name'] == args.tag]
-            if len(matches) != 1:
-                raise UploadError('Created release could not be read back')
-        release_id = int(matches[0]['id'])
+            release = created_release(endpoint, args.tag)
+        release_id = release['id']
         assets = pages(f'{endpoint}/{release_id}/assets')
         remote = {}
         for asset in assets:

@@ -1,4 +1,5 @@
 """Exercise the production uploader against a local, strict gh command boundary."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -6,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / 'scripts/upload-release-assets.py'
@@ -22,7 +24,15 @@ if a[:2] == ['api', '--paginate']:
         print('{}'); sys.exit(0)
     endpoint = a[-1]
     if endpoint == 'repos/example/project/releases':
-        print(json.dumps([[{'id': 1, 'tag_name': 'v1.2.3-rc1'}] if s['exists'] else []]))
+        if 'listings' in s:
+            index = s.get('queries', 0)
+            s['queries'] = index + 1
+            listing = s['listings'][min(index, len(s['listings']) - 1)]
+            save()
+            if listing == 'error': fail()
+            print(json.dumps(listing))
+        else:
+            print(json.dumps([[{'id': 1, 'tag_name': 'v1.2.3-rc1'}] if s['exists'] else []]))
     elif endpoint == 'repos/example/project/releases/1/assets':
         if s.get('error') == 'assets': fail()
         print(json.dumps([[{'id': i+1, 'name': n}] for i,n in enumerate(s['assets'])]))
@@ -76,10 +86,84 @@ class ReleaseUploadTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content.encode('latin1'))
             paths.append(str(path))
-        result = subprocess.run([sys.executable,str(HELPER),'--repo','example/project',
+        result = subprocess.run([sys.executable, '-c',
+                                 'import runpy, sys, time; time.sleep = lambda _: None; '
+                                 'runpy.run_path(sys.argv.pop(1), run_name="__main__")',
+                                 str(HELPER),'--repo','example/project',
                                  '--tag','v1.2.3-rc1','--notes-file',str(self.notes),*paths],
                                 env=self.env, capture_output=True, text=True)
         return result, json.loads(self.state.read_text()), initial
+
+    def test_created_release_waits_for_visibility_before_uploading(self):
+        visible = [[{'id': 1, 'tag_name': 'v1.2.3-rc1'}]]
+        result, state, _ = self.run_upload(exists=False, listings=[[], [], [], visible])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(state['queries'], 4)
+        self.assertEqual(state['mutations'], ['create', 'upload:a.tar.gz', 'upload:b.deb'])
+
+    def test_created_release_visibility_exhaustion_never_recreates_or_uploads(self):
+        result, state, _ = self.run_upload(exists=False, listings=[[]])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('visibility', result.stderr)
+        self.assertIn('retry', result.stderr.lower())
+        self.assertEqual(state['queries'], 8)  # Initial preflight plus seven readbacks.
+        self.assertEqual(state['mutations'], ['create'])
+        self.assertEqual(state['assets'], {})
+
+    def test_duplicate_releases_are_fatal_before_and_after_creation(self):
+        duplicate = [[{'id': 1, 'tag_name': 'v1.2.3-rc1'},
+                      {'id': 2, 'tag_name': 'v1.2.3-rc1'}]]
+        for listings, mutations in [([duplicate], []), ([[], [], duplicate], ['create'])]:
+            with self.subTest(listings=listings):
+                result, state, _ = self.run_upload(exists=False, listings=listings)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Multiple releases', result.stderr)
+                self.assertEqual(state['queries'], len(listings))
+                self.assertEqual(state['mutations'], mutations)
+
+    def test_invalid_release_records_fail_without_retry_or_upload(self):
+        invalid = [None, {}, {'tag_name': 'v1.2.3-rc1'},
+                   *({'tag_name': 'v1.2.3-rc1', 'id': value}
+                     for value in [True, False, 0, -1, 1.5, '', 'abc', '1', None])]
+        for record in invalid:
+            for created in [False, True]:
+                with self.subTest(record=record, created=created):
+                    listings = [[], [], [[record]]] if created else [[[record]]]
+                    result, state, _ = self.run_upload(exists=False, listings=listings)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(state['queries'], len(listings))
+                    self.assertEqual(state['mutations'], ['create'] if created else [])
+
+    def test_readback_api_or_pagination_errors_are_not_retried(self):
+        for response in ['error', {}, [None]]:
+            with self.subTest(response=response):
+                result, state, _ = self.run_upload(exists=False, listings=[[], [], response])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(state['queries'], 3)
+                self.assertEqual(state['mutations'], ['create'])
+
+    def test_later_conflict_after_visibility_prevents_all_uploads(self):
+        visible = [[{'id': 1, 'tag_name': 'v1.2.3-rc1'}]]
+        result, state, _ = self.run_upload({'b.deb': 'different'}, exists=False,
+                                         listings=[[], [], visible])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Conflicting release asset: b.deb', result.stderr)
+        self.assertEqual(state['mutations'], ['create'])
+        self.assertEqual(state['assets'], {'b.deb': 'different'})
+
+    def test_created_release_backoff_is_bounded_and_injectable(self):
+        spec = importlib.util.spec_from_file_location('release_upload', HELPER)
+        uploader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(uploader)
+        waits = []
+        with patch.object(uploader, 'gh', return_value=b'[[]]') as query:
+            with self.assertRaisesRegex(uploader.UploadError, 'visibility'):
+                uploader.created_release('repos/example/project/releases', 'v1.2.3-rc1',
+                                         sleeper=waits.append)
+        self.assertEqual(query.call_count, 7)
+        self.assertEqual(waits, [1, 2, 4, 8, 16, 32])
+        self.assertTrue(all(call.args[:3] == ('api', '--paginate', '--slurp')
+                            for call in query.call_args_list))
 
     def test_first_publication(self):
         r, s, _ = self.run_upload(exists=False)
