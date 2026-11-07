@@ -74,6 +74,7 @@ struct Fixture {
     cancel_after_trust: bool,
     poison_path: Option<PathBuf>,
     verification_fault: Option<VerificationFault>,
+    publication_fault: bool,
     temporary: Option<(String, Arc<AtomicBool>)>,
 }
 impl Fixture {
@@ -89,6 +90,7 @@ impl Fixture {
             cancel_after_trust: false,
             poison_path: None,
             verification_fault: None,
+            publication_fault: false,
             temporary: None,
         }
     }
@@ -142,6 +144,13 @@ impl Remote for Fixture {
     ) -> Result<exec::Output, BringUpError> {
         check_cancel(cancel)?;
         self.commands.push((what.into(), script.into()));
+        if what == "qshd publication" && self.publication_fault {
+            return Ok(exec::test_support::output_with_stderr(
+                19,
+                "",
+                "\x1b[31mdenied\x1b[0m",
+            ));
+        }
         if what == "the qshd lookup" {
             let found = self
                 .found
@@ -562,4 +571,44 @@ fn verification_stderr_warning_preserves_valid_stdout_and_publication() {
             .file_name()
             .to_string_lossy()
             .starts_with(".qshd-")));
+}
+
+#[test]
+fn failed_publication_keeps_old_file_and_cleans_only_own_temporary() {
+    let mut f = Fixture::new();
+    f.publication_fault = true;
+    fs::create_dir_all(f.final_path().parent().unwrap()).unwrap();
+    fs::write(f.final_path(), b"old").unwrap();
+    mode(&f.final_path(), 0o600);
+    let foreign = f
+        .final_path()
+        .parent()
+        .unwrap()
+        .join(".qshd-someone-else.tmp");
+    fs::write(&foreign, b"foreign partial file").unwrap();
+    let (_, hooks) = hooks();
+    let result = f.run(bundled(), hooks, &knock::Cancel::new());
+    let Err(BringUpError::Publish(message)) = result else {
+        panic!("{result:?}")
+    };
+    assert!(message.contains("19"));
+    assert!(!message.contains('\x1b'));
+    assert!(message.chars().count() <= exec::MAX_DIAGNOSTIC + 100);
+    assert_eq!(fs::read(f.final_path()).unwrap(), b"old");
+    assert_eq!(fs::read(&foreign).unwrap(), b"foreign partial file");
+    assert_eq!(f.starts(), 0);
+    assert_eq!(f.uploads, 1);
+    let temporary = f.temporary.take().unwrap();
+    let path = temporary.0.clone();
+    assert!(Path::new(&path).exists());
+    cleanup_temporary(&mut f, Some(temporary));
+    assert!(!Path::new(&path).exists());
+    assert_eq!(fs::read(f.final_path()).unwrap(), b"old");
+    assert_eq!(fs::read(foreign).unwrap(), b"foreign partial file");
+    assert_eq!(
+        fs::read_dir(f.final_path().parent().unwrap())
+            .unwrap()
+            .count(),
+        2
+    );
 }

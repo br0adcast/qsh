@@ -534,33 +534,6 @@ fn unsupported_platform_never_asks_or_loads() {
     assert_not_started(&sb);
 }
 
-#[test]
-fn failed_publication_keeps_old_file_and_cleans_only_own_temporary() {
-    let mut sb = Sandbox::start();
-    fs::write(final_path(&sb), b"old").unwrap();
-    let foreign = sb.cache().join(".qshd-someone-else.tmp");
-    fs::write(&foreign, b"foreign partial file").unwrap();
-    sb.fake_qshd(
-        &sb.home.path().join("bin/mv"),
-        "printf '\\033[31mdenied\\033[0m' >&2; exit 19",
-    );
-    let result = run(
-        &mut sb,
-        bundled(),
-        hooks(source(SCRIPT), approval(true), Arc::default()),
-        &knock::Cancel::new(),
-    );
-    let Err(BringUpError::Publish(message)) = result else {
-        panic!("{result:?}")
-    };
-    assert!(message.contains("19"));
-    assert!(!message.contains('\x1b'));
-    assert_eq!(fs::read(final_path(&sb)).unwrap(), b"old");
-    assert_eq!(fs::read(&foreign).unwrap(), b"foreign partial file");
-    assert_eq!(fs::read_dir(sb.cache()).unwrap().count(), 2);
-    assert_not_started(&sb);
-}
-
 // Regression examples for bootstrap output and literal shell arguments.
 #[test]
 fn compatible_bootstrap_ready_examples_survive_the_full_install() {

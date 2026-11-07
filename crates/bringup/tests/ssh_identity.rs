@@ -24,6 +24,7 @@ fn identified_ready_names_the_same_connection_key() {
         activity: activity.clone(),
         exec_outputs: vec![
             b"os Linux\narch x86_64\nhome /test\npath /test/qshd\n".to_vec(),
+            b"QSH-TRUST /test/qshd\n".to_vec(),
             b"server-pubkey: BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\nTRANSPORT-READY {\"version\":\"0.5.0\",\"ports\":[60022]}\n".to_vec(),
         ],
         ..Default::default()
@@ -70,7 +71,7 @@ fn identified_ready_names_the_same_connection_key() {
         "verification and login share a connection"
     );
     assert!(activity.userauth.load(Ordering::SeqCst) > 0);
-    assert_eq!(activity.exec.load(Ordering::SeqCst), 2);
+    assert_eq!(activity.exec.load(Ordering::SeqCst), 3);
 }
 
 #[test]
@@ -81,9 +82,11 @@ fn ready_records_without_exit_status_are_not_success() {
         activity: activity.clone(),
         exec_outputs: vec![
             b"os Linux\narch x86_64\nhome /test\npath /test/qshd\n".to_vec(),
+            b"QSH-TRUST /test/qshd\n".to_vec(),
             b"server-pubkey: BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\nTRANSPORT-READY {\"version\":\"0.5.0\",\"ports\":[60022]}\n".to_vec(),
         ],
-        exec_missing_status: Some(1),
+        // Lookup and trust succeed; omit only the ensure exit status.
+        exec_missing_status: Some(2),
         ..Default::default()
     });
     let error = bring_up_identified(
@@ -119,5 +122,5 @@ fn ready_records_without_exit_status_are_not_success() {
     .unwrap_err();
     assert!(matches!(error, BringUpError::EnsureFailed(_)), "{error:?}");
     assert!(error.to_string().contains("exit -1"), "{error}");
-    assert_eq!(activity.exec.load(Ordering::SeqCst), 2);
+    assert_eq!(activity.exec.load(Ordering::SeqCst), 3);
 }

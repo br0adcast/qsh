@@ -26,6 +26,68 @@ use transport::channel::{ChannelKind, OpenRequest};
 /// How many `bring_up` logins one sandbox allows (each takes its own key).
 const LOGINS: usize = 2;
 
+/// Opt-in faults for owned integration fixtures, never production policy.
+#[derive(Clone, Copy)]
+pub enum VerificationFault {
+    FailVerification,
+    HoldUploadedVerification,
+}
+
+fn verification_fault_config(home: &Path, fault: VerificationFault) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |path: &&str| {
+        std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    };
+    let sftp = ["/usr/lib/openssh/sftp-server", "/usr/lib/ssh/sftp-server"]
+        .into_iter()
+        .find(executable)
+        .expect("fault fixture needs an installed executable OpenSSH sftp-server");
+    let fault = match fault {
+        VerificationFault::FailVerification => r#"case "$SSH_ORIGINAL_COMMAND" in
+    *'/usr/bin/sha256sum'*) printf 'fixture verification refused\n' >&2; exit 1 ;;
+esac
+"#
+        .to_owned(),
+        VerificationFault::HoldUploadedVerification => {
+            assert!(
+                executable(&"/usr/bin/timeout"),
+                "hold fixture needs executable /usr/bin/timeout"
+            );
+            r#"case "$SSH_ORIGINAL_COMMAND" in
+    *'/usr/bin/sha256sum'*'.qshd-'*'.tmp'*) exec /usr/bin/timeout 30 /bin/sh "$0" hold ;;
+esac
+"#
+            .to_owned()
+        }
+    };
+    let wrapper = home.join(".verification-exec.sh");
+    let script = format!(
+        r#"#!/bin/sh
+umask 077
+# Waiting on channel stdin ends on disconnect; timeout bounds a missing cancel.
+# timeout owns/reaps the reader, rather than leaving a background sleep behind.
+if [ "${{1-}}" = hold ]; then
+    trap 'exit 0' HUP INT TERM
+    trap 'printf complete > "$HOME/.verification-hold-complete"' EXIT
+    printf held > "$HOME/.verification-held"
+    IFS= read -r _held
+    exit 0
+fi
+case "$SSH_ORIGINAL_COMMAND" in
+    internal-sftp) exec {sftp} ;;
+esac
+{fault}exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"
+"#
+    );
+    std::fs::write(&wrapper, script).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o600)).unwrap();
+    format!(
+        "ForceCommand /bin/sh {}",
+        ssh_support::shell_env::quote(&wrapper)
+    )
+}
+
 pub struct Sandbox {
     // `Drop` below stops the daemon first; then sshd, then the home go.
     pub sshd: TestSshd,
@@ -43,6 +105,17 @@ impl Sandbox {
     /// lines) also in sshd's `authorized_keys`: a client that logs in with
     /// its own key, such as `qsh -i <file>`.
     pub fn start_with(extra_authorized: &[String]) -> Sandbox {
+        Self::start_with_verification_fault(extra_authorized, None)
+    }
+
+    pub fn start_with_fault(extra_authorized: &[String], fault: VerificationFault) -> Sandbox {
+        Self::start_with_verification_fault(extra_authorized, Some(fault))
+    }
+
+    fn start_with_verification_fault(
+        extra_authorized: &[String],
+        fault: Option<VerificationFault>,
+    ) -> Sandbox {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let home = tempfile::Builder::new()
             .prefix("qsh home ' ")
@@ -67,6 +140,10 @@ impl Sandbox {
         let sshd = TestSshd::start_with(SshdOptions {
             authorized_keys: authorized,
             session_env,
+            extra_config: fault
+                .map(|fault| verification_fault_config(home.path(), fault))
+                .into_iter()
+                .collect(),
             ..SshdOptions::default()
         });
         let sandbox = Sandbox { sshd, home, logins };
