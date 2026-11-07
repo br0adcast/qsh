@@ -6,6 +6,31 @@ version. qsh authenticates the original `SHA256SUMS` bytes using the adjacent
 come only from the authenticated twelve-product manifest; extraction, size, layout
 and daemon-image checks still apply.
 
+## Client bootstrap trust
+
+Managed console installation uses `scripts/install.sh` from the official raw
+GitHub HTTPS endpoint. The script downloads an exact platform archive from the
+official GitHub release and executes only its temporary `qsh` member. Initial
+trust covers both the script and that executable through GitHub HTTPS; neither
+checksums served beside it nor its later signature verification can authenticate
+that executable before it runs. There is no downloaded verifier or mutable root
+bootstrap.
+
+The temporary client delegates to the Rust installation engine. That engine
+re-downloads and authenticates the selected release manifest and bundle under
+the compiled production policy before persistent installation. The installation
+receipt records ownership and hashes, not independent signature authority.
+Latest-stable discovery is release selection, not artifact authentication. Exact
+`--version` selection is forwarded unchanged, including an explicitly chosen RC.
+
+Activation requires a later release containing `--self-install` and
+`--self-update`; published `0.6.0-rc.1` lacks those commands. Old bootstraps fail
+closed. The shell script stays on GitHub and is not an additional asset in the
+fixed twelve-product signed manifest. Release validation must check the safe
+`--self-install --help` capability probe and exercise first installation from
+the exact candidate artifacts before claiming live bootstrap support. Existing
+published tags and assets must remain unchanged.
+
 ## Authority
 
 The authority is the public `br0adcast/qsh` GitHub Actions release workflow. The

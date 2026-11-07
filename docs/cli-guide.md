@@ -268,6 +268,61 @@ Encryption does not conceal network addresses, volume, or timing. It cannot
 protect either endpoint after that machine is compromised. The full threat model
 and wire format are in [the protocol specification](protocol.md).
 
+## Client installation and updates
+
+These commands describe `main` and require a later installer-capable release.
+Published `0.6.0-rc.1` lacks `--self-install` and `--self-update`; the bootstrap
+refuses an older executable rather than falling back to another release.
+
+The [README installer instructions](../README.md#installing) download
+`scripts/install.sh` directly from official GitHub HTTPS. The script selects the
+latest stable release by default. `--version VERSION` selects an exact version,
+including an RC such as `0.6.0-rc.2`; this example is syntax, not an availability
+claim. It downloads only a temporary bootstrap client and invokes:
+
+```sh
+qsh --self-install [--version VERSION] [--prefix PATH]
+```
+
+The default prefix is `$HOME/.local`; the client is `<prefix>/bin/qsh`. The
+prefix must be inside the user's home. Installation needs no sudo and installs
+no daemon. The engine authenticates the final selected release with compiled
+release roots before publishing a complete generation and its active link.
+The [bootstrap trust boundary](release-security.md#client-bootstrap-trust)
+explains why this does not authenticate the temporary executable before execution.
+
+A different `qsh` on PATH causes the default installation to refuse. An explicit
+`--prefix` acknowledges a separate installation and reports both paths; it does
+not edit PATH. An existing unregistered destination is never overwritten.
+Manual copies and package-owned clients cannot acquire managed status merely by
+being in a particular directory. Keep DEB/RPM installations under their package
+manager, using local release packages; qsh provides no apt/dnf repository,
+Homebrew formula, or `cargo install qsh` channel.
+
+For a registered managed installation:
+
+```sh
+qsh --self-update
+qsh --self-update --version VERSION
+```
+
+The default selects a newer stable release. Exact selection allows an RC but
+never downgrades the installed client. Update validates the actual running
+executable, its receipt and binary digest before downloading. Running from a
+checkout does not change an installed client's provenance; copying a developer
+binary elsewhere does not make it eligible. Source builds, including release
+profile builds, never download, install, or switch console clients. Manual,
+package-owned, modified and unregistered copies refuse self-update.
+
+Release authentication, destination validation or cancellation failures before
+publication leave the prior active generation in place. Updates retain the old
+generation and report the exact executable path to run next. They never replace
+the running process, restart a session, or run automatically after a connection
+failure. Different client/server versions alone do not establish incompatibility;
+compatible peers remain usable. Unsupported protocol or capability combinations
+produce a diagnostic and require an explicit update through the client's normal
+installation channel.
+
 ## SSH startup and installation
 
 Use `,ssh` for port 22, `,ssh=N` for a specific SSH port, or `--ssh[=N]` to enable
@@ -660,6 +715,10 @@ configured roads if needed.
 
 | Option | Meaning |
 | --- | --- |
+| `--self-install` | Install an official client under a home prefix; requires an installer-capable release. |
+| `--self-update` | Explicitly update the registered running client; requires an installer-capable release. |
+| `--version VERSION` | Exact release selection with either self-installation flag. |
+| `--prefix PATH` | Installation prefix with `--self-install`; default `$HOME/.local`. |
 | `-l USER` | Account to claim unless supplied as `user@`. |
 | `-p, --port N` | Default qsh UDP port; an explicit `host:port` takes precedence. |
 | `-i, --identity PATH` | The only identity for direct qsh authentication; first choice for SSH. |

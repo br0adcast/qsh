@@ -86,6 +86,16 @@ fn extract(
     bytes: &[u8],
     budget: &Budget<'_>,
 ) -> Result<Vec<u8>, ImageError> {
+    extract_member(request, bytes, budget, "qshd")
+}
+
+/// Select one executable without unpacking archive paths onto the filesystem.
+pub(super) fn extract_member(
+    request: &ImageRequest,
+    bytes: &[u8],
+    budget: &Budget<'_>,
+    member: &str,
+) -> Result<Vec<u8>, ImageError> {
     let reader = Bounded {
         inner: flate2::read::MultiGzDecoder::new(bytes),
         consumed: 0,
@@ -93,7 +103,7 @@ fn extract(
     };
     let mut archive = tar::Archive::new(reader);
     let root = stem(request);
-    let expected = format!("{root}/qshd");
+    let expected = format!("{root}/{member}");
     let mut image = None;
     // Raw iteration counts and rejects extension headers instead of letting tar
     // hide GNU/PAX entries or their allocations behind a single logical member.

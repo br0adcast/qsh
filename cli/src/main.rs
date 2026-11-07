@@ -52,6 +52,23 @@ fn main() {
 }
 
 pub(crate) fn entry(argv: Vec<std::ffi::OsString>) {
+    match qsh::client_install::parse(&argv) {
+        Ok(Some(command)) => match qsh::client_install::run(&command) {
+            Ok(message) => {
+                println!("{message}");
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("qsh: {error}");
+                std::process::exit(1);
+            }
+        },
+        Err(error) => {
+            eprintln!("qsh: {error}");
+            std::process::exit(2);
+        }
+        Ok(None) => (),
+    }
     let parsed = match args::parse_args_os(&argv) {
         Ok(a) => a,
         Err(args::ArgError::HelpRequested) => {
