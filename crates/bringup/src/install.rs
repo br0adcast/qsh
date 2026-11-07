@@ -388,21 +388,22 @@ impl Remote for Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some((path, owned)) = self
-            .temporary
-            .take()
-            .filter(|(_, owned)| owned.load(Ordering::SeqCst))
-        {
-            drop(owned);
-            // A fresh token permits bounded cleanup even after user cancellation.
-            let _ = self.command(
-                "qshd temporary file cleanup",
-                &format!("/bin/rm -f {}", shell::quote(&path)),
-                Duration::from_secs(1),
-                &knock::Cancel::new(),
-            );
-        }
+        let temporary = self.temporary.take();
+        cleanup_temporary(self, temporary);
         self.conn.close();
+    }
+}
+
+fn cleanup_temporary(remote: &mut impl Remote, temporary: Option<(String, Arc<AtomicBool>)>) {
+    if let Some((path, owned)) = temporary.filter(|(_, owned)| owned.load(Ordering::SeqCst)) {
+        drop(owned);
+        // A fresh token permits bounded cleanup even after user cancellation.
+        let _ = remote.command(
+            "qshd temporary file cleanup",
+            &format!("/bin/rm -f {}", shell::quote(&path)),
+            Duration::from_secs(1),
+            &knock::Cancel::new(),
+        );
     }
 }
 

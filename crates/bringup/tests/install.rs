@@ -213,27 +213,6 @@ fn refusal_never_loads_or_starts() {
     assert!(!final_path(&sb).exists());
 }
 
-#[test]
-fn bad_remote_sum_keeps_old_file() {
-    let mut sb = Sandbox::start();
-    let original = b"old daemon";
-    fs::write(final_path(&sb), original).unwrap();
-    sb.fake_qshd(
-        &sb.home.path().join("bin/sha256sum"),
-        "printf '%064d  file\\n' 0",
-    );
-    let result = run(
-        &mut sb,
-        bundled(),
-        hooks(source(SCRIPT), approval(true), Arc::default()),
-        &knock::Cancel::new(),
-    );
-    assert!(matches!(result, Err(BringUpError::Verify(_))), "{result:?}");
-    assert_eq!(fs::read(final_path(&sb)).unwrap(), original);
-    assert_not_started(&sb);
-    assert_no_temporary(&sb);
-}
-
 fn cancel_at(stage: BringUpStage, finished: bool, published: bool) {
     let mut sb = Sandbox::start();
     let cancel = knock::Cancel::new();
@@ -397,24 +376,6 @@ fn matching_remote_image_skips_upload_but_sets_executable_mode() {
         fs::metadata(final_path(&sb)).unwrap().permissions().mode() & 0o777,
         0o700
     );
-}
-
-#[test]
-fn absent_hash_utility_is_a_typed_failure() {
-    let mut sb = Sandbox::start();
-    sb.fake_qshd(
-        &sb.home.path().join("bin/sha256sum"),
-        "echo unavailable >&2; exit 127",
-    );
-    let result = run(
-        &mut sb,
-        bundled(),
-        hooks(source(SCRIPT), approval(true), Arc::default()),
-        &knock::Cancel::new(),
-    );
-    assert!(matches!(result, Err(BringUpError::Verify(_))), "{result:?}");
-    assert_not_started(&sb);
-    assert!(!final_path(&sb).exists());
 }
 
 #[test]
@@ -777,16 +738,14 @@ fn compatible_architecture_aliases_and_image_names_remain_compatible() {
 }
 
 #[test]
-fn stderr_warnings_do_not_corrupt_discovery_verification_or_readiness() {
+fn stderr_warnings_do_not_corrupt_discovery_or_readiness() {
     let mut sb = Sandbox::start();
     sb.fake_qshd(
         &sb.home.path().join("bin/uname"),
         "echo harmless-uname-warning >&2; exec /usr/bin/uname \"$@\"",
     );
-    sb.fake_qshd(
-        &sb.home.path().join("bin/sha256sum"),
-        "echo harmless-hash-warning >&2; exec /usr/bin/sha256sum \"$@\"",
-    );
+    // Verification-output faults and warnings use the private Remote fixtures
+    // in src/install_tests.rs; managed hashes intentionally ignore PATH.
     let mut bytes = b"#!/bin/sh\necho harmless-ready-warning >&2\n".to_vec();
     bytes.extend_from_slice(SCRIPT);
     let images = source(&bytes);
@@ -885,25 +844,6 @@ fn stderr_only_lookup_failure_preserves_its_reason() {
     assert!(error.to_string().contains("lookup-denied"));
     assert_eq!(images.calls.load(Ordering::SeqCst), 0);
     assert!(consent.offers.lock().unwrap().is_empty());
-}
-
-#[test]
-fn checksum_stdout_with_an_extra_record_is_not_a_verified_image() {
-    let mut sb = Sandbox::start();
-    sb.fake_qshd(
-        &sb.home.path().join("bin/sha256sum"),
-        "/usr/bin/sha256sum; echo unexpected-record",
-    );
-    let error = run(
-        &mut sb,
-        bundled(),
-        hooks(source(SCRIPT), approval(true), Arc::default()),
-        &knock::Cancel::new(),
-    )
-    .unwrap_err();
-    assert!(matches!(error, BringUpError::Verify(_)), "{error:?}");
-    assert_not_started(&sb);
-    assert_no_temporary(&sb);
 }
 
 #[test]

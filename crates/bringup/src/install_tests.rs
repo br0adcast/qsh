@@ -58,6 +58,13 @@ fn hooks() -> (Arc<Hooks>, BringUpHooks) {
         },
     )
 }
+#[derive(Clone, Copy)]
+enum VerificationFault {
+    WrongDigest,
+    MissingTool,
+    ExtraRecord,
+    Warning,
+}
 struct Fixture {
     root: tempfile::TempDir,
     found: Option<PathBuf>,
@@ -66,6 +73,8 @@ struct Fixture {
     uploads: usize,
     cancel_after_trust: bool,
     poison_path: Option<PathBuf>,
+    verification_fault: Option<VerificationFault>,
+    temporary: Option<(String, Arc<AtomicBool>)>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -79,6 +88,8 @@ impl Fixture {
             uploads: 0,
             cancel_after_trust: false,
             poison_path: None,
+            verification_fault: None,
+            temporary: None,
         }
     }
     fn daemon(&mut self, permissions: u32) -> PathBuf {
@@ -168,9 +179,34 @@ impl Remote for Fixture {
         if self.cancel_after_trust && what == "qshd path trust" {
             cancel.cancel();
         }
-        Ok(exec::test_support::output(
-            output.status.code().unwrap_or(-1),
-            std::str::from_utf8(&output.stdout).unwrap(),
+        let code = output.status.code().unwrap_or(-1);
+        let mut stdout = String::from_utf8(output.stdout).unwrap();
+        let mut stderr = String::from_utf8(output.stderr).unwrap();
+        if what == "qshd verification" {
+            match self.verification_fault {
+                Some(VerificationFault::MissingTool) => {
+                    return Ok(exec::test_support::output_with_stderr(
+                        127,
+                        "",
+                        "hash utility unavailable",
+                    ))
+                }
+                Some(VerificationFault::WrongDigest) if code == 0 => {
+                    stdout = format!(
+                        "{}\n{}  file\n",
+                        stdout.lines().next().unwrap(),
+                        "0".repeat(64)
+                    );
+                }
+                Some(VerificationFault::ExtraRecord) if code == 0 => {
+                    stdout.push_str("unexpected-record\n")
+                }
+                Some(VerificationFault::Warning) => stderr.push_str("harmless-hash-warning\n"),
+                _ => {}
+            }
+        }
+        Ok(exec::test_support::output_with_stderr(
+            code, &stdout, &stderr,
         ))
     }
     fn upload(
@@ -195,7 +231,9 @@ impl Remote for Fixture {
         owned.store(true, Ordering::SeqCst);
         Ok(())
     }
-    fn temporary(&mut self, _: Option<(String, Arc<AtomicBool>)>) {}
+    fn temporary(&mut self, value: Option<(String, Arc<AtomicBool>)>) {
+        self.temporary = value;
+    }
 }
 fn bundled() -> InstallPolicy {
     InstallPolicy::EnsureBundled {
@@ -442,4 +480,86 @@ fn managed_install_uses_system_utilities_independent_of_candidate_path() {
         fs::read(f.final_path()).unwrap(),
         b"owned fixture; never execute"
     );
+}
+
+#[test]
+fn verification_wrong_digest_keeps_old_file_and_cleans_owned_upload() {
+    let mut f = Fixture::new();
+    fs::create_dir_all(f.final_path().parent().unwrap()).unwrap();
+    fs::write(f.final_path(), b"old daemon").unwrap();
+    mode(&f.final_path(), 0o600);
+    f.verification_fault = Some(VerificationFault::WrongDigest);
+    let (_, hooks) = hooks();
+    let result = f.run(bundled(), hooks, &knock::Cancel::new());
+    assert!(matches!(result, Err(BringUpError::Verify(_))), "{result:?}");
+    assert_eq!(fs::read(f.final_path()).unwrap(), b"old daemon");
+    assert_eq!(f.starts(), 0);
+    assert_eq!(f.uploads, 1);
+    assert!(!f
+        .commands
+        .iter()
+        .any(|(what, _)| what == "qshd publication"));
+    let temporary = f.temporary.take().unwrap();
+    let path = temporary.0.clone();
+    assert!(Path::new(&path).exists());
+    cleanup_temporary(&mut f, Some(temporary));
+    assert!(!Path::new(&path).exists());
+    assert_eq!(fs::read(f.final_path()).unwrap(), b"old daemon");
+}
+#[test]
+fn verification_missing_hash_tool_is_typed_and_stops_before_upload() {
+    let mut f = Fixture::new();
+    f.verification_fault = Some(VerificationFault::MissingTool);
+    let (_, hooks) = hooks();
+    let result = f.run(bundled(), hooks, &knock::Cancel::new());
+    let error = result.unwrap_err();
+    assert!(matches!(error, BringUpError::Verify(_)));
+    assert!(error.to_string().contains("hash utility unavailable"));
+    assert_eq!(f.starts(), 0);
+    assert_eq!(f.uploads, 0);
+    assert!(!f.final_path().exists());
+    assert!(f.temporary.is_none());
+}
+#[test]
+fn verification_extra_stdout_refuses_publication_and_cleans_owned_upload() {
+    let mut f = Fixture::new();
+    f.verification_fault = Some(VerificationFault::ExtraRecord);
+    let (_, hooks) = hooks();
+    let result = f.run(bundled(), hooks, &knock::Cancel::new());
+    assert!(matches!(result, Err(BringUpError::Verify(_))), "{result:?}");
+    assert_eq!(f.starts(), 0);
+    assert_eq!(f.uploads, 1);
+    assert!(!f.final_path().exists());
+    assert!(!f
+        .commands
+        .iter()
+        .any(|(what, _)| what == "qshd publication"));
+    let temporary = f.temporary.take().unwrap();
+    let path = temporary.0.clone();
+    assert!(Path::new(&path).exists());
+    cleanup_temporary(&mut f, Some(temporary));
+    assert!(!Path::new(&path).exists());
+    assert!(!f.final_path().exists());
+}
+#[test]
+fn verification_stderr_warning_preserves_valid_stdout_and_publication() {
+    let mut f = Fixture::new();
+    f.verification_fault = Some(VerificationFault::Warning);
+    let (_, hooks) = hooks();
+    let result = f.run(bundled(), hooks, &knock::Cancel::new());
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(f.starts(), 1);
+    assert_eq!(f.uploads, 1);
+    assert_eq!(
+        fs::read(f.final_path()).unwrap(),
+        b"owned fixture; never execute"
+    );
+    assert!(f.temporary.is_none());
+    assert!(fs::read_dir(f.final_path().parent().unwrap())
+        .unwrap()
+        .all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".qshd-")));
 }
