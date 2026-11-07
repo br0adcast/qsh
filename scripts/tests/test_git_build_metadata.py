@@ -37,7 +37,7 @@ class GitBuildMetadataTests(unittest.TestCase):
                         GIT_AUTHOR_NAME='Fixture', GIT_COMMITTER_NAME='Fixture',
                         GIT_AUTHOR_EMAIL='fixture@example.invalid',
                         GIT_COMMITTER_EMAIL='fixture@example.invalid',
-                        CARGO_TARGET_DIR=str(self.base/'target'),
+                        CARGO_TARGET_DIR=str(self.base/'target'), CARGO_TERM_COLOR='never',
                         RUSTUP_TOOLCHAIN=tomllib.loads((ROOT/'rust-toolchain.toml').read_text())['toolchain']['channel'])
         for key in ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'SSH_AUTH_SOCK',
                     'QSH_OFFICIAL_RELEASE', 'GITHUB_SHA']:
