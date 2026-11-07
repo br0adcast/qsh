@@ -7,6 +7,27 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0-rc1]
+
+### Changed
+
+- Require protocol 2, with authenticated session acceptance, negotiated input
+  credit, confirmed terminal geometry, and explicit output-continuity reporting.
+  Protocol-1 peers are incompatible; upgrade both client and daemon together.
+- Recover across available network endpoints while preserving retained sessions,
+  and offer a new shell when an authenticated session can no longer resume.
+- Use qualified native OpenSSL builds for private-key operations and distribute
+  verified client archives and Linux daemon packages.
+
+### Fixed
+
+- Bound authentication, channel input, session cleanup, and connection deadlines
+  without blocking independent sessions.
+- Preserve terminal Unicode text, synchronized output, history position, paste
+  handling, and local terminal modes after failures.
+- Harden SSH host-key trust, private-key loading, signature policy, daemon
+  installation, and managed session ownership on Linux and macOS.
+
 ### Security
 
 - Require authenticated exact-version release metadata and reverified signed
