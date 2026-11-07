@@ -382,6 +382,57 @@ fn until(
     }
 }
 
+async fn terminal_marker_until(output: &std::sync::Mutex<Vec<u8>>, end: std::time::Instant) {
+    until(
+        || {
+            let observed = output
+                .lock()
+                .unwrap()
+                .windows(b"KEEPER_RESIZED".len())
+                .any(|window| window == b"KEEPER_RESIZED");
+            assert!(
+                observed || std::time::Instant::now() < end,
+                "KEEPER_RESIZED not delivered before original integrated fixture deadline"
+            );
+            observed
+        },
+        end,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn keeper_terminal_marker_waits_for_delayed_callback_delivery() {
+    let output = std::sync::Mutex::new(b"KEEPER_READY".to_vec());
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut wait = Box::pin(terminal_marker_until(&output, end));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(wait.as_mut(), &mut context).is_pending());
+    // Only the first-channel callback's delivery makes the marker observable.
+    output.lock().unwrap().extend_from_slice(b"KEEPER_RESIZED");
+    wait.await;
+    assert!(std::time::Instant::now() < end);
+}
+
+#[tokio::test]
+async fn keeper_terminal_marker_absent_at_original_deadline_fails() {
+    let end = std::time::Instant::now();
+    let failure = tokio::spawn(async move {
+        let output = std::sync::Mutex::new(b"KEEPER_READY".to_vec());
+        terminal_marker_until(&output, end).await;
+    })
+    .await
+    .expect_err("absent marker must fail at the supplied deadline");
+    let panic = failure.into_panic();
+    let text = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("marker-specific panic text");
+    assert!(text.contains("KEEPER_RESIZED"));
+    assert!(text.contains("original integrated fixture deadline"));
+}
+
 // Availability is not validation: return the first snapshot, even if its
 // contents will fail the caller's existing custody assertions.
 async fn snapshot_available_until<T>(
@@ -1740,6 +1791,8 @@ pub(super) mod native {
                         });
                         snapshot.await;
                     }
+                    // Actor gates and the second channel do not acknowledge first-channel delivery.
+                    super::terminal_marker_until(&events.output,end).await;
                     let output=events.output.lock().unwrap().clone();let echoed=output.windows(b"keeper-input-proof".len()).any(|w|w==b"keeper-input-proof");assert_eq!(echoed,kind==ChannelKind::Shell);
                     assert!(output.windows(b"KEEPER_RESIZED".len()).any(|w|w==b"KEEPER_RESIZED"));
                     if kind==ChannelKind::Command{exclusive(&path.join("release"),nonce.as_bytes());}
