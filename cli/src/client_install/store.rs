@@ -494,7 +494,11 @@ mod tests {
             let error =
                 publish_prepared_with_cancel(home.path(), &prefix, &image(), None, &cancelled)
                     .unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::Interrupted,
+                "cancellation boundary {stop_at}: {error}"
+            );
             assert!(
                 fs::symlink_metadata(active(&prefix)).is_err(),
                 "cancellation at boundary{stop_at} activated a client"
@@ -531,7 +535,11 @@ mod tests {
                 &cancelled,
             )
             .unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::Interrupted,
+                "cancellation boundary {stop_at}: {error}"
+            );
             assert_eq!(
                 active_link(&prefix).unwrap(),
                 before,
