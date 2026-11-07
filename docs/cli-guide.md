@@ -285,6 +285,37 @@ host trust or installation on the user's behalf.
 qsh searches the remote `PATH`, `~/.local/bin`, and the supported user-cache
 locations. An existing managed service is reported and reused instead of launching a competing daemon.
 
+Before executing a discovered daemon, qsh checks ownership and Unix permissions
+from `/` through its canonical path, including symlink inodes and targets. Every
+object must belong to root or the SSH command's effective account. The executable
+must be a regular executable file without group/other write or setuid/setgid bits.
+Reachable directories must deny group/other write. A trusted private directory
+that denies group/other search permits writable inner directories; this exemption
+does not carry across symlinks or exempt executable permissions. Trusted sticky
+directories such as `/tmp` permit traversal through existing trusted-owned
+children, but are not installation destinations. Symlink and path traversal are
+bounded; missing metadata tools or malformed responses cause refusal.
+
+An unsafe selected daemon stops startup with a verification error. qsh does not
+try a lower-priority candidate, request installation approval, or download a
+replacement. Correct the reported ownership/permissions or install qshd in a
+private directory owned by your account. Custom builds do not need a published
+release hash or a matching filename version: cache filenames only rank candidates,
+and the running command reports its actual version. Protocol and capability
+negotiation still determine compatibility.
+
+Managed installation separately checks its destination before reading, changing,
+or replacing files, creates missing cache directories with private permissions,
+and refuses an existing final symlink or unsafe file without repairing it. A safe
+cache-directory symlink is supported. Callers that explicitly request a bundled
+image verify and install that image at their own trusted destination instead of
+executing a discovered candidate.
+
+These checks assume the server, root, account, shell and OS tools are trusted,
+Unix permissions are enforced, and ACLs do not grant additional access. Rechecks
+narrow races but do not atomically bind pathname execution or protect against
+concurrent changes by trusted writers.
+
 If no daemon is found during an interactive connection:
 
 1. qsh asks permission to install a daemon for the remote OS and architecture.

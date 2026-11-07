@@ -9,7 +9,7 @@ pub(crate) fn quote(s: &str) -> String {
 /// hands a command to the login shell, and fish or csh would read a POSIX
 /// script differently.
 pub(crate) fn posix(script: &str) -> String {
-    format!("sh -c {}", quote(script))
+    format!("/bin/sh -c {}", quote(script))
 }
 
 #[cfg(test)]
@@ -23,6 +23,6 @@ mod tests {
 
     #[test]
     fn every_command_goes_through_sh() {
-        assert_eq!(posix("echo 'x'"), r"sh -c 'echo '\''x'\'''");
+        assert_eq!(posix("echo 'x'"), r"/bin/sh -c 'echo '\''x'\'''");
     }
 }

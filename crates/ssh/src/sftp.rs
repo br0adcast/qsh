@@ -309,6 +309,13 @@ impl Clock<'_> {
     }
 }
 
+fn upload_attributes() -> FileAttributes {
+    FileAttributes {
+        permissions: Some(0o600),
+        ..FileAttributes::default()
+    }
+}
+
 async fn transfer(
     session: &RawSftpSession,
     path: &str,
@@ -321,12 +328,12 @@ async fn transfer(
         .wait(requests.wait(9, async { session.init().await.map_err(protocol) }))
         .await?;
     let file = clock
-        .wait(requests.wait(path.len() as u64 + 21, async {
+        .wait(requests.wait(path.len() as u64 + 25, async {
             session
                 .open(
                     path,
                     OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
-                    FileAttributes::default(),
+                    upload_attributes(),
                 )
                 .await
                 .map_err(protocol)
@@ -505,5 +512,13 @@ impl<S> Drop for Interruptible<S> {
         if let Some(dropped) = self.dropped.take() {
             let _ = dropped.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn upload_create_attributes_are_private_before_first_write() {
+        assert_eq!(super::upload_attributes().permissions, Some(0o600));
     }
 }
