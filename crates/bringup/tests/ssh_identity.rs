@@ -32,6 +32,8 @@ fn identified_ready_names_the_same_connection_key() {
     let wire = server.host_public_key_wire();
     let result = bring_up_identified(
         BringUpRequest {
+            report_busy: false,
+            accept_busy: None,
             name: "identity-test".into(),
             ssh: ssh::SshParams {
                 host: "127.0.0.1".into(),
@@ -91,6 +93,8 @@ fn ready_records_without_exit_status_are_not_success() {
     });
     let error = bring_up_identified(
         BringUpRequest {
+            report_busy: false,
+            accept_busy: None,
             name: "missing-status-test".into(),
             ssh: ssh::SshParams {
                 host: "127.0.0.1".into(),

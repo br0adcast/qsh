@@ -867,40 +867,15 @@ mod tests {
     }
 
     #[test]
-    fn reuse_requires_explicit_matching_protocol_without_identity_shortcuts() {
+    fn reuse_compatibility_never_infers_unknown_from_identity_strings() {
+        use super::ReuseCompatibility::*;
         for checksum in ["", "same", "different", "not-a-checksum"] {
-            for (protocol, accepted) in [
-                (None, false),
-                (Some(1), false),
-                (Some(2), true),
-                (Some(3), false),
-            ] {
+            for (protocol, expected) in [(None, Unknown), (Some(1), Incompatible { actual: 1, required: 2 }), (Some(2), Compatible), (Some(3), Incompatible { actual: 3, required: 2 })] {
                 let mut status = transport_status_response(&[60022], 2, None).unwrap();
-                status.checksum = checksum.into();
-                status.transport_protocol = protocol;
-                assert_eq!(
-                    super::validate_reuse_protocol(&status).is_ok(),
-                    accepted,
-                    "protocol {protocol:?}, checksum {checksum:?}"
-                );
+                status.checksum = checksum.into(); status.transport_protocol = protocol;
+                assert_eq!(super::reuse_compatibility(&status), expected);
             }
         }
-    }
-
-    #[test]
-    fn reuse_protocol_diagnostic_is_bounded_and_names_preserved_sessions() {
-        let mut status = transport_status_response(&[60022], 2, None).unwrap();
-        status.transport_protocol = None;
-        status.version = "0.5.0\n\x1b".repeat(5000);
-        let error = super::validate_reuse_protocol(&status)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("unknown"));
-        assert!(error.contains("expected 2"));
-        assert!(error.contains("active connections: 2"));
-        assert!(error.contains("left unchanged"));
-        assert!(!error.chars().any(char::is_control));
-        assert!(error.len() < 1500);
     }
 
     #[test]

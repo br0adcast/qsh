@@ -1716,37 +1716,96 @@ mod tests {
     }
 
     #[test]
-    fn ready_ports_are_the_ones_the_live_daemon_reports() {
-        let status = control::StatusResponse {
+    fn busy_flags_require_explicit_report_mode_and_valid_scoped_identity() {
+        let identity = serde_json::json!({"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42}).to_string();
+        for suffix in [vec!["--accept-busy", identity.as_str()], vec!["--report-busy", "--restart-only"], vec!["--report-busy", "--accept-busy", "{}"], vec!["--report-busy", "--accept-busy", "bad"]] {
+            let mut input=vec!["transport-ensure", "--name", "main", "--port", "60022"];
+            input.extend(suffix);
+            assert!(parse_transport_ensure_args(&args(&input)).is_err());
+        }
+        let parsed=parse_transport_ensure_args(&args(&["transport-ensure","--name","main","--port","60022","--report-busy","--accept-busy", &identity])).unwrap();
+        assert!(parsed.report_busy);
+        assert_eq!(parsed.accept_busy.unwrap().version,"0.5.0");
+    }
+
+    fn reusable_status() -> control::StatusResponse {
+        control::StatusResponse {
+            transport_protocol: Some(2),
             logging_warning: None,
             cleanup: None,
-            version: "0.3.0".into(),
+            version: "0.5.99".into(),
             build: 1,
-            checksum: "x".into(),
+            checksum: "image".into(),
             ports: vec![control::PortStatus {
                 port: 60000,
                 default: true,
-                connections: 0,
+                connections: 1,
             }],
-            total_connections: 0,
-            pid: 1,
-        };
-        assert_eq!(ready_ports(&status, &[60022]), vec![60000]);
+            total_connections: 1,
+            pid: 42,
+        }
     }
 
     #[test]
-    fn a_status_without_ports_falls_back_to_the_requested_ones() {
-        let status = control::StatusResponse {
-            logging_warning: None,
-            cleanup: None,
-            version: "0.3.0".into(),
-            build: 1,
-            checksum: "x".into(),
-            ports: vec![],
-            total_connections: 0,
-            pid: 1,
-        };
-        assert_eq!(ready_ports(&status, &[60022]), vec![60022]);
+    fn ready_ports_require_real_nonzero_listeners() {
+        let mut status = reusable_status();
+        assert_eq!(ready_ports(&status).unwrap(), vec![60000]);
+        status.ports[0].port = 0;
+        assert!(ready_ports(&status).is_err());
+        status.ports.clear();
+        assert!(ready_ports(&status).is_err());
+    }
+
+    #[test]
+    fn add_client_requires_a_valid_ack_from_the_same_compatible_daemon() {
+        let prior = reusable_status();
+        for reply in [
+            control::ControlReply::NoDaemon,
+            control::ControlReply::TimedOut,
+            control::ControlReply::Answered("not-json".into()),
+            control::ControlReply::Answered(r#"{"error":"denied"}"#.into()),
+        ] {
+            assert!(validate_add_client_reply(reply, &prior).is_err());
+        }
+        for changed in 0..8 {
+            let mut ack = prior.clone();
+            match changed {
+                0 => ack.checksum = "other".into(),
+                1 => ack.pid = 43,
+                2 => ack.version = "other".into(),
+                3 => ack.build = 2,
+                4 => ack.transport_protocol = None,
+                5 => ack.transport_protocol = Some(1),
+                6 => ack.ports.clear(),
+                7 => ack.ports[0].port = 0,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_add_client_reply(
+                    control::ControlReply::Answered(ack.to_line().unwrap()),
+                    &prior
+                )
+                .is_err(),
+                "changed {changed}"
+            );
+        }
+        let mut ack = prior.clone();
+        ack.total_connections = 3;
+        let actual = validate_add_client_reply(
+            control::ControlReply::Answered(ack.to_line().unwrap()),
+            &prior,
+        )
+        .unwrap();
+        assert_eq!(actual.total_connections, 3);
+        // Legacy omission of PID is permitted only if the initial response
+        // itself supplied no identity to pin.
+        let mut legacy = prior.clone();
+        legacy.pid = 0;
+        assert!(validate_add_client_reply(
+            control::ControlReply::Answered(ack.to_line().unwrap()),
+            &legacy
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1821,7 +1880,7 @@ mod tests {
         assert!(warning.contains("file logging disabled: log-path"));
         assert!(warning.len() <= 1024 && !warning.contains('\x1b'));
         let mut output = Vec::new();
-        write_transport_ready(&mut output, &[7; 32], &[60000], Some(&warning)).unwrap();
+        write_transport_ready(&mut output, "0.5.99", &[7; 32], &[60000], Some(&warning)).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output.lines().count(), 2);
         let json: serde_json::Value = serde_json::from_str(
@@ -1841,7 +1900,7 @@ mod tests {
         let pubkey = [7u8; 32];
         let mut buf: Vec<u8> = Vec::new();
 
-        write_transport_ready(&mut buf, &pubkey, &[60000, 60999], None).unwrap();
+        write_transport_ready(&mut buf, "0.5.99", &pubkey, &[60000, 60999], None).unwrap();
 
         let text = String::from_utf8(buf).unwrap();
         let mut lines = text.lines();
@@ -1857,7 +1916,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&second[prefix.len()..]).unwrap();
         assert_eq!(
             value,
-            serde_json::json!({"version": state::QSHD_VERSION, "ports": [60000, 60999], "warning": null})
+            serde_json::json!({"version": "0.5.99", "ports": [60000, 60999], "warning": null})
         );
     }
 
@@ -1865,13 +1924,13 @@ mod tests {
     fn transport_ready_carries_optional_warning() {
         let mut buf = Vec::new();
         let pk = [0u8; 32];
-        write_transport_ready(&mut buf, &pk, &[60000], Some("daemon differs")).unwrap();
+        write_transport_ready(&mut buf, "0.5.99", &pk, &[60000], Some("daemon differs")).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("server-pubkey: "));
         assert!(s.contains("\"warning\":\"daemon differs\""));
 
         let mut buf2 = Vec::new();
-        write_transport_ready(&mut buf2, &pk, &[60000], None).unwrap();
+        write_transport_ready(&mut buf2, "0.5.99", &pk, &[60000], None).unwrap();
         let s2 = String::from_utf8(buf2).unwrap();
         assert!(s2.contains("TRANSPORT-READY "));
         // No warning -> field is null (client tolerates absence/null).

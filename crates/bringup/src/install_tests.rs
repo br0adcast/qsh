@@ -119,6 +119,8 @@ impl Fixture {
             "fixture".into(),
             60022,
             [7; 32],
+            false,
+            None,
             "fixture.invalid".into(),
             "fixture".into(),
             22,

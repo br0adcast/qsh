@@ -1276,3 +1276,194 @@ fn path_diagnostics_relative_cache_route_survives_detach_and_status_reuse() {
         "the detached guard retains the original route too"
     );
 }
+
+/// Owns only a scripted local control peer; the real ensure executable must
+/// decide whether it can reuse it, and which requests it is allowed to send.
+#[allow(clippy::too_many_arguments)]
+fn reuse_transaction(
+    protocol: Option<u8>,
+    active: u64,
+    newer: bool,
+    restart_only: bool,
+    client_key: bool,
+    report_busy: bool,
+    accept_busy: Option<&str>,
+    acknowledgement: Option<&str>,
+) -> ((bool, String, String), Vec<String>) {
+    use std::io::{BufRead, BufReader, Write};
+    let home = private_temp_home().unwrap();
+    let socket = home.path().join("qsh/control.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let (listener, _cleanup) = qshd::control::bind_private_owned(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut status = serde_json::json!({
+        "version": "0.5.99", "build": if newer { u64::MAX } else { 0 },
+        "checksum": "ab".repeat(32), "pid": std::process::id(),
+        "ports": [{"port": 60123, "default": true, "connections": active}],
+        "total_connections": active
+    });
+    if let Some(protocol) = protocol {
+        status["transport_protocol"] = protocol.into();
+    }
+    let stop = AtomicBool::new(false);
+    let requests = Mutex::new(Vec::new());
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(peer) => peer,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("scripted accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                requests.lock().unwrap().push(request.trim().to_owned());
+                let reply = if request.starts_with("ADD-CLIENT ") {
+                    acknowledgement.map(str::to_owned)
+                } else {
+                    Some(status.to_string())
+                };
+                if let Some(reply) = reply {
+                    let _ = writeln!(stream, "{reply}");
+                }
+            }
+        });
+        let out = tempfile::tempfile().unwrap();
+        let err = tempfile::tempfile().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_qshd"));
+        command.args(["transport-ensure", "--name", "reuse", "--port", "60022"]);
+        if report_busy { command.arg("--report-busy"); }
+        if let Some(identity) = accept_busy { command.args(["--accept-busy", identity]); }
+        if restart_only {
+            command.arg("--restart-only");
+        }
+        if client_key {
+            command.args([
+                "--client-pubkey",
+                "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
+            ]);
+        }
+        // restart-only deliberately cannot create the key itself.
+        qshd::load_or_create_transport_key(&home.path().join("qsh/transport_server_key.bin"))
+            .unwrap();
+        let child = command
+            .env("HOME", home.path())
+            .env("XDG_CACHE_HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("HISTFILE", "/dev/null")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("SSH_AGENT_PID")
+            .stdin(Stdio::null())
+            .stdout(out.try_clone().unwrap())
+            .stderr(err.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        let result = Ensure {
+            child: Some(child),
+            out,
+            err,
+        }
+        .finish();
+        stop.store(true, Ordering::Release);
+        result
+    });
+    (result, requests.into_inner().unwrap())
+}
+
+fn scripted_identity(newer: bool) -> serde_json::Value {
+    serde_json::json!({"version":"0.5.99","build":if newer {u64::MAX} else {0},"checksum":"ab".repeat(32),"pid":std::process::id()})
+}
+
+fn scripted_ack(protocol: Option<u8>) -> String {
+    let mut ack = scripted_identity(false);
+    ack["total_connections"] = 3.into();
+    ack["ports"] = serde_json::json!([{"port":60124,"default":true,"connections":3}]);
+    if let Some(protocol)=protocol { ack["transport_protocol"]=protocol.into(); }
+    ack.to_string()
+}
+
+#[test]
+fn report_mode_offers_busy_choice_before_compatibility_or_mutation() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for protocol in [None, Some(1), Some(2)] {
+        for key in [false, true] {
+            let ((success,out,err),requests)=reuse_transaction(protocol,2,false,false,key,true,None,None);
+            assert!(success,"{err}");
+            assert_eq!(out.lines().count(),1,"{out}");
+            let busy:serde_json::Value=serde_json::from_str(out.strip_prefix("TRANSPORT-BUSY ").unwrap().trim()).unwrap();
+            assert_eq!(busy["schema"],1); assert_eq!(busy["identity"],scripted_identity(false));
+            assert_eq!(busy["active_connections"],2); assert_eq!(busy["required_protocol"],2);
+            assert!(!out.contains("TRANSPORT-READY") && !out.contains("server-pubkey:"));
+            assert_eq!(requests,["STATUS"]);
+        }
+    }
+}
+
+#[test]
+fn accepted_busy_reuse_checks_explicit_protocol_and_reports_actual_ready() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let identity=scripted_identity(false).to_string();
+    for protocol in [None, Some(1), Some(2)] {
+        let ack=scripted_ack(protocol);
+        let ((success,out,err),requests)=reuse_transaction(protocol,2,false,false,true,true,Some(&identity),Some(&ack));
+        if protocol==Some(1) {
+            assert!(!success,"{out}"); assert!(err.contains("protocol 1") && err.contains("expected 2"),"{err}");
+            assert!(!out.contains("TRANSPORT-READY")); assert_eq!(requests,["STATUS"]);
+        } else {
+            assert!(success,"{err}");
+            let ready:serde_json::Value=serde_json::from_str(out.lines().find_map(|line|line.strip_prefix("TRANSPORT-READY ")).unwrap()).unwrap();
+            assert_eq!(ready["version"],"0.5.99"); assert_eq!(ready["ports"],serde_json::json!([60124]));
+            assert_eq!(ready["transport_protocol"],serde_json::json!(protocol)); assert!(ready["warning"].is_null());
+            assert_eq!(requests.len(),2); assert!(requests[1].starts_with("ADD-CLIENT "));
+        }
+    }
+}
+
+#[test]
+fn changed_busy_identity_requires_a_fresh_choice() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let mut identity=scripted_identity(false); identity["pid"]=999.into();
+    let ((success,out,err),requests)=reuse_transaction(Some(2),2,false,false,true,true,Some(&identity.to_string()),None);
+    assert!(success,"{err}"); assert!(out.starts_with("TRANSPORT-BUSY ")); assert_eq!(requests,["STATUS"]);
+}
+
+#[test]
+fn default_reuse_preserves_unknown_compatibility_and_never_reports_a_dialog() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for protocol in [None,Some(1),Some(2)] {
+        let ack=scripted_ack(protocol);
+        let ((success,out,err),requests)=reuse_transaction(protocol,2,false,false,true,false,None,Some(&ack));
+        assert!(!out.contains("TRANSPORT-BUSY"));
+        if protocol==Some(1) {
+            assert!(!success,"{out}"); assert!(err.contains("expected 2"),"{err}"); assert_eq!(requests,["STATUS"]);
+        } else {
+            assert!(success,"{err}"); assert!(out.contains("TRANSPORT-READY")); assert!(out.contains("0.5.99"));
+            assert!(out.contains("active sessions")); assert_eq!(requests.len(),2);
+        }
+    }
+}
+
+#[test]
+fn newer_incompatible_and_restart_only_peers_are_not_stopped() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for (active,newer,restart) in [(0,true,false),(2,false,true)] {
+        let ((success,out,err),requests)=reuse_transaction(Some(1),active,newer,restart,true,false,None,None);
+        assert!(!success,"{out}"); assert!(err.contains("expected 2"),"{err}"); assert_eq!(requests,["STATUS"]);
+    }
+}
+
+#[test]
+fn reuse_cannot_report_ready_after_a_missing_or_malformed_acknowledgement() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for acknowledgement in [None, Some("not-json"), Some(r#"{"error":"denied"}"#)] {
+        let ((success,out,err),requests)=reuse_transaction(Some(2),2,false,false,true,false,None,acknowledgement);
+        assert!(!success,"{out}; {err}"); assert!(!out.contains("TRANSPORT-READY"));
+        assert_eq!(requests.len(),2); assert!(!requests.iter().any(|request|request=="STOP"));
+    }
+}

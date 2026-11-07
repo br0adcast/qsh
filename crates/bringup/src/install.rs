@@ -424,6 +424,11 @@ pub(crate) fn bring_up(
             ));
         }
     }
+    if (req.accept_busy.is_some() && !req.report_busy)
+        || (req.report_busy && matches!(policy, InstallPolicy::RestartOnly))
+        || req.accept_busy.as_ref().is_some_and(|identity| !identity.valid()) {
+        return Err(BringUpError::InvalidRequest("invalid busy-daemon decision options".into()));
+    }
     if req.name.contains('\0') || req.qsh_port == 0 {
         return Err(BringUpError::InvalidRequest(
             "the name must not contain NUL and the port must be nonzero".into(),
@@ -448,6 +453,8 @@ pub(crate) fn bring_up(
         req.name,
         req.qsh_port,
         req.client_pubkey,
+        req.report_busy,
+        req.accept_busy,
         host,
         username,
         ssh_port,
@@ -467,6 +474,8 @@ fn on_session(
     name: String,
     qsh_port: u16,
     client_pubkey: [u8; 32],
+    report_busy: bool,
+    accept_busy: Option<crate::BusyDaemonIdentity>,
     host: String,
     username: String,
     ssh_port: u16,
@@ -551,7 +560,7 @@ fn on_session(
     check_cancel(cancel)?;
     let output = session.command(
         "qshd transport-ensure",
-        &ensure::command_for_policy(&path, &name, qsh_port, &client_pubkey, &policy),
+        &ensure::command_for_policy(&path, &name, qsh_port, &client_pubkey, &policy, report_busy, accept_busy.as_ref())?,
         hooks.timing.ensure,
         cancel,
     )?;

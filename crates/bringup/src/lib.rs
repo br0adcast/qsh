@@ -18,6 +18,8 @@ mod shell;
 mod timing;
 mod trust;
 
+pub use ensure::{BusyDaemonIdentity, BusyDaemonInfo};
+
 pub use image::{
     DaemonImage, ImageError, ImageRequest, ImageSource, Platform, ServerArch, ServerOs,
 };
@@ -27,6 +29,10 @@ pub use progress::{BringUpObserver, BringUpProgress, BringUpStage};
 pub use timing::InstallTiming;
 
 pub struct BringUpRequest {
+    /// Opt in to a non-ready busy decision; ordinary/background callers use false.
+    pub report_busy: bool,
+    /// Consent for precisely the daemon identity reported in this attempt.
+    pub accept_busy: Option<BusyDaemonIdentity>,
     pub name: String,
     pub ssh: ssh::SshParams,
     pub auth: ssh::SshAuthPlan,
@@ -36,14 +42,14 @@ pub struct BringUpRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ready {
+    /// Reported wire protocol; None is unknown and still requires authentication.
+    pub transport_protocol: Option<u8>,
     /// Reported by the verified SSH login for endpoint identity binding.
     /// Noise must still prove that the daemon holds the corresponding private key.
     pub server_pubkey: [u8; 32],
     /// Where the daemon actually listens (`TRANSPORT-READY`, qshd >= this slice).
     pub ports: Vec<u16>,
-    /// The version of the `qshd` binary that ran `transport-ensure`
-    /// (`state::QSHD_VERSION` in its `write_transport_ready`), which may
-    /// differ from a live daemon it reused -- see `warning`.
+    /// The version reported by the daemon selected for the connection.
     pub version: String,
     pub warning: Option<String>,
 }
@@ -70,6 +76,8 @@ impl Ready {
 
 #[derive(Debug)]
 pub enum BringUpError {
+    /// A preflight choice requiring caller consent before registration/readiness.
+    BusyDaemon(BusyDaemonInfo),
     InvalidRequest(String),
     UnsupportedPlatform(String),
     InstallRequired,
@@ -92,6 +100,9 @@ pub enum BringUpError {
 impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            BringUpError::BusyDaemon(info) => write!(f,
+                "running qshd {} has {} active connections; the new daemon cannot start. Connect using the running daemon instead?",
+                info.identity.version, info.active_connections),
             BringUpError::InvalidRequest(reason) => write!(f, "invalid bring-up request: {reason}"),
             BringUpError::UnsupportedPlatform(platform) => {
                 write!(f, "unsupported server platform: {platform}")
@@ -298,6 +309,7 @@ mod tests {
 
     fn ready(ports: Vec<u16>) -> Ready {
         Ready {
+            transport_protocol: None,
             ports,
             server_pubkey: [7; 32],
             version: "0.3.0".into(),

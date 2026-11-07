@@ -322,6 +322,8 @@ impl SshStep<'_> {
             .map(default_key_files)
             .unwrap_or_default();
         bringup::BringUpRequest {
+            report_busy: false,
+            accept_busy: None,
             name: "console".into(),
             ssh: ssh::SshParams {
                 host: addr.host.clone(),

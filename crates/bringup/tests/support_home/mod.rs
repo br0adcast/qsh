@@ -171,6 +171,8 @@ impl Sandbox {
     pub fn request(&mut self, qsh_port: u16) -> bringup::BringUpRequest {
         let signer = self.logins.pop().expect("more logins than LOGINS");
         bringup::BringUpRequest {
+            report_busy: false,
+            accept_busy: None,
             name: "console".into(),
             ssh: self.params(),
             auth: ssh::SshAuthPlan::single(ssh::AuthMethod::Signer(Arc::new(signer))),
