@@ -487,16 +487,20 @@ def debian_version(version):
     return version + '-1'
 
 
+def rpm_version(version):
+    # Match the pinned generator: RPM forbids hyphens in Version.
+    return version.replace('-', '~')
+
+
 def check_fields(fmt, fields, filename, program, version, arch):
     if fmt == 'deb':
         package_version = debian_version(version)
         expected = [program, package_version, arch]
         name = '{}_{}_{}.deb'.format(program, package_version, arch)
     else:
-        # cargo-generate-rpm 0.21.0 passes the raw version, Release defaults
-        # to 1. Its pinned rpm library rejects '-' rather than normalizing it.
-        expected = [program, version, '1', arch]
-        name = '{}-{}-1.{}.rpm'.format(program, version, arch)
+        package_version = rpm_version(version)
+        expected = [program, package_version, '1', arch]
+        name = '{}-{}-1.{}.rpm'.format(program, package_version, arch)
     if fields != expected or Path(filename).name != name:
         raise ValueError('package metadata or filename differs from selected version/identity')
 

@@ -1,0 +1,17 @@
+--- a/cargo-generate-rpm-0.21.0/src/config/mod.rs
++++ b/cargo-generate-rpm-0.21.0/src/config/mod.rs
+@@ -157,5 +157,7 @@
+         let name = metadata.get_str("name")?.unwrap_or(pkg.name.as_str());
++        // RPM forbids hyphens in Version; tilde sorts prereleases before stable.
++        // Explicit RPM version metadata remains under the caller's control.
+         let version = match metadata.get_str("version")? {
+-            Some(v) => v,
+-            None => pkg.version.get()?,
++            Some(v) => v.to_owned(),
++            None => pkg.version.get()?.replace('-', "~"),
+         };
+@@ -192,3 +194,3 @@
+         };
+-        let mut builder = rpm::PackageBuilder::new(name, version, license, arch.as_str(), desc);
++        let mut builder = rpm::PackageBuilder::new(name, &version, license, arch.as_str(), desc);
+         builder.using_config(build_config);

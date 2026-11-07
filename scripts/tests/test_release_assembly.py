@@ -22,10 +22,11 @@ PEER_NAMES=('identity.txt','passed.txt','current_qsh_pastes_a_megabyte_into_curr
 
 def names(version='0.5.0',deb='0.5.0-1'):
     result={}
+    rpm=version.replace('-', '~')
     for target,deb_arch,rpm_arch in [('x86_64-unknown-linux-musl','amd64','x86_64'),('aarch64-unknown-linux-musl','arm64','aarch64')]:
-        result['linux-'+target]=(f'qsh-{version}-{target}.tar.gz',f'qsh_{deb}_{deb_arch}.deb',f'qsh-{version}-1.{rpm_arch}.rpm')
+        result['linux-'+target]=(f'qsh-{version}-{target}.tar.gz',f'qsh_{deb}_{deb_arch}.deb',f'qsh-{rpm}-1.{rpm_arch}.rpm')
     result['macos']=tuple(f'qsh-{version}-{target}.tar.gz' for target in ('aarch64-apple-darwin','x86_64-apple-darwin'))
-    result['server-packages']=tuple(f'qshd_{deb}_{a}.deb' for a in ('amd64','arm64'))+tuple(f'qshd-{version}-1.{a}.rpm' for a in ('x86_64','aarch64'))
+    result['server-packages']=tuple(f'qshd_{deb}_{a}.deb' for a in ('amd64','arm64'))+tuple(f'qshd-{rpm}-1.{a}.rpm' for a in ('x86_64','aarch64'))
     return result
 
 
@@ -70,6 +71,17 @@ class Layout(unittest.TestCase):
         before,body=self.workflow_body()
         env=os.environ|dict(RELEASE_VERSION=version,HOME=str(self.root/'home'),XDG_CONFIG_HOME=str(self.root/'config'),XDG_CACHE_HOME=str(self.root/'cache'),HISTFILE='/dev/null')
         return subprocess.run(['bash','-e','-c',body],cwd=self.root,env=env,capture_output=True,timeout=10)
+
+
+class PrereleaseProducts(unittest.TestCase):
+    def test_rpm_prerelease_names_keep_archives_and_debian_versions(self):
+        spec=importlib.util.spec_from_file_location('assembly',ROOT/'scripts/assemble-release-assets.py')
+        assembly=importlib.util.module_from_spec(spec);spec.loader.exec_module(assembly)
+        products=assembly.expected_products('0.6.0-rc1')
+        self.assertIn('qsh-0.6.0-rc1-x86_64-unknown-linux-musl.tar.gz', products['linux-x86_64-unknown-linux-musl'])
+        self.assertIn('qsh_0.6.0~rc1-1_amd64.deb', products['linux-x86_64-unknown-linux-musl'])
+        self.assertIn('qsh-0.6.0~rc1-1.x86_64.rpm', products['linux-x86_64-unknown-linux-musl'])
+        self.assertIn('qshd-0.6.0~rc1-1.aarch64.rpm', products['server-packages'])
 
 
 class WorkflowTests(Layout):

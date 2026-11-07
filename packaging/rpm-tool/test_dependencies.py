@@ -11,7 +11,7 @@ import unittest
 class GeneratedDependencyTests(unittest.TestCase):
     tool = None
 
-    def generate(self, metadata):
+    def generate(self, metadata, version="1.0.0"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             # Rocky minimal images expose /bin/true as a coreutils shebang
@@ -23,17 +23,20 @@ class GeneratedDependencyTests(unittest.TestCase):
             (root / "payload").write_bytes(payload)
             (root / "payload").chmod(0o755)
             (root / "Cargo.toml").write_text(
-                '[package]\nname="phase-test"\nversion="1.0.0"\nlicense="MIT"\n'
+                '[package]\nname="phase-test"\nversion="' + version + '"\nlicense="MIT"\n'
                 'description="RPM phase test"\n[package.metadata.generate-rpm]\n'
                 'assets=[{source="payload", dest="/usr/bin/phase-test", mode="755"}]\n'
                 + metadata)
-            output = root / "test.rpm"
+            output = root
             result = subprocess.run([self.tool, "--auto-req", "builtin",
                                      "--output", str(output)], cwd=root,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if result.returncode:
                 return result, None
-            data = output.read_bytes()
+            packages = list(root.glob("*.rpm"))
+            self.assertEqual(len(packages), 1)
+            self.rpm_name = packages[0].name
+            data = packages[0].read_bytes()
             def header(offset):
                 self.assertEqual(data[offset:offset + 3], b"\x8e\xad\xe8")
                 count, size = struct.unpack_from(">II", data, offset + 8)
@@ -41,14 +44,34 @@ class GeneratedDependencyTests(unittest.TestCase):
                 entries = {}
                 for index in range(count):
                     tag, kind, start, length = struct.unpack_from(">IIII", data, offset + 16 + index * 16)
-                    if kind == 8:
+                    if kind == 6:
+                        entries[tag] = data[store + start:].split(b"\0", 1)[0]
+                    elif kind == 8:
                         entries[tag] = data[store + start:].split(b"\0", length)[:length]
                     elif kind == 4:
                         entries[tag] = struct.unpack_from(">" + "I" * length, data, store + start)
                 return entries, store + size
             _, end = header(96)
             entries, _ = header((end + 7) & ~7)
+            self.headers = entries
             return result, list(zip(entries[1049], entries[1048], entries[1050]))
+
+    def test_prerelease_version_headers_and_default_filename(self):
+        for version, expected in [('0.6.0-rc1', '0.6.0~rc1'),
+                                  ('0.6.0-rc.1+build.2', '0.6.0~rc.1+build.2'),
+                                  ('0.6.0', '0.6.0')]:
+            with self.subTest(version=version):
+                result, _ = self.generate('', version)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.headers[1001], expected.encode())
+                self.assertEqual(self.headers[1002], b'1')
+                self.assertEqual(self.rpm_name, 'phase-test-' + expected + '-1.'
+                                 + self.headers[1022].decode() + '.rpm')
+
+    def test_explicit_rpm_version_override_is_literal(self):
+        result, _ = self.generate('version="2.0.0~custom"\n', '0.6.0-rc1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.headers[1001], b'2.0.0~custom')
 
     def test_pre_post_and_automatic_elf_requirements(self):
         result, dependencies = self.generate(

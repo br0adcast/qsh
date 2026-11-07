@@ -256,6 +256,19 @@ class ReleaseOutputTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertEqual(output.debian_version(raw), expected)
 
+    def test_rpm_prerelease_version_and_filename(self):
+        for raw, expected in [('0.6.0-rc1', '0.6.0~rc1'),
+                              ('0.6.0-rc.1+build.2', '0.6.0~rc.1+build.2'),
+                              ('0.6.0', '0.6.0')]:
+            with self.subTest(raw=raw):
+                self.assertEqual(output.rpm_version(raw), expected)
+                output.check_fields('rpm', ['qsh', expected, '1', 'x86_64'],
+                                    f'qsh-{expected}-1.x86_64.rpm', 'qsh', raw, 'x86_64')
+                if raw != expected:
+                    with self.assertRaises(ValueError):
+                        output.check_fields('rpm', ['qsh', raw, '1', 'x86_64'],
+                                            f'qsh-{raw}-1.x86_64.rpm', 'qsh', raw, 'x86_64')
+
     def test_package_fields_and_filename_must_both_match(self):
         for fmt, fields, filename, arch in [
                 ('deb', ['qsh', '0.5.0-1', 'amd64'], 'qsh_0.5.0-1_amd64.deb', 'amd64'),
