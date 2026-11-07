@@ -19,7 +19,7 @@ case "$account" in ''|*[!0-9]*) fail ;; esac
 metadata() {
     case "$os" in
         linux) record=$("$stat" -c '%a:%u' -- "$boundary" 2>/dev/null) || fail ;;
-        darwin) record=$("$stat" -f '%Lp:%u' "$boundary" 2>/dev/null) || fail ;;
+        darwin) record=$("$stat" -f '%OMp%03OLp:%u' "$boundary" 2>/dev/null) || fail ;;
     esac
     bits=${record%%:*}; owner=${record#*:}
     case "$bits" in ''|*[!0-7]*) fail ;; esac

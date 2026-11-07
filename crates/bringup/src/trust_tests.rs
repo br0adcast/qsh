@@ -135,8 +135,12 @@ fn trust_leaf_must_be_regular_executable_without_special_bits() {
     assert!(inspect(root.path(), Purpose::Execute).is_err());
     mode(&file, 0o600);
     assert!(inspect(&file, Purpose::Execute).is_err());
-    mode(&file, 0o4700);
-    assert!(inspect(&file, Purpose::Execute).is_err());
+    for permissions in [0o4700, 0o2700, 0o6700] {
+        mode(&file, permissions);
+        assert!(inspect(&file, Purpose::Execute).is_err());
+    }
+    mode(&file, 0o700);
+    assert!(inspect(&file, Purpose::Execute).is_ok());
     assert!(inspect(root.path(), Purpose::InstallDirectory).is_ok());
 }
 #[test]
@@ -268,25 +272,78 @@ fn trust_link_and_component_limits_are_enforced_on_existing_paths() {
 fn trust_darwin_metadata_format_fixture() {
     let (root, file) = fixture();
     let utility = root.path().join("stat-fixture");
-    fs::write(&utility,b"#!/bin/sh\n[ \"$1\" = -f ] && [ \"$2\" = '%Lp:%u' ] && [ \"$#\" = 3 ] || exit 2\nexec /usr/bin/stat -c '%a:%u' -- \"$3\"\n").unwrap();
+    // Model Apple's numeric M (special) and L (low permission) pieces explicitly.
+    fs::write(
+        &utility,
+        br#"#!/bin/sh
+[ "$1" = -f ] && [ "$#" = 3 ] || exit 2
+record=$(/usr/bin/stat -c '%a:%u' -- "$3") || exit 2
+bits=${record%%:*}
+owner=${record#*:}
+value=$((0$bits))
+case "$2" in
+    '%Lp:%u') printf '%o:%s\n' "$((value & 0777))" "$owner" ;;
+    '%OMp%03OLp:%u') printf '%o%03o:%s\n' "$(((value >> 9) & 7))" "$((value & 0777))" "$owner" ;;
+    *) exit 2 ;;
+esac
+"#,
+    )
+    .unwrap();
     mode(&utility, 0o700);
-    let script = command(file.to_str().unwrap(), ServerOs::Darwin, Purpose::Execute)
-        .unwrap()
-        .replace(
-            "stat=/usr/bin/stat",
-            &format!("stat={}", shell::quote(utility.to_str().unwrap())),
-        );
-    let output = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(script)
-        .output()
-        .unwrap();
-    assert_eq!(
+    for permissions in [0o0000, 0o0700, 0o0755, 0o1777, 0o2700, 0o4700, 0o6700] {
+        mode(&file, permissions);
+        for (format, expected) in [
+            ("%Lp:%u", format!("{:o}", permissions & 0o777)),
+            ("%OMp%03OLp:%u", format!("{permissions:04o}")),
+        ] {
+            let output = Command::new(&utility)
+                .args(["-f", format])
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .split(':')
+                    .next()
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+    let inspect_darwin = |path: &std::path::Path, purpose| {
+        let script = command(path.to_str().unwrap(), ServerOs::Darwin, purpose)
+            .unwrap()
+            .replace(
+                "stat=/usr/bin/stat",
+                &format!("stat={}", shell::quote(utility.to_str().unwrap())),
+            );
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
         parse(
             output.status.code().unwrap(),
-            std::str::from_utf8(&output.stdout).unwrap()
+            std::str::from_utf8(&output.stdout).unwrap(),
         )
-        .unwrap(),
+    };
+    mode(&file, 0o700);
+    // A protected child under a sticky public ancestor remains trusted.
+    mode(root.path(), 0o1777);
+    assert_eq!(
+        inspect_darwin(&file, Purpose::Execute).unwrap(),
         file.to_str().unwrap()
     );
+    assert!(inspect_darwin(root.path(), Purpose::InstallDirectory).is_err());
+    mode(root.path(), 0o777);
+    assert!(inspect_darwin(&file, Purpose::Execute).is_err());
+    mode(root.path(), 0o700);
+    for permissions in [0o4700, 0o2700, 0o6700] {
+        mode(&file, permissions);
+        assert!(inspect_darwin(&file, Purpose::Execute).is_err());
+    }
+    mode(&file, 0o700);
+    assert!(inspect_darwin(&file, Purpose::Execute).is_ok());
 }
