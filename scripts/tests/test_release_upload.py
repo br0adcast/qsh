@@ -87,6 +87,15 @@ class ReleaseUploadTests(unittest.TestCase):
         self.assertEqual(s['assets'], {'a.tar.gz':'aaa','b.deb':'bbb'})
         self.assertEqual(s['mutations'], ['create','upload:a.tar.gz','upload:b.deb'])
 
+    def test_prerelease_rpm_asset_name_uploads_and_retries(self):
+        name='qsh-1.2.3~rc1-1.x86_64.rpm'
+        result,state,_=self.run_upload(files={name:'rpm fixture'})
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(state['mutations'],['upload:'+name])
+        result,state,initial=self.run_upload({name:'rpm fixture'},files={name:'rpm fixture'})
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(state,initial)
+
     def test_binary_identical_retry_and_same_size_conflict(self):
         for remote, success in [('\x00\xffa', True), ('\x00\xffb', False)]:
             with self.subTest(success=success):
@@ -169,7 +178,7 @@ class ReleaseUploadTests(unittest.TestCase):
                 self.assertEqual(json.loads(self.state.read_text()), initial)
 
     def test_invalid_names_and_duplicates_fail_before_mutation(self):
-        for files in [{'bad#label':'x'}, {'one/a':'x','two/a':'y'}]:
+        for files in [{'bad#label':'x'}, {'bad~name;cmd.rpm':'x'}, {'~leading.rpm':'x'}, {'one/a':'x','two/a':'y'}]:
             with self.subTest(files=files):
                 r, s, initial = self.run_upload(files=files)
                 self.assertNotEqual(r.returncode, 0)

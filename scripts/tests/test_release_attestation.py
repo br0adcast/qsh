@@ -216,6 +216,16 @@ class Harness(unittest.TestCase):
         return path
 
 
+class AssetDiagnosticTests(unittest.TestCase):
+    def test_rpm_tilde_name_is_readable_and_unsafe_names_are_redacted(self):
+        helper=_load('prepare-release-attestation')
+        name='qsh-0.6.0~rc1-1.x86_64.rpm'
+        self.assertEqual(helper._safe(name),name)
+        for unsafe in ('~leading.rpm','qsh~rc1;cmd.rpm','../qsh~rc1.rpm'):
+            with self.subTest(name=unsafe):
+                self.assertEqual(helper._safe(unsafe),'<unsafe name>')
+
+
 class PreflightTests(Harness):
     def test_without_a_release_it_asks_for_one_signature_of_the_exact_statement(self):
         r = self.run_helper('preflight')

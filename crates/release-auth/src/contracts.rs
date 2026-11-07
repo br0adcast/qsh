@@ -57,6 +57,8 @@ fn products(version: &str) -> Vec<String> {
         }
         _ => version.to_owned(),
     };
+    // Match the pinned RPM generator and release assembly.
+    let rpm = version.replace('-', "~");
     let mut names = Vec::with_capacity(12);
     for target in [
         "x86_64-unknown-linux-musl",
@@ -71,7 +73,7 @@ fn products(version: &str) -> Vec<String> {
             names.push(format!("{tool}_{deb}-1_{arch}.deb"));
         }
         for arch in ["x86_64", "aarch64"] {
-            names.push(format!("{tool}-{version}-1.{arch}.rpm"));
+            names.push(format!("{tool}-{rpm}-1.{arch}.rpm"));
         }
     }
     names.sort();

@@ -12,11 +12,12 @@ fn good_claims() -> sigstore_crypto::FulcioCiClaims {
     c
 }
 fn names(version: &str) -> Vec<String> {
-    let deb = if version == "0.6.0-rc.1" {
-        "0.6.0~rc.1"
-    } else {
-        version
+    let deb = match version {
+        "0.6.0-rc.1" => "0.6.0~rc.1",
+        "0.6.0-rc1" => "0.6.0~rc1",
+        _ => version,
     };
+    let rpm = version.replace('-', "~");
     let mut n = Vec::new();
     for target in [
         "x86_64-unknown-linux-musl",
@@ -31,7 +32,7 @@ fn names(version: &str) -> Vec<String> {
             n.push(format!("{tool}_{deb}-1_{arch}.deb"));
         }
         for arch in ["x86_64", "aarch64"] {
-            n.push(format!("{tool}-{version}-1.{arch}.rpm"));
+            n.push(format!("{tool}-{rpm}-1.{arch}.rpm"));
         }
     }
     n.sort();
@@ -56,12 +57,33 @@ fn canonical_twelve_product_manifest_accepts_release_and_prerelease() {
     for v in [
         "0.6.0",
         "0.6.0-rc.1",
+        "0.6.0-rc1",
         "0.6.0-123",
         "0.6.0-alpha",
         "0.6.0+build.7",
     ] {
         assert_eq!(contracts::manifest(v, &sums(v)).unwrap().len(), 12);
     }
+}
+#[test]
+fn prerelease_manifest_rejects_old_rpm_version_spelling() {
+    let old = names("0.6.0-rc1")
+        .into_iter()
+        .map(|name| {
+            if name.ends_with(".rpm") {
+                name.replace("~rc1", "-rc1")
+            } else {
+                name
+            }
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|name| format!("{}  {name}\n", "a".repeat(64)))
+        .collect::<String>();
+    assert_eq!(
+        contracts::manifest("0.6.0-rc1", old.as_bytes()).unwrap_err(),
+        "noncanonical release manifest"
+    );
 }
 #[test]
 fn exact_qsh_statement_binds_original_manifest_and_commit() {
