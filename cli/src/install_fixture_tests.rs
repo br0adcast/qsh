@@ -7,7 +7,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use support::*;
 use support_home::Sandbox;
@@ -355,10 +354,12 @@ fn approval_does_not_authorize_another_host() {
     let _serial = serialised();
     let home = tempfile::tempdir().unwrap();
     let (key, public) = key(home.path());
-    let first = Sandbox::start_with(std::slice::from_ref(&public));
+    let first = Sandbox::start_with_fault(
+        std::slice::from_ref(&public),
+        support_home::VerificationFault::FailVerification,
+    );
     let second = Sandbox::start_with(&[public]);
     // Fail remote verification after approval, forcing a separate SSH operation.
-    first.fake_qshd(&first.home.path().join("bin/sha256sum"), "exit 1");
     trust(home.path(), &first);
     trust(home.path(), &second);
     let (mut client, screen) = start(home.path(), &key, &[address(&first), address(&second)]);
@@ -379,10 +380,12 @@ fn ctrl_c_during_install_restores_tty() {
     let _serial = serialised();
     let home = tempfile::tempdir().unwrap();
     let (key, public) = key(home.path());
-    let sb = Sandbox::start_with(&[public]);
+    let sb = Sandbox::start_with_fault(
+        &[public],
+        support_home::VerificationFault::HoldUploadedVerification,
+    );
     trust(home.path(), &sb);
     // Keep verification in flight, so Ctrl-C cancels an installation after approval.
-    sb.fake_qshd(&sb.home.path().join("bin/sha256sum"), "exec /bin/sleep 30");
     let addr = address(&sb);
     let (mut client, slave) = fixture_on(&["-i", key.to_str().unwrap(), &addr], home.path());
     let original = nix::sys::termios::tcgetattr(&slave).unwrap();
@@ -390,10 +393,25 @@ fn ctrl_c_during_install_restores_tty() {
     screen.wait("Install qshd");
     client.master.write_all(b"yes\n").unwrap();
     screen.wait("Uploading qshd");
-    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        wait_until(|| sb.home.path().join(".verification-held").is_file()),
+        "uploaded verification never reached hold"
+    );
+    assert!(
+        !sb.home.path().join(".verification-hold-complete").exists(),
+        "verification finished before Ctrl-C reached the held operation"
+    );
+    assert!(
+        client.child.try_wait().unwrap().is_none(),
+        "client exited before verification cancellation"
+    );
     client.master.write_all(b"\x03").unwrap();
     assert_eq!(wait_for_exit(&mut client.child).unwrap().code(), Some(130));
     assert_fixture_used(home.path());
+    assert!(
+        wait_until(|| sb.home.path().join(".verification-hold-complete").is_file()),
+        "owned verification reader did not finish after cancellation"
+    );
     assert_eq!(nix::sys::termios::tcgetattr(&slave).unwrap(), original);
     assert!(!image_path(&sb).exists());
 }

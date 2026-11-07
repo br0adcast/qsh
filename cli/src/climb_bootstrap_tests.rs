@@ -14,6 +14,7 @@ fn fixture(keys: &[[u8; 32]]) -> (tempfile::TempDir, fake::FakeServer, Setup) {
     let home = tempfile::tempdir().unwrap();
     let outputs = keys.iter().flat_map(|key| [
         b"os Linux\narch x86_64\nhome /test\npath /test/qshd\n".to_vec(),
+            b"QSH-TRUST /test/qshd\n".to_vec(),
         format!("server-pubkey: {}\nTRANSPORT-READY {{\"version\":\"0.5.0\",\"ports\":[60023]}}\n", base64::engine::general_purpose::STANDARD.encode(key)).into_bytes(),
     ]).collect();
     let ssh = fake::FakeServer::start(fake::FakeAuth {

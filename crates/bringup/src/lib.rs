@@ -16,6 +16,7 @@ mod policy;
 mod progress;
 mod shell;
 mod timing;
+mod trust;
 
 pub use image::{
     DaemonImage, ImageError, ImageRequest, ImageSource, Platform, ServerArch, ServerOs,
