@@ -44,7 +44,7 @@ def publish(args):
     names = set()
     paths = [Path(value) for value in args.assets]
     for path in paths:
-        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+-]*', path.name):
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+~-]*', path.name):
             raise UploadError('Unsafe asset name: ' + path.name)
         if path.name in names:
             raise UploadError('Duplicate asset name: ' + path.name)
