@@ -40,6 +40,7 @@ fn fake_daemon_process() {
             "{\"stopped\":true}\n".to_string()
         } else {
             StatusResponse {
+                transport_protocol: None,
                 logging_warning: None,
                 cleanup: None,
                 version: "fake".into(),

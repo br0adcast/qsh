@@ -2533,6 +2533,15 @@ new outcome. `transport-ensure` carries it in `TRANSPORT-READY.warning` on both
 fresh startup and reuse, alongside any version warning. Missing or null means
 no known initialization warning; this does not promise successful later writes.
 
+Personal transport control status replies advertise `transport_protocol` as the
+wire protocol number (currently 2). Legacy omission means unknown. Before
+reusing a running daemon, `transport-ensure` requires explicit matching protocol
+evidence; version strings, build labels and executable checksums never imply
+compatibility. This check does not change protocol-2 handshake feature negotiation.
+An incompatible or unknown retained daemon is left running and startup fails
+before readiness. The existing policy can still replace an idle older daemon;
+it never replaces a busy daemon or downgrades a newer one.
+
 Personal local-control status replies (`STATUS`, `ADD-CLIENT`, `ADD-PORT`) may
 include `cleanup`, with `domain: "personal_channels"` and a `phase` of
 `completed`, `pending`, `unresolved`, or `unknown`. `counts` reports healthy

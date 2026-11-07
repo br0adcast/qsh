@@ -88,6 +88,25 @@ pub fn decide_reuse(action: &ReconcileAction) -> EnsureDecision {
     }
 }
 
+/// Proves wire compatibility before reuse, independently of replacement policy.
+/// Legacy version/build/checksum strings cannot establish a transport protocol.
+pub fn validate_reuse_protocol(status: &StatusResponse) -> Result<()> {
+    let expected = transport::wire::VERSION;
+    if status.transport_protocol == Some(expected) {
+        return Ok(());
+    }
+    let advertised = status
+        .transport_protocol
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    anyhow::bail!(
+        "running qshd version {} advertises transport protocol {advertised}, expected {expected}; \
+         active connections: {}. The running daemon was left unchanged. \
+         Use a compatible client/daemon; finish or disconnect existing sessions before retrying an upgrade.",
+        logging::diagnostic(&status.version), status.total_connections
+    );
+}
+
 /// Builds the INITIAL server allowlist for starting the daemon: just this
 /// call's supplied `--client-pubkey`, if any (the on-disk allowlist was
 /// retired, so there is no disk set to
@@ -128,6 +147,7 @@ pub fn transport_status_response(
     cleanup_registry: Option<&ChannelOpenRegistry>,
 ) -> Result<StatusResponse> {
     Ok(StatusResponse {
+        transport_protocol: Some(transport::wire::VERSION),
         logging_warning: crate::log::initialization_warning().map(str::to_owned),
         cleanup: cleanup_registry.map(|registry| {
             control::CleanupStatusResponse::from_snapshot(registry.try_cleanup_snapshot())
@@ -839,6 +859,49 @@ mod tests {
     };
     use crate::version::ReconcileAction;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn transport_status_reports_wire_protocol() {
+        let status = transport_status_response(&[60022], 1, None).unwrap();
+        assert_eq!(status.transport_protocol, Some(2));
+    }
+
+    #[test]
+    fn reuse_requires_explicit_matching_protocol_without_identity_shortcuts() {
+        for checksum in ["", "same", "different", "not-a-checksum"] {
+            for (protocol, accepted) in [
+                (None, false),
+                (Some(1), false),
+                (Some(2), true),
+                (Some(3), false),
+            ] {
+                let mut status = transport_status_response(&[60022], 2, None).unwrap();
+                status.checksum = checksum.into();
+                status.transport_protocol = protocol;
+                assert_eq!(
+                    super::validate_reuse_protocol(&status).is_ok(),
+                    accepted,
+                    "protocol {protocol:?}, checksum {checksum:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reuse_protocol_diagnostic_is_bounded_and_names_preserved_sessions() {
+        let mut status = transport_status_response(&[60022], 2, None).unwrap();
+        status.transport_protocol = None;
+        status.version = "0.5.0\n\x1b".repeat(5000);
+        let error = super::validate_reuse_protocol(&status)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown"));
+        assert!(error.contains("expected 2"));
+        assert!(error.contains("active connections: 2"));
+        assert!(error.contains("left unchanged"));
+        assert!(!error.chars().any(char::is_control));
+        assert!(error.len() < 1500);
+    }
 
     #[test]
     fn decide_reuse_maps_reconcile_actions() {

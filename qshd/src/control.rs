@@ -133,6 +133,9 @@ impl CleanupStatusResponse {
 /// without a coordinated update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
+    /// Explicit wire compatibility evidence. Legacy omission means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_protocol: Option<u8>,
     /// Bounded same-account startup diagnostic, never credential contents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logging_warning: Option<String>,
@@ -1138,8 +1141,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_status_has_unknown_transport_protocol() {
+        let status = StatusResponse::from_line(
+            r#"{"version":"0.5.0","build":1,"checksum":"ab","ports":[],"total_connections":2}"#,
+        )
+        .unwrap();
+        assert_eq!(status.transport_protocol, None);
+        assert!(!status.to_line().unwrap().contains("transport_protocol"));
+    }
+
+    #[test]
     fn status_response_round_trips() {
         let resp = StatusResponse {
+            transport_protocol: None,
             logging_warning: Some("file logging disabled: /owned/qshd.log".into()),
             cleanup: None,
             version: "0.1.0".into(),
@@ -1602,6 +1616,7 @@ mod tests {
 
     fn status_line(pid: u32) -> String {
         let status = StatusResponse {
+            transport_protocol: None,
             logging_warning: None,
             cleanup: None,
             version: "0.0.0".into(),
