@@ -296,6 +296,18 @@ fn config_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+// The caller retains the unreaped group leader while signaling this owned group.
+fn kill_sftp_group(group: libc::pid_t) -> std::io::Result<std::process::ExitStatus> {
+    assert!(group > 0, "owned SFTP group id must be positive");
+    Command::new("/bin/kill")
+        .args(["-KILL", "--"])
+        .arg(format!("-{group}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+}
+
 /// Establish the SFTP sandbox with an independent OpenSSH marker round trip.
 /// Both remote paths are absolute and contained in this server's TempDir.
 pub fn sftp_probe(sshd: &TestSshd, key: &Path) {
@@ -350,16 +362,20 @@ pub fn sftp_probe(sshd: &TestSshd, key: &Path) {
     let group = libc::pid_t::try_from(child.id()).expect("owned SFTP group id");
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut timed_out = false;
+    let mut group_kill = None;
     loop {
         if child.try_wait().expect("SFTP child observation").is_some() {
             break;
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            // SAFETY: process_group(0) created this exact owned child group.
-            // The Child is still unreaped, so its PID/group cannot be reused.
-            unsafe {
-                libc::kill(-group, libc::SIGKILL);
+            // process_group(0) created this group; its retained, unreaped
+            // leader prevents PID/group reuse while the fixed OS tool signals it.
+            group_kill = Some(kill_sftp_group(group));
+            if !matches!(&group_kill, Some(Ok(status)) if status.success()) {
+                // Still reap the retained leader if the group signal fails;
+                // the failed probe reports that group cleanup was not confirmed.
+                let _ = child.kill();
             }
             break;
         }
@@ -380,7 +396,7 @@ pub fn sftp_probe(sshd: &TestSshd, key: &Path) {
         .collect();
     assert!(
         written.is_ok() && !timed_out && status.success(),
-        "SFTP probe: status={status}, timed_out={timed_out}, write={written:?}, stderr={:?}, owned sshd log tail={server_tail:?}",
+        "SFTP probe: status={status}, timed_out={timed_out}, group_kill={group_kill:?}, write={written:?}, stderr={:?}, owned sshd log tail={server_tail:?}",
         String::from_utf8_lossy(&diagnostic)
     );
     assert_eq!(std::fs::read(&remote).unwrap(), marker);
