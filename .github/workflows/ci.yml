@@ -587,8 +587,32 @@ jobs:
             echo '::error::native control path tests reported a runtime skip' >&2
             exit 1
           fi
-      - name: Portable bringup SSH identity tests
-        run: cargo test -p bringup --test ssh_identity --locked
+      - name: Portable bringup SSH identity and filesystem trust tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-bringup-trust.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export HOME="$runtime/home"
+          export XDG_CONFIG_HOME="$runtime/config"
+          export XDG_CACHE_HOME="$runtime/cache"
+          export TMPDIR="$runtime/tmp"
+          export HISTFILE=/dev/null
+          unset SSH_AUTH_SOCK SSH_AGENT_PID
+          mkdir -m 700 "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+          cargo test -p bringup --test ssh_identity --locked
+          # Run the whole portable library so the existing no-skips guard can
+          # require the filesystem boundaries without accepting filtered tests.
+          cargo test -p bringup --lib --locked -- --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/trust-results.log"
+          scripts/no-silent-skips.sh "$runtime/trust-results.log" \
+            --require trust::tests::trust_rejects_reachable_writable_parent_and_unsafe_private_boundary \
+            --require trust::tests::trust_rejects_dangling_cyclic_and_escaped_links \
+            --require trust::tests::trust_does_not_inherit_privacy_across_dotdot \
+            --require trust::tests::trust_sticky_directory_is_traversable_but_not_a_destination
       - name: Portable inline SSH bootstrap tests
         shell: bash
         run: |

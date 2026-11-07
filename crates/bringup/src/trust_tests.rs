@@ -25,8 +25,14 @@ fn inspect(path: &std::path::Path, purpose: Purpose) -> Result<String, BringUpEr
 fn mode(path: &std::path::Path, value: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(value)).unwrap();
 }
+// Reachability tests need a public ancestor even when TMPDIR is private.
+// Only unpredictable owned children are changed; /tmp itself is untouched.
+fn public_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(fs::canonicalize("/tmp").unwrap()).unwrap()
+}
+
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
-    let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let root = public_tempdir();
     mode(root.path(), 0o700);
     let file = root.path().join("qshd");
     fs::write(&file, b"must never execute").unwrap();
@@ -88,7 +94,7 @@ fn trust_rejects_dangling_cyclic_and_escaped_links() {
     assert!(inspect(&root.path().join("loop"), Purpose::Execute).is_err());
     std::os::unix::fs::symlink("missing", root.path().join("dangling")).unwrap();
     assert!(inspect(&root.path().join("dangling"), Purpose::Execute).is_err());
-    let other = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let other = public_tempdir();
     mode(other.path(), 0o700);
     let target = other.path().join("qshd");
     fs::write(&target, b"unused").unwrap();
