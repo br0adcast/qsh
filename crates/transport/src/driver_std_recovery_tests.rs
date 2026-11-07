@@ -51,9 +51,14 @@ fn shared_recovery_driver_reaches_catalog_larger_than_live_path_limit() {
     let mut buffer = [0; 2048];
     let started = Instant::now();
     for (index, socket) in sockets.iter().enumerate() {
-        let (len, from) = socket
-            .recv_from(&mut buffer)
-            .unwrap_or_else(|error| panic!("catalog endpoint {index} received no msg1: {error}"));
+        let (len, from) = loop {
+            let received = socket.recv_from(&mut buffer).unwrap_or_else(|error| {
+                panic!("catalog endpoint {index} received no msg1: {error}")
+            });
+            if !crate::bootstrap::is_bootstrap(&buffer[..received.0]) {
+                break received;
+            }
+        };
         assert!(matches!(
             crate::wire::parse(&buffer[..len]),
             Ok(crate::wire::Frame::Handshake {

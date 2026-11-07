@@ -3043,3 +3043,72 @@ same reason.
 
 Terminal geometry, admission refusals, payload caps and qualified storage bounds
 are documented in [Terminal resource policy](terminal-resources.md).
+
+## Authenticated bootstrap discovery
+
+Bootstrap discovery uses the session UDP socket but is dispatched before session
+wire parsing. It remains available when the session wire, Noise-payload or
+channel protocol versions differ. Its fixed prefix is `51 53 48 42 01`
+(`QSHB`, format 1), followed by a one-byte kind and a two-byte big-endian body
+length. Kinds are request (1), reply (2), cookie (3), and cookie request (4).
+Requests are exactly 512 bytes, with zero padding after the body; replies never
+exceed 512 bytes. Truncated, oversized or nonzero-padded packets are discarded.
+This format does not inherit the current session wire version.
+
+The request body is Noise IK message 1 using the existing pinned daemon X25519
+identity and prologue `qsh/bootstrap/1`. Format 1 permanently fixes the suite
+`Noise_IK_25519_ChaChaPoly_BLAKE2s`, independently of ordinary session crypto. Its encrypted payload is a fresh
+32-byte challenge. Message 2 echoes that challenge followed by metadata:
+`generation(16) | version-length(1) | UTF-8 core version | profile-count(1) |
+profiles(3 each)`. Version text is 1–128 printable ASCII bytes;
+at most 16 profiles are permitted. Each profile is the complete triple
+`wire(1) | handshake(1) | channel(1)`. Release precedence and protocol compatibility
+are independent decisions. An empty profile list supplies no compatibility proof.
+The process generation is random, minted once per daemon process and shared by
+its listeners and control responses; a replacement or rollback has a new value.
+
+Every bootstrap exchange proves its return address before Noise work. A cookie
+reply contains the first 16 bytes of the request's ephemeral key and a 16-byte
+BLAKE2s MAC. A cookie request prepends that MAC to the original Noise message.
+The MAC uses a distinct `qsh/bootstrap/1/cookie` domain, source address/port and
+ephemeral key, rotating secrets and the existing bounded per-source rate limiter.
+Only a matching outstanding exchange accepts a cookie. A cookie proves address
+reachability, never release age or daemon identity; only authenticated Noise
+message 2 supplies metadata. One completed initiator cannot accept another
+reply. Discovery creates no transport session, auth nonce, login, allowlist
+entry, backend or PTY and grants no client authorization.
+
+Discovery runs concurrently with ordinary admission. Legacy silence means
+unknown metadata and adds no serial waiting to a working session. An ordinary
+admission failure does not discard already-started discovery: a retained local
+owner may finish only the remaining original two-second discovery budget while
+other addresses continue. Once all ordinary routes fail, the terminal diagnostic
+may collect that remaining evidence. Cancellation or a successful alternative
+retires failed collectors immediately. Local metadata-only retirement sends no
+peer Close or CloseSession and releases ordinary data storage before refunding
+its input permits. New ordinary
+msg2 payloads may append `QGEN | generation(16)` after their existing 30 bytes.
+Only metadata matching that authenticated generation may inform an attached
+connection; a late mismatched reply cannot interrupt it. A client with fresh
+metadata before starting an attempt appends `QGEN | 1 | generation(16)` to
+msg1 after its existing 23 bytes. A new client whose discovery is still in flight
+appends `QGEN | 0` to announce support without requiring a generation. A server
+sends its msg2 generation only to a client with either explicit awareness form;
+an absent msg1 marker preserves the old msg2 bytes and length. A new server rejects a mismatch before issuing
+an auth nonce or changing admission state. Without the extension the old bytes
+are unchanged; legacy msg2 supplies no generation binding. Recognized truncated
+generation extensions are invalid. `Restarting` remains advisory: losing that
+notice does not skip discovery on the next connection attempt. An authenticated
+notice may refresh the bounded metadata round without replacing a working
+transport or changing its paths; obsolete replies cannot satisfy the new round.
+
+For a configured, verified SSH path, `qshd server-info --challenge <64 hex digits>`
+queries the running personal daemon's dedicated `SERVER-INFO` control request.
+An optional `--socket` chooses an existing local control endpoint. It never
+loads or creates server keys, installs a daemon, or uses the invoked binary's
+version as evidence. The bounded JSON response contains `challenge`,
+`server_pubkey`, `generation` (hex strings), `core_version`, and
+`session_protocols` (arrays of three integers). The SSH caller must verify the
+challenge and pinned qsh identity before treating this as evidence. Missing,
+inaccessible or unsupported control endpoints mean unknown metadata; service
+modes without a personal control socket do not acquire one through this query.

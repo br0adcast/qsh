@@ -494,6 +494,8 @@ name = "connect"
 version = "0.6.0-rc1"
 dependencies = [
  "knock",
+ "semver",
+ "transport",
 ]
 
 [[package]]
@@ -3298,6 +3300,8 @@ dependencies = [
  "rand_core 0.6.4",
  "russh",
  "russh-sftp",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "socket2",
  "ssh-key",

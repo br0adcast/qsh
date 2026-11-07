@@ -98,6 +98,40 @@ jobs:
             2>&1 | tee "$runtime/store-policy.log"
           grep -E '^test client_install::.* \.\.\. ok$' "$runtime/store-policy.log"
           grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$runtime/store-policy.log"
+          # Resolve the owned unit runner once; repetitions must never rebuild.
+          cargo test -p qsh --lib --locked --no-run --message-format=json > "$runtime/store-artifacts.jsonl"
+          python3 -I -B - "$runtime/store-artifacts.jsonl" "$runtime" <<'PY_STORE_REPEAT'
+          import json, os, pathlib, subprocess, sys
+          root = pathlib.Path.cwd().resolve(strict=True)
+          rows = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
+          candidates = [row for row in rows if row.get('reason') == 'compiler-artifact'
+                        and row.get('target', {}).get('name') == 'qsh'
+                        and row.get('target', {}).get('kind') == ['lib']
+                        and row.get('profile', {}).get('test') is True
+                        and row.get('executable')
+                        and pathlib.Path(row['manifest_path']).resolve(strict=True) == root / 'cli/Cargo.toml'
+                        and pathlib.Path(row['target']['src_path']).resolve(strict=True) == root / 'cli/src/lib.rs']
+          assert len(candidates) == 1, 'expected one current Cargo qsh library test executable'
+          executable = pathlib.Path(candidates[0]['executable'])
+          assert executable.is_absolute() and executable.is_file() and os.access(executable, os.X_OK)
+          executable = executable.resolve(strict=True)
+          target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', root / 'target')).resolve(strict=True)
+          assert target in executable.parents, 'unit runner must belong to the owned Cargo target'
+          for iteration in range(1, 21):
+              print(f'macOS managed store repetition {iteration}/20', flush=True)
+              try:
+                  result = subprocess.run([str(executable), 'client_install::store::tests', '--color', 'never'],
+                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+              except subprocess.TimeoutExpired as error:
+                  output = error.stdout or b''
+                  print(output.decode(errors='replace') if isinstance(output, bytes) else output, flush=True)
+                  raise SystemExit(f'store repetition {iteration}/20 exceeded 30 seconds')
+              pathlib.Path(sys.argv[2], f'store-repeat-{iteration}.log').write_text(result.stdout)
+              print(result.stdout, end='', flush=True)
+              if result.returncode != 0:
+                  raise SystemExit(f'store repetition {iteration}/20 failed ({result.returncode})')
+              assert 'test result: ok. 13 passed; 0 failed; 0 ignored;' in result.stdout
+          PY_STORE_REPEAT
           cargo test -p qsh --lib --locked releases::client -- --color never \
             2>&1 | tee "$runtime/release-client.log"
           grep -E '^test releases::client::.* \.\.\. ok$' "$runtime/release-client.log"
@@ -107,6 +141,55 @@ jobs:
           grep -F 'test managed_help_capability_pty_has_no_state ... ok' "$runtime/command.log"
           grep -F 'test development_managed_commands_pty_refuse_without_state ... ok' "$runtime/command.log"
           grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$runtime/command.log"
+      - name: Test authenticated server discovery and upgrade policy on macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-server-discovery.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
+          unset SSH_AUTH_SOCK
+          focused_lib() {
+            local package=$1 filter=$2
+            shift 2
+            local output="$runtime/$package-$filter.log"
+            cargo test -p "$package" --lib --locked "$@" "$filter" -- --color never \
+              2>&1 | tee "$output"
+            grep -E '^test .+ \.\.\. ok$' "$output"
+            grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$output"
+            if grep -F 'SKIPPED' "$output"; then exit 1; fi
+          }
+          # These tests use authenticated in-process peers or pure decisions;
+          # no installed daemon, SSH agent or retained release artifact is used.
+          focused_lib transport bootstrap --features tokio-driver
+          grep -E '^test bootstrap_client::tests::.* \.\.\. ok$' "$runtime/transport-bootstrap.log"
+          focused_lib transport generation --features tokio-driver
+          focused_lib qshd server_info
+          grep -F 'test server_info::tests::server_info_generation_is_shared_and_control_echoes_live_values ... ok' "$runtime/qshd-server_info.log"
+          grep -F 'test transport_daemon::server_info_tests::server_info_control_reads_running_owner_without_authorization_mutation ... ok' "$runtime/qshd-server_info.log"
+          focused_lib connect upgrade
+          focused_lib qsh server_discovery
+          focused_lib qsh recovery::discovery_tests
+          focused_lib qsh recovery::pending_tests
+          focused_lib qsh upgrade_offer
+          focused_lib qsh authenticated_upgrade_overlay_defaults_to_postpone_and_requires_explicit_choice
+          focused_lib qsh expired_upgrade_choice_neither_installs_nor_types_into_the_shell
+          focused_lib qsh released_attempt_delivers_only_metadata_wakes_to_the_next_receiver
+          focused_lib ssh server_info
+          # This integration target owns its authenticated loopback peer and PTY;
+          # it does not infer a daemon path from a Cargo sibling executable.
+          cargo test -p qsh --test server_discovery --locked -- --color never \
+            2>&1 | tee "$runtime/discovery-pty.log"
+          grep -F 'test source_incompatible_initial_discovery_pty_shows_manual_rebuild_without_download_offer ... ok' "$runtime/discovery-pty.log"
+          grep -F 'test legacy_unknown_initial_discovery_pty_keeps_ordinary_timeout_and_no_release_claim ... ok' "$runtime/discovery-pty.log"
+          grep -F 'test authenticated_ordinary_rejection_cannot_cancel_initial_discovery_pty ... ok' "$runtime/discovery-pty.log"
+          grep -F 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$runtime/discovery-pty.log"
+          if grep -F 'SKIPPED' "$runtime/discovery-pty.log"; then exit 1; fi
       - name: Qualify the production Darwin process owner
         shell: bash
         run: |

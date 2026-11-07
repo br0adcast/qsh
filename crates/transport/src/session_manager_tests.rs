@@ -12524,3 +12524,5 @@ include!("session_manager_refusal_retirement_tests.rs");
 include!("session_manager_mailbox_tests.rs");
 
 include!("session_manager_intake_tests.rs");
+
+include!("session_manager_bootstrap_tests.rs");

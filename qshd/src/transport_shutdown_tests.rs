@@ -728,6 +728,7 @@ async fn personal39_join_retains_a_stop_ack_whose_writer_is_pending() {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(tokio::sync::RwLock::new(())),
         None,
+        None,
     );
     stop_rx
         .recv()

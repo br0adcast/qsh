@@ -97,6 +97,10 @@ fn wake300_every_command_dispatches_without_udp_or_timer_fallback() {
         UseRoadOutcome::NoSession
     );
     control.wait_commands(8);
+    client.refresh_server_info();
+    control.wait_commands(9);
+    client.retire_for_discovery();
+    control.wait_commands(10);
     assert_eq!(
         control.commands(),
         vec![
@@ -107,7 +111,9 @@ fn wake300_every_command_dispatches_without_udp_or_timer_fallback() {
             "SetPaths",
             "SetStreamClass",
             "StreamProgress",
-            "UseRoad"
+            "UseRoad",
+            "RefreshServerInfo",
+            "RetireForDiscovery"
         ]
     );
     assert!(control.registrations() >= 2);

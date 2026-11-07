@@ -17,6 +17,7 @@ use crate::wire::TRANSPORT_HEADER_LEN;
 
 /// Noise parameters, fixed for the whole project.
 const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+const BOOTSTRAP_PROLOGUE: &[u8] = b"qsh/bootstrap/1";
 
 /// X25519 static key length in bytes.
 const KEY_LEN: usize = 32;
@@ -26,6 +27,13 @@ const KEY_LEN: usize = 32;
 /// AEAD tag of the payload (16) = 96 bytes with margin (the second handshake
 /// message actually uses less).
 const HANDSHAKE_OVERHEAD: usize = 96;
+
+/// Immutable cipher suite for bootstrap format 1. Changing session crypto must not change it.
+fn bootstrap_noise_params() -> snow::params::NoiseParams {
+    "Noise_IK_25519_ChaChaPoly_BLAKE2s"
+        .parse()
+        .expect("fixed bootstrap suite is valid")
+}
 
 /// Parse the fixed Noise parameter string.
 fn noise_params() -> snow::params::NoiseParams {
@@ -127,9 +135,40 @@ pub struct Handshake {
 }
 
 impl Handshake {
+    // Bootstrap format 1 freezes its cipher suite independently of ordinary sessions.
+    pub(crate) fn new_bootstrap_initiator(
+        local_priv: &[u8; KEY_LEN],
+        remote_pub: &[u8; KEY_LEN],
+    ) -> Self {
+        let state = Builder::new(bootstrap_noise_params())
+            .prologue(BOOTSTRAP_PROLOGUE)
+            .local_private_key(local_priv)
+            .remote_public_key(remote_pub)
+            .build_initiator()
+            .expect("fixed bootstrap IK parameters and key lengths are valid");
+        Self { state: Some(state) }
+    }
+    pub(crate) fn new_bootstrap_responder(local_priv: &[u8; KEY_LEN]) -> Self {
+        let state = Builder::new(bootstrap_noise_params())
+            .prologue(BOOTSTRAP_PROLOGUE)
+            .local_private_key(local_priv)
+            .build_responder()
+            .expect("fixed bootstrap IK parameters and key length are valid");
+        Self { state: Some(state) }
+    }
+
     /// Start a handshake as the initiator (client).
     pub fn new_initiator(local_priv: &[u8; KEY_LEN], remote_pub: &[u8; KEY_LEN]) -> Self {
+        Self::new_initiator_with_prologue(local_priv, remote_pub, &[])
+    }
+
+    pub(crate) fn new_initiator_with_prologue(
+        local_priv: &[u8; KEY_LEN],
+        remote_pub: &[u8; KEY_LEN],
+        prologue: &[u8],
+    ) -> Self {
         let state = Builder::new(noise_params())
+            .prologue(prologue)
             .local_private_key(local_priv)
             .remote_public_key(remote_pub)
             .build_initiator()
@@ -141,7 +180,12 @@ impl Handshake {
     /// key is not known to the responder in advance -- it arrives in the
     /// first handshake message.
     pub fn new_responder(local_priv: &[u8; KEY_LEN]) -> Self {
+        Self::new_responder_with_prologue(local_priv, &[])
+    }
+
+    pub(crate) fn new_responder_with_prologue(local_priv: &[u8; KEY_LEN], prologue: &[u8]) -> Self {
         let state = Builder::new(noise_params())
+            .prologue(prologue)
             .local_private_key(local_priv)
             .build_responder()
             .expect("building an IK responder with a valid key cannot fail");
@@ -762,6 +806,60 @@ mod tests {
         assert_eq!(a_ini, a_res, "both sides derive the same hash");
         let (b_ini, _) = run();
         assert_ne!(a_ini, b_ini, "a fresh session gets a fresh hash");
+    }
+
+    #[test]
+    fn bootstrap_frozen_suite_transcript_ignores_ordinary_protocol_profiles() {
+        let remote = public_of(&RESPONDER_STATIC);
+        let mut ini = Handshake {
+            state: Some(
+                Builder::new(bootstrap_noise_params())
+                    .prologue(BOOTSTRAP_PROLOGUE)
+                    .local_private_key(&INITIATOR_STATIC)
+                    .remote_public_key(&remote)
+                    .fixed_ephemeral_key_for_testing_only(&INITIATOR_EPHEMERAL)
+                    .build_initiator()
+                    .unwrap(),
+            ),
+        };
+        let mut resp = Handshake {
+            state: Some(
+                Builder::new(bootstrap_noise_params())
+                    .prologue(BOOTSTRAP_PROLOGUE)
+                    .local_private_key(&RESPONDER_STATIC)
+                    .fixed_ephemeral_key_for_testing_only(&RESPONDER_EPHEMERAL)
+                    .build_responder()
+                    .unwrap(),
+            ),
+        };
+        let first = ini.write_msg(&[0x55; 32]);
+        assert_eq!(
+            Blake2s256::digest(&first).as_slice(),
+            &[
+                86, 22, 118, 160, 159, 255, 70, 132, 63, 42, 199, 161, 30, 87, 49, 101, 63, 181,
+                176, 100, 218, 180, 62, 127, 119, 244, 100, 223, 182, 248, 93, 38
+            ]
+        );
+        let mut payload = resp.read_msg(&first).unwrap();
+        let info = crate::bootstrap::ServerInfo {
+            generation: [7; 16],
+            core_version: "0.6.0".into(),
+            session_protocols: vec![crate::bootstrap::SessionProfile {
+                wire: 255,
+                handshake: 254,
+                channel: 253,
+            }],
+        };
+        payload.extend_from_slice(&crate::bootstrap::encode_server_info(&info).unwrap());
+        let second = resp.write_msg(&payload);
+        assert_eq!(
+            Blake2s256::digest(&second).as_slice(),
+            &[
+                93, 86, 22, 13, 13, 2, 150, 158, 48, 92, 168, 101, 186, 21, 216, 188, 171, 206, 1,
+                148, 196, 55, 178, 19, 57, 160, 231, 224, 178, 206, 0, 148
+            ]
+        );
+        assert_eq!(ini.read_msg(&second).unwrap(), payload);
     }
 }
 

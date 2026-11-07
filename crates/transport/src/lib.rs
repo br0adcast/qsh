@@ -2,6 +2,8 @@
 
 pub mod auth;
 pub mod auth_acceptance;
+pub mod bootstrap;
+pub mod bootstrap_client;
 pub mod channel;
 pub mod channel_geometry;
 #[cfg(feature = "tokio-driver")]

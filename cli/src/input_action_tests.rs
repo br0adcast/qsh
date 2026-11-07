@@ -21,6 +21,9 @@ fn input_executor_links() -> (tempfile::TempDir, Links) {
     let (tx, _rx) = mpsc::channel();
     // No live link, recovery round, DNS request or terminal reader is started.
     let links = Links {
+        terminal_restored: true,
+        metadata_failure: false,
+        pending_update: None,
         setup,
         live: None,
         shell_channel: None,
@@ -102,6 +105,7 @@ fn input_executor(sink: Sink, ready: bool) -> InputExecutor {
         );
     }
     links.live = Some(Live {
+        restart_advisory: Default::default(),
         attempt,
         channel_session,
         link: 1,
@@ -132,6 +136,189 @@ fn predictive_input_session() -> Session {
     session.handle(UiEvent::Link(LinkState::Live), 0);
     session.on_channel_ready(16, 0);
     session
+}
+
+#[test]
+fn failed_terminal_restoration_blocks_pending_installer_and_cooked_confirmation() {
+    for update in [false, true] {
+        let (_home, mut links) = input_executor_links();
+        links.terminal_restored = false;
+        if update {
+            links.pending_update = Some("1.2.3".into());
+        } else {
+            links.metadata_failure = true;
+        }
+        links.complete_terminal_restore(&Err(nix::Error::EIO));
+        let installer = std::cell::Cell::new(0);
+        let prompt = std::cell::Cell::new(0);
+        let _ = confirmed_terminal_action(links.terminal_restored, || {
+            installer.set(installer.get() + 1)
+        });
+        let _ = confirmed_terminal_action(links.terminal_restored, || prompt.set(prompt.get() + 1));
+        assert_eq!((installer.get(), prompt.get()), (0, 0));
+        assert!(links.pending_update.is_none() && !links.metadata_failure && links.keep);
+    }
+    let (_home, mut links) = input_executor_links();
+    assert!(
+        links.terminal_restored,
+        "startup that never entered raw is known cooked"
+    );
+    links.terminal_restored = false;
+    links.pending_update = Some("1.2.3".into());
+    links.metadata_failure = true;
+    links.complete_terminal_restore(&Ok(()));
+    assert_eq!(
+        confirmed_terminal_action(links.terminal_restored, || 7),
+        Some(7)
+    );
+    assert!(links.pending_update.is_some() && links.metadata_failure);
+}
+
+#[test]
+fn approved_client_update_leaves_with_detach_without_replaying_channel_input() {
+    update_exit_custody_check();
+}
+
+pub(crate) fn update_exit_custody_check() -> Arc<connect::Events> {
+    let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = writes.clone();
+    let sink: Sink = Box::new(move |stream, bytes| {
+        observed.lock().unwrap().push((stream, bytes));
+        Ok(())
+    });
+    let mut fixture = input_executor(sink, true);
+    let before = writes.lock().unwrap().len();
+    let events = fixture.links.live.as_ref().unwrap().attempt.events.clone();
+    fixture.links.approve_client_update("1.2.3".into());
+    assert_eq!(fixture.links.pending_update.as_deref(), Some("1.2.3"));
+    let (_home, replacement) = input_executor_links();
+    let links = std::mem::replace(&mut fixture.links, replacement);
+    links.leave();
+    assert_eq!(
+        writes.lock().unwrap().len(),
+        before,
+        "update exit must not replay input or send channel closure"
+    );
+    events
+}
+
+pub(crate) fn refused_shell_discovery_custody_check() -> Arc<connect::Events> {
+    use transport::channel::{encode_server, ServerRecord, CONTROL_STREAM};
+    let mut fixture = input_executor(Box::new(|_, _| Ok(())), false);
+    fixture
+        ._peer
+        .set_read_timeout(Some(Duration::from_millis(30)))
+        .unwrap();
+    let mut datagram = [0; 2048];
+    let bound = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok((n, _)) = fixture._peer.recv_from(&mut datagram) {
+            if datagram[..n].starts_with(b"QSHB") {
+                break;
+            }
+        }
+        assert!(Instant::now() < bound, "metadata round did not start");
+    }
+    let events = fixture.links.live.as_ref().unwrap().attempt.events.clone();
+    let mut session = predictive_input_session();
+    let record = encode_server(&ServerRecord::Refused {
+        stream: 16,
+        reason: "fixture refusal".into(),
+    });
+    on_wire(
+        CONTROL_STREAM,
+        &record,
+        &mut fixture.links,
+        &mut session,
+        &mut Vec::new(),
+        &|| 0,
+    );
+    assert!(
+        fixture.links.metadata_failure,
+        "a refused shell must transfer metadata ownership to the cooked owner"
+    );
+    let started = Instant::now();
+    assert!(!fixture.links.finish_startup_discovery());
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "failure may only finish the original two-second metadata budget"
+    );
+    let (_home, replacement) = input_executor_links();
+    let links = std::mem::replace(&mut fixture.links, replacement);
+    links.leave();
+    events
+}
+
+#[test]
+fn refused_shell_finishes_bounded_discovery_without_a_client_offer() {
+    refused_shell_discovery_custody_check();
+}
+
+#[test]
+fn restart_intent_refreshes_discovery_once_without_detaching_the_current_link() {
+    use transport::channel::{encode_server, ServerRecord, CONTROL_STREAM};
+    let mut fixture = input_executor(Box::new(|_, _| Ok(())), true);
+    fixture
+        ._peer
+        .set_read_timeout(Some(Duration::from_millis(30)))
+        .unwrap();
+    let mut bytes = [0; 2048];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let first = loop {
+        if let Ok((n, _)) = fixture._peer.recv_from(&mut bytes) {
+            if bytes[..n].starts_with(b"QSHB") {
+                break bytes[..n].to_vec();
+            }
+        }
+        assert!(Instant::now() < deadline, "initial discovery did not start");
+    };
+    let original_link = fixture.links.live.as_ref().unwrap().link;
+    let events = fixture.links.live.as_ref().unwrap().attempt.events.clone();
+    let mut session = predictive_input_session();
+    let record = encode_server(&ServerRecord::Restarting);
+    assert!(
+        fixture
+            .links
+            .current(UiEvent::FromLink {
+                link: original_link + 1,
+                event: Box::new(UiEvent::Wire {
+                    stream: CONTROL_STREAM,
+                    bytes: record.clone()
+                }),
+            })
+            .is_none(),
+        "an advisory from a retired/other transport must never schedule discovery"
+    );
+    for _ in 0..2 {
+        let actions = on_wire(
+            CONTROL_STREAM,
+            &record,
+            &mut fixture.links,
+            &mut session,
+            &mut Vec::new(),
+            &|| 0,
+        );
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::Exit(_) | Action::Reconnect)));
+    }
+    let deadline = Instant::now() + Duration::from_millis(600);
+    let mut fresh = std::collections::HashSet::new();
+    while Instant::now() < deadline {
+        if let Ok((n, _)) = fixture._peer.recv_from(&mut bytes) {
+            if bytes[..n].starts_with(b"QSHB") && bytes[..n] != first {
+                fresh.insert(bytes[..n].to_vec());
+            }
+        }
+    }
+    assert_eq!(
+        fresh.len(),
+        1,
+        "duplicate advisory must produce only one fresh challenge"
+    );
+    assert_eq!(fixture.links.live.as_ref().unwrap().link, original_link);
+    assert!(fixture.links.round.is_none());
+    assert!(!events.closed.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[test]

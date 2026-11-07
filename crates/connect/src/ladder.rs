@@ -66,6 +66,13 @@ pub enum Mode {
 pub enum NoAnswerWhy {
     /// Noise authenticated an incompatible handshake protocol.
     UnsupportedProtocol { supported: u8 },
+    /// Authenticated discovery explicitly excludes this complete client profile.
+    ServerIncompatible {
+        version: String,
+        wire: u8,
+        handshake: u8,
+        channel: u8,
+    },
     /// Noise authenticated a profile missing required capabilities.
     MissingRequiredFeatures { required: u32, enabled: u32 },
     /// An authenticated handshake payload violated the protocol.

@@ -531,6 +531,47 @@ pub fn help_box(prefix_name: &str, cols: u16, height: u16, g: Glyphs) -> Option<
     Some(frame("Keys", "Esc close", body, inner, cols, height, g))
 }
 
+pub fn upgrade_box(version: &str, cols: u16, height: u16, g: Glyphs) -> Option<Boxed> {
+    if cols < MIN_COLS || height < MIN_HEIGHT {
+        return None;
+    }
+    let body = vec![
+        cells(&format!("Server qshd {version} is newer.")),
+        cells("1  Postpone (default)"),
+        cells("2  Update client and relaunch"),
+    ];
+    let inner = body.iter().map(Vec::len).max().unwrap_or(0);
+    if usize::from(cols) < (inner + 6).max(44) || road_capacity(cols, height) < body.len() {
+        return None;
+    }
+    Some(frame(
+        "Client update",
+        "Enter/Esc postpone; 2 update",
+        body,
+        inner,
+        cols,
+        height,
+        g,
+    ))
+}
+
+pub fn upgrade_expired_box(cols: u16, height: u16, g: Glyphs) -> Option<Boxed> {
+    if cols < MIN_COLS || height < MIN_HEIGHT {
+        return None;
+    }
+    let body = vec![cells("Server observation changed. Update canceled.")];
+    let inner = body[0].len();
+    Some(frame(
+        "Client update",
+        "Any key closes; 2 rechecks",
+        body,
+        inner,
+        cols,
+        height,
+        g,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

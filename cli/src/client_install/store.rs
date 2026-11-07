@@ -182,8 +182,18 @@ pub fn publish(
     image: &ClientImage,
     expected: Option<&ManagedInstallation>,
 ) -> io::Result<InstalledClient> {
+    publish_cancellable(home, prefix, image, expected, &|| false)
+}
+
+pub fn publish_cancellable(
+    home: &Path,
+    prefix: &Path,
+    image: &ClientImage,
+    expected: Option<&ManagedInstallation>,
+    cancelled: &dyn Fn() -> bool,
+) -> io::Result<InstalledClient> {
     let manifest = image.manifest();
-    publish_prepared(
+    publish_prepared_with_cancel(
         home,
         prefix,
         &Prepared {
@@ -197,15 +207,38 @@ pub fn publish(
             bundle: manifest.bundle_bytes(),
         },
         expected,
+        cancelled,
     )
 }
 
+#[cfg(test)]
 fn publish_prepared(
     home: &Path,
     prefix: &Path,
     image: &Prepared<'_>,
     expected: Option<&ManagedInstallation>,
 ) -> io::Result<InstalledClient> {
+    publish_prepared_with_cancel(home, prefix, image, expected, &|| false)
+}
+
+fn publish_prepared_with_cancel(
+    home: &Path,
+    prefix: &Path,
+    image: &Prepared<'_>,
+    expected: Option<&ManagedInstallation>,
+    cancelled: &dyn Fn() -> bool,
+) -> io::Result<InstalledClient> {
+    let check_cancel = || {
+        if cancelled() {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "client update canceled",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancel()?;
     let prefix = normalize_prefix(home, prefix)?;
     let home = fs::canonicalize(home)?;
     inspect_directories(&home, &prefix.join("bin"), true)?;
@@ -255,6 +288,7 @@ fn publish_prepared(
     if hex(&Sha256::digest(image.bytes)) != image.binary_sha256 {
         return Err(refuse("verified client digest changed"));
     }
+    check_cancel()?;
     let staging = tempfile::Builder::new()
         .prefix("generation-")
         .tempdir_in(&generations)?;
@@ -293,14 +327,17 @@ fn publish_prepared(
         .join("qsh");
     // Keep before linking: cleanup must never remove a committed generation.
     // An interrupted attempt can leave an unreferenced generation, never a partial active one.
+    check_cancel()?;
     let kept = staging.keep();
     sync_dir(&generations)?;
-    let result = if expected.is_none() {
+    let result = if let Err(error) = check_cancel() {
+        Err(error)
+    } else if expected.is_none() {
         symlink(&target, active(&prefix)) // Atomic create, fails if any destination appeared.
     } else {
         let temporary = prefix.join("bin").join(format!(".qsh-{generation}"));
         symlink(&target, &temporary)?;
-        let result = fs::rename(&temporary, active(&prefix));
+        let result = check_cancel().and_then(|()| fs::rename(&temporary, active(&prefix)));
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
@@ -442,6 +479,78 @@ mod tests {
             source_commit: "fixture",
             manifest: b"manifest fixture",
             bundle: b"bundle fixture",
+        }
+    }
+    #[test]
+    fn cancellation_before_each_publication_boundary_never_activates_a_generation() {
+        for stop_at in 1..=4 {
+            let home = temp();
+            let prefix = home.path().join(".local");
+            let checks = std::cell::Cell::new(0);
+            let cancelled = || {
+                checks.set(checks.get() + 1);
+                checks.get() >= stop_at
+            };
+            let error =
+                publish_prepared_with_cancel(home.path(), &prefix, &image(), None, &cancelled)
+                    .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::Interrupted,
+                "cancellation boundary {stop_at}: {error}"
+            );
+            assert!(
+                fs::symlink_metadata(active(&prefix)).is_err(),
+                "cancellation at boundary{stop_at} activated a client"
+            );
+            if let Ok(generations) = fs::read_dir(prefix.join("lib/qsh/generations")) {
+                assert_eq!(
+                    generations.count(),
+                    0,
+                    "canceled staged generation must be cleaned"
+                );
+            }
+        }
+    }
+    #[test]
+    fn canceled_update_preserves_the_previous_active_generation() {
+        for stop_at in 1..=5 {
+            let home = temp();
+            let prefix = home.path().join(".local");
+            publish_prepared(home.path(), &prefix, &image(), None).unwrap();
+            let previous = snapshot(&prefix);
+            let before = active_link(&prefix).unwrap();
+            let mut next = image();
+            next.version = "0.7.1";
+            let checks = std::cell::Cell::new(0);
+            let cancelled = || {
+                checks.set(checks.get() + 1);
+                checks.get() >= stop_at
+            };
+            let error = publish_prepared_with_cancel(
+                home.path(),
+                &prefix,
+                &next,
+                Some(&previous),
+                &cancelled,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::Interrupted,
+                "cancellation boundary {stop_at}: {error}"
+            );
+            assert_eq!(
+                active_link(&prefix).unwrap(),
+                before,
+                "cancellation at boundary{stop_at} replaced the active client"
+            );
+            assert_eq!(
+                fs::read_dir(prefix.join("lib/qsh/generations"))
+                    .unwrap()
+                    .count(),
+                1
+            );
         }
     }
     #[test]
