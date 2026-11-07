@@ -133,16 +133,37 @@ def _metadata_failure(category, reason):
     return ValueError('Darwin metadata '+category+': '+reason)
 
 
+def _metadata_lookup_identity(value):
+    if (type(value) is not dict or set(value)!={'invocation','target_name','alias','force_arg0_present'}
+            or value['invocation']!='rustup' or type(value['target_name']) is not str
+            or value['target_name'] not in ('RUSTUP','RUSTUP_INIT','OTHER')
+            or type(value['alias']) is not bool or type(value['force_arg0_present']) is not bool):
+        raise ValueError('invalid Darwin metadata lookup identity')
+    return dict(value)
+
+
+def _metadata_lookup_suffix(value):
+    return (' lookup=COMPLETED_REFUSAL invocation=rustup target_name='+value['target_name']
+            +' alias='+('true' if value['alias'] else 'false')
+            +' force_arg0_present='+('true' if value['force_arg0_present'] else 'false'))
+
+
 class _MetadataRefusal(ValueError):
     """Completed query refusal containing only closed, public scalar facts."""
-    def __init__(self, category, status, stderr_present):
+    def __init__(self, category, status, stderr_present, *, lookup_identity=None):
         if (type(category) is not str or category not in METADATA_CATEGORIES
                 or type(stderr_present) is not bool):
             raise ValueError('invalid Darwin metadata refusal fields')
+        suffix=''
+        if lookup_identity is not None:
+            if category!='rust-toolchain':raise ValueError('invalid Darwin metadata lookup identity')
+            context=_metadata_lookup_identity(lookup_identity)
+            try:suffix=_metadata_lookup_suffix(context)
+            except Exception:pass  # Optional formatting cannot replace the completed refusal.
         public_status = (str(status) if type(status) is int
                          and -2147483648 <= status <= 2147483647 else 'unknown')
         super().__init__('Darwin metadata '+category+': tool refused status='+public_status
-                         +' stderr_present='+('true' if stderr_present else 'false'))
+                         +' stderr_present='+('true' if stderr_present else 'false')+suffix)
 
 
 def _metadata_home(value):
@@ -150,7 +171,7 @@ def _metadata_home(value):
             and Path(value).is_absolute() and str(Path(value))==value and '..' not in Path(value).parts)
 
 
-def metadata_command(argv, timeout=10, *, category='static-tool', toolchain_homes=None):
+def metadata_command(argv, timeout=10, *, category='static-tool', toolchain_homes=None, lookup_identity=None):
     """Bounded static-tool query; retain and reap the exact direct child."""
     if type(category) is not str or category not in METADATA_CATEGORIES:
         raise ValueError('invalid Darwin metadata query category')
@@ -158,6 +179,9 @@ def metadata_command(argv, timeout=10, *, category='static-tool', toolchain_home
             or type(toolchain_homes) is not dict or set(toolchain_homes)!={'RUSTUP_HOME','CARGO_HOME'}
             or not all(_metadata_home(value) for value in toolchain_homes.values())):
         raise ValueError('invalid Darwin metadata toolchain homes')
+    if lookup_identity is not None:
+        if category!='rust-toolchain':raise ValueError('invalid Darwin metadata lookup identity')
+        lookup_identity=_metadata_lookup_identity(lookup_identity)
     with tempfile.TemporaryDirectory(prefix='qsh-release-metadata-') as home:
         env = os.environ.copy()
         env.update(HOME=home, XDG_CACHE_HOME=home+'/cache', XDG_CONFIG_HOME=home+'/config',
@@ -192,7 +216,7 @@ def metadata_command(argv, timeout=10, *, category='static-tool', toolchain_home
             try: status=child.wait(timeout=max(0,deadline-time.monotonic()))
             except subprocess.TimeoutExpired: raise _metadata_failure(category,'timed out')
             if time.monotonic()>=deadline: raise _metadata_failure(category,'timed out')
-            if status or captured[1]: raise _MetadataRefusal(category,status,bool(captured[1]))
+            if status or captured[1]: raise _MetadataRefusal(category,status,bool(captured[1]),lookup_identity=lookup_identity)
             return bytes(captured[0])
         except OSError:
             raise _metadata_failure(category,'tool unavailable') from None
@@ -267,12 +291,29 @@ def _metadata_rustc():
     if type(selected) is not str or re.fullmatch(r'[A-Za-z0-9_.+-]{1,128}',selected) is None:
         raise ValueError('invalid Darwin metadata selected toolchain')
     located=shutil.which('rustup')
+    if located is None or not Path(located).is_absolute():
+        raise _metadata_failure('rust-toolchain','tool unavailable')
+    invocation=Path(located)
+    def identity(path):
+        info=path.lstat()
+        return tuple(getattr(info,key) for key in ('st_dev','st_ino','st_mode','st_size','st_mtime_ns','st_ctime_ns'))
     try:
-        if located is None or not Path(located).is_absolute():
-            raise _metadata_failure('rust-toolchain','tool unavailable')
-        rustup=Path(located).resolve(strict=True)
-        raw=metadata_command([str(rustup),'which','--toolchain',selected,'rustc'],
-                             category='rust-toolchain',toolchain_homes=homes)
+        rustup=invocation.resolve(strict=True)
+        target_identity=identity(rustup);entry_identity=identity(invocation)
+        if not stat.S_ISREG(rustup.stat().st_mode) or not os.access(rustup,os.X_OK):raise ValueError()
+    except (ValueError,OSError,RuntimeError):
+        raise _metadata_failure('rust-toolchain','TARGET_INVALID') from None
+    lookup=dict(invocation='rustup',target_name={'rustup':'RUSTUP','rustup-init':'RUSTUP_INIT'}.get(rustup.name,'OTHER'),
+                alias=invocation!=rustup,force_arg0_present='RUSTUP_FORCE_ARG0' in os.environ)
+    # Preserve the management entry name: canonical targets may be multicall tools.
+    raw=metadata_command([str(invocation),'which','--toolchain',selected,'rustc'],
+                         category='rust-toolchain',toolchain_homes=homes,lookup_identity=lookup)
+    try:
+        if (invocation.resolve(strict=True)!=rustup or identity(invocation)!=entry_identity
+                or identity(rustup)!=target_identity):raise ValueError()
+    except (ValueError,OSError,RuntimeError):
+        raise _metadata_failure('rust-toolchain','TARGET_CHANGED') from None
+    try:
         value=raw.decode('utf-8')
         if value.endswith('\n'):value=value[:-1]
         if not _metadata_home(value):raise ValueError()
@@ -280,11 +321,8 @@ def _metadata_rustc():
         info=compiler.stat()
         if os.path.samefile(compiler,rustup) or not stat.S_ISREG(info.st_mode) or not os.access(compiler,os.X_OK):raise ValueError()
         return compiler
-    except (UnicodeDecodeError,OSError,RuntimeError):
-        raise _metadata_failure('rust-toolchain','invalid output') from None
-    except ValueError as error:
-        if str(error).startswith('Darwin metadata '):raise
-        raise _metadata_failure('rust-toolchain','invalid output') from None
+    except (UnicodeDecodeError,OSError,RuntimeError,ValueError):
+        raise _metadata_failure('rust-toolchain','COMPILER_INVALID') from None
 
 
 def _metadata_compiler_identity(path):
