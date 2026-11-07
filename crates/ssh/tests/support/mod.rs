@@ -299,12 +299,16 @@ fn config_quote(value: &str) -> String {
 /// Establish the SFTP sandbox with an independent OpenSSH marker round trip.
 /// Both remote paths are absolute and contained in this server's TempDir.
 pub fn sftp_probe(sshd: &TestSshd, key: &Path) {
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::process::CommandExt;
     let source = sshd.dir.path().join("probe-source");
     let remote = sshd.dir.path().join("probe-remote");
     let returned = sshd.dir.path().join("probe-returned");
     let marker = b"qsh SFTP sandbox\0\xff\n";
     std::fs::write(&source, marker).unwrap();
+    // File capture avoids pipe EOF waits if a transport subprocess outlives
+    // the client. Both remain in the fresh group retained by this Child.
+    let mut stderr = tempfile::tempfile_in(sshd.dir.path()).expect("SFTP stderr capture");
     let mut child = Command::new("sftp")
         .args([
             "-q",
@@ -327,25 +331,57 @@ pub fn sftp_probe(sshd: &TestSshd, key: &Path) {
         .arg(sshd.port.to_string())
         .args(["-b", "-", "127.0.0.1"])
         .env("HISTFILE", "/dev/null")
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
+        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(stderr.try_clone().unwrap())
         .spawn()
         .expect("SFTP probe");
-    write!(
+    let written = write!(
         child.stdin.take().unwrap(),
         "put \"{}\" \"{}\"\nget \"{}\" \"{}\"\n",
         source.display(),
         remote.display(),
         remote.display(),
         returned.display()
-    )
-    .unwrap();
-    let result = child.wait_with_output().unwrap();
+    );
+    let group = libc::pid_t::try_from(child.id()).expect("owned SFTP group id");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut timed_out = false;
+    loop {
+        if child.try_wait().expect("SFTP child observation").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            // SAFETY: process_group(0) created this exact owned child group.
+            // The Child is still unreaped, so its PID/group cannot be reused.
+            unsafe {
+                libc::kill(-group, libc::SIGKILL);
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let status = child.wait().expect("reap owned SFTP child");
+    stderr.seek(SeekFrom::Start(0)).unwrap();
+    let mut diagnostic = Vec::new();
+    stderr.take(4096).read_to_end(&mut diagnostic).unwrap();
+    let server_log = sshd.log();
+    let server_tail: String = server_log
+        .chars()
+        .rev()
+        .take(4096)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     assert!(
-        result.status.success(),
-        "SFTP probe: {}",
-        String::from_utf8_lossy(&result.stderr)
+        written.is_ok() && !timed_out && status.success(),
+        "SFTP probe: status={status}, timed_out={timed_out}, write={written:?}, stderr={:?}, owned sshd log tail={server_tail:?}",
+        String::from_utf8_lossy(&diagnostic)
     );
     assert_eq!(std::fs::read(&remote).unwrap(), marker);
     assert_eq!(std::fs::read(&returned).unwrap(), marker);

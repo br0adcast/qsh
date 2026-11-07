@@ -33,6 +33,17 @@ pub enum VerificationFault {
     HoldUploadedVerification,
 }
 
+// Shared with classification-only coverage; ordinary commands keep their bytes.
+pub(crate) const SFTP_CLASSIFICATION: &str = r#"subsystem=$SSH_ORIGINAL_COMMAND
+tab=$(printf '\t')
+while :; do
+    case "$subsystem" in
+        *" "|*"$tab") subsystem=${subsystem%?} ;;
+        *) break ;;
+    esac
+done
+"#;
+
 fn verification_fault_config(home: &Path, fault: VerificationFault) -> String {
     use std::os::unix::fs::PermissionsExt;
     let executable = |path: &&str| {
@@ -74,7 +85,7 @@ if [ "${{1-}}" = hold ]; then
     IFS= read -r _held
     exit 0
 fi
-case "$SSH_ORIGINAL_COMMAND" in
+{SFTP_CLASSIFICATION}case "$subsystem" in
     internal-sftp) exec {sftp} ;;
 esac
 {fault}exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"
