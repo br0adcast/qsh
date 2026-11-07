@@ -98,6 +98,14 @@ jobs:
             2>&1 | tee "$runtime/store-policy.log"
           grep -E '^test client_install::.* \.\.\. ok$' "$runtime/store-policy.log"
           grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$runtime/store-policy.log"
+          # Keep native filesystem races visible; every repetition must pass.
+          for iteration in $(seq 1 20); do
+            echo "macOS managed store repetition $iteration/20"
+            output="$runtime/store-repeat-$iteration.log"
+            cargo test -p qsh --lib --locked client_install::store::tests -- --color never \
+              2>&1 | tee "$output"
+            grep -F 'test result: ok. 13 passed; 0 failed; 0 ignored;' "$output"
+          done
           cargo test -p qsh --lib --locked releases::client -- --color never \
             2>&1 | tee "$runtime/release-client.log"
           grep -E '^test releases::client::.* \.\.\. ok$' "$runtime/release-client.log"
