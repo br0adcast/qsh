@@ -1,6 +1,7 @@
 """Generated public payloads model assembly only; never execute package contents."""
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -82,6 +83,47 @@ class PrereleaseProducts(unittest.TestCase):
         self.assertIn('qsh_0.6.0~rc1-1_amd64.deb', products['linux-x86_64-unknown-linux-musl'])
         self.assertIn('qsh-0.6.0~rc1-1.x86_64.rpm', products['linux-x86_64-unknown-linux-musl'])
         self.assertIn('qshd-0.6.0~rc1-1.aarch64.rpm', products['server-packages'])
+
+
+class ClientAcceptanceWorkflowTests(unittest.TestCase):
+    def test_actual_acceptance_block_selects_existing_stable_and_prerelease_products(self):
+        workflow=(ROOT/'.github/workflows/release.yml').read_text()
+        step=workflow.split('      - name: Exercise shipped Linux clients before upload\n',1)[1]
+        block=step.split('        run: |\n',1)[1]
+        lines=[]
+        for line in block.splitlines():
+            if line and not line.startswith('          '):break
+            lines.append(line[10:])
+        body='\n'.join(lines)
+        for version,rpm_version,deb_version in [('0.6.0','0.6.0','0.6.0-1'),
+                                                ('0.6.0-rc1','0.6.0~rc1','0.6.0~rc1-1')]:
+            for cpu,deb_arch in [('x86_64','amd64'),('aarch64','arm64')]:
+                with self.subTest(version=version,cpu=cpu), tempfile.TemporaryDirectory() as directory:
+                    root=Path(directory);(root/'scripts').mkdir();(root/'packaging').mkdir();(root/'dist').mkdir()
+                    for name in ('check-release-output.py','check-release-version.py'):
+                        shutil.copyfile(ROOT/'scripts'/name,root/'scripts'/name)
+                    target=cpu+'-unknown-linux-musl'
+                    archive=f'dist/qsh-{version}-{target}.tar.gz'
+                    deb=f'dist/qsh_{deb_version}_{deb_arch}.deb'
+                    rpm=f'dist/qsh-{rpm_version}-1.{cpu}.rpm'
+                    for name in (archive,deb,rpm):(root/name).write_text('Synthetic selection fixture\n')
+                    (root/'packaging/client-acceptance.py').write_text(
+                        'import json,os,pathlib,sys\n'
+                        'args=sys.argv[1:]\n'
+                        'assert args[args.index("--version")+1]==os.environ["RELEASE_VERSION"]\n'
+                        'assert args[args.index("--target")+1]==os.environ["NATIVE_TARGET"]\n'
+                        'assert pathlib.Path(args[args.index("--archive")+1]).is_file()\n'
+                        'if "--package" in args: assert pathlib.Path(args[args.index("--package")+1]).is_file()\n'
+                        'with open("calls.jsonl","a") as output: output.write(json.dumps(args)+"\\n")\n')
+                    env=dict(os.environ,RELEASE_VERSION=version,NATIVE_TARGET=target,
+                             HOME=str(root/'home'),XDG_CONFIG_HOME=str(root/'config'),
+                             XDG_CACHE_HOME=str(root/'cache'),HISTFILE='/dev/null',PYTHONDONTWRITEBYTECODE='1')
+                    result=subprocess.run(['bash','-e','-c',body],cwd=root,env=env,capture_output=True,timeout=10)
+                    self.assertEqual(result.returncode,0,result.stderr.decode())
+                    calls=[json.loads(line) for line in (root/'calls.jsonl').read_text().splitlines()]
+                    self.assertEqual(len(calls),3)
+                    self.assertEqual([args[args.index('--package')+1] for args in calls if '--package' in args],[deb,rpm])
+                    self.assertTrue(all(args[args.index('--archive')+1]==archive for args in calls))
 
 
 class WorkflowTests(Layout):
