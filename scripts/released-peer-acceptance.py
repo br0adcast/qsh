@@ -30,6 +30,7 @@ CASES = (
     ('qsh', 'this_qsh_follows_a_flood_as_screen_repaints_with_the_header_under_aead', False),
     ('qsh', 'current_qsh_pastes_a_megabyte_into_current_daemon', False),
     ('qshd', 'protocol2_client_cannot_allocate_a_connection_on_published_v050', True),
+    ('qsh', 'current_ensure_reports_busy_published_v050_without_interrupting_shell', True),
 )
 
 
@@ -128,7 +129,7 @@ def main():
         subprocess.run(['cargo', 'build', '--locked', '-p', 'qsh', '-p', 'qshd', '--bins'], env=env, check=True)
         for case in CASES:
             run_case(*case, env, args.evidence)
-    (args.evidence / 'passed.txt').write_text('6 selected tests; 6 passed; 0 skipped\n')
+    (args.evidence / 'passed.txt').write_text(f'{len(CASES)} selected tests; {len(CASES)} passed; 0 skipped\n')
 
 
 if __name__ == '__main__':

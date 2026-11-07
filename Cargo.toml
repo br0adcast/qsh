@@ -1,7 +1,7 @@
 [workspace]
 exclude = ["vendor/vte", "vendor/alacritty_terminal", "vendor/russh"]
 resolver = "2"
-members = ["crates/release-auth", "crates/terminal-size", "qshd", "crates/transport", "crates/terminal", "crates/prediction", "crates/client", "crates/render", "crates/sshauth", "crates/knock", "crates/ssh", "crates/bringup", "crates/connect", "crates/logging", "cli"]
+members = ["crates/daemon-bootstrap-protocol", "crates/release-auth", "crates/terminal-size", "qshd", "crates/transport", "crates/terminal", "crates/prediction", "crates/client", "crates/render", "crates/sshauth", "crates/knock", "crates/ssh", "crates/bringup", "crates/connect", "crates/logging", "cli"]
 
 [workspace.package]
 edition = "2021"

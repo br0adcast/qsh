@@ -1153,8 +1153,13 @@ impl Recovery {
                                     }
                                 }
                             }
+                            Err(crate::ssh_step::SshStepError::BusyCancelled) => {
+                                recovery.stop();
+                                return;
+                            }
                             Err(why) => {
                                 let message = match &why {
+                                    crate::ssh_step::SshStepError::BusyCancelled => unreachable!("handled as a terminal user choice"),
                                     crate::ssh_step::SshStepError::Failed(failure) => report::ssh_failed(&address.host, failure),
                                     crate::ssh_step::SshStepError::NeedsPrompt => format!(
                                         "qsh: {}: SSH recovery needs credentials unavailable without a prompt; QSH keeps retrying",

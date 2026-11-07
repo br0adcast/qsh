@@ -33,7 +33,8 @@ fn identified_ready_names_the_same_connection_key() {
     let result = bring_up_identified(
         BringUpRequest {
             report_busy: false,
-            accept_busy: None,
+            busy_decision: None,
+            destructive_consent: None,
             name: "identity-test".into(),
             ssh: ssh::SshParams {
                 host: "127.0.0.1".into(),
@@ -94,7 +95,8 @@ fn ready_records_without_exit_status_are_not_success() {
     let error = bring_up_identified(
         BringUpRequest {
             report_busy: false,
-            accept_busy: None,
+            busy_decision: None,
+            destructive_consent: None,
             name: "missing-status-test".into(),
             ssh: ssh::SshParams {
                 host: "127.0.0.1".into(),
@@ -127,4 +129,76 @@ fn ready_records_without_exit_status_are_not_success() {
     assert!(matches!(error, BringUpError::EnsureFailed(_)), "{error:?}");
     assert!(error.to_string().contains("exit -1"), "{error}");
     assert_eq!(activity.exec.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn busy_cancel_and_unqualified_force_have_no_ssh_or_daemon_effect() {
+    let activity = Arc::new(ServerActivity::default());
+    let server = FakeServer::start(FakeAuth {
+        activity: activity.clone(),
+        ..Default::default()
+    });
+    let info = BusyDaemonInfo {
+        schema: 1,
+        attempt: BusyAttemptId::from_bytes([1; 16]),
+        identity: BusyDaemonIdentity {
+            version: "0.5.9".into(),
+            build: 1,
+            checksum: "ab".repeat(32),
+            pid: 42,
+            generation: None,
+        },
+        active_connections: 2,
+        serving_profiles: None,
+        preservation: PreservationCapability::Unknown,
+    };
+    for (choice, confirmed) in [
+        (BusyChoice::Cancel, false),
+        (BusyChoice::ForceUpdate, false),
+        (BusyChoice::ForceUpdate, true),
+    ] {
+        let result = bring_up_identified(
+            BringUpRequest {
+                report_busy: true,
+                busy_decision: Some(PendingBusy::new(info.clone()).unwrap().decide(choice)),
+                destructive_consent: confirmed.then(|| info.confirm_destructive_restart()),
+                name: "busy-test".into(),
+                ssh: ssh::SshParams {
+                    host: "127.0.0.1".into(),
+                    port: server.port,
+                    username: "test-user".into(),
+                    known_host_keys: vec![server.host_public_key_wire()],
+                    connect_timeout: Duration::from_secs(2),
+                    keepalive_interval: Duration::ZERO,
+                    compression: false,
+                    tcp_nodelay: true,
+                    knock: vec![],
+                },
+                auth: ssh::SshAuthPlan::single(ssh::AuthMethod::Signer(Arc::new(
+                    support::SoftSigner::random(),
+                ))),
+                qsh_port: 60022,
+                client_pubkey: [9; 32],
+            },
+            InstallPolicy::ExistingOnly,
+            BringUpHooks {
+                source: None,
+                approval: Arc::new(Silent),
+                observer: Arc::new(Silent),
+                timing: InstallTiming::default(),
+            },
+            Arc::new(knock::NoBind),
+            &knock::Cancel::new(),
+        );
+        if choice == BusyChoice::Cancel {
+            assert!(matches!(result, Err(BringUpError::Declined)));
+        } else {
+            assert!(matches!(
+                result,
+                Err(BringUpError::DestructiveRestartUnavailable)
+            ));
+        }
+    }
+    assert_eq!(activity.connections.load(Ordering::SeqCst), 0);
+    assert_eq!(activity.exec.load(Ordering::SeqCst), 0);
 }

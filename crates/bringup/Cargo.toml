@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+daemon-bootstrap-protocol = { path = "../daemon-bootstrap-protocol" }
 ssh = { path = "../ssh" }
 knock = { path = "../knock" }
 client = { path = "../client" }

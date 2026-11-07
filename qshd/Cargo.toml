@@ -6,6 +6,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+daemon-bootstrap-protocol = { path = "../crates/daemon-bootstrap-protocol" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 tokio = { version = "1.53.3", features = ["full"] }
 anyhow = "1"

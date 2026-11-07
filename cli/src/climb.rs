@@ -571,10 +571,27 @@ impl Drop for RetainedDiscovery {
 /// An identity grant belongs only to the route and UDP port reported by
 /// this verified SSH login; it cannot authorize another candidate endpoint.
 struct SshBootstrap {
+    /// SSH bootstrap display context only; never authenticated discovery policy.
+    serving_version: String,
+    serving_profiles: Option<Vec<[u8; 3]>>,
     addr: usize,
     port: u16,
     key: [u8; 32],
     ssh_host_key: ssh::HostKeyInfo,
+}
+
+impl SshBootstrap {
+    fn failure_diagnostic(&self, line: &str) -> String {
+        let profile = if self.serving_profiles.is_none() {
+            "; session profile unknown"
+        } else {
+            ""
+        };
+        format!(
+            "{line} (selected running qshd {}{profile})",
+            report::printable(&self.serving_version)
+        )
+    }
 }
 
 impl<'a> Climb<'a> {
@@ -776,6 +793,8 @@ impl<'a> Climb<'a> {
                             let ready = identified.ready;
                             let port = ready.port_for(addrs[addr].qsh_port);
                             self.bootstrap = Some(SshBootstrap {
+                                serving_version: ready.version.clone(),
+                                serving_profiles: ready.serving_profiles.clone(),
                                 addr,
                                 port,
                                 key: ready.server_pubkey,
@@ -789,6 +808,26 @@ impl<'a> Climb<'a> {
                             let outcome = Outcome::Ssh(SshOutcome::Ready { port });
                             log::log(&format!("ladder: outcome {outcome:?}"));
                             ladder.on(outcome)
+                        }
+                        Err(SshStepError::BusyCancelled) => {
+                            // This is the person's decision, not a failed route.
+                            // Revoke this attempt and join every retained probe
+                            // before returning, even if the Climb itself survives.
+                            cancel.cancel();
+                            let retained = std::mem::take(
+                                &mut *self
+                                    .retained_discovery
+                                    .0
+                                    .lock()
+                                    .expect("retained discovery"),
+                            );
+                            for client in retained.into_values() {
+                                client.detach();
+                            }
+                            self.bootstrap = None;
+                            self.drain();
+                            self.say("qsh: connection cancelled; running daemon unchanged");
+                            return Climbed::Exit(1);
                         }
                         Err(SshStepError::InstallDeclined) => {
                             self.say(&report::install_declined());
@@ -824,6 +863,12 @@ impl<'a> Climb<'a> {
                         Ok(v) => v,
                         Err(code) => return Climbed::Exit(code),
                     };
+                    let line = line.map(|line| {
+                        self.bootstrap
+                            .as_ref()
+                            .filter(|b| b.addr == addr && b.port == port)
+                            .map_or_else(|| line.clone(), |b| b.failure_diagnostic(&line))
+                    });
                     self.advance(&mut ladder, Outcome::Direct(outcome), line)
                 }
                 Action::Connected { addr, port } => {

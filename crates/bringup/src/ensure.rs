@@ -2,41 +2,22 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::{shell, BringUpError, Ready};
 
-/// Same-account reported identity used to scope one busy-daemon choice.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BusyDaemonIdentity {
-    pub version: String,
-    pub build: u64,
-    pub checksum: String,
-    pub pid: u32,
-}
-
-impl BusyDaemonIdentity {
-    pub(crate) fn valid(&self) -> bool {
-        self.version.len() <= 128 && !self.version.is_empty()
-            && !self.version.chars().any(char::is_control)
-            && self.checksum.len() == 64 && self.checksum.bytes().all(|b| b.is_ascii_hexdigit())
-    }
-}
-
-/// A preflight decision, never daemon readiness or proof of compatibility.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BusyDaemonInfo {
-    pub schema: u8,
-    pub identity: BusyDaemonIdentity,
-    pub active_connections: u64,
-    pub transport_protocol: Option<u8>,
-    pub required_protocol: u8,
-}
+use daemon_bootstrap_protocol::{BusyAttemptId, BusyDaemonInfo, BusyDecision};
 
 /// How much of a failed command's output a person gets to read.
 pub(crate) const ERROR_TEXT_MAX: usize = crate::exec::MAX_DIAGNOSTIC;
+
+pub(crate) fn tool_supports_busy(code: i32, out: &str) -> bool {
+    code == 0
+        && out.len() <= 4096
+        && out.lines().filter(|line| !line.trim().is_empty()).count() == 1
+        && serde_json::from_str::<daemon_bootstrap_protocol::BootstrapToolCapabilities>(out.trim())
+            .is_ok_and(|capabilities| capabilities.schema == 1 && capabilities.busy_decisions)
+}
 
 pub(crate) fn command(path: &str, name: &str, port: u16, client_pubkey: &[u8; 32]) -> String {
     format!(
@@ -53,19 +34,24 @@ pub(crate) fn command_for_policy(
     port: u16,
     client_pubkey: &[u8; 32],
     policy: &crate::InstallPolicy,
-    report_busy: bool,
-    accept_busy: Option<&BusyDaemonIdentity>,
+    busy_attempt: Option<&BusyAttemptId>,
+    busy_decision: Option<&BusyDecision>,
 ) -> Result<String, BringUpError> {
     let mut command = command(path, name, port, client_pubkey);
     if matches!(policy, crate::InstallPolicy::RestartOnly) {
         command.push_str(" --restart-only");
     }
-    if report_busy {
+    if busy_attempt.is_some() {
         command.push_str(" --report-busy");
     }
-    if let Some(identity) = accept_busy {
-        let json = serde_json::to_string(identity).map_err(|_| BringUpError::InvalidRequest("invalid busy identity".into()))?;
-        command.push_str(" --accept-busy ");
+    if let Some(attempt) = busy_attempt {
+        command.push_str(" --busy-attempt ");
+        command.push_str(&shell::quote(attempt.as_str()));
+    }
+    if let Some(decision) = busy_decision {
+        let json = serde_json::to_string(decision)
+            .map_err(|_| BringUpError::InvalidRequest("invalid busy identity".into()))?;
+        command.push_str(" --busy-decision ");
         command.push_str(&shell::quote(&json));
     }
     Ok(command)
@@ -74,11 +60,24 @@ pub(crate) fn command_for_policy(
 #[derive(Deserialize)]
 struct ReadyBody {
     #[serde(default)]
-    transport_protocol: Option<u8>,
+    serving_profiles: Option<Vec<[u8; 3]>>,
     version: String,
     ports: Vec<u16>,
     #[serde(default)]
     warning: Option<String>,
+}
+
+pub(crate) fn parse_for_attempt(
+    code: i32,
+    out: &str,
+    expected: Option<&BusyAttemptId>,
+) -> Result<Ready, BringUpError> {
+    match parse(code, out) {
+        Err(BringUpError::BusyDaemon(info)) if expected != Some(&info.attempt) => Err(
+            BringUpError::BadReady("unrelated or unrequested busy-daemon attempt".into()),
+        ),
+        result => result,
+    }
 }
 
 pub(crate) fn parse(code: i32, out: &str) -> Result<Ready, BringUpError> {
@@ -94,16 +93,23 @@ pub(crate) fn parse(code: i32, out: &str) -> Result<Ready, BringUpError> {
     let ready_count = count("TRANSPORT-READY ");
     let key_count = count("server-pubkey: ");
     if busy_count != 0 {
-        if busy_count != 1 || ready_count != 0 || key_count != 0 || out.lines().filter(|line| !line.trim().is_empty()).count() != 1 {
+        if busy_count != 1
+            || ready_count != 0
+            || key_count != 0
+            || out.lines().filter(|line| !line.trim().is_empty()).count() != 1
+        {
             return Err(bad("conflicting or duplicate startup results"));
         }
         let json = line_after(out, "TRANSPORT-BUSY ").unwrap();
-        if json.len() > 4096 { return Err(bad("TRANSPORT-BUSY exceeds the decision limit")); }
-        let info: BusyDaemonInfo = serde_json::from_str(json).map_err(|_| bad("invalid TRANSPORT-BUSY record"))?;
-        if info.schema != 1 || info.active_connections == 0 || info.required_protocol == 0 || !info.identity.valid() {
+        if json.len() > 4096 {
+            return Err(bad("TRANSPORT-BUSY exceeds the decision limit"));
+        }
+        let info: BusyDaemonInfo =
+            serde_json::from_str(json).map_err(|_| bad("invalid TRANSPORT-BUSY record"))?;
+        if !info.valid() {
             return Err(bad("invalid TRANSPORT-BUSY fields"));
         }
-        return Err(BringUpError::BusyDaemon(info));
+        return Err(BringUpError::BusyDaemon(Box::new(info)));
     }
     if ready_count != 1 || key_count != 1 {
         return Err(bad("missing or duplicate readiness records"));
@@ -131,7 +137,7 @@ pub(crate) fn parse(code: i32, out: &str) -> Result<Ready, BringUpError> {
         return Err(bad("TRANSPORT-READY lists no ports"));
     }
     Ok(Ready {
-        transport_protocol: body.transport_protocol,
+        serving_profiles: body.serving_profiles,
         server_pubkey,
         ports: body.ports,
         version: body.version,
@@ -165,40 +171,110 @@ mod tests {
     }
 
     fn busy_json() -> serde_json::Value {
-        serde_json::json!({"schema":1,"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"active_connections":2,"transport_protocol":null,"required_protocol":2})
+        serde_json::json!({"schema":1,"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"active_connections":2,"serving_profiles":null,"preservation":"unknown"})
     }
 
     #[test]
+    fn tool_capability_is_explicit_bounded_and_independent_of_release_age() {
+        assert!(tool_supports_busy(
+            0,
+            r#"{"schema":1,"busy_decisions":true}"#
+        ));
+        for (code, text) in [
+            (1, r#"{"schema":1,"busy_decisions":true}"#),
+            (0, r#"{"schema":2,"busy_decisions":true}"#),
+            (0, r#"{"schema":1,"busy_decisions":false}"#),
+            (
+                0,
+                r#"{"schema":1,"busy_decisions":true,"version":"999.0.0"}"#,
+            ),
+            (0, "qshd 999.0.0"),
+            (0, "{}\n{}"),
+            (0, ""),
+        ] {
+            assert!(!tool_supports_busy(code, text));
+        }
+    }
+    #[test]
+    fn unrelated_or_unrequested_busy_record_is_not_a_current_prompt() {
+        let record = format!("TRANSPORT-BUSY {}", busy_json());
+        let current = BusyAttemptId::from_bytes([18; 16]);
+        let unrelated = BusyAttemptId::from_bytes([52; 16]);
+        assert!(matches!(
+            parse_for_attempt(0, &record, Some(&current)),
+            Err(BringUpError::BusyDaemon(_))
+        ));
+        for expected in [None, Some(&unrelated)] {
+            assert!(matches!(
+                parse_for_attempt(0, &record, expected),
+                Err(BringUpError::BadReady(_))
+            ));
+        }
+    }
+    #[test]
     fn busy_is_a_typed_decision_and_never_readiness() {
         let record = format!("TRANSPORT-BUSY {}\n", busy_json());
-        let Err(BringUpError::BusyDaemon(info)) = parse(0, &record) else { panic!("expected typed Busy"); };
+        let Err(BringUpError::BusyDaemon(info)) = parse(0, &record) else {
+            panic!("expected typed Busy");
+        };
         assert_eq!(info.schema, 1);
         assert_eq!(info.identity.version, "0.5.0");
         assert_eq!(info.active_connections, 2);
-        assert_eq!(info.transport_protocol, None);
-        assert_eq!(info.required_protocol, 2);
-        assert!(matches!(parse(1, &record), Err(BringUpError::EnsureFailed(_))));
+        assert_eq!(info.serving_profiles, None);
+        assert!(matches!(
+            parse(1, &record),
+            Err(BringUpError::EnsureFailed(_))
+        ));
     }
 
     #[test]
     fn busy_rejects_ambiguous_or_unbounded_decisions() {
         let busy = format!("TRANSPORT-BUSY {}\n", busy_json());
-        for output in [format!("{busy}{busy}"), format!("{busy}{}", ready_out(r#"{"version":"0.6.0","ports":[60022]}"#)), format!("server-pubkey: {KEY_B64}\n{busy}")] {
+        for output in [
+            format!("{busy}{busy}"),
+            format!(
+                "{busy}{}",
+                ready_out(r#"{"version":"0.6.0","ports":[60022]}"#)
+            ),
+            format!("server-pubkey: {KEY_B64}\n{busy}"),
+        ] {
             assert!(matches!(parse(0, &output), Err(BringUpError::BadReady(_))));
         }
-        for (field, value) in [("schema", serde_json::json!(2)), ("active_connections", serde_json::json!(0)), ("required_protocol", serde_json::json!(0))] {
-            let mut json = busy_json(); json[field] = value;
-            assert!(matches!(parse(0, &format!("TRANSPORT-BUSY {json}")), Err(BringUpError::BadReady(_))));
+        for (field, value) in [
+            ("schema", serde_json::json!(2)),
+            ("active_connections", serde_json::json!(0)),
+            ("attempt", serde_json::json!("")),
+        ] {
+            let mut json = busy_json();
+            json[field] = value;
+            assert!(matches!(
+                parse(0, &format!("TRANSPORT-BUSY {json}")),
+                Err(BringUpError::BadReady(_))
+            ));
         }
         for version in ["x".repeat(129), "bad\nversion".into()] {
-            let mut json=busy_json(); json["identity"]["version"] = version.into();
-            assert!(matches!(parse(0, &format!("TRANSPORT-BUSY {json}")), Err(BringUpError::BadReady(_))));
+            let mut json = busy_json();
+            json["identity"]["version"] = version.into();
+            assert!(matches!(
+                parse(0, &format!("TRANSPORT-BUSY {json}")),
+                Err(BringUpError::BadReady(_))
+            ));
         }
-        let mut json=busy_json(); json["identity"]["checksum"]="not-hex".into();
-        assert!(matches!(parse(0, &format!("TRANSPORT-BUSY {json}")), Err(BringUpError::BadReady(_))));
-        assert!(matches!(parse(0, &format!("TRANSPORT-BUSY {}", "x".repeat(4097))), Err(BringUpError::BadReady(_))));
-        let ready=ready_out(r#"{"version":"0.6.0","ports":[60022]}"#);
-        assert!(matches!(parse(0, &format!("{ready}{ready}")), Err(BringUpError::BadReady(_))));
+        let mut json = busy_json();
+        json["identity"]["checksum"] = "not-hex".into();
+        assert!(matches!(
+            parse(0, &format!("TRANSPORT-BUSY {json}")),
+            Err(BringUpError::BadReady(_))
+        ));
+        assert!(matches!(
+            parse(0, &format!("TRANSPORT-BUSY {}", "x".repeat(4097))),
+            Err(BringUpError::BadReady(_))
+        ));
+        let ready = ready_out(r#"{"version":"0.6.0","ports":[60022]}"#);
+        assert!(matches!(
+            parse(0, &format!("{ready}{ready}")),
+            Err(BringUpError::BadReady(_))
+        ));
     }
 
     #[test]
@@ -234,7 +310,7 @@ mod tests {
         assert_eq!(
             r,
             Ready {
-                transport_protocol: None,
+                serving_profiles: None,
                 server_pubkey: [7; 32],
                 ports: vec![60000],
                 version: "0.3.0".into(),

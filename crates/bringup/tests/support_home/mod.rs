@@ -172,7 +172,8 @@ impl Sandbox {
         let signer = self.logins.pop().expect("more logins than LOGINS");
         bringup::BringUpRequest {
             report_busy: false,
-            accept_busy: None,
+            busy_decision: None,
+            destructive_consent: None,
             name: "console".into(),
             ssh: self.params(),
             auth: ssh::SshAuthPlan::single(ssh::AuthMethod::Signer(Arc::new(signer))),

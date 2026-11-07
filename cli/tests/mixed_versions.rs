@@ -746,9 +746,71 @@ fn personal_status(socket: &Path) -> Option<qshd::control::StatusResponse> {
 }
 
 #[cfg(target_os = "linux")]
+fn assert_legacy_fixture_metadata(check: &serde_json::Value, version: &str) {
+    let mut fields = version
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_ascii_whitespace();
+    assert_eq!(fields.next(), Some("qshd"));
+    assert_eq!(fields.next(), Some("0.5.0"));
+    // SelfCheck reports channel protocol here, not transport wire compatibility.
+    assert_eq!(check["protocol"], 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_fixture_accepts_published_self_check_without_a_version_field() {
+    // Public v0.5 root 5a5f561 SelfCheck schema; build is synthetic.
+    let check = serde_json::json!({"build":0,"arch":"x86_64","protocol":1,"protocols":[1],"handover_versions":[1],"transport_features":[]});
+    assert_legacy_fixture_metadata(&check, "qshd 0.5.0 (build 0)\n");
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_ensure_command(binary: &Path, port: u16, client_key: &str, report_busy: bool) -> Command {
+    let mut command = Command::new(binary);
+    command.arg("transport-ensure");
+    if report_busy {
+        command.args(["--report-busy", "--busy-attempt", &"12".repeat(16)]);
+    }
+    command.args([
+        "--name",
+        "legacy",
+        "--port",
+        &port.to_string(),
+        "--client-pubkey",
+        client_key,
+    ]);
+    command
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn busy_ensure_fixture_reaches_real_transport_dispatch_without_daemon_mutation() {
+    let home = tempfile::tempdir().unwrap();
+    let output = legacy_ensure_command(&qshd_path(), 60022, "invalid-key", true)
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("HISTFILE", "/dev/null")
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("--client-pubkey"),
+        "the dispatcher must reach transport-ensure argument validation: {error}"
+    );
+    assert!(!error.contains("unknown command"), "{error}");
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "needs unchanged published v0.5.0 QSH_OLD_QSH and QSH_OLD_QSHD"]
-fn current_ensure_rejects_busy_published_v050_without_interrupting_shell() {
+fn current_ensure_reports_busy_published_v050_without_interrupting_shell() {
     use std::os::unix::fs::PermissionsExt;
     let _serial = serialised();
     let home = tempfile::Builder::new()
@@ -765,8 +827,9 @@ fn current_ensure_rejects_busy_published_v050_without_interrupting_shell() {
         .unwrap();
     assert!(check.status.success());
     let check: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
-    assert_eq!(check["version"], "0.5.0");
-    assert_eq!(check["protocol"], 1);
+    let version = Command::new(&old_daemon).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_legacy_fixture_metadata(&check, std::str::from_utf8(&version.stdout).unwrap());
     let key = ssh_key::PrivateKey::random(
         &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
         ssh_key::Algorithm::Ed25519,
@@ -792,17 +855,8 @@ fn current_ensure_rejects_busy_published_v050_without_interrupting_shell() {
         0
     );
     assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
-    let run_ensure = |binary: &Path, client_key: &str| {
-        Command::new(binary)
-            .args([
-                "transport-ensure",
-                "--name",
-                "legacy",
-                "--port",
-                &port.to_string(),
-                "--client-pubkey",
-                client_key,
-            ])
+    let run_ensure = |binary: &Path, client_key: &str, report_busy: bool| {
+        legacy_ensure_command(binary, port, client_key, report_busy)
             .env("HOME", home.path())
             .env("XDG_CACHE_HOME", home.path())
             .env("XDG_CONFIG_HOME", home.path())
@@ -813,7 +867,11 @@ fn current_ensure_rejects_busy_published_v050_without_interrupting_shell() {
             .output()
             .unwrap()
     };
-    let started = run_ensure(&old_daemon, "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=");
+    let started = run_ensure(
+        &old_daemon,
+        "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        false,
+    );
     assert!(
         started.status.success(),
         "{}",
@@ -854,7 +912,11 @@ fn current_ensure_rejects_busy_published_v050_without_interrupting_shell() {
     let current = std::env::var_os("QSH_TEST_CURRENT_ENSURE")
         .map(PathBuf::from)
         .unwrap_or_else(qshd_path);
-    let rejected = run_ensure(&current, "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=");
+    let rejected = run_ensure(
+        &current,
+        "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
+        true,
+    );
     // Prove survival before asserting rejection, so even the baseline RED
     // demonstrates an active real shell rather than merely a synthetic count.
     let after = personal_status(&socket).unwrap();
@@ -876,12 +938,13 @@ fn current_ensure_rejects_busy_published_v050_without_interrupting_shell() {
     let stdout = String::from_utf8_lossy(&rejected.stdout);
     let stderr = String::from_utf8_lossy(&rejected.stderr);
     assert!(
-        !rejected.status.success(),
-        "startup falsely succeeded: {stdout}; {stderr}"
+        rejected.status.success(),
+        "busy report failed: {stdout}; {stderr}"
     );
     assert!(!stdout.contains("TRANSPORT-READY"), "{stdout}");
-    assert!(
-        stderr.contains("0.5.0") && stderr.contains("unknown") && stderr.contains("left unchanged"),
-        "{stderr}"
-    );
+    let info: bringup::BusyDaemonInfo =
+        serde_json::from_str(stdout.trim().strip_prefix("TRANSPORT-BUSY ").unwrap()).unwrap();
+    assert_eq!(info.identity.version, "0.5.0");
+    assert_eq!(info.serving_profiles, None);
+    assert_eq!(info.preservation, bringup::PreservationCapability::Unknown);
 }

@@ -70,6 +70,7 @@ struct Fixture {
     found: Option<PathBuf>,
     cached: Option<PathBuf>,
     commands: Vec<(String, String)>,
+    bootstrap_capabilities: Option<String>,
     uploads: usize,
     cancel_after_trust: bool,
     poison_path: Option<PathBuf>,
@@ -86,6 +87,7 @@ impl Fixture {
             found: None,
             cached: None,
             commands: vec![],
+            bootstrap_capabilities: None,
             uploads: 0,
             cancel_after_trust: false,
             poison_path: None,
@@ -170,6 +172,12 @@ impl Remote for Fixture {
                     self.root.path().display()
                 ),
             ));
+        }
+        if what == "qshd bootstrap-capabilities" {
+            return Ok(match &self.bootstrap_capabilities {
+                Some(json) => exec::test_support::output(0, json),
+                None => exec::test_support::output(1, ""),
+            });
         }
         if what == "qshd transport-ensure" {
             return Ok(exec::test_support::output(0,"server-pubkey: BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\nTRANSPORT-READY {\"version\":\"custom-actual\",\"ports\":[60022]}\n"));
@@ -613,4 +621,81 @@ fn failed_publication_keeps_old_file_and_cleans_only_own_temporary() {
             .count(),
         2
     );
+}
+
+#[test]
+fn busy_opt_in_requires_explicit_tool_capability_without_mutating_legacy_daemon() {
+    let mut fixture = Fixture::new();
+    fixture.daemon(0o700);
+    let (observed, hooks) = hooks();
+    let result = on_session(
+        &mut fixture,
+        "fixture".into(),
+        60022,
+        [7; 32],
+        true,
+        None,
+        "fixture.invalid".into(),
+        "fixture".into(),
+        22,
+        InstallPolicy::ExistingOnly,
+        hooks,
+        &knock::Cancel::new(),
+    );
+    assert!(
+        matches!(result, Err(BringUpError::BusyReportingUnavailable)),
+        "{result:?}"
+    );
+    assert_eq!(fixture.starts(), 0);
+    assert_eq!(fixture.uploads, 0);
+    assert_eq!(observed.loads.load(Ordering::SeqCst), 0);
+    assert_eq!(observed.approvals.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .commands
+            .iter()
+            .filter(|(what, _)| what == "qshd bootstrap-capabilities")
+            .count(),
+        1
+    );
+    fixture.commands.clear();
+    let (_, hooks) = self::hooks();
+    let ready = fixture
+        .run(InstallPolicy::ExistingOnly, hooks, &knock::Cancel::new())
+        .unwrap();
+    assert_eq!(ready.version, "custom-actual");
+    assert_eq!(fixture.starts(), 1);
+    assert!(!fixture
+        .commands
+        .iter()
+        .any(|(what, _)| what == "qshd bootstrap-capabilities"));
+}
+
+#[test]
+fn advertised_tool_capability_allows_scoped_busy_flags_without_version_inference() {
+    let mut fixture = Fixture::new();
+    fixture.daemon(0o700);
+    fixture.bootstrap_capabilities = Some(r#"{"schema":1,"busy_decisions":true}"#.into());
+    let (_, hooks) = hooks();
+    on_session(
+        &mut fixture,
+        "fixture".into(),
+        60022,
+        [7; 32],
+        true,
+        None,
+        "fixture.invalid".into(),
+        "fixture".into(),
+        22,
+        InstallPolicy::ExistingOnly,
+        hooks,
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    let ensure = fixture
+        .commands
+        .iter()
+        .find(|(what, _)| what == "qshd transport-ensure")
+        .unwrap();
+    assert!(ensure.1.contains("--report-busy") && ensure.1.contains("--busy-attempt"));
 }

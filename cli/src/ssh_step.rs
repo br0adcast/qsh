@@ -188,6 +188,8 @@ impl ssh::AuthPrompter for Unanswered {
 /// Why step 2 did not bring qshd up.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SshStepError {
+    /// An explicit busy-daemon Cancel/dismissal ends the whole foreground attempt.
+    BusyCancelled,
     /// The installation was offered and declined for this login.
     InstallDeclined,
     /// Background only: the step needed a question nobody may ask now.
@@ -323,7 +325,8 @@ impl SshStep<'_> {
             .unwrap_or_default();
         bringup::BringUpRequest {
             report_busy: false,
-            accept_busy: None,
+            busy_decision: None,
+            destructive_consent: None,
             name: "console".into(),
             ssh: ssh::SshParams {
                 host: addr.host.clone(),
@@ -361,18 +364,41 @@ impl SshStep<'_> {
         cancel: &knock::Cancel,
     ) -> Result<bringup::IdentifiedReady, Attempted> {
         let prompter = self.prompter();
-        let result = bringup::bring_up_identified(
-            self.request(addr, route, client_pubkey, keys, prompter.answers.clone()),
-            self.install_policy.clone(),
-            bringup::BringUpHooks {
-                source: Some(self.images.clone()),
-                approval: Arc::new(InstallQuestion(self.tty.clone())),
-                observer: Arc::new(InstallProgress::new(self.background)),
-                timing: bringup::InstallTiming::default(),
-            },
-            Arc::new(knock::NoBind),
-            cancel,
-        );
+        let mut decision = None;
+        let mut consent = None;
+        let result = loop {
+            let mut request =
+                self.request(addr, route, client_pubkey, keys, prompter.answers.clone());
+            request.report_busy = !self.background
+                && !self.no_password
+                && self.install_policy != bringup::InstallPolicy::RestartOnly;
+            request.busy_decision = decision.take();
+            request.destructive_consent = consent.take();
+            let result = bringup::bring_up_identified(
+                request,
+                self.install_policy.clone(),
+                bringup::BringUpHooks {
+                    source: Some(self.images.clone()),
+                    approval: Arc::new(InstallQuestion(self.tty.clone())),
+                    observer: Arc::new(InstallProgress::new(self.background)),
+                    timing: bringup::InstallTiming::default(),
+                },
+                Arc::new(knock::NoBind),
+                cancel,
+            );
+            match result {
+                Err(bringup::BringUpError::BusyDaemon(info)) => {
+                    let (answer, confirmed) =
+                        crate::busy_daemon::ask(self.tty, *info, cancel).map_err(Attempted::Ssh)?;
+                    if answer.choice == bringup::BusyChoice::Cancel {
+                        return Err(Attempted::BusyCancelled);
+                    }
+                    decision = Some(answer);
+                    consent = confirmed;
+                }
+                other => break other,
+            }
+        };
         match result {
             Ok(ready) => Ok(ready),
             // Only the login itself: a login that got in after an unanswered
@@ -590,6 +616,7 @@ fn install_question(offer: &bringup::InstallOffer) -> String {
 
 /// How one `bring_up` did not work.
 enum Attempted {
+    BusyCancelled,
     /// The ssh login itself; the host key may be what it is about.
     Ssh(ssh::SshError),
     /// A later stage of the bringup, as the line to print.
@@ -605,6 +632,7 @@ impl Attempted {
         match self {
             Attempted::Ssh(e) => SshStepError::Failed(ssh_failure(&e, cfg!(target_os = "macos"))),
             Attempted::Other(why) => plain(why),
+            Attempted::BusyCancelled => SshStepError::BusyCancelled,
             Attempted::Unanswered => SshStepError::NeedsPrompt,
             Attempted::InstallDeclined => SshStepError::InstallDeclined,
         }
@@ -624,6 +652,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use super::test_support as support_home;
+
+    #[test]
+    fn only_explicit_busy_choice_is_a_terminal_user_cancellation() {
+        assert_eq!(
+            Attempted::BusyCancelled.into_error(),
+            SshStepError::BusyCancelled
+        );
+        assert!(matches!(
+            Attempted::Ssh(ssh::SshError::Cancelled).into_error(),
+            SshStepError::Failed(_)
+        ));
+    }
 
     #[test]
     fn installation_approval_propagates_confirmation_cancellation() {

@@ -18,7 +18,10 @@ mod shell;
 mod timing;
 mod trust;
 
-pub use ensure::{BusyDaemonIdentity, BusyDaemonInfo};
+pub use daemon_bootstrap_protocol::{
+    BusyAttemptId, BusyChoice, BusyDaemonIdentity, BusyDaemonInfo, BusyDecision,
+    DestructiveRestartConsent, PendingBusy, PreservationCapability,
+};
 
 pub use image::{
     DaemonImage, ImageError, ImageRequest, ImageSource, Platform, ServerArch, ServerOs,
@@ -32,7 +35,10 @@ pub struct BringUpRequest {
     /// Opt in to a non-ready busy decision; ordinary/background callers use false.
     pub report_busy: bool,
     /// Consent for precisely the daemon identity reported in this attempt.
-    pub accept_busy: Option<BusyDaemonIdentity>,
+    pub busy_decision: Option<BusyDecision>,
+    /// Separate interrupting-restart confirmation; currently always refused without
+    /// qualified exact-instance authority. ForceUpdate alone cannot imply it.
+    pub destructive_consent: Option<DestructiveRestartConsent>,
     pub name: String,
     pub ssh: ssh::SshParams,
     pub auth: ssh::SshAuthPlan,
@@ -42,8 +48,8 @@ pub struct BringUpRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ready {
-    /// Reported wire protocol; None is unknown and still requires authentication.
-    pub transport_protocol: Option<u8>,
+    /// Reported complete [wire, handshake, channel] profiles; None is unknown.
+    pub serving_profiles: Option<Vec<[u8; 3]>>,
     /// Reported by the verified SSH login for endpoint identity binding.
     /// Noise must still prove that the daemon holds the corresponding private key.
     pub server_pubkey: [u8; 32],
@@ -77,7 +83,11 @@ impl Ready {
 #[derive(Debug)]
 pub enum BringUpError {
     /// A preflight choice requiring caller consent before registration/readiness.
-    BusyDaemon(BusyDaemonInfo),
+    BusyDaemon(Box<BusyDaemonInfo>),
+    /// No qualified preservation transaction or exact-instance destructive authority.
+    DestructiveRestartUnavailable,
+    /// The installed helper cannot offer a pre-handshake busy decision.
+    BusyReportingUnavailable,
     InvalidRequest(String),
     UnsupportedPlatform(String),
     InstallRequired,
@@ -101,8 +111,10 @@ impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BringUpError::BusyDaemon(info) => write!(f,
-                "running qshd {} has {} active connections; the new daemon cannot start. Connect using the running daemon instead?",
+                "running qshd {} has {} active connections; the new daemon cannot start. choose Cancel, Continue with old daemon, or Force update.",
                 info.identity.version, info.active_connections),
+            BringUpError::BusyReportingUnavailable => write!(f, "the installed qshd helper did not advertise support for busy-daemon choices; update that executable before retrying. The running daemon was left unchanged"),
+            BringUpError::DestructiveRestartUnavailable => write!(f, "forced update is unavailable: this daemon cannot prove an exact-instance restart; no sessions were interrupted"),
             BringUpError::InvalidRequest(reason) => write!(f, "invalid bring-up request: {reason}"),
             BringUpError::UnsupportedPlatform(platform) => {
                 write!(f, "unsupported server platform: {platform}")
@@ -309,7 +321,7 @@ mod tests {
 
     fn ready(ports: Vec<u16>) -> Ready {
         Ready {
-            transport_protocol: None,
+            serving_profiles: None,
             ports,
             server_pubkey: [7; 32],
             version: "0.3.0".into(),

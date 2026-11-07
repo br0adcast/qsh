@@ -5,6 +5,7 @@
 
 pub mod args;
 pub mod background;
+mod busy_daemon;
 pub mod client_install;
 pub mod climb;
 pub mod connect;
