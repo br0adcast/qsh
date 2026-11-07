@@ -46,6 +46,40 @@ struct Prepared<'a> {
     bundle: &'a [u8],
 }
 
+struct InstallationLock {
+    file: File,
+}
+
+impl InstallationLock {
+    fn acquire(file: File) -> io::Result<Self> {
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .map_err(installation_lock_error)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for InstallationLock {
+    fn drop(&mut self) {
+        // Closing only this File can leave the lock alive through a descriptor
+        // alias. End the publication lease before closing the owning File.
+        while let Err(rustix::io::Errno::INTR) =
+            rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock)
+        {}
+    }
+}
+
+fn installation_lock_error(error: rustix::io::Errno) -> io::Error {
+    let error = io::Error::from(error);
+    if error.kind() == io::ErrorKind::WouldBlock {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "another installation is in progress; try again",
+        )
+    } else {
+        error
+    }
+}
+
 fn refuse(message: &str) -> io::Error {
     io::Error::other(message)
 }
@@ -257,8 +291,7 @@ fn publish_prepared_with_cancel(
     if !meta.is_file() || meta.uid() != uid() || meta.nlink() != 1 || meta.mode() & 0o077 != 0 {
         return Err(refuse("unsafe installation lock"));
     }
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .map_err(|_| refuse("another installation is in progress; try again"))?;
+    let _lock = InstallationLock::acquire(lock)?;
     match expected {
         Some(previous) => {
             if previous.prefix != prefix || active_link(&prefix)? != previous.active_target {
@@ -469,6 +502,92 @@ mod tests {
         fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         Temp(path)
     }
+    fn installation_lock_file(path: &Path) -> File {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .unwrap();
+        let meta = file.metadata().unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.uid(), uid());
+        assert_eq!(meta.nlink(), 1);
+        assert_eq!(meta.mode() & 0o077, 0);
+        file
+    }
+
+    #[test]
+    fn installation_lock_drop_releases_with_retained_descriptor_alias() {
+        for exit in [
+            None,
+            Some(io::ErrorKind::Other),
+            Some(io::ErrorKind::Interrupted),
+        ] {
+            let home = temp();
+            let path = home.path().join("install.lock");
+            let mut alias = None;
+            let result = (|| -> io::Result<()> {
+                let guard = InstallationLock::acquire(installation_lock_file(&path))?;
+                alias = Some(guard.file.try_clone()?);
+                if let Some(kind) = exit {
+                    return Err(io::Error::new(kind, "fixture publication exit"));
+                }
+                Ok(())
+            })();
+            assert_eq!(result.as_ref().err().map(io::Error::kind), exit);
+            let alias = alias.unwrap();
+            assert!(alias.metadata().unwrap().is_file());
+            let contender = InstallationLock::acquire(installation_lock_file(&path))
+                .unwrap_or_else(|error| {
+                    panic!("publication exit {exit:?} retained its lock: {error}")
+                });
+            drop(contender);
+            assert!(alias.metadata().unwrap().is_file());
+        }
+    }
+
+    #[test]
+    fn installation_lock_blocks_competitor_until_owner_drop() {
+        let home = temp();
+        let path = home.path().join("install.lock");
+        let owner = InstallationLock::acquire(installation_lock_file(&path)).unwrap();
+        let alias = owner.file.try_clone().unwrap();
+        for _ in 0..2 {
+            let error = InstallationLock::acquire(installation_lock_file(&path))
+                .err()
+                .expect("independent contender must not acquire the active owner's lock");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+        drop(owner);
+        let _contender = InstallationLock::acquire(installation_lock_file(&path)).unwrap();
+        assert!(alias.metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn installation_lock_acquisition_errors_preserve_native_errno() {
+        let blocked = installation_lock_error(rustix::io::Errno::WOULDBLOCK);
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+        assert!(blocked.to_string().contains("another installation"));
+        for errno in [
+            rustix::io::Errno::INTR,
+            rustix::io::Errno::BADF,
+            rustix::io::Errno::ACCESS,
+            rustix::io::Errno::IO,
+        ] {
+            let error = installation_lock_error(errno);
+            assert_eq!(error.raw_os_error(), Some(errno.raw_os_error()));
+            assert_eq!(
+                error.kind(),
+                io::Error::from_raw_os_error(errno.raw_os_error()).kind()
+            );
+            assert!(!error.to_string().contains("another installation"));
+        }
+    }
+
     fn image() -> Prepared<'static> {
         Prepared {
             bytes: b"verified client fixture",
@@ -494,6 +613,11 @@ mod tests {
             let error =
                 publish_prepared_with_cancel(home.path(), &prefix, &image(), None, &cancelled)
                     .unwrap_err();
+            assert_eq!(
+                checks.get(),
+                stop_at,
+                "injected cancellation boundary {stop_at} was not reached: {error}"
+            );
             assert_eq!(
                 error.kind(),
                 io::ErrorKind::Interrupted,
@@ -535,6 +659,11 @@ mod tests {
                 &cancelled,
             )
             .unwrap_err();
+            assert_eq!(
+                checks.get(),
+                stop_at,
+                "injected cancellation boundary {stop_at} was not reached: {error}"
+            );
             assert_eq!(
                 error.kind(),
                 io::ErrorKind::Interrupted,

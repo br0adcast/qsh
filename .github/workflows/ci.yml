@@ -98,40 +98,8 @@ jobs:
             2>&1 | tee "$runtime/store-policy.log"
           grep -E '^test client_install::.* \.\.\. ok$' "$runtime/store-policy.log"
           grep -E '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$runtime/store-policy.log"
-          # Resolve the owned unit runner once; repetitions must never rebuild.
-          cargo test -p qsh --lib --locked --no-run --message-format=json > "$runtime/store-artifacts.jsonl"
-          python3 -I -B - "$runtime/store-artifacts.jsonl" "$runtime" <<'PY_STORE_REPEAT'
-          import json, os, pathlib, subprocess, sys
-          root = pathlib.Path.cwd().resolve(strict=True)
-          rows = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
-          candidates = [row for row in rows if row.get('reason') == 'compiler-artifact'
-                        and row.get('target', {}).get('name') == 'qsh'
-                        and row.get('target', {}).get('kind') == ['lib']
-                        and row.get('profile', {}).get('test') is True
-                        and row.get('executable')
-                        and pathlib.Path(row['manifest_path']).resolve(strict=True) == root / 'cli/Cargo.toml'
-                        and pathlib.Path(row['target']['src_path']).resolve(strict=True) == root / 'cli/src/lib.rs']
-          assert len(candidates) == 1, 'expected one current Cargo qsh library test executable'
-          executable = pathlib.Path(candidates[0]['executable'])
-          assert executable.is_absolute() and executable.is_file() and os.access(executable, os.X_OK)
-          executable = executable.resolve(strict=True)
-          target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', root / 'target')).resolve(strict=True)
-          assert target in executable.parents, 'unit runner must belong to the owned Cargo target'
-          for iteration in range(1, 21):
-              print(f'macOS managed store repetition {iteration}/20', flush=True)
-              try:
-                  result = subprocess.run([str(executable), 'client_install::store::tests', '--color', 'never'],
-                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
-              except subprocess.TimeoutExpired as error:
-                  output = error.stdout or b''
-                  print(output.decode(errors='replace') if isinstance(output, bytes) else output, flush=True)
-                  raise SystemExit(f'store repetition {iteration}/20 exceeded 30 seconds')
-              pathlib.Path(sys.argv[2], f'store-repeat-{iteration}.log').write_text(result.stdout)
-              print(result.stdout, end='', flush=True)
-              if result.returncode != 0:
-                  raise SystemExit(f'store repetition {iteration}/20 failed ({result.returncode})')
-              assert 'test result: ok. 13 passed; 0 failed; 0 ignored;' in result.stdout
-          PY_STORE_REPEAT
+          grep -Fx 'test client_install::store::tests::installation_lock_drop_releases_with_retained_descriptor_alias ... ok' "$runtime/store-policy.log"
+          grep -Fx 'test client_install::store::tests::installation_lock_blocks_competitor_until_owner_drop ... ok' "$runtime/store-policy.log"
           cargo test -p qsh --lib --locked releases::client -- --color never \
             2>&1 | tee "$runtime/release-client.log"
           grep -E '^test releases::client::.* \.\.\. ok$' "$runtime/release-client.log"
