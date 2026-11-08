@@ -24,3 +24,8 @@ mod resources_tests;
 pub mod input;
 pub mod recovery_runtime;
 mod writer;
+
+#[allow(dead_code)] // Dormant state shard; real proof/custody adapters are not integrated.
+pub(crate) mod authorization;
+#[allow(dead_code)] // No host process, endpoint, or writer is activated.
+pub(crate) mod host;
