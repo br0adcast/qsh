@@ -114,7 +114,13 @@ class AcceptanceTests(unittest.TestCase):
                         '.github/workflows/release.yml',
                         'scripts/released-peer-acceptance.py',
                         'scripts/tests/test_released_peer_acceptance.py',
-                        'cli/tests/mixed_versions.rs', 'qshd/tests/mixed_versions.rs'):
+                        'cli/tests/mixed_versions.rs', 'qshd/tests/mixed_versions.rs',
+                        'crates/daemon-bootstrap-protocol/src/lib.rs',
+                        'crates/bringup/src/ensure.rs', 'crates/bringup/src/install.rs',
+                        'qshd/src/main.rs', 'qshd/src/control.rs', 'qshd/src/control/path.rs',
+                        'qshd/src/transport_daemon.rs', 'qshd/src/destructive_restart.rs',
+                        'qshd/src/modern_restart.rs', 'cli/src/ssh_step.rs',
+                        'cli/src/busy_daemon.rs', 'cli/src/climb.rs'):
             self.assertTrue(any(fnmatch.fnmatchcase(changed, pattern) for pattern in paths), changed)
         self.assertFalse(any(fnmatch.fnmatchcase('README.md', pattern) for pattern in paths))
         self.assertIn('ref: ${{ github.sha }}', workflow)

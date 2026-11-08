@@ -27,6 +27,7 @@ impl BusyPrompt {
         let pending = self.pending.as_ref()?;
         if pending.info().attempt != expected.attempt
             || pending.info().identity != expected.identity
+            || pending.info().candidate != expected.candidate
         {
             return None;
         }
@@ -79,6 +80,10 @@ mod tests {
                 checksum: "ab".repeat(32),
                 pid: 42,
                 generation: None,
+            },
+            candidate: bringup::CandidateImageIdentity {
+                build: 2,
+                checksum: "ef".repeat(32),
             },
             active_connections: 2,
             serving_profiles: None,
@@ -161,6 +166,16 @@ mod tests {
         }
         assert!(!text.contains("safe update"));
     }
+    #[test]
+    fn changed_candidate_cannot_answer_an_old_local_prompt() {
+        let live = info();
+        let mut prompt = BusyPrompt::new(live.clone()).unwrap();
+        let mut changed = live.clone();
+        changed.candidate.build += 1;
+        assert!(prompt.resolve(&changed, BusyChoice::ForceUpdate).is_none());
+        assert!(prompt.resolve(&live, BusyChoice::ContinueOld).is_some());
+    }
+
     #[test]
     fn stale_or_duplicate_local_answers_are_inert() {
         let live = info();

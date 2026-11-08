@@ -65,12 +65,22 @@ enum VerificationFault {
     ExtraRecord,
     Warning,
 }
+#[derive(Clone, Copy)]
+enum EnsureFault {
+    Transport,
+    Exit,
+    Malformed,
+    Refused,
+    Uncertain,
+}
 struct Fixture {
     root: tempfile::TempDir,
     found: Option<PathBuf>,
     cached: Option<PathBuf>,
     commands: Vec<(String, String)>,
     bootstrap_capabilities: Option<String>,
+    busy_candidate: Option<crate::CandidateImageIdentity>,
+    ensure_fault: Option<EnsureFault>,
     uploads: usize,
     cancel_after_trust: bool,
     poison_path: Option<PathBuf>,
@@ -88,6 +98,8 @@ impl Fixture {
             cached: None,
             commands: vec![],
             bootstrap_capabilities: None,
+            busy_candidate: None,
+            ensure_fault: None,
             uploads: 0,
             cancel_after_trust: false,
             poison_path: None,
@@ -122,6 +134,7 @@ impl Fixture {
             60022,
             [7; 32],
             false,
+            None,
             None,
             "fixture.invalid".into(),
             "fixture".into(),
@@ -180,6 +193,44 @@ impl Remote for Fixture {
             });
         }
         if what == "qshd transport-ensure" {
+            if let Some(fault) = self.ensure_fault {
+                return match fault {
+                    EnsureFault::Transport => Err(BringUpError::Transfer(
+                        "owned fixture exec disconnected".into(),
+                    )),
+                    EnsureFault::Exit => Ok(exec::test_support::output(
+                        1,
+                        "owned fixture failed after possible commit",
+                    )),
+                    EnsureFault::Malformed => Ok(exec::test_support::output(0, "not readiness")),
+                    EnsureFault::Refused | EnsureFault::Uncertain => {
+                        let attempt = script
+                            .split("--busy-attempt ")
+                            .nth(1)
+                            .unwrap()
+                            .split_whitespace()
+                            .next()
+                            .unwrap()
+                            .trim_matches('\'');
+                        Ok(exec::test_support::output(0,&format!("TRANSPORT-RESTART-FAILED {{\"attempt\":\"{attempt}\",\"disposition\":\"{}\"}}\n",if matches!(fault,EnsureFault::Refused) {"refused"}else{"uncertain"})))
+                    }
+                };
+            }
+            if let Some(candidate) = &self.busy_candidate {
+                let attempt = script
+                    .split("--busy-attempt ")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .trim_matches('\'');
+                let info = serde_json::json!({"schema":1,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":candidate,"active_connections":2,"serving_profiles":null,"preservation":"unknown"});
+                return Ok(exec::test_support::output(
+                    0,
+                    &format!("TRANSPORT-BUSY {info}\n"),
+                ));
+            }
             return Ok(exec::test_support::output(0,"server-pubkey: BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\nTRANSPORT-READY {\"version\":\"custom-actual\",\"ports\":[60022]}\n"));
         }
         let mut command = Command::new("/bin/sh");
@@ -635,6 +686,7 @@ fn busy_opt_in_requires_explicit_tool_capability_without_mutating_legacy_daemon(
         [7; 32],
         true,
         None,
+        None,
         "fixture.invalid".into(),
         "fixture".into(),
         22,
@@ -684,6 +736,7 @@ fn advertised_tool_capability_allows_scoped_busy_flags_without_version_inference
         [7; 32],
         true,
         None,
+        None,
         "fixture.invalid".into(),
         "fixture".into(),
         22,
@@ -698,4 +751,136 @@ fn advertised_tool_capability_allows_scoped_busy_flags_without_version_inference
         .find(|(what, _)| what == "qshd transport-ensure")
         .unwrap();
     assert!(ensure.1.contains("--report-busy") && ensure.1.contains("--busy-attempt"));
+}
+
+#[test]
+fn reported_candidate_must_match_verified_provider_bytes_before_prompting() {
+    for matches in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.bootstrap_capabilities = Some(r#"{"schema":1,"busy_decisions":true}"#.into());
+        let expected = hex(&Sha256::digest(b"owned fixture; never execute"));
+        fixture.busy_candidate = Some(crate::CandidateImageIdentity {
+            build: 2,
+            checksum: if matches {
+                expected.clone()
+            } else {
+                "aa".repeat(32)
+            },
+        });
+        let (_, hooks) = hooks();
+        let result = on_session(
+            &mut fixture,
+            "fixture".into(),
+            60022,
+            [7; 32],
+            true,
+            None,
+            None,
+            "fixture.invalid".into(),
+            "fixture".into(),
+            22,
+            InstallPolicy::EnsureBundled {
+                version: "0.5.0".into(),
+            },
+            hooks,
+            &knock::Cancel::new(),
+        );
+        if matches {
+            assert!(
+                matches!(result,Err(BringUpError::BusyDaemon(info)) if info.candidate.checksum==expected)
+            );
+        } else {
+            assert!(matches!(result, Err(BringUpError::Verify(_))), "{result:?}");
+        }
+    }
+}
+
+#[test]
+fn confirmed_destructive_command_loss_is_uncertain_without_retry_or_ready() {
+    use daemon_bootstrap_protocol::*;
+    for fault in [
+        EnsureFault::Transport,
+        EnsureFault::Exit,
+        EnsureFault::Malformed,
+        EnsureFault::Refused,
+        EnsureFault::Uncertain,
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.daemon(0o700);
+        fixture.bootstrap_capabilities = Some(r#"{"schema":1,"busy_decisions":true}"#.into());
+        fixture.ensure_fault = Some(fault);
+        let busy = BusyDaemonInfo {
+            schema: 1,
+            attempt: BusyAttemptId::from_bytes([1; 16]),
+            identity: BusyDaemonIdentity {
+                version: "0.6.0-rc1".into(),
+                build: 1,
+                checksum: "ab".repeat(32),
+                pid: 42,
+                generation: Some("cd".repeat(16)),
+            },
+            candidate: CandidateImageIdentity {
+                build: 2,
+                checksum: "ef".repeat(32),
+            },
+            active_connections: 2,
+            serving_profiles: None,
+            preservation: PreservationCapability::Unknown,
+        };
+        let consent = busy.confirm_destructive_restart();
+        let decision = PendingBusy::new(busy)
+            .unwrap()
+            .decide(BusyChoice::ForceUpdate);
+        let (_, hooks) = hooks();
+        let result = on_session(
+            &mut fixture,
+            "fixture".into(),
+            60022,
+            [7; 32],
+            true,
+            Some(decision),
+            Some(consent),
+            "fixture.invalid".into(),
+            "fixture".into(),
+            22,
+            InstallPolicy::ExistingOnly,
+            hooks,
+            &knock::Cancel::new(),
+        );
+        if matches!(fault, EnsureFault::Refused) {
+            assert!(matches!(
+                result,
+                Err(BringUpError::DestructiveRestartUnavailable)
+            ));
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(BringUpError::DestructiveRestartUncertain { .. })
+                ),
+                "{result:?}"
+            );
+        }
+        if matches!(fault, EnsureFault::Transport) {
+            assert!(
+                matches!(&result,Err(BringUpError::DestructiveRestartUncertain {cause:Some(cause)}) if matches!(cause.as_ref(),BringUpError::Transfer(message) if message=="owned fixture exec disconnected"))
+            );
+        }
+        assert_eq!(fixture.starts(), 1);
+        assert!(fixture
+            .commands
+            .last()
+            .unwrap()
+            .1
+            .contains("--destructive-consent"));
+    }
+    let mut fixture = Fixture::new();
+    fixture.daemon(0o700);
+    fixture.ensure_fault = Some(EnsureFault::Transport);
+    let (_, hooks) = hooks();
+    assert!(matches!(
+        fixture.run(InstallPolicy::ExistingOnly, hooks, &knock::Cancel::new()),
+        Err(BringUpError::Transfer(_))
+    ));
+    assert_eq!(fixture.starts(), 1);
 }

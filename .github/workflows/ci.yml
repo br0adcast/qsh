@@ -255,6 +255,21 @@ jobs:
           ! grep -F 'SKIPPED' "$runtime/results.log"
           grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
+          observer_name=darwin_process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session
+          timed observer-runtime "$ordinary_harness" --exact "$observer_name" \
+            --nocapture --test-threads=1 --color=never 2>&1 | tee "$runtime/observer-results.log"
+          awk -v expected="test $observer_name ... " '
+            index($0, expected) == 1 {
+              seen++; pending = 1
+              if ($0 == expected "ok") { passed++; pending = 0 }
+              next
+            }
+            pending && $0 == "ok" { passed++; pending = 0 }
+            END { exit !(seen == 1 && passed == 1) }
+          ' "$runtime/observer-results.log"
+          test "$(grep -Fc 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$runtime/observer-results.log")" -eq 1
+          ! grep -F 'SKIPPED' "$runtime/observer-results.log"
+          verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
           timed keeper-runtime "$ordinary_harness" darwin_process_scope::keeper_tests::keeper_native_ \
             --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-results.log"
           for name in \
@@ -718,25 +733,26 @@ jobs:
             climb::bootstrap_tests::background_ssh_rejects_a_foreign_ready_key_and_retries_the_same_route \
             climb::bootstrap_tests::background_ssh_rejects_a_conflicting_pin_on_the_returned_port \
             climb::bootstrap_tests::background_ssh_cannot_publish_from_an_unreadable_endpoint_pin_store \
-            climb::bootstrap_tests::busy_user_decline_stops_all_routes_before_later_connection_activity \
             climb::bootstrap_tests::an_ssh_bootstrap_grant_is_bound_to_the_exact_route_port_and_stage \
             climb::bootstrap_tests::foreground_replacement_cannot_adopt_another_ssh_returned_daemon_key \
-            climb::bootstrap_tests::ssh_first_memory_recovery_ignores_corrupt_store_and_rechecks_qsh_identity \
+            climb::bootstrap_tests::ssh_first_selected_identity_publishes_without_store_and_replacement_retains_it \
             climb::bootstrap_tests::ssh_first_mismatched_or_cancelled_bootstrap_never_publishes \
             climb::bootstrap_tests::ssh_first_new_connection_is_empty_and_foreign_identity_cannot_inherit \
+            climb::bootstrap_tests::ssh_first_memory_recovery_ignores_corrupt_store_and_rechecks_qsh_identity \
             climb::bootstrap_tests::ssh_first_origin_uses_ssh_port_and_established_evidence_is_immutable \
-            climb::bootstrap_tests::ssh_first_selected_identity_publishes_without_store_and_replacement_retains_it \
             climb::bootstrap_tests::ssh_first_wrong_origin_or_unauthenticated_peer_cannot_publish \
             climb::bootstrap_tests::ssh_selected_version_is_display_context_for_unknown_handshake_failure \
+            climb::bootstrap_tests::busy_user_decline_stops_all_routes_before_later_connection_activity \
             climb::bootstrap_tests::selected_continue_helper_failure_stops_all_routes_and_joins_probes \
             climb::bootstrap_tests::selected_continue_uncertain_ssh_command_stops_all_routes_and_joins_probes \
             climb::bootstrap_tests::selected_confirmed_force_unavailable_stops_all_routes_and_joins_probes \
+            climb::bootstrap_tests::selected_confirmed_modern_force_uncertainty_stops_all_routes_and_joins_probes \
             climb::bootstrap_tests::selected_ready_unknown_profile_timeout_stops_all_routes_and_joins_probes \
             climb::bootstrap_tests::selected_ready_known_profile_data_failure_stops_all_routes_and_joins_probes \
-            climb::bootstrap_tests::selected_ready_authenticated_protocol_mismatch_stops_all_routes_and_joins_probes \
-            climb::bootstrap_tests::successful_selected_connection_discards_boundary_before_established_recovery \
             climb::bootstrap_tests::unselected_foreground_helper_failure_still_advances_to_the_next_route \
             climb::bootstrap_tests::unselected_background_failure_still_advances_to_the_next_route \
+            climb::bootstrap_tests::selected_ready_authenticated_protocol_mismatch_stops_all_routes_and_joins_probes \
+            climb::bootstrap_tests::successful_selected_connection_discards_boundary_before_established_recovery \
             climb::bootstrap_tests::selected_continue_fresh_busy_replaces_consent_and_cancel_stops_all_routes; do
             awk -v expected="test $name ... " '
               index($0, expected) == 1 {
@@ -748,7 +764,7 @@ jobs:
               END { exit !(seen == 1 && passed == 1) }
             ' "$runtime/results.log"
           done
-          grep -F 'test result: ok. 23 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          grep -F 'test result: ok. 24 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           if grep -Fq 'SKIPPED' "$runtime/results.log"; then
             echo '::error::portable inline SSH bootstrap tests reported a runtime skip' >&2
             exit 1
@@ -1562,9 +1578,11 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 74` is the exact compiled system-library body count:
-          # the prior 73 plus the owned worker stage-barrier fixture body.
-          # Its four required parent regressions below drive that body.
+          # `--ignored 75` is the exact compiled system-library body count:
+          # the prior 74 plus native_observer_process, an isolated exit-only
+          # observer role. Its required native_observer_retains_unrelated_process
+          # parent below drives marker/liveness, drop-without-kill and exact exit.
+          # The owned worker stage-barrier body's four parents remain required.
           # The deleted-cwd body is in qshd's binary test target, not this
           # library binary. Keep the strict count and require both library
           # wrappers below so a missing body or wrapper fails visibly.
@@ -1601,12 +1619,13 @@ jobs:
           # could still vanish from a `399 passed` run unnoticed -- just
           # smaller by the one test this line now does cover.
           #
-          # The 74 isolated bodies are a separate matter and get no
+          # The 75 isolated bodies are a separate matter and get no
           # --require: each is #[ignore]d here BY DESIGN and re-run as a
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 74 \
+          run_suite lib qshd --ignored 75 \
+            --require process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session \
             --require control::peer_tests::control_peer_root_client_rejects_foreign_server \
             --require control::peer_tests::control_peer_foreign_client_rejects_root_server \
             --require transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \

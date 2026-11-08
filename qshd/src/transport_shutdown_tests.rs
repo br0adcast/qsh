@@ -201,6 +201,7 @@ async fn stop_with_held_cleanup(replace: bool, signal: bool, fail: bool, pressur
                 gate,
                 None,
                 stop,
+                None,
             )
             .await
         })
@@ -597,23 +598,22 @@ async fn personal39_signal_preserves_an_admitted_gate_held_stop_ack() {
     let gate = Arc::new(tokio::sync::RwLock::new(()));
     let held = gate.clone().write_owned().await;
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
     let mut daemon = spawn_control_fixture(
         &path,
         gate.clone(),
         Arc::new(Mutex::new(Vec::new())),
         async move { stop_rx.await.map_err(anyhow::Error::new) },
+        Some(admitted_tx),
     );
     let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
     client.write_all(b"STOP\n").await.unwrap();
-    // The test, write guard and daemon own three references. Only an accepted
-    // handler creates the fourth: the signal must race an admitted connection.
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while Arc::strong_count(&gate) < 4 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("STOP handler was admitted before the signal");
+    // A receipt from the actual accept future establishes admission without
+    // assuming how many coordinator owners retain the shared control gate.
+    tokio::time::timeout(Duration::from_secs(3), admitted_rx)
+        .await
+        .expect("STOP acceptance deadline")
+        .expect("STOP was accepted before signal");
     stop_tx.send(()).unwrap();
     let early = tokio::time::timeout(Duration::from_millis(50), &mut daemon)
         .await
@@ -729,6 +729,7 @@ async fn personal39_join_retains_a_stop_ack_whose_writer_is_pending() {
         Arc::new(tokio::sync::RwLock::new(())),
         None,
         None,
+        None,
     );
     stop_rx
         .recv()
@@ -750,43 +751,75 @@ async fn personal39_join_retains_a_stop_ack_whose_writer_is_pending() {
     assert!(handlers.is_empty());
 }
 
+struct AcceptanceReceipt {
+    listener: tokio::net::UnixListener,
+    admitted: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl super::ControlAcceptor for AcceptanceReceipt {
+    async fn accept(&mut self) -> std::io::Result<tokio::net::UnixStream> {
+        let (stream, _) = self.listener.accept().await?;
+        // Once accept resolves, the owner spawns this stream's handler in the
+        // selected branch without another cancellation point.
+        if let Some(admitted) = self.admitted.take() {
+            let _ = admitted.send(());
+        }
+        Ok(stream)
+    }
+}
+
 fn spawn_control_fixture(
     path: &std::path::Path,
     gate: Arc<tokio::sync::RwLock<()>>,
     allowlist: Arc<Mutex<Vec<[u8; 32]>>>,
     stop: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+    admitted: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let (listener, cleanup) = crate::control::bind_private_owned(path).unwrap();
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let server = generate_keypair();
-    tokio::spawn(super::run_transport_daemon_until_stop(
-        socket,
-        server.private,
-        ServerAuth {
-            allowlist,
-            verifier: None,
-            server_pub: server.public,
-            self_principal: Principal {
-                uid: 1000,
-                name: "fixture".into(),
-                identity: "allowlist".into(),
-                incarnation: 0,
-            },
-            nonces: Arc::new(crate::RandomNonces),
-            logins: Arc::new(crate::ForgetNothing),
-        },
-        Arc::new(HeldCleanup {
-            runs: [HeldRun::new(), HeldRun::new()],
-            next: AtomicUsize::new(0),
-        }),
-        listener,
-        cleanup,
-        vec![1],
-        Arc::new(AtomicUsize::new(0)),
-        gate,
+    listener.set_nonblocking(true).unwrap();
+    let listener = AcceptanceReceipt {
+        listener: tokio::net::UnixListener::from_std(listener).unwrap(),
+        admitted,
+    };
+    let actions = Arc::new(super::Actions::new(
         None,
-        stop,
-    ))
+        gate.clone(),
+        Arc::new(crate::update::AdmissionGate::default()),
+        false,
+    ));
+    tokio::spawn(async move {
+        let _cleanup = cleanup;
+        super::run_transport_daemon_with_acceptor(
+            socket,
+            server.private,
+            ServerAuth {
+                allowlist,
+                verifier: None,
+                server_pub: server.public,
+                self_principal: Principal {
+                    uid: 1000,
+                    name: "fixture".into(),
+                    identity: "allowlist".into(),
+                    incarnation: 0,
+                },
+                nonces: Arc::new(crate::RandomNonces),
+                logins: Arc::new(crate::ForgetNothing),
+            },
+            Arc::new(HeldCleanup {
+                runs: [HeldRun::new(), HeldRun::new()],
+                next: AtomicUsize::new(0),
+            }),
+            listener,
+            vec![1],
+            Arc::new(AtomicUsize::new(0)),
+            gate,
+            None,
+            stop,
+            Some(actions),
+        )
+        .await
+    })
 }
 
 #[tokio::test]
@@ -805,6 +838,7 @@ async fn personal39_a_panicked_control_task_fails_the_joined_daemon() {
         Arc::new(tokio::sync::RwLock::new(())),
         allowlist,
         std::future::pending(),
+        None,
     );
     let mut client = tokio::net::UnixStream::connect(path).await.unwrap();
     client
@@ -911,6 +945,7 @@ fn spawn_accept_fixture(
             gate,
             None,
             stop,
+            None,
         )
         .await
     })

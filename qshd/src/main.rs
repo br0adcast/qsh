@@ -52,7 +52,7 @@ mod detach;
 
 use daemon_bootstrap_protocol::{
     BusyAttemptId, BusyChoice, BusyDaemonIdentity, BusyDaemonInfo, BusyDecision,
-    PreservationCapability,
+    CandidateImageIdentity, PreservationCapability,
 };
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
@@ -72,6 +72,14 @@ use qshd::{
     channel_backend, control, handover, load_or_create_transport_key, load_transport_key, log, pty,
     serve, state, transport_daemon, update, version,
 };
+
+fn candidate_identity() -> Result<CandidateImageIdentity> {
+    let own = update::OwnImage::current()?;
+    Ok(CandidateImageIdentity {
+        build: own.build,
+        checksum: own.checksum,
+    })
+}
 
 /// Read-only executable API discovery; no control socket or identity-key access.
 fn bootstrap_capabilities_line() -> String {
@@ -514,6 +522,7 @@ struct ParsedTransportEnsureArgs {
     report_busy: bool,
     busy_attempt: Option<BusyAttemptId>,
     busy_decision: Option<BusyDecision>,
+    destructive_consent: Option<daemon_bootstrap_protocol::DestructiveRestartConsent>,
     restart_only: bool,
     name: String,
     port: u16,
@@ -542,6 +551,8 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
     let mut report_busy = false;
     let mut busy_attempt = None;
     let mut busy_decision: Option<BusyDecision> = None;
+    let mut destructive_consent: Option<daemon_bootstrap_protocol::DestructiveRestartConsent> =
+        None;
     let mut restart_only = false;
     let mut name: Option<String> = None;
     let mut port: Option<u16> = None;
@@ -579,6 +590,17 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
                     bail!("invalid busy identity");
                 }
                 busy_decision = Some(decision);
+                i += 2;
+            }
+            "--destructive-consent" if destructive_consent.is_none() => {
+                let value = argument_text(
+                    args.get(i + 1)
+                        .context("--destructive-consent requires a value")?,
+                    i + 2,
+                )?;
+                anyhow::ensure!(value.len() <= 4096, "destructive consent exceeds limit");
+                destructive_consent =
+                    Some(serde_json::from_str(value).context("invalid destructive consent")?);
                 i += 2;
             }
             "--restart-only" => {
@@ -636,6 +658,17 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
     {
         bail!("invalid busy-daemon decision options");
     }
+    if let Some(consent) = &destructive_consent {
+        anyhow::ensure!(
+            busy_decision
+                .as_ref()
+                .is_some_and(|decision| decision.choice == BusyChoice::ForceUpdate
+                    && decision.attempt == consent.attempt
+                    && decision.identity == consent.identity
+                    && decision.candidate == consent.candidate),
+            "destructive consent does not match a force decision"
+        );
+    }
     let name = name.context("--name is required")?;
     let port = port.context("--port is required")?;
     let mut ports = vec![port];
@@ -649,6 +682,7 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
         report_busy,
         busy_attempt,
         busy_decision,
+        destructive_consent,
         restart_only,
         name,
         port,
@@ -962,21 +996,63 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
             };
             let (generation, profiles) = live_profiles(&transaction, &status, &keypair.public)?;
             let identity = status_identity(&status, generation.clone());
+            let candidate = parsed.report_busy.then(candidate_identity).transpose()?;
             let needs_choice = parsed.report_busy
                 && matches!(action, version::ReconcileAction::KeepOldWarn(_))
                 && status.total_connections > 0;
             // Current activity decides whether to report a new BUSY record, not
             // whether an identity-scoped Continue still selects this daemon.
+            let mut forced_exit = false;
             let accepted = if let Some(decision) =
                 parsed.busy_decision.as_ref().filter(|decision| {
                     Some(&decision.attempt) == parsed.busy_attempt.as_ref()
                         && decision.identity == identity
+                        && Some(&decision.candidate) == candidate.as_ref()
                         && decision.valid()
                 }) {
                 match decision.choice {
                     BusyChoice::Cancel => bail!("busy daemon startup cancelled"),
                     BusyChoice::ContinueOld => true,
-                    BusyChoice::ForceUpdate => bail!("forced update unavailable: exact-instance restart authority is not qualified; no sessions were interrupted"),
+                    BusyChoice::ForceUpdate => {
+                        anyhow::ensure!(parsed.destructive_consent.is_some(),"forced update unavailable without separate exact-instance destructive consent; no sessions were interrupted");
+                        let outcome = match (&parsed.destructive_consent, &candidate) {
+                            (Some(consent), Some(candidate)) => {
+                                qshd::interrupt_selected(&transaction, consent, candidate)
+                            }
+                            _ => qshd::RestartOutcome::Refused,
+                        };
+                        if outcome != qshd::RestartOutcome::ExactExit {
+                            use daemon_bootstrap_protocol::{
+                                DestructiveRestartDisposition, DestructiveRestartFailure,
+                            };
+                            let failure = DestructiveRestartFailure {
+                                attempt: decision.attempt.clone(),
+                                disposition: if outcome == qshd::RestartOutcome::Refused {
+                                    DestructiveRestartDisposition::Refused
+                                } else {
+                                    DestructiveRestartDisposition::Uncertain
+                                },
+                            };
+                            writeln!(
+                                std::io::stdout(),
+                                "TRANSPORT-RESTART-FAILED {}",
+                                serde_json::to_string(&failure)?
+                            )?;
+                            std::io::stdout().flush()?;
+                            return Ok(());
+                        }
+                        // Exact retained exit is necessary but does not authorize
+                        // replacing a new endpoint that appeared meanwhile.
+                        anyhow::ensure!(
+                            matches!(
+                                transaction.request(&control::ControlRequest::Status)?,
+                                control::ControlReply::NoDaemon
+                            ),
+                            "daemon changed after exact exit; rediscover before starting"
+                        );
+                        forced_exit = true;
+                        true
+                    }
                 }
             } else {
                 false
@@ -992,6 +1068,7 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
                         .clone()
                         .context("missing busy attempt")?,
                     identity,
+                    candidate: candidate.clone().context("missing selected candidate")?,
                     active_connections: status.total_connections,
                     serving_profiles: profiles.clone(),
                     preservation: PreservationCapability::Unknown,
@@ -1007,57 +1084,63 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
                 std::io::stdout().flush()?;
                 return Ok(());
             }
-            let warning = match &action {
-                version::ReconcileAction::KeepOldWarn(reason) if !accepted => Some(reason.as_str()),
-                _ => None,
-            };
-            let decision = if accepted {
-                transport_daemon::EnsureDecision::Reuse
-            } else {
-                transport_daemon::decide_reuse(&action)
-            };
-            match decision {
-                transport_daemon::EnsureDecision::Reuse => {
-                    if transport_daemon::reuse_compatibility(profiles.as_deref())
-                        == transport_daemon::ReuseCompatibility::Incompatible
-                    {
-                        bail!("running qshd {} serves incompatible session profiles {:?}; required profile [{}, {}, {}]. The running daemon was left unchanged. Use a client with a matching profile, or finish active qsh sessions before updating the daemon", status.version, profiles, transport::wire::VERSION, transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION);
+            if !forced_exit {
+                let warning = match &action {
+                    version::ReconcileAction::KeepOldWarn(reason) if !accepted => {
+                        Some(reason.as_str())
                     }
-                    let actual = if let Some(pubkey) = parsed.client_pubkey {
-                        let request = registration_request(
-                            &transaction,
-                            &status,
-                            generation.as_deref(),
-                            pubkey,
+                    _ => None,
+                };
+                let decision = if accepted {
+                    transport_daemon::EnsureDecision::Reuse
+                } else {
+                    transport_daemon::decide_reuse(&action)
+                };
+                match decision {
+                    transport_daemon::EnsureDecision::Reuse => {
+                        if transport_daemon::reuse_compatibility(profiles.as_deref())
+                            == transport_daemon::ReuseCompatibility::Incompatible
+                        {
+                            bail!("running qshd {} serves incompatible session profiles {:?}; required profile [{}, {}, {}]. The running daemon was left unchanged. Use a client with a matching profile, or finish active qsh sessions before updating the daemon", status.version, profiles, transport::wire::VERSION, transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION);
+                        }
+                        let actual = if let Some(pubkey) = parsed.client_pubkey {
+                            let request = registration_request(
+                                &transaction,
+                                &status,
+                                generation.as_deref(),
+                                pubkey,
+                            )?;
+                            validate_add_client_reply(transaction.request(&request)?, &status)?
+                        } else {
+                            ready_ports(&status)?;
+                            status.clone()
+                        };
+                        let (after_generation, after_profiles) =
+                            live_profiles(&transaction, &actual, &keypair.public)?;
+                        if after_generation != generation || after_profiles != profiles {
+                            bail!(
+                                "daemon changed during registration; rediscover and choose again"
+                            );
+                        }
+                        transaction.validate_route()?;
+                        write_transport_ready_profiles(
+                            &mut std::io::stdout(),
+                            &actual.version,
+                            &keypair.public,
+                            &ready_ports(&actual)?,
+                            combined_warning(warning, actual.logging_warning.as_deref()).as_deref(),
+                            profiles,
                         )?;
-                        validate_add_client_reply(transaction.request(&request)?, &status)?
-                    } else {
-                        ready_ports(&status)?;
-                        status.clone()
-                    };
-                    let (after_generation, after_profiles) =
-                        live_profiles(&transaction, &actual, &keypair.public)?;
-                    if after_generation != generation || after_profiles != profiles {
-                        bail!("daemon changed during registration; rediscover and choose again");
+                        return Ok(());
                     }
-                    transaction.validate_route()?;
-                    write_transport_ready_profiles(
-                        &mut std::io::stdout(),
-                        &actual.version,
-                        &keypair.public,
-                        &ready_ports(&actual)?,
-                        combined_warning(warning, actual.logging_warning.as_deref()).as_deref(),
-                        profiles,
-                    )?;
-                    return Ok(());
-                }
-                transport_daemon::EnsureDecision::BecomeDaemon => {
-                    // The daemon is stale (`Replace`): ask it to stop,
-                    // wait for the socket/port to be released, and become
-                    // the daemon ourselves.
-                    transaction.request(&control::ControlRequest::Stop)?;
-                    wait_for_daemon_release(&transaction, parsed.port)?;
-                    // Falls through to the "become the daemon" branch below.
+                    transport_daemon::EnsureDecision::BecomeDaemon => {
+                        // The daemon is stale (`Replace`): ask it to stop,
+                        // wait for the socket/port to be released, and become
+                        // the daemon ourselves.
+                        transaction.request(&control::ControlRequest::Stop)?;
+                        wait_for_daemon_release(&transaction, parsed.port)?;
+                        // Falls through to the "become the daemon" branch below.
+                    }
                 }
             }
         }
@@ -1188,9 +1271,16 @@ fn become_transport_daemon(
     // from its first instant (spec §4.16, QSH-14). By this point there is
     // definitely no live daemon (see `run_transport_ensure`), so a file at
     // the name is a stale one, and `bind_private` replaces it.
-    let (listener, mut cleanup) = transaction
-        .bind_private_owned()
-        .with_context(|| format!("binding the control socket {}", sock_path.display()))?;
+    #[cfg(target_os = "linux")]
+    let bound = if parsed.destructive_consent.is_some() {
+        transaction.bind_private_absent_owned()
+    } else {
+        transaction.bind_private_owned()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let bound = transaction.bind_private_owned();
+    let (listener, mut cleanup) =
+        bound.with_context(|| format!("binding the control socket {}", sock_path.display()))?;
     let bound_port = socket
         .local_addr()
         .context("reading the bound UDP port")?
@@ -1323,6 +1413,21 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     let active_count = Arc::new(AtomicUsize::new(0));
     let control_gate = Arc::new(tokio::sync::RwLock::new(()));
     let admission = Arc::new(update::AdmissionGate::default());
+    let identity = update::OwnImage::current()
+        .ok()
+        .map(|own| BusyDaemonIdentity {
+            version: state::QSHD_VERSION.into(),
+            build: own.build,
+            checksum: own.checksum,
+            pid: std::process::id(),
+            generation: Some(hex::encode(qshd::server_info::current().generation)),
+        });
+    let actions = Arc::new(qshd::RestartActions::new(
+        identity,
+        control_gate.clone(),
+        admission.clone(),
+        cfg!(target_os = "linux"),
+    ));
 
     // The same session backend `serve` hands its router: the daemon has no
     // startup session of its own to decide, and no tmux to drive -- it hands
@@ -1354,6 +1459,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
                 allowlist: Arc::clone(&shared_allowlist),
                 control_gate: Arc::clone(&control_gate),
                 admission: Arc::clone(&admission),
+                actions: actions.clone(),
             }),
         )));
     }
@@ -1364,7 +1470,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
         tokio::runtime::Runtime::new().context("creating the transport daemon's runtime")?;
     runtime.block_on(async {
         let mut signals = transport_daemon::PersonalSignals::register()?;
-        transport_daemon::run_transport_daemon_until_stop(
+        transport_daemon::run_transport_daemon_until_stop_with_actions(
             start.socket,
             start.keypair.private,
             personal_server_auth(shared_allowlist, start.keypair.public, admission),
@@ -1373,7 +1479,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
             start.cleanup,
             vec![start.port],
             active_count,
-            control_gate,
+            actions,
             Some(opens),
             signals.requested(),
         )
@@ -2003,8 +2109,47 @@ mod tests {
     }
 
     #[test]
+    fn destructive_confirmation_requires_exact_force_attempt_identity_and_candidate() {
+        let decision = serde_json::json!({"attempt":"12".repeat(16),"identity":{"version":"0.6.0-rc1","build":1,"checksum":"ab".repeat(32),"pid":42,"generation":"cd".repeat(16)},"candidate":{"build":2,"checksum":"ef".repeat(32)},"choice":"force_update"});
+        let consent = serde_json::json!({"attempt":decision["attempt"],"identity":decision["identity"],"candidate":decision["candidate"],"action":"stop_and_restart"});
+        let parse = |decision: &serde_json::Value, consent: &serde_json::Value| {
+            parse_transport_ensure_args(&args(&[
+                "transport-ensure",
+                "--name",
+                "fixture",
+                "--port",
+                "60022",
+                "--report-busy",
+                "--busy-attempt",
+                &"12".repeat(16),
+                "--busy-decision",
+                &decision.to_string(),
+                "--destructive-consent",
+                &consent.to_string(),
+            ]))
+        };
+        assert!(parse(&decision, &consent)
+            .unwrap()
+            .destructive_consent
+            .is_some());
+        for field in ["attempt", "generation", "candidate", "action"] {
+            let mut stale = consent.clone();
+            match field {
+                "attempt" => stale["attempt"] = "34".repeat(16).into(),
+                "generation" => stale["identity"]["generation"] = "aa".repeat(16).into(),
+                "candidate" => stale["candidate"]["build"] = 3.into(),
+                _ => stale["action"] = "preserve".into(),
+            }
+            assert!(parse(&decision, &stale).is_err());
+        }
+        let mut ordinary = decision;
+        ordinary["choice"] = "continue_old".into();
+        assert!(parse(&ordinary, &consent).is_err());
+    }
+
+    #[test]
     fn busy_flags_require_explicit_report_mode_and_valid_scoped_identity() {
-        let decision = serde_json::json!({"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"choice":"continue_old"}).to_string();
+        let decision = serde_json::json!({"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"choice":"continue_old"}).to_string();
         let attempt = "12".repeat(16);
         for suffix in [
             vec!["--busy-decision", decision.as_str()],

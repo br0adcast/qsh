@@ -20,7 +20,8 @@ mod trust;
 
 pub use daemon_bootstrap_protocol::{
     BusyAttemptId, BusyChoice, BusyDaemonIdentity, BusyDaemonInfo, BusyDecision,
-    DestructiveRestartConsent, PendingBusy, PreservationCapability,
+    CandidateImageIdentity, DestructiveRestartAction, DestructiveRestartConsent, PendingBusy,
+    PreservationCapability,
 };
 
 pub use image::{
@@ -86,6 +87,10 @@ pub enum BringUpError {
     BusyDaemon(Box<BusyDaemonInfo>),
     /// No qualified preservation transaction or exact-instance destructive authority.
     DestructiveRestartUnavailable,
+    /// A confirmed command may have committed but did not yield verified readiness.
+    DestructiveRestartUncertain {
+        cause: Option<Box<BringUpError>>,
+    },
     /// The installed helper cannot offer a pre-handshake busy decision.
     BusyReportingUnavailable,
     InvalidRequest(String),
@@ -114,6 +119,10 @@ impl fmt::Display for BringUpError {
                 "running qshd {} has {} active connections; the new daemon cannot start. choose Cancel, Continue with old daemon, or Force update.",
                 info.identity.version, info.active_connections),
             BringUpError::BusyReportingUnavailable => write!(f, "the installed qshd helper did not advertise support for busy-daemon choices; update that executable before retrying. The running daemon was left unchanged"),
+            BringUpError::DestructiveRestartUncertain {cause}=> {
+                write!(f,"forced update may have committed, but replacement readiness was not proved; rediscover before trying again")?;
+                if let Some(cause)=cause {write!(f,": {cause}")?;}Ok(())
+            },
             BringUpError::DestructiveRestartUnavailable => write!(f, "forced update is unavailable: this daemon cannot prove an exact-instance restart; no sessions were interrupted"),
             BringUpError::InvalidRequest(reason) => write!(f, "invalid bring-up request: {reason}"),
             BringUpError::UnsupportedPlatform(platform) => {
@@ -141,7 +150,14 @@ impl fmt::Display for BringUpError {
     }
 }
 
-impl std::error::Error for BringUpError {}
+impl std::error::Error for BringUpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DestructiveRestartUncertain { cause: Some(cause) } => Some(cause.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Uses an existing daemon, preserving the original bring-up policy.
 pub fn bring_up(

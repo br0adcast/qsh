@@ -1,5 +1,8 @@
 //! Identity-bound Darwin process ownership and personal PTY cleanup.
+mod observation;
 mod personal;
+#[cfg(target_os = "macos")]
+pub(crate) use observation::{Evidence as ObservationEvidence, NativeObserved};
 mod scope;
 
 pub(super) const CAPACITY: usize = 4096;

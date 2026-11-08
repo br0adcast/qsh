@@ -443,13 +443,16 @@ pub(crate) fn bring_up(
             if decision.choice != crate::BusyChoice::ForceUpdate
                 || consent.attempt != decision.attempt
                 || consent.identity != decision.identity
+                || consent.candidate != decision.candidate
             {
                 return Err(BringUpError::InvalidRequest(
                     "stale destructive restart consent".into(),
                 ));
             }
         }
-        if decision.choice == crate::BusyChoice::ForceUpdate {
+        if decision.choice == crate::BusyChoice::ForceUpdate
+            && (req.destructive_consent.is_none() || decision.identity.generation.is_none())
+        {
             return Err(BringUpError::DestructiveRestartUnavailable);
         }
     } else if req.destructive_consent.is_some() {
@@ -483,6 +486,7 @@ pub(crate) fn bring_up(
         req.client_pubkey,
         req.report_busy,
         req.busy_decision,
+        req.destructive_consent,
         host,
         username,
         ssh_port,
@@ -504,6 +508,7 @@ fn on_session(
     client_pubkey: [u8; 32],
     report_busy: bool,
     busy_decision: Option<crate::BusyDecision>,
+    destructive_consent: Option<crate::DestructiveRestartConsent>,
     host: String,
     username: String,
     ssh_port: u16,
@@ -531,6 +536,7 @@ fn on_session(
     if let locate::Located::Service(kind) = probe.located {
         return Err(BringUpError::ServiceRunning(kind));
     }
+    let mut verified_candidate_digest = None;
     let path = match (&policy, probe.located) {
         (
             InstallPolicy::ExistingOnly
@@ -574,6 +580,7 @@ fn on_session(
                 .map_err(BringUpError::Image)?;
             check_cancel(cancel)?;
             validate_image(&request, &image, cancel)?;
+            verified_candidate_digest = Some(hex(&image.sha256));
             session.install(&path, image, &hooks, cancel)?
         }
     };
@@ -607,25 +614,68 @@ fn on_session(
             .map(|d| d.attempt.clone())
             .unwrap_or_else(|| crate::BusyAttemptId::from_bytes(rand::random()))
     });
-    let output = session.command(
-        "qshd transport-ensure",
-        &ensure::command_for_policy(
-            &path,
-            &name,
-            qsh_port,
-            &client_pubkey,
-            &policy,
-            attempt.as_ref(),
-            busy_decision.as_ref(),
-        )?,
-        hooks.timing.ensure,
-        cancel,
-    )?;
+    let output = session
+        .command(
+            "qshd transport-ensure",
+            &ensure::command_for_policy(
+                &path,
+                &name,
+                qsh_port,
+                &client_pubkey,
+                &policy,
+                ensure::BusyCommand {
+                    attempt: attempt.as_ref(),
+                    decision: busy_decision.as_ref(),
+                    destructive_consent: destructive_consent.as_ref(),
+                },
+            )?,
+            hooks.timing.ensure,
+            cancel,
+        )
+        .map_err(|error| {
+            if destructive_consent.is_some() {
+                BringUpError::DestructiveRestartUncertain {
+                    cause: Some(Box::new(error)),
+                }
+            } else {
+                error
+            }
+        })?;
     if output.code != 0 {
-        return Err(output.failure("qshd transport-ensure"));
+        return Err(if destructive_consent.is_some() {
+            BringUpError::DestructiveRestartUncertain {
+                cause: Some(Box::new(output.failure("qshd transport-ensure"))),
+            }
+        } else {
+            output.failure("qshd transport-ensure")
+        });
     }
-    let stdout = output.complete_stdout().map_err(BringUpError::BadReady)?;
-    let ready = ensure::parse_for_attempt(output.code, stdout, attempt.as_ref())?;
+    let stdout = output.complete_stdout().map_err(|error| {
+        if destructive_consent.is_some() {
+            BringUpError::DestructiveRestartUncertain {
+                cause: Some(Box::new(BringUpError::BadReady(error))),
+            }
+        } else {
+            BringUpError::BadReady(error)
+        }
+    })?;
+    let ready = match ensure::parse_for_attempt(output.code, stdout, attempt.as_ref()) {
+        Err(BringUpError::BusyDaemon(info))
+            if verified_candidate_digest
+                .as_ref()
+                .is_some_and(|digest| digest != &info.candidate.checksum) =>
+        {
+            return Err(BringUpError::Verify(
+                "reported candidate differs from verified provider bytes".into(),
+            ));
+        }
+        Err(error @ BringUpError::BadReady(_)) if destructive_consent.is_some() => {
+            return Err(BringUpError::DestructiveRestartUncertain {
+                cause: Some(Box::new(error)),
+            })
+        }
+        result => result?,
+    };
     progress(hooks.observer.as_ref(), BringUpStage::Starting, true);
     check_cancel(cancel)?;
     Ok(ready)

@@ -256,6 +256,11 @@ int qsh_scope_keeper_prepare(struct qsh_scope_runtime *runtime, struct qsh_scope
     struct sigaction action;
     if (sigaction(SIGCHLD, NULL, &action) < 0) return unix_error(error);
     if (action.sa_handler == SIG_IGN || (action.sa_flags & SA_NOCLDWAIT)) return invalid(error);
+    return qsh_scope_observation_prepare(runtime,error);
+}
+
+/* Exit-only admission has no child disposition, keeper or exact-signal premise. */
+int qsh_scope_observation_prepare(struct qsh_scope_runtime *runtime, struct qsh_scope_error *error) {
     struct utsname system;
     if (uname(&system) < 0) return unix_error(error);
     if (strcmp(system.sysname, "Darwin")) return invalid(error);

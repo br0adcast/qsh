@@ -486,6 +486,21 @@ jobs:
           ! grep -F 'SKIPPED' "$runtime/results.log"
           grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
+          observer_name=darwin_process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session
+          timed observer-runtime "$ordinary_harness" --exact "$observer_name" \
+            --nocapture --test-threads=1 --color=never 2>&1 | tee "$runtime/observer-results.log"
+          awk -v expected="test $observer_name ... " '
+            index($0, expected) == 1 {
+              seen++; pending = 1
+              if ($0 == expected "ok") { passed++; pending = 0 }
+              next
+            }
+            pending && $0 == "ok" { passed++; pending = 0 }
+            END { exit !(seen == 1 && passed == 1) }
+          ' "$runtime/observer-results.log"
+          test "$(grep -Fc 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$runtime/observer-results.log")" -eq 1
+          ! grep -F 'SKIPPED' "$runtime/observer-results.log"
+          verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
           timed keeper-runtime "$ordinary_harness" darwin_process_scope::keeper_tests::keeper_native_ \
             --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-results.log"
           for name in \
