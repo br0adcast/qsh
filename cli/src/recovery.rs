@@ -1153,13 +1153,17 @@ impl Recovery {
                                     }
                                 }
                             }
-                            Err(crate::ssh_step::SshStepError::BusyCancelled) => {
+                            Err(crate::ssh_step::SshStepError::BusyCancelled
+                                | crate::ssh_step::SshStepError::SelectedBusyFailed(_)) => {
+                                // Prompt-free recovery cannot select a busy operation.
+                                // Defensively stop if a caller ever violates that boundary.
                                 recovery.stop();
                                 return;
                             }
                             Err(why) => {
                                 let message = match &why {
-                                    crate::ssh_step::SshStepError::BusyCancelled => unreachable!("handled as a terminal user choice"),
+                                    crate::ssh_step::SshStepError::BusyCancelled
+                                    | crate::ssh_step::SshStepError::SelectedBusyFailed(_) => unreachable!("handled as a terminal selected operation"),
                                     crate::ssh_step::SshStepError::Failed(failure) => report::ssh_failed(&address.host, failure),
                                     crate::ssh_step::SshStepError::NeedsPrompt => format!(
                                         "qsh: {}: SSH recovery needs credentials unavailable without a prompt; QSH keeps retrying",

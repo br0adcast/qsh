@@ -554,6 +554,7 @@ pub struct Climb<'a> {
         ::connect::recovery_gate::SweepId,
     )>,
     bootstrap: Option<SshBootstrap>,
+    selected_operation: Option<(usize, u16)>,
 }
 
 #[derive(Default)]
@@ -629,6 +630,7 @@ impl<'a> Climb<'a> {
             fresh_session: false,
             recovery_attempt: None,
             bootstrap: None,
+            selected_operation: None,
         }
     }
 }
@@ -784,14 +786,16 @@ impl<'a> Climb<'a> {
                             self.setup
                                 .install_policy(self.recovery.is_some(), self.background()),
                         )
-                        .run_identified(&addrs[addr], route, self.setup.keypair.public, cancel);
+                        .run_foreground(&addrs[addr], route, self.setup.keypair.public, cancel);
                     if !self.background() && crate::signals::termination_requested() {
                         return Climbed::Exit(130);
                     }
                     match result {
-                        Ok(identified) => {
+                        Ok(result) => {
+                            let identified = result.identified;
                             let ready = identified.ready;
                             let port = ready.port_for(addrs[addr].qsh_port);
+                            self.selected_operation = result.selected.then_some((addr, port));
                             self.bootstrap = Some(SshBootstrap {
                                 serving_version: ready.version.clone(),
                                 serving_profiles: ready.serving_profiles.clone(),
@@ -810,23 +814,18 @@ impl<'a> Climb<'a> {
                             ladder.on(outcome)
                         }
                         Err(SshStepError::BusyCancelled) => {
-                            // This is the person's decision, not a failed route.
-                            // Revoke this attempt and join every retained probe
-                            // before returning, even if the Climb itself survives.
-                            cancel.cancel();
-                            let retained = std::mem::take(
-                                &mut *self
-                                    .retained_discovery
-                                    .0
-                                    .lock()
-                                    .expect("retained discovery"),
-                            );
-                            for client in retained.into_values() {
-                                client.detach();
-                            }
-                            self.bootstrap = None;
-                            self.drain();
+                            self.end_selected_operation(cancel);
                             self.say("qsh: connection cancelled; running daemon unchanged");
+                            return Climbed::Exit(1);
+                        }
+                        Err(SshStepError::SelectedBusyFailed(failure)) => {
+                            self.end_selected_operation(cancel);
+                            let why = ::connect::SshFailure::plain(format!(
+                                "{} (selected running qshd {})",
+                                failure.error,
+                                report::printable(&failure.info.identity.version),
+                            ));
+                            self.say(&report::ssh_failed(host, &why));
                             return Climbed::Exit(1);
                         }
                         Err(SshStepError::InstallDeclined) => {
@@ -859,9 +858,15 @@ impl<'a> Climb<'a> {
                     }
                 }
                 Action::TryDirectAfterSsh { addr, port } => {
+                    let selected = self.selected_operation == Some((addr, port));
                     let (outcome, line) = match self.direct(addr, port, Stage::AfterSsh, cancel) {
                         Ok(v) => v,
-                        Err(code) => return Climbed::Exit(code),
+                        Err(code) => {
+                            if selected {
+                                self.end_selected_operation(cancel);
+                            }
+                            return Climbed::Exit(code);
+                        }
                     };
                     let line = line.map(|line| {
                         self.bootstrap
@@ -869,9 +874,23 @@ impl<'a> Climb<'a> {
                             .filter(|b| b.addr == addr && b.port == port)
                             .map_or_else(|| line.clone(), |b| b.failure_diagnostic(&line))
                     });
+                    if selected && outcome != DirectOutcome::Connected {
+                        let line = line.unwrap_or_else(|| {
+                            let reason =
+                                format!("qsh: selected daemon data connection failed: {outcome:?}");
+                            self.bootstrap.as_ref().map_or_else(
+                                || reason.clone(),
+                                |bootstrap| bootstrap.failure_diagnostic(&reason),
+                            )
+                        });
+                        self.end_selected_operation(cancel);
+                        self.say(&line);
+                        return Climbed::Exit(1);
+                    }
                     self.advance(&mut ladder, Outcome::Direct(outcome), line)
                 }
                 Action::Connected { addr, port } => {
+                    self.selected_operation = None;
                     let (attempt, trial, remote) = self
                         .connected
                         .take()
@@ -906,6 +925,25 @@ impl<'a> Climb<'a> {
                 Action::GiveUp(give_up) => return self.give_up(give_up, &addrs),
             };
         }
+    }
+
+    /// A chosen operation owns this attempt, including any retained discovery
+    /// workers. Detach and join without sending Close to an existing session.
+    fn end_selected_operation(&mut self, cancel: &knock::Cancel) {
+        cancel.cancel();
+        let retained = std::mem::take(
+            &mut *self
+                .retained_discovery
+                .0
+                .lock()
+                .expect("retained discovery"),
+        );
+        for client in retained.into_values() {
+            client.detach();
+        }
+        self.bootstrap = None;
+        self.selected_operation = None;
+        self.drain();
     }
 
     /// Spec §4a rule 1, at login, before the first attempt: addresses of one

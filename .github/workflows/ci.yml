@@ -727,7 +727,17 @@ jobs:
             climb::bootstrap_tests::ssh_first_origin_uses_ssh_port_and_established_evidence_is_immutable \
             climb::bootstrap_tests::ssh_first_selected_identity_publishes_without_store_and_replacement_retains_it \
             climb::bootstrap_tests::ssh_first_wrong_origin_or_unauthenticated_peer_cannot_publish \
-            climb::bootstrap_tests::ssh_selected_version_is_display_context_for_unknown_handshake_failure; do
+            climb::bootstrap_tests::ssh_selected_version_is_display_context_for_unknown_handshake_failure \
+            climb::bootstrap_tests::selected_continue_helper_failure_stops_all_routes_and_joins_probes \
+            climb::bootstrap_tests::selected_continue_uncertain_ssh_command_stops_all_routes_and_joins_probes \
+            climb::bootstrap_tests::selected_confirmed_force_unavailable_stops_all_routes_and_joins_probes \
+            climb::bootstrap_tests::selected_ready_unknown_profile_timeout_stops_all_routes_and_joins_probes \
+            climb::bootstrap_tests::selected_ready_known_profile_data_failure_stops_all_routes_and_joins_probes \
+            climb::bootstrap_tests::selected_ready_authenticated_protocol_mismatch_stops_all_routes_and_joins_probes \
+            climb::bootstrap_tests::successful_selected_connection_discards_boundary_before_established_recovery \
+            climb::bootstrap_tests::unselected_foreground_helper_failure_still_advances_to_the_next_route \
+            climb::bootstrap_tests::unselected_background_failure_still_advances_to_the_next_route \
+            climb::bootstrap_tests::selected_continue_fresh_busy_replaces_consent_and_cancel_stops_all_routes; do
             awk -v expected="test $name ... " '
               index($0, expected) == 1 {
                 seen++; pending = 1
@@ -738,7 +748,7 @@ jobs:
               END { exit !(seen == 1 && passed == 1) }
             ' "$runtime/results.log"
           done
-          grep -F 'test result: ok. 13 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          grep -F 'test result: ok. 23 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           if grep -Fq 'SKIPPED' "$runtime/results.log"; then
             echo '::error::portable inline SSH bootstrap tests reported a runtime skip' >&2
             exit 1
