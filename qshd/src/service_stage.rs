@@ -604,7 +604,7 @@ fn open_at(parent: &File, leaf: &str, flags: i32, mode: libc::mode_t) -> Result<
             parent.as_raw_fd(),
             leaf.as_ptr(),
             flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            mode,
+            mode as libc::c_uint,
         )
     })
 }
