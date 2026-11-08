@@ -61,11 +61,17 @@ pub mod channel_backend;
 pub mod control;
 #[cfg(any(test, target_os = "macos"))]
 mod darwin_process_scope;
+mod destructive_restart;
+#[doc(hidden)]
+pub use destructive_restart::Actions as RestartActions;
 pub mod handover;
 #[cfg(feature = "system")]
 pub mod helper;
 pub mod helper_status;
 pub mod log;
+mod modern_restart;
+#[doc(hidden)]
+pub use modern_restart::{interrupt_selected, RestartOutcome};
 #[cfg(feature = "system")]
 pub mod nonce_pool;
 #[cfg(target_os = "linux")]

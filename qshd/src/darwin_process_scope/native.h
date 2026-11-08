@@ -9,6 +9,7 @@ struct qsh_scope_class { struct qsh_scope_identity identity; int32_t sid; uint32
 struct qsh_scope_token { uint32_t words[8]; };
 struct qsh_scope_runtime { char release[64], version[512], build[64], machine[32]; };
 int qsh_scope_modern_signal_available(void);
+int qsh_scope_observation_prepare(struct qsh_scope_runtime *, struct qsh_scope_error *);
 int qsh_scope_prepare(struct qsh_scope_runtime *, struct qsh_scope_error *);
 int qsh_scope_identity(int32_t, struct qsh_scope_identity *, struct qsh_scope_error *);
 int qsh_scope_classification_matches(struct qsh_scope_class, struct qsh_scope_class);

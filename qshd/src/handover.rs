@@ -303,9 +303,18 @@ pub(crate) fn mark_close_on_exec(
 /// close-on-exec on the handed-over descriptors right before this and puts
 /// it back if this returns.
 pub fn exec_staged(staged: &Path, handover_fd: RawFd) -> Errno {
-    let Ok(path) = CString::new(staged.as_os_str().as_bytes()) else {
-        return Errno::EINVAL;
+    let (path, argv, env) = match exec_arguments(staged, handover_fd) {
+        Ok(args) => args,
+        Err(e) => return e,
     };
+    exec_with_retries(|| raw_exec(&path, &argv, &env), EXEC_ATTEMPTS, EXEC_RETRY)
+}
+
+fn exec_arguments(
+    staged: &Path,
+    handover_fd: RawFd,
+) -> Result<(CString, [CString; 2], Vec<CString>), Errno> {
+    let path = CString::new(staged.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
     let argv = [c"qshd".to_owned(), c"transport-resume".to_owned()];
     let mut env: Vec<CString> = std::env::vars_os()
         .filter(|(key, _)| key != HANDOVER_FD_ENV)
@@ -319,14 +328,49 @@ pub fn exec_staged(staged: &Path, handover_fd: RawFd) -> Errno {
     env.push(
         CString::new(format!("{HANDOVER_FD_ENV}={handover_fd}")).expect("a number has no NUL byte"),
     );
-    exec_with_retries(
-        || match nix::unistd::execve(&path, &argv, &env) {
-            Ok(never) => match never {},
-            Err(e) => e,
-        },
+    Ok((path, argv, env))
+}
+fn raw_exec(path: &CString, argv: &[CString], env: &[CString]) -> Errno {
+    match nix::unistd::execve(path, argv, env) {
+        Ok(never) => match never {},
+        Err(e) => e,
+    }
+}
+pub(crate) fn exec_staged_guarded(
+    staged: &Path,
+    handover_fd: RawFd,
+    guard: &crate::destructive_restart::ExecAttemptGuard<'_>,
+) -> crate::destructive_restart::ExecFailure {
+    let (path, argv, env) = match exec_arguments(staged, handover_fd) {
+        Ok(args) => args,
+        Err(e) => return crate::destructive_restart::ExecFailure::Os(e),
+    };
+    exec_guarded_with_retries(
+        guard,
+        || raw_exec(&path, &argv, &env),
         EXEC_ATTEMPTS,
-        EXEC_RETRY,
+        || std::thread::sleep(EXEC_RETRY),
     )
+}
+/// The retry wait occurs after a returned syscall released the action mutex.
+/// Existing descriptor/control guards remain with the caller across retries.
+pub(crate) fn exec_guarded_with_retries(
+    guard: &crate::destructive_restart::ExecAttemptGuard<'_>,
+    mut exec: impl FnMut() -> Errno,
+    attempts: u32,
+    mut wait: impl FnMut(),
+) -> crate::destructive_restart::ExecFailure {
+    use crate::destructive_restart::ExecFailure;
+    let mut attempt = 1;
+    loop {
+        match guard.attempt(&mut exec) {
+            ExecFailure::Os(Errno::ETXTBSY) if attempt < attempts => {
+                attempt += 1;
+                wait();
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Call `exec` (which returns only its error) up to `attempts` times,

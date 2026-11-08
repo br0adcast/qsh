@@ -51,6 +51,7 @@ pub(super) struct Token {
 }
 unsafe extern "C" {
     fn qsh_scope_modern_signal_available() -> i32;
+    fn qsh_scope_observation_prepare(runtime: *mut Runtime, error: *mut Error) -> i32;
     fn qsh_scope_prepare(runtime: *mut Runtime, error: *mut Error) -> i32;
     fn qsh_scope_keeper_pre_exec(slave: i32, session: i32, broker: i32) -> i32;
     fn qsh_scope_keeper_prepare(runtime: *mut Runtime, error: *mut Error) -> i32;
@@ -145,6 +146,33 @@ pub(crate) fn prepare() -> Result<QualifiedDarwin, AdmissionError> {
         contract: contract.family.id,
     })
 }
+/// The reviewed runtime/ABI row without modern signal-token/keeper ownership.
+pub(super) fn prepare_observation(
+) -> Result<super::observation::QualifiedObservation, AdmissionError> {
+    let mut error = Error::default();
+    let mut runtime = Runtime {
+        release: [0; 64],
+        version: [0; 512],
+        build: [0; 64],
+        machine: [0; 32],
+    };
+    result(
+        unsafe { qsh_scope_observation_prepare(&mut runtime, &mut error) },
+        error,
+    )
+    .map_err(AdmissionError::Native)?;
+    let contract = runtime_contract(
+        runtime_text(&runtime.release)?,
+        runtime_text(&runtime.version)?,
+        runtime_text(&runtime.build)?,
+        runtime_text(&runtime.machine)?,
+        std::env::consts::ARCH,
+    )
+    .ok_or(AdmissionError::UnsupportedContract)?;
+    Ok(super::observation::QualifiedObservation {
+        contract: contract.family.id,
+    })
+}
 pub(super) struct Watch {
     fd: OwnedFd,
     identity: Identity,
@@ -172,6 +200,21 @@ impl NativeOps {
             return Err(Failure::Invalid);
         }
         Ok(value)
+    }
+}
+impl super::observation::ObservationOps for NativeOps {
+    type Watch = Watch;
+    fn classify(&mut self, pid: i32) -> Result<Classified, Failure> {
+        <Self as Ops<PtyChild>>::classify(self, pid)
+    }
+    fn bind(&mut self, process: Classified, cookie: u64) -> Result<Registration<Watch>, Failure> {
+        <Self as Ops<PtyChild>>::bind_exit(self, process, cookie)
+    }
+    fn identity(&mut self, pid: i32) -> Result<Identity, Failure> {
+        NativeOps::identity(self, pid)
+    }
+    fn event(&mut self, watch: &mut Watch) -> Result<Option<ExitEvent>, Failure> {
+        <Self as Ops<PtyChild>>::observe_exit(self, watch)
     }
 }
 impl Ops<PtyChild> for NativeOps {

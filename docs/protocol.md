@@ -2551,7 +2551,10 @@ do not request decisions retain their existing command path.
 Foreground callers can request `TRANSPORT-BUSY` before client registration,
 readiness or a new session handshake. Its bounded schema binds a random caller
 attempt to the reported live daemon identity, generation when available, actual
-connection count and optional serving profiles. Cancel is the default. Continue
+connection count, optional serving profiles and the selected actual helper's
+`candidate: {build, checksum}`. Candidate build is a build stamp; its checksum
+names the executing image, not whichever file later occupies its path. Verified
+provider bytes must match that digest. Cancel is the default. Continue
 with old daemon rechecks identity and requires a valid `ADD-CLIENT` acknowledgement
 before reporting the actual serving version and listeners in `TRANSPORT-READY`.
 Conditional registration is negotiated by a separate bounded, read-only
@@ -2566,8 +2569,48 @@ handshake once detected. This non-destructive legacy exception never permits
 STOP, process termination or forced restart.
 
 Force update is a distinct choice; it cannot imply the separate confirmation
-required to interrupt sessions. Forced restart remains unavailable until an
-exact-instance operation is qualified. No preservation support is advertised.
+required to interrupt sessions. Consent binds attempt, full daemon identity,
+candidate and explicit `action: "stop_and_restart"`. No preservation support is
+advertised.
+
+Supporting Linux personal daemons separately advertise schema1
+`DESTRUCTIVE-RESTART-INFO <random32 challenge>` with the echoed challenge,
+actual identity/generation and capability `conditional-stop-receipt-v1`.
+Generation alone never grants destructive authority. The same-account control
+endpoint accepts `PREPARE-DESTRUCTIVE-STOP <base64 consent JSON>` and
+`COMMIT-DESTRUCTIVE-STOP <receipt hex32> <base64 consent JSON>`. Request/reply
+frames are bounded to 4096 bytes. Prepare returns a random128 receipt and the
+bound consent; at most 64 live receipts expire after 120 seconds. Commit checks
+and consumes it under the exclusive control gate and shared action mutex before
+sealing admission and synchronously requesting sticky shutdown. ACK loss or
+request cancellation after commitment cannot undo shutdown. Replay can report
+the stored result, without another shutdown effect. Mismatch/expiry/replacement
+or terminal shutdown refuses new authority.
+
+Updates claim an exclusive replacement lease before verification closes
+admission or announces/drains sessions. Each raw exec attempt validates that
+exact lease under the action mutex; the mutex is released during retry waits.
+Administrative shutdown uses the same terminal latch. Rollback cannot reopen
+admission/channel fences or publish ordinary Idle after shutdown wins.
+
+The confirmed helper compares its actual candidate before any mutation, brackets
+an observation-only retained process acquisition with actual generation/identity
+queries, then prepares and commits once. It never falls back to generic STOP.
+Only positive retained-instance exit evidence permits startup. Missing ACK,
+EOF, timeout, unknown observation or a changed endpoint never proves exit.
+Linux restart publication uses no-replace rename; a leftover/racing endpoint or
+unsupported syscall/filesystem refuses startup without overwriting it.
+`TRANSPORT-RESTART-FAILED` is a bounded attempt-bound result with disposition
+`refused` or `uncertain`; it cannot coexist with readiness. A caller
+must rediscover after uncertainty rather than retry destruction or another route.
+
+Released peers without explicit receipt support remain refused for Force.
+Darwin has an exit-only full-identity/cookie observer, but full destructive Force
+is refused before commit: the existing proc_pidpath-to-open candidate checksum
+route does not bind executing bytes across replacement. Native Darwin observer
+qualification and an immutable candidate-artifact binding remain separate gates.
+Neither limitation changes ordinary Continue, old-helper capability refusal or
+session-protocol compatibility.
 
 Personal local-control status replies (`STATUS`, `ADD-CLIENT`, `ADD-PORT`) may
 include `cleanup`, with `domain: "personal_channels"` and a `phase` of

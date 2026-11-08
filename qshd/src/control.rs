@@ -35,7 +35,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// Control socket client request (a text line without `\n`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlRequest {
     /// Return the daemon's current state ([`StatusResponse`]).
     Status,
@@ -43,6 +43,12 @@ pub enum ControlRequest {
     ServerInfo([u8; 32]),
     /// Read-only, generation-bound negotiation of conditional registration.
     RegistrationInfo([u8; 32]),
+    DestructiveRestartInfo([u8; 32]),
+    PrepareDestructiveStop(daemon_bootstrap_protocol::DestructiveRestartConsent),
+    CommitDestructiveStop {
+        receipt: [u8; 16],
+        consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
+    },
     /// Exact-generation executable identity guard, checked atomically with insertion.
     AddClientIf {
         generation: [u8; 16],
@@ -72,6 +78,71 @@ pub struct RegistrationInfoResponse {
     pub challenge: String,
     pub conditional_add_client: bool,
     pub identity: daemon_bootstrap_protocol::BusyDaemonIdentity,
+}
+
+/// Separate exact-generation destructive-operation capability; SERVER-INFO
+/// generation by itself never grants conditional STOP authority.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestructiveRestartInfoResponse {
+    pub schema: u8,
+    pub challenge: String,
+    pub capability: String,
+    pub identity: daemon_bootstrap_protocol::BusyDaemonIdentity,
+}
+pub use crate::destructive_restart::Rejected as DestructiveRestartRefusal;
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DestructivePrepareResponse {
+    Prepared {
+        receipt: String,
+        consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
+    },
+    Refused {
+        reason: DestructiveRestartRefusal,
+    },
+}
+impl DestructivePrepareResponse {
+    pub(crate) fn from_result(
+        result: Result<[u8; 16], DestructiveRestartRefusal>,
+        consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
+    ) -> Self {
+        match result {
+            Ok(receipt) => Self::Prepared {
+                receipt: hex::encode(receipt),
+                consent,
+            },
+            Err(reason) => Self::Refused { reason },
+        }
+    }
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DestructiveCommitResponse {
+    Committed {
+        receipt: String,
+        consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
+        already_committed: bool,
+    },
+    Refused {
+        reason: DestructiveRestartRefusal,
+    },
+}
+impl DestructiveCommitResponse {
+    pub(crate) fn from_result(
+        result: Result<crate::destructive_restart::Commit, DestructiveRestartRefusal>,
+        receipt: [u8; 16],
+        consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
+    ) -> Self {
+        match result {
+            Ok(outcome) => Self::Committed {
+                receipt: hex::encode(receipt),
+                consent,
+                already_committed: outcome == crate::destructive_restart::Commit::AlreadyCommitted,
+            },
+            Err(reason) => Self::Refused { reason },
+        }
+    }
 }
 
 /// State of a single port on which the daemon accepts QUIC connections --
@@ -191,8 +262,38 @@ impl StatusResponse {
 /// Parse a control socket request line. The line arrives already stripped
 /// of its trailing `\n` (the socket's line reader removes it).
 pub fn parse_request(line: &str) -> Option<ControlRequest> {
+    if line.len() > 4096 {
+        return None;
+    }
     let mut parts = line.split(' ');
     match parts.next()? {
+        "DESTRUCTIVE-RESTART-INFO" => {
+            let challenge = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::DestructiveRestartInfo(challenge))
+        }
+        "PREPARE-DESTRUCTIVE-STOP" => {
+            let raw = BASE64.decode(parts.next()?).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::PrepareDestructiveStop(
+                serde_json::from_slice(&raw).ok()?,
+            ))
+        }
+        "COMMIT-DESTRUCTIVE-STOP" => {
+            let receipt = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+            let raw = BASE64.decode(parts.next()?).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::CommitDestructiveStop {
+                receipt,
+                consent: serde_json::from_slice(&raw).ok()?,
+            })
+        }
         "SERVER-INFO" => {
             let text = parts.next()?;
             if text.len() != 64 {
@@ -265,6 +366,18 @@ pub fn parse_request(line: &str) -> Option<ControlRequest> {
 pub fn format_request(req: &ControlRequest) -> String {
     match req {
         ControlRequest::Status => "STATUS\n".to_string(),
+        ControlRequest::DestructiveRestartInfo(challenge) => {
+            format!("DESTRUCTIVE-RESTART-INFO {}\n", hex::encode(challenge))
+        }
+        ControlRequest::PrepareDestructiveStop(consent) => format!(
+            "PREPARE-DESTRUCTIVE-STOP {}\n",
+            BASE64.encode(serde_json::to_vec(consent).expect("consent serializes"))
+        ),
+        ControlRequest::CommitDestructiveStop { receipt, consent } => format!(
+            "COMMIT-DESTRUCTIVE-STOP {} {}\n",
+            hex::encode(receipt),
+            BASE64.encode(serde_json::to_vec(consent).expect("consent serializes"))
+        ),
         ControlRequest::ServerInfo(challenge) => {
             format!("SERVER-INFO {}\n", hex::encode(challenge))
         }
@@ -417,7 +530,11 @@ fn client_request_at(
     let mut line = String::new();
     let read_result = if matches!(
         req,
-        ControlRequest::ServerInfo(_) | ControlRequest::RegistrationInfo(_)
+        ControlRequest::ServerInfo(_)
+            | ControlRequest::RegistrationInfo(_)
+            | ControlRequest::DestructiveRestartInfo(_)
+            | ControlRequest::PrepareDestructiveStop(_)
+            | ControlRequest::CommitDestructiveStop { .. }
     ) {
         std::io::Read::take(&mut reader, 4097).read_line(&mut line)
     } else {
@@ -425,7 +542,11 @@ fn client_request_at(
     };
     if matches!(
         req,
-        ControlRequest::ServerInfo(_) | ControlRequest::RegistrationInfo(_)
+        ControlRequest::ServerInfo(_)
+            | ControlRequest::RegistrationInfo(_)
+            | ControlRequest::DestructiveRestartInfo(_)
+            | ControlRequest::PrepareDestructiveStop(_)
+            | ControlRequest::CommitDestructiveStop { .. }
     ) && line.len() > 4096
     {
         anyhow::bail!("server-info response exceeds limit");
@@ -678,6 +799,12 @@ impl EnsureLock {
     pub fn bind_private_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
         bind_with_authority(&self.authority)
     }
+    /// A confirmed destructive restart may publish only into an absent leaf.
+    /// A competing endpoint is never removed under the old consent.
+    #[cfg(target_os = "linux")]
+    pub fn bind_private_absent_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
+        bind_prepared_mode(&self.authority, |_| {}, false)
+    }
 
     /// Check the retained parent, not a pathname reopened independently.
     #[cfg(all(target_os = "linux", feature = "system"))]
@@ -844,6 +971,13 @@ fn bind_prepared(
     authority: &path::EndpointAuthority,
     configure: impl FnOnce(&mut path::Stage),
 ) -> std::io::Result<(UnixListener, SocketCleanup)> {
+    bind_prepared_mode(authority, configure, true)
+}
+fn bind_prepared_mode(
+    authority: &path::EndpointAuthority,
+    configure: impl FnOnce(&mut path::Stage),
+    replace: bool,
+) -> std::io::Result<(UnixListener, SocketCleanup)> {
     authority.validate_route()?;
     authority.entry()?;
     sweep_stale_staging_at(&authority.parent, std::time::SystemTime::now());
@@ -853,7 +987,17 @@ fn bind_prepared(
     // Allocate every cleanup descriptor before publication. On a later error,
     // this guard owns only this socket in this pinned parent, never a new route.
     let cleanup = SocketCleanup::from_authority(&listener, authority, stage.socket())?;
-    stage.publish(authority)?;
+    if replace {
+        stage.publish(authority)?;
+    } else {
+        #[cfg(target_os = "linux")]
+        stage.publish_absent(authority)?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no-replace restart publication is unavailable",
+        ));
+    }
     Ok((listener, cleanup))
 }
 
@@ -1211,6 +1355,118 @@ mod tests {
         }
         let info = ControlRequest::RegistrationInfo([8; 32]);
         assert_eq!(parse_request(format_request(&info).trim_end()), Some(info));
+    }
+
+    #[test]
+    fn destructive_receipt_codec_binds_checked_consent_and_bounds_frames() {
+        let consent = daemon_bootstrap_protocol::DestructiveRestartConsent {
+            attempt: daemon_bootstrap_protocol::BusyAttemptId::from_bytes([1; 16]),
+            identity: daemon_bootstrap_protocol::BusyDaemonIdentity {
+                version: "0.6.0-rc1".into(),
+                build: 1,
+                checksum: "ab".repeat(32),
+                pid: 42,
+                generation: Some("cd".repeat(16)),
+            },
+            candidate: daemon_bootstrap_protocol::CandidateImageIdentity {
+                build: 2,
+                checksum: "ef".repeat(32),
+            },
+            action: daemon_bootstrap_protocol::DestructiveRestartAction::StopAndRestart,
+        };
+        for request in [
+            ControlRequest::DestructiveRestartInfo([9; 32]),
+            ControlRequest::PrepareDestructiveStop(consent.clone()),
+            ControlRequest::CommitDestructiveStop {
+                receipt: [3; 16],
+                consent,
+            },
+        ] {
+            let line = format_request(&request);
+            assert!(line.len() <= 4096);
+            assert_eq!(parse_request(line.trim_end()), Some(request));
+            assert!(parse_request(&format!("{} extra", line.trim_end())).is_none());
+        }
+        for line in [
+            "DESTRUCTIVE-RESTART-INFO bad".to_string(),
+            "COMMIT-DESTRUCTIVE-STOP 0000 e30=".to_string(),
+            format!("PREPARE-DESTRUCTIVE-STOP {}", BASE64.encode(b"{}")),
+            "x".repeat(4097),
+        ] {
+            assert!(parse_request(&line).is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_restart_publication_never_replaces_a_new_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let transaction = EnsureLock::acquire(&path, Duration::from_secs(1)).unwrap();
+        let competitor = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let prior = std::fs::symlink_metadata(&path).unwrap();
+        assert!(transaction.bind_private_absent_owned().is_err());
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), prior.ino());
+        let _client = UnixStream::connect(&path).unwrap();
+        let _accepted = competitor.accept().unwrap();
+        drop(competitor);
+        std::fs::remove_file(&path).unwrap();
+        let (_listener, _cleanup) = transaction.bind_private_absent_owned().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_restart_publication_refuses_race_and_unsupported_primitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let authority = path::EndpointAuthority::open(&path, true).unwrap();
+        for errno in [nix::libc::ENOSYS, nix::libc::EOPNOTSUPP] {
+            let result = bind_prepared_mode(
+                &authority,
+                |stage| stage.no_replace_error = Some(errno),
+                false,
+            );
+            assert!(matches!(result,Err(error) if error.raw_os_error()==Some(errno)));
+            assert!(!path.exists());
+            assert!(!dir
+                .path()
+                .join(format!(".c{}", std::process::id()))
+                .exists());
+        }
+        let competitor = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let retained = competitor.clone();
+        let endpoint = path.clone();
+        let result = bind_prepared_mode(
+            &authority,
+            move |stage| {
+                stage.before_publish = Some(Box::new(move || {
+                    let listener = UnixListener::bind(&endpoint).unwrap();
+                    std::fs::set_permissions(
+                        &endpoint,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                    )
+                    .unwrap();
+                    *retained.lock().unwrap() = Some(listener);
+                }))
+            },
+            false,
+        );
+        assert!(result.is_err());
+        let _client = UnixStream::connect(&path).unwrap();
+        let _accepted = competitor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .accept()
+            .unwrap();
+        assert!(!dir
+            .path()
+            .join(format!(".c{}", std::process::id()))
+            .exists());
     }
 
     #[test]

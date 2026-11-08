@@ -125,6 +125,10 @@ pub(super) struct Stage {
     pub before_chmod: Option<Box<dyn FnOnce()>>,
     #[cfg(test)]
     pub after_publish: Option<Box<dyn FnOnce()>>,
+    #[cfg(test)]
+    pub before_publish: Option<Box<dyn FnOnce()>>,
+    #[cfg(test)]
+    pub no_replace_error: Option<i32>,
 }
 
 impl Stage {
@@ -162,6 +166,10 @@ impl Stage {
             before_chmod: None,
             #[cfg(test)]
             after_publish: None,
+            #[cfg(test)]
+            before_publish: None,
+            #[cfg(test)]
+            no_replace_error: None,
         };
         stage.validate(authority)?;
         Ok(stage)
@@ -245,7 +253,14 @@ impl Stage {
         self.socket.as_ref().expect("bound before publication")
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn publish_absent(&mut self, authority: &EndpointAuthority) -> io::Result<()> {
+        self.publish_mode(authority, false)
+    }
     pub fn publish(&mut self, authority: &EndpointAuthority) -> io::Result<()> {
+        self.publish_mode(authority, true)
+    }
+    fn publish_mode(&mut self, authority: &EndpointAuthority, replace: bool) -> io::Result<()> {
         self.validate(authority)?;
         authority.entry()?;
         let current = stat::fstatat(
@@ -259,12 +274,38 @@ impl Stage {
         {
             return Err(refused("the staged control socket changed"));
         }
-        fcntl::renameat(
-            Some(self.directory.as_raw_fd()),
-            super::STAGED_NAME,
-            Some(authority.parent.as_raw_fd()),
-            authority.leaf.as_os_str(),
-        )?;
+        #[cfg(test)]
+        if let Some(before) = self.before_publish.take() {
+            before();
+        }
+        #[cfg(test)]
+        if !replace {
+            if let Some(errno) = self.no_replace_error.take() {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+        }
+        if replace {
+            fcntl::renameat(
+                Some(self.directory.as_raw_fd()),
+                super::STAGED_NAME,
+                Some(authority.parent.as_raw_fd()),
+                authority.leaf.as_os_str(),
+            )?;
+        } else {
+            #[cfg(target_os = "linux")]
+            fcntl::renameat2(
+                Some(self.directory.as_raw_fd()),
+                super::STAGED_NAME,
+                Some(authority.parent.as_raw_fd()),
+                authority.leaf.as_os_str(),
+                fcntl::RenameFlags::RENAME_NOREPLACE,
+            )?;
+            #[cfg(not(target_os = "linux"))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exclusive restart publication is unavailable",
+            ));
+        }
         self.socket = None;
         #[cfg(test)]
         if let Some(after) = self.after_publish.take() {

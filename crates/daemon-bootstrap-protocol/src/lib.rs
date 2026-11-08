@@ -13,6 +13,45 @@ pub struct BootstrapToolCapabilities {
     pub busy_decisions: bool,
 }
 
+/// Exact selected executable bytes and actual build, never inferred from a release label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateImageIdentity {
+    pub build: u64,
+    pub checksum: String,
+}
+impl CandidateImageIdentity {
+    pub fn valid(&self) -> bool {
+        hex_field(&self.checksum, 32)
+    }
+}
+impl<'de> Deserialize<'de> for CandidateImageIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            build: u64,
+            checksum: String,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let value = Self {
+            build: fields.build,
+            checksum: fields.checksum,
+        };
+        if value.valid() {
+            Ok(value)
+        } else {
+            Err(serde::de::Error::custom("invalid candidate checksum"))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DestructiveRestartAction {
+    #[serde(rename = "stop_and_restart")]
+    StopAndRestart,
+}
+
 /// Caller-generated correlation token, never a bearer capability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -116,6 +155,7 @@ pub struct BusyDaemonInfo {
     pub schema: u8,
     pub attempt: BusyAttemptId,
     pub identity: BusyDaemonIdentity,
+    pub candidate: CandidateImageIdentity,
     pub active_connections: u64,
     /// Complete [wire, handshake, channel] profiles; None means unknown.
     pub serving_profiles: Option<Vec<[u8; 3]>>,
@@ -129,6 +169,7 @@ impl<'de> Deserialize<'de> for BusyDaemonInfo {
             schema: u8,
             attempt: BusyAttemptId,
             identity: BusyDaemonIdentity,
+            candidate: CandidateImageIdentity,
             active_connections: u64,
             serving_profiles: Option<Vec<[u8; 3]>>,
             preservation: PreservationCapability,
@@ -138,6 +179,7 @@ impl<'de> Deserialize<'de> for BusyDaemonInfo {
             schema: fields.schema,
             attempt: fields.attempt,
             identity: fields.identity,
+            candidate: fields.candidate,
             active_connections: fields.active_connections,
             serving_profiles: fields.serving_profiles,
             preservation: fields.preservation,
@@ -154,6 +196,7 @@ impl BusyDaemonInfo {
     pub fn valid(&self) -> bool {
         self.schema == 1
             && self.identity.valid()
+            && self.candidate.valid()
             && self.active_connections > 0
             && self.serving_profiles.as_ref().is_none_or(|p| p.len() <= 16)
     }
@@ -162,6 +205,8 @@ impl BusyDaemonInfo {
         DestructiveRestartConsent {
             attempt: self.attempt.clone(),
             identity: self.identity.clone(),
+            candidate: self.candidate.clone(),
+            action: DestructiveRestartAction::StopAndRestart,
         }
     }
 }
@@ -181,16 +226,18 @@ impl PendingBusy {
         BusyDecision {
             attempt: self.0.attempt,
             identity: self.0.identity,
+            candidate: self.0.candidate,
             choice,
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BusyDecision {
     pub attempt: BusyAttemptId,
     pub identity: BusyDaemonIdentity,
+    pub candidate: CandidateImageIdentity,
     pub choice: BusyChoice,
 }
 impl<'de> Deserialize<'de> for BusyDecision {
@@ -200,12 +247,14 @@ impl<'de> Deserialize<'de> for BusyDecision {
         struct Fields {
             attempt: BusyAttemptId,
             identity: BusyDaemonIdentity,
+            candidate: CandidateImageIdentity,
             choice: BusyChoice,
         }
         let fields = Fields::deserialize(deserializer)?;
         let value = Self {
             attempt: fields.attempt,
             identity: fields.identity,
+            candidate: fields.candidate,
             choice: fields.choice,
         };
         if value.valid() {
@@ -218,24 +267,27 @@ impl<'de> Deserialize<'de> for BusyDecision {
 
 impl BusyDecision {
     pub fn valid(&self) -> bool {
-        self.identity.valid()
+        self.identity.valid() && self.candidate.valid()
     }
     pub fn matches(&self, info: &BusyDaemonInfo) -> bool {
         self.valid()
             && info.valid()
             && self.attempt == info.attempt
             && self.identity == info.identity
+            && self.candidate == info.candidate
     }
 }
 
 /// Separate, identity-scoped user consent for an interrupting restart. Dispatch
 /// still requires a bounded one-use server receipt or qualified exact endpoint
 /// custody; serializing this value cannot authorize generic STOP.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestructiveRestartConsent {
     pub attempt: BusyAttemptId,
     pub identity: BusyDaemonIdentity,
+    pub candidate: CandidateImageIdentity,
+    pub action: DestructiveRestartAction,
 }
 impl<'de> Deserialize<'de> for DestructiveRestartConsent {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -244,13 +296,17 @@ impl<'de> Deserialize<'de> for DestructiveRestartConsent {
         struct Fields {
             attempt: BusyAttemptId,
             identity: BusyDaemonIdentity,
+            candidate: CandidateImageIdentity,
+            action: DestructiveRestartAction,
         }
         let fields = Fields::deserialize(deserializer)?;
         let value = Self {
             attempt: fields.attempt,
             identity: fields.identity,
+            candidate: fields.candidate,
+            action: fields.action,
         };
-        if value.identity.valid() {
+        if value.identity.valid() && value.candidate.valid() {
             Ok(value)
         } else {
             Err(serde::de::Error::custom(
@@ -262,8 +318,27 @@ impl<'de> Deserialize<'de> for DestructiveRestartConsent {
 
 impl DestructiveRestartConsent {
     pub fn matches(&self, info: &BusyDaemonInfo) -> bool {
-        info.valid() && self.attempt == info.attempt && self.identity == info.identity
+        info.valid()
+            && self.attempt == info.attempt
+            && self.identity == info.identity
+            && self.candidate == info.candidate
+            && self.action == DestructiveRestartAction::StopAndRestart
     }
+}
+
+/// A failed explicit destructive operation never becomes readiness. The
+/// attempt binds this terminal result to the pending authenticated SSH call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestructiveRestartFailure {
+    pub attempt: BusyAttemptId,
+    pub disposition: DestructiveRestartDisposition,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DestructiveRestartDisposition {
+    Refused,
+    Uncertain,
 }
 
 #[cfg(test)]
@@ -280,11 +355,39 @@ mod tests {
                 pid: 42,
                 generation: Some("cd".repeat(16)),
             },
+            candidate: CandidateImageIdentity {
+                build: 2,
+                checksum: "ef".repeat(32),
+            },
             active_connections: 2,
             serving_profiles: Some(vec![[2, 1, 1]]),
             preservation: PreservationCapability::Unknown,
         }
     }
+    #[test]
+    fn destructive_consent_binds_candidate_and_explicit_action() {
+        let mut value = serde_json::to_value(info()).unwrap();
+        value["candidate"] = serde_json::json!({"build":2,"checksum":"ef".repeat(32)});
+        let live: BusyDaemonInfo =
+            serde_json::from_value(value.clone()).expect("candidate-bound BUSY schema");
+        let consent = live.confirm_destructive_restart();
+        let encoded = serde_json::to_value(&consent).unwrap();
+        assert_eq!(encoded["candidate"], value["candidate"]);
+        assert_eq!(encoded["action"], "stop_and_restart");
+        let mut changed = value.clone();
+        changed["candidate"]["build"] = 3.into();
+        assert!(!consent.matches(&serde_json::from_value(changed).unwrap()));
+        let mut changed = value.clone();
+        changed["candidate"]["checksum"] = "aa".repeat(32).into();
+        assert!(!consent.matches(&serde_json::from_value(changed).unwrap()));
+        let mut changed = value.clone();
+        changed["candidate"]["checksum"] = "invalid".into();
+        assert!(serde_json::from_value::<BusyDaemonInfo>(changed).is_err());
+        let mut changed = encoded;
+        changed["action"] = "preserve_sessions".into();
+        assert!(serde_json::from_value::<DestructiveRestartConsent>(changed).is_err());
+    }
+
     #[test]
     fn wire_dtos_reject_malformed_bounded_fields_and_round_trip() {
         let live = info();

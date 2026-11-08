@@ -148,6 +148,10 @@ fn busy_cancel_and_unqualified_force_have_no_ssh_or_daemon_effect() {
             pid: 42,
             generation: None,
         },
+        candidate: bringup::CandidateImageIdentity {
+            build: 2,
+            checksum: "ef".repeat(32),
+        },
         active_connections: 2,
         serving_profiles: None,
         preservation: PreservationCapability::Unknown,

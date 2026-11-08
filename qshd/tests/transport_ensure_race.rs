@@ -606,20 +606,24 @@ fn socket(home: &Path) -> PathBuf {
 
 #[test]
 fn stop_joins_a_silent_authenticated_channel_before_daemon_exit() {
-    stop_with_silent_channel(false, false);
+    stop_with_silent_channel(false, false, false);
 }
 
 #[test]
 fn stop_joins_a_silent_channel_with_a_hup_ignoring_descendant() {
-    stop_with_silent_channel(true, false);
+    stop_with_silent_channel(true, false, false);
 }
 
 #[test]
 fn stop_then_ensure_reuses_the_port_after_owned_channel_cleanup() {
-    stop_with_silent_channel(true, true);
+    stop_with_silent_channel(true, true, false);
 }
 
-fn stop_with_silent_channel(keep_descendant: bool, ensure_again: bool) {
+#[test]
+fn modern_receipt_interrupts_owned_silent_channel_only_after_exact_generation_commit() {
+    stop_with_silent_channel(true, true, true);
+}
+fn stop_with_silent_channel(keep_descendant: bool, ensure_again: bool, modern: bool) {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let home = private_temp_home().unwrap();
     // This dedicated, serialized binary owns every descendant it creates.
@@ -767,11 +771,36 @@ fn stop_with_silent_channel(keep_descendant: bool, ensure_again: bool) {
         })
         .collect();
     eprintln!("owned process scope (pid, pgid, sid): {owned_scope:?}");
-    assert!(
-        matches!(client_request_with_timeout(&sock, &ControlRequest::Stop,
+    if modern {
+        let transaction =
+            qshd::control::EnsureLock::acquire(&sock, Duration::from_secs(1)).unwrap();
+        let ControlReply::Answered(line) = transaction
+            .request(&ControlRequest::DestructiveRestartInfo([9; 32]))
+            .unwrap()
+        else {
+            panic!("missing modern capability");
+        };
+        let info: qshd::control::DestructiveRestartInfoResponse =
+            serde_json::from_str(&line).unwrap();
+        let candidate: daemon_bootstrap_protocol::CandidateImageIdentity =
+            serde_json::from_value(scripted_candidate()).unwrap();
+        let consent = daemon_bootstrap_protocol::DestructiveRestartConsent {
+            attempt: daemon_bootstrap_protocol::BusyAttemptId::from_bytes([1; 16]),
+            identity: info.identity,
+            candidate: candidate.clone(),
+            action: daemon_bootstrap_protocol::DestructiveRestartAction::StopAndRestart,
+        };
+        assert_eq!(
+            qshd::interrupt_selected(&transaction, &consent, &candidate),
+            qshd::RestartOutcome::ExactExit
+        );
+    } else {
+        assert!(
+            matches!(client_request_with_timeout(&sock, &ControlRequest::Stop,
         Duration::from_secs(2)).unwrap(),
         ControlReply::Answered(line) if line.contains("stopping"))
-    );
+        );
+    }
 
     // Observe each obligation before cleanup or assertions can change it.
     // A successful STOP reply is not an exit/cleanup receipt.
@@ -1394,7 +1423,7 @@ fn reuse_transaction_mode(
             if protocol.is_some() {
                 identity["generation"] = "cd".repeat(16).into();
             }
-            let decision = serde_json::json!({"attempt":"12".repeat(16), "identity":identity, "choice":match mode { RegistrationFixture::ForceChoice => "force_update", RegistrationFixture::CancelChoice => "cancel", _ => "continue_old" }}).to_string();
+            let decision = serde_json::json!({"attempt":"12".repeat(16), "identity":identity, "candidate":scripted_candidate(), "choice":match mode { RegistrationFixture::ForceChoice => "force_update", RegistrationFixture::CancelChoice => "cancel", _ => "continue_old" }}).to_string();
             command.args(["--busy-decision", &decision]);
         }
         if restart_only {
@@ -1444,6 +1473,17 @@ fn reuse_transaction_mode(
             .filter(|r| !r.starts_with("SERVER-INFO ") && !r.starts_with("REGISTRATION-INFO "))
             .collect(),
     )
+}
+
+fn scripted_candidate() -> serde_json::Value {
+    use sha2::Digest;
+    static CHECKSUM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let checksum = CHECKSUM.get_or_init(|| {
+        hex::encode(sha2::Sha256::digest(
+            std::fs::read(env!("CARGO_BIN_EXE_qshd")).unwrap(),
+        ))
+    });
+    serde_json::json!({"build":qshd::state::build_label(),"checksum":checksum})
 }
 
 fn scripted_identity(newer: bool) -> serde_json::Value {
@@ -1757,4 +1797,89 @@ fn continue_same_identity_after_busy_count_drops_to_zero_still_reuses_old_daemon
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0], "STATUS");
     assert!(requests[1].starts_with("ADD-CLIENT "));
+}
+
+#[test]
+fn confirmed_modern_helper_restarts_only_after_old_exact_exit() {
+    use daemon_bootstrap_protocol::*;
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let _descendants = Descendants::own();
+    let home = private_temp_home().unwrap();
+    let port = ready(Ensure::start(home.path(), 0).finish());
+    let sock = socket(home.path());
+    let old = status(&sock);
+    let old_fd = pidfd(old.pid);
+    let ControlReply::Answered(line) = client_request_with_timeout(
+        &sock,
+        &ControlRequest::DestructiveRestartInfo([9; 32]),
+        Duration::from_secs(2),
+    )
+    .unwrap() else {
+        panic!("missing capability");
+    };
+    let info: qshd::control::DestructiveRestartInfoResponse = serde_json::from_str(&line).unwrap();
+    let busy = BusyDaemonInfo {
+        schema: 1,
+        attempt: BusyAttemptId::from_bytes([1; 16]),
+        identity: info.identity,
+        candidate: serde_json::from_value(scripted_candidate()).unwrap(),
+        active_connections: 1,
+        serving_profiles: None,
+        preservation: PreservationCapability::Unknown,
+    };
+    let consent = busy.confirm_destructive_restart();
+    let decision = PendingBusy::new(busy)
+        .unwrap()
+        .decide(BusyChoice::ForceUpdate);
+    let out = tempfile::tempfile().unwrap();
+    let err = tempfile::tempfile().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_qshd"))
+        .args([
+            "transport-ensure",
+            "--name",
+            "race",
+            "--port",
+            &port.to_string(),
+            "--report-busy",
+            "--busy-attempt",
+            decision.attempt.as_str(),
+            "--busy-decision",
+            &serde_json::to_string(&decision).unwrap(),
+            "--destructive-consent",
+            &serde_json::to_string(&consent).unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("HISTFILE", "/dev/null")
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
+        .stdin(Stdio::null())
+        .stdout(out.try_clone().unwrap())
+        .stderr(err.try_clone().unwrap())
+        .spawn()
+        .unwrap();
+    assert_eq!(
+        ready(
+            Ensure {
+                child: Some(child),
+                out,
+                err
+            }
+            .finish()
+        ),
+        port
+    );
+    assert!(exited(&old_fd));
+    wait_owned_daemon(old.pid);
+    let replacement = status(&sock);
+    assert_ne!(replacement.pid, old.pid);
+    let replacement_fd = pidfd(replacement.pid);
+    assert!(matches!(
+        client_request_with_timeout(&sock, &ControlRequest::Stop, Duration::from_secs(2)).unwrap(),
+        ControlReply::Answered(_)
+    ));
+    wait_owned_daemon(replacement.pid);
+    assert!(exited(&replacement_fd));
+    reap_without_rescue();
 }

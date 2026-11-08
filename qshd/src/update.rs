@@ -49,7 +49,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 use transport::channel_open::{ChannelOpenRegistry, OpenExecPermit, RestartOpenFence};
@@ -65,6 +65,7 @@ use transport::channel::{
 use transport::channel_server::{DaemonUpdates, RestartPhase, RestartSignal, UpdateTransfer};
 use transport::{NonceSource, Principal, SharedAllowlist, AUTH_NONCE_LEN};
 
+use crate::destructive_restart::{Actions, ExecAttemptGuard, ReplacementLease};
 use crate::handover::{self, Handover};
 use crate::state::{self, SelfCheck, HANDOVER_VERSION};
 use crate::version::{replacement, Replacement};
@@ -126,20 +127,22 @@ pub(crate) fn exec_window_for_test() -> std::sync::RwLockWriteGuard<'static, ()>
 /// exec window (see the module docs).
 #[derive(Debug, Default)]
 pub struct AdmissionGate {
-    closed: AtomicBool,
+    // Temporary replacement closure and irreversible shutdown share one
+    // atomic word: clearing the former can never clear the latter.
+    state: AtomicU8,
 }
-
 impl AdmissionGate {
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        self.state.fetch_or(1, Ordering::SeqCst);
     }
-
     pub fn open(&self) {
-        self.closed.store(false, Ordering::SeqCst);
+        self.state.fetch_and(!1, Ordering::SeqCst);
     }
-
+    pub(crate) fn seal_shutdown(&self) {
+        self.state.fetch_or(2, Ordering::SeqCst);
+    }
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.state.load(Ordering::SeqCst) != 0
     }
 }
 
@@ -224,6 +227,9 @@ pub struct HandoverBase {
     /// The gate of the [`GatedNonces`] the session router was given: closed
     /// from the last count of the sessions through the exec.
     pub admission: Arc<AdmissionGate>,
+    /// The same action coordinator passed to the personal transport owner.
+    /// It shares this control gate and the router's actual nonce admission gate.
+    pub actions: Arc<Actions>,
 }
 
 /// Everything an offer is decided by.
@@ -517,7 +523,7 @@ pub struct DaemonSelf {
     restarts: Arc<Restarts>,
     opens: Arc<ChannelOpenRegistry>,
     handover: Option<Arc<HandoverBase>>,
-    exec: ExecFn,
+    exec: Option<ExecFn>,
 }
 
 impl DaemonSelf {
@@ -548,7 +554,7 @@ impl DaemonSelf {
             restarts: Arc::new(Restarts::new()),
             opens,
             handover: handover.map(Arc::new),
-            exec: Arc::new(handover::exec_staged),
+            exec: None,
         }
     }
 
@@ -565,13 +571,13 @@ impl DaemonSelf {
             restarts: Arc::new(Restarts::new()),
             opens,
             handover: None,
-            exec: Arc::new(handover::exec_staged),
+            exec: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_exec(mut self, exec: ExecFn) -> DaemonSelf {
-        self.exec = exec;
+        self.exec = Some(exec);
         self
     }
 
@@ -653,6 +659,16 @@ impl DaemonUpdates for DaemonSelf {
         from: &Principal,
         offer: &UpdateOffer,
     ) -> Result<Box<dyn UpdateTransfer>, UpdateAnswer> {
+        if let Some(base) = &self.handover {
+            let state = base
+                .actions
+                .state
+                .lock()
+                .map_err(|_| UpdateAnswer::NotAllowed)?;
+            if state.shutdown_committed() {
+                return Err(UpdateAnswer::NotAllowed);
+            }
+        }
         if self.managed {
             return Err(UpdateAnswer::Managed);
         }
@@ -698,7 +714,8 @@ impl DaemonUpdates for DaemonSelf {
             restarts: Arc::clone(&self.restarts),
             opens: self.opens.clone(),
             handover: self.handover.clone(),
-            exec: Arc::clone(&self.exec),
+            exec: self.exec.clone(),
+            lease: None,
         }))
     }
 
@@ -718,6 +735,7 @@ impl DaemonUpdates for DaemonSelf {
 /// An accepted image on its way to replacing the daemon. Dropped before the
 /// exec succeeds, it removes its staged file and frees the slot.
 struct StagedImage {
+    lease: Option<ReplacementLease>,
     offer: UpdateOffer,
     path: PathBuf,
     /// Opened on the first write, so a directory that cannot take the file
@@ -735,7 +753,7 @@ struct StagedImage {
     restarts: Arc<Restarts>,
     opens: Arc<ChannelOpenRegistry>,
     handover: Option<Arc<HandoverBase>>,
-    exec: ExecFn,
+    exec: Option<ExecFn>,
 }
 
 impl StagedImage {
@@ -763,7 +781,11 @@ impl StagedImage {
     fn reopen_admission(&mut self) {
         if std::mem::take(&mut self.closed_admission) {
             if let Some(base) = &self.handover {
-                base.admission.open();
+                if let (Some(lease), Ok(state)) = (self.lease, base.actions.state.lock()) {
+                    if state.owns_replacement(lease) {
+                        base.admission.open();
+                    }
+                }
             }
         }
     }
@@ -790,6 +812,18 @@ impl UpdateTransfer for StagedImage {
     }
 
     fn verify(&mut self) -> Result<(), UpdateResult> {
+        if let Some(base) = &self.handover {
+            if self.lease.is_none() {
+                self.lease = Some(
+                    base.actions
+                        .state
+                        .lock()
+                        .map_err(|_| revoked_update())?
+                        .begin_replacement()
+                        .map_err(|_| revoked_update())?,
+                );
+            }
+        }
         let rejected = |code: RejectCode, detail: String| UpdateResult::Rejected { code, detail };
         if self.written != self.offer.size {
             return Err(rejected(
@@ -857,6 +891,13 @@ impl UpdateTransfer for StagedImage {
         // -- and it comes before anything is announced: a `Busy` here has
         // told no session `Restarting`, and cut none.
         if let Some(base) = &self.handover {
+            let state = base.actions.state.lock().map_err(|_| revoked_update())?;
+            if !self
+                .lease
+                .is_some_and(|lease| state.owns_replacement(lease))
+            {
+                return Err(revoked_update());
+            }
             base.admission.close();
             self.closed_admission = true;
         }
@@ -885,8 +926,19 @@ impl UpdateTransfer for StagedImage {
         };
         // Closed already by the last count in `verify`, and kept closed to
         // the exec: no new session from here on (see the module docs).
-        base.admission.close();
-        self.closed_admission = true;
+        let Some(lease) = self.lease else {
+            return revoked_update();
+        };
+        {
+            let Ok(state) = base.actions.state.lock() else {
+                return revoked_update();
+            };
+            if !state.owns_replacement(lease) {
+                return revoked_update();
+            }
+            base.admission.close();
+            self.closed_admission = true;
+        }
         if let Err(error) = self.cleanup_preflight() {
             return error;
         }
@@ -898,29 +950,40 @@ impl UpdateTransfer for StagedImage {
                 hook();
             }
         }
-        let fence = match self.opens.begin_restart_fence() {
-            Ok(fence) => fence,
-            Err(_) => {
-                return UpdateResult::Rejected {
-                    code: RejectCode::ExecFailed,
-                    detail: "channel opening could not be fenced".into(),
-                };
+        let (undo, restart) = {
+            let Ok(state) = base.actions.state.lock() else {
+                return revoked_update();
+            };
+            if !state.owns_replacement(lease) {
+                return revoked_update();
             }
-        };
-        // Fence first: cancellation survives a dropped runner and precedes
-        // watch publication. Every failure unwinds Idle -> registry -> admission.
-        let undo = UndoRestart {
-            admission: Arc::clone(&base.admission),
-            restarts: Arc::clone(&self.restarts),
-            opens: Some(fence),
-        };
-        let restart = match self.restarts.announce() {
-            Ok(restart) => restart,
-            Err(_) => {
-                return UpdateResult::Rejected {
-                    code: RejectCode::ExecFailed,
-                    detail: "restart identity exhausted".into(),
-                };
+            let fence = match self.opens.begin_restart_fence() {
+                Ok(fence) => fence,
+                Err(_) => {
+                    return UpdateResult::Rejected {
+                        code: RejectCode::ExecFailed,
+                        detail: "channel opening could not be fenced".into(),
+                    }
+                }
+            };
+            let undo = UndoRestart {
+                admission: base.admission.clone(),
+                restarts: self.restarts.clone(),
+                opens: Some(fence),
+                actions: base.actions.clone(),
+                lease,
+            };
+            // On exhaustion, release the action lock before undo runs.
+            let announced = self.restarts.announce();
+            drop(state);
+            match announced {
+                Ok(restart) => (undo, restart),
+                Err(_) => {
+                    return UpdateResult::Rejected {
+                        code: RejectCode::ExecFailed,
+                        detail: "restart identity exhausted".into(),
+                    }
+                }
             }
         };
         // Only for the sessions to put `Restarting` on the wire: the
@@ -938,7 +1001,15 @@ impl UpdateTransfer for StagedImage {
             );
         }
         let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
-        self.restarts.drain(restart);
+        {
+            let Ok(state) = base.actions.state.lock() else {
+                return revoked_update();
+            };
+            if !state.owns_replacement(lease) {
+                return revoked_update();
+            }
+            self.restarts.drain(restart);
+        }
         if !self.restarts.wait_drained_until(restart, drain_deadline) {
             crate::log::warn(
                 "update",
@@ -988,7 +1059,16 @@ impl UpdateTransfer for StagedImage {
 
 /// Undoes an attempt on every way out of [`StagedImage::restart`] short of a
 /// successful exec, a panic included.
+fn revoked_update() -> UpdateResult {
+    UpdateResult::Rejected {
+        code: RejectCode::ExecFailed,
+        detail: "replacement authority was revoked by daemon shutdown or another operation".into(),
+    }
+}
+
 struct UndoRestart {
+    actions: Arc<Actions>,
+    lease: ReplacementLease,
     admission: Arc<AdmissionGate>,
     restarts: Arc<Restarts>,
     opens: Option<RestartOpenFence>,
@@ -996,11 +1076,15 @@ struct UndoRestart {
 
 impl Drop for UndoRestart {
     fn drop(&mut self) {
-        self.restarts.end();
-        if let Some(fence) = self.opens.take() {
-            fence.reopen();
+        if let Ok(state) = self.actions.state.lock() {
+            if state.owns_replacement(self.lease) {
+                self.restarts.end();
+                if let Some(fence) = self.opens.take() {
+                    fence.reopen();
+                }
+                self.admission.open();
+            }
         }
-        self.admission.open();
     }
 }
 
@@ -1085,7 +1169,14 @@ impl StagedImage {
             "update",
             &format!("replacing this process with build {}", self.offer.build),
         );
-        let err = (self.exec)(&self.path, memfd.as_raw_fd());
+        let Some(lease) = self.lease else {
+            return "replacement authority missing".into();
+        };
+        let guard = ExecAttemptGuard::new(&base.actions, lease);
+        let err = match &self.exec {
+            Some(exec) => guard.attempt(|| exec(&self.path, memfd.as_raw_fd())),
+            None => handover::exec_staged_guarded(&self.path, memfd.as_raw_fd(), &guard),
+        };
         // Closed while the spawn gate is still held: it is inheritable now.
         // (The sockets are put back by `_put_back`, dropped before the gate.)
         drop(memfd);
@@ -1096,6 +1187,11 @@ impl StagedImage {
 impl Drop for StagedImage {
     fn drop(&mut self) {
         self.reopen_admission();
+        if let (Some(base), Some(lease)) = (&self.handover, self.lease.take()) {
+            if let Ok(mut state) = base.actions.state.lock() {
+                state.finish_replacement(lease);
+            }
+        }
         self.file = None;
         if self.created {
             let _ = std::fs::remove_file(&self.path);
@@ -1206,6 +1302,22 @@ fn spawn_self_check(path: &Path) -> Result<Child, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shutdown_seal_cannot_be_cleared_by_replacement_rollback() {
+        let gate = AdmissionGate::default();
+        gate.close();
+        gate.seal_shutdown();
+        gate.open();
+        assert!(gate.is_closed());
+        gate.close();
+        gate.open();
+        assert!(gate.is_closed());
+        let ordinary = AdmissionGate::default();
+        ordinary.close();
+        ordinary.open();
+        assert!(!ordinary.is_closed());
+    }
+
     include!("update_restart_bounds_tests.rs");
     include!("update_open_tests.rs");
     include!("update_scope_tests.rs");
@@ -1436,7 +1548,16 @@ mod tests {
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let control_path = dir.join("control.sock");
         let control = std::os::unix::net::UnixListener::bind(&control_path).unwrap();
+        let control_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let admission = Arc::new(AdmissionGate::default());
+        let actions = Arc::new(Actions::new(
+            None,
+            control_gate.clone(),
+            admission.clone(),
+            false,
+        ));
         let base = HandoverBase {
+            actions,
             udp_fd: udp.as_raw_fd(),
             control_fd: control.as_raw_fd(),
             control_path,
@@ -1445,10 +1566,93 @@ mod tests {
             ports: vec![1],
             name: "main".to_string(),
             allowlist: Arc::new(Mutex::new(vec![[3u8; 32]])),
-            control_gate: Arc::new(tokio::sync::RwLock::new(())),
-            admission: Arc::new(AdmissionGate::default()),
+            control_gate,
+            admission,
         };
         (base, udp, control)
+    }
+
+    #[test]
+    fn terminal_shutdown_revokes_verified_update_without_exec_or_reopen() {
+        let _fds = crate::test_support::fd_flags_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let ready = verified_transfer(
+            dir.path(),
+            Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Errno::ENOENT
+            }),
+        );
+        let actions = ready.daemon.handover.as_ref().unwrap().actions.clone();
+        actions.administrative_shutdown();
+        assert!(matches!(
+            ready.transfer.restart(),
+            UpdateResult::Rejected { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(ready.admission.is_closed());
+        assert_eq!(ready.daemon.restarts.phase(), RestartPhase::Idle);
+        assert!(actions.shutdown.is_requested());
+        let image = script_image(101, 0);
+        assert!(matches!(
+            ready.daemon.offer(&me(), &offer_for(&image, 101)),
+            Err(UpdateAnswer::NotAllowed)
+        ));
+    }
+
+    #[test]
+    fn shutdown_during_restart_keeps_channel_fence_and_never_publishes_idle() {
+        let _fds = crate::test_support::fd_flags_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let ready = verified_transfer(
+            dir.path(),
+            Arc::new(|_, _| panic!("shutdown must revoke exec")),
+        );
+        let daemon = ready.daemon.clone();
+        let actions = daemon.handover.as_ref().unwrap().actions.clone();
+        let rx = daemon.restart_signal();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while rx.borrow().phase != RestartPhase::Announced {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let restart = rx.borrow().restart;
+            assert!(daemon.restart_joined(restart));
+            actions.administrative_shutdown();
+        });
+        assert!(matches!(
+            ready.transfer.restart(),
+            UpdateResult::Rejected { .. }
+        ));
+        worker.join().unwrap();
+        assert!(ready.admission.is_closed());
+        assert_eq!(ready.daemon.restarts.phase(), RestartPhase::Announced);
+        assert!(ready.daemon.opens.begin_restart_fence().is_err());
+    }
+
+    #[test]
+    fn replacement_claims_action_before_verify_closes_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _udp, _control) = handover_base(dir.path());
+        let actions = base.actions.clone();
+        let daemon = DaemonSelf::personal(
+            ChannelOpenRegistry::new(Default::default()),
+            Some(own_image()),
+            dir.path().join("qshd"),
+            uid(),
+            Arc::new(AtomicUsize::new(1)),
+            Some(base),
+        );
+        let image = script_image(101, 0);
+        let mut transfer = daemon.offer(&me(), &offer_for(&image, 101)).unwrap();
+        transfer.write(&image).unwrap();
+        actions.administrative_shutdown();
+        assert!(transfer.verify().is_err());
+        drop(transfer);
+        assert!(actions.admission.is_closed());
     }
 
     #[test]
@@ -2565,6 +2769,28 @@ mod tests {
             daemon.offer(&me(), &offer_for(&image, 101)).is_ok(),
             "the slot is free"
         );
+    }
+
+    #[test]
+    fn shutdown_between_exec_panic_and_rollback_keeps_terminal_fences() {
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let dir = tempfile::tempdir().unwrap();
+        let ready = verified_transfer(dir.path(), Arc::new(|_, _| panic!("injected exec panic")));
+        let actions = ready.daemon.handover.as_ref().unwrap().actions.clone();
+        let shutdown = actions.clone();
+        *actions.after_exec_panic.lock().unwrap() =
+            Some(Box::new(move || shutdown.administrative_shutdown()));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ready.transfer.restart()))
+                .is_err()
+        );
+        assert!(ready.admission.is_closed());
+        assert_eq!(ready.daemon.restarts.phase(), RestartPhase::Draining);
+        assert!(ready.daemon.opens.begin_restart_fence().is_err());
+        assert!(handover::is_cloexec(ready.udp.as_raw_fd()).unwrap());
+        assert!(handover::is_cloexec(ready.control.as_raw_fd()).unwrap());
+        assert!(spawn_gate_free());
     }
 
     /// The daemon's receivers are the sessions' alone: it keeps none of its
