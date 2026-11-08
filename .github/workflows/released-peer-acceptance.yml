@@ -57,7 +57,7 @@ jobs:
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Qualify the acceptance controls
         run: python3 -m unittest discover -s scripts/tests -p 'test_released_peer_acceptance.py'
-      - name: Run six exact released-peer and current-peer scenarios
+      - name: Run seven exact released-peer and current-peer scenarios
         run: python3 scripts/released-peer-acceptance.py --evidence "$RUNNER_TEMP/released-peer-evidence"
       - name: Retain source, fixture and exact test evidence
         if: always()

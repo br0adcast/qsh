@@ -88,6 +88,29 @@ pub fn decide_reuse(action: &ReconcileAction) -> EnsureDecision {
     }
 }
 
+/// Compatibility is established only by complete profiles from the live daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseCompatibility {
+    Unknown,
+    Compatible,
+    Incompatible,
+}
+pub fn reuse_compatibility(profiles: Option<&[[u8; 3]]>) -> ReuseCompatibility {
+    let Some(profiles) = profiles else {
+        return ReuseCompatibility::Unknown;
+    };
+    let required = [
+        transport::wire::VERSION,
+        transport::handshake_payload::HS_VERSION,
+        transport::channel::PROTOCOL_VERSION,
+    ];
+    if profiles.contains(&required) {
+        ReuseCompatibility::Compatible
+    } else {
+        ReuseCompatibility::Incompatible
+    }
+}
+
 /// Builds the INITIAL server allowlist for starting the daemon: just this
 /// call's supplied `--client-pubkey`, if any (the on-disk allowlist was
 /// retired, so there is no disk set to
@@ -784,6 +807,24 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
                         .await?;
                 }
             }
+            ControlRequest::RegistrationInfo(challenge) => {
+                if let Some(info) = &running_info {
+                    let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup_registry.as_deref())?;
+                    let response = control::RegistrationInfoResponse { schema:1, challenge:hex::encode(challenge), conditional_add_client:true, identity:daemon_bootstrap_protocol::BusyDaemonIdentity {
+                        version:status.version, build:status.build, checksum:status.checksum, pid:status.pid, generation:Some(hex::encode(info.info.generation)),
+                    }};
+                    let line = format!("{}\n", serde_json::to_string(&response)?);
+                    write_half.write_all(line.as_bytes()).await?;
+                }
+            }
+            ControlRequest::AddClientIf { generation, build, checksum, pid, key } => {
+                let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup_registry.as_deref())?;
+                if running_info.as_ref().is_some_and(|info| info.info.generation == generation)
+                    && status.build == build && status.checksum == hex::encode(checksum) && status.pid == pid {
+                    apply_add_client(&shared_allowlist, key);
+                    write_half.write_all(status.to_line()?.as_bytes()).await?;
+                } else { write_half.write_all(b"{\"error\":\"daemon identity changed; rediscover before registering\"}\n").await?; }
+            }
             ControlRequest::Status => {
                 let response = transport_status_response(
                     &ports,
@@ -839,6 +880,31 @@ mod tests {
     };
     use crate::version::ReconcileAction;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn reuse_compatibility_uses_complete_serving_profiles() {
+        use super::ReuseCompatibility::*;
+        assert_eq!(super::reuse_compatibility(None), Unknown);
+        let required = [
+            transport::wire::VERSION,
+            transport::handshake_payload::HS_VERSION,
+            transport::channel::PROTOCOL_VERSION,
+        ];
+        assert_eq!(super::reuse_compatibility(Some(&[required])), Compatible);
+        for index in 0..3 {
+            let mut incompatible = required;
+            incompatible[index] = 99;
+            assert_eq!(
+                super::reuse_compatibility(Some(&[incompatible])),
+                Incompatible
+            );
+        }
+        assert_eq!(super::reuse_compatibility(Some(&[])), Incompatible);
+        assert_eq!(
+            super::reuse_compatibility(Some(&[[99; 3], required])),
+            Compatible
+        );
+    }
 
     #[test]
     fn decide_reuse_maps_reconcile_actions() {
@@ -1298,6 +1364,69 @@ mod peer_tests;
 mod server_info_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn conditional_registration_rejects_changed_identity_without_mutation() {
+        let allowlist = Arc::new(std::sync::Mutex::new(vec![[2; 32]]));
+        let info = Arc::new(crate::server_info::RunningServerInfo {
+            public_key: [4; 32],
+            info: crate::server_info::current(),
+        });
+        let status = transport_status_response(&[60000], 2, None).unwrap();
+        let checksum: [u8; 32] = hex::decode(&status.checksum).unwrap().try_into().unwrap();
+        for changed in 0..5 {
+            let mut generation = info.info.generation;
+            let mut build = status.build;
+            let mut digest = checksum;
+            let mut pid = status.pid;
+            match changed {
+                0 => generation[0] ^= 1,
+                1 => build ^= 1,
+                2 => digest[0] ^= 1,
+                3 => pid ^= 1,
+                _ => {}
+            }
+            let request = ControlRequest::AddClientIf {
+                generation,
+                build,
+                checksum: digest,
+                pid,
+                key: [3; 32],
+            };
+            let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+            client
+                .write_all(control::format_request(&request).as_bytes())
+                .await
+                .unwrap();
+            let (stop, mut stop_rx) = mpsc::channel(1);
+            handle_transport_control_connection_with_info(
+                server,
+                allowlist.clone(),
+                vec![60000],
+                stop,
+                Arc::new(AtomicUsize::new(2)),
+                Arc::new(tokio::sync::RwLock::new(())),
+                None,
+                tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT,
+                Some(info.clone()),
+            )
+            .await
+            .unwrap();
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            if changed < 4 {
+                assert!(
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"]
+                        .is_string()
+                );
+                assert_eq!(*allowlist.lock().unwrap(), vec![[2; 32]]);
+            } else {
+                assert!(StatusResponse::from_line(std::str::from_utf8(&bytes).unwrap()).is_ok());
+                assert_eq!(*allowlist.lock().unwrap(), vec![[2; 32], [3; 32]]);
+            }
+            assert!(stop_rx.try_recv().is_err());
+        }
+    }
+
     #[tokio::test]
     async fn server_info_control_reads_running_owner_without_authorization_mutation() {
         let (server, mut client) = tokio::net::UnixStream::pair().unwrap();

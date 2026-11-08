@@ -50,6 +50,10 @@
 
 mod detach;
 
+use daemon_bootstrap_protocol::{
+    BusyAttemptId, BusyChoice, BusyDaemonIdentity, BusyDaemonInfo, BusyDecision,
+    PreservationCapability,
+};
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -68,6 +72,18 @@ use qshd::{
     channel_backend, control, handover, load_or_create_transport_key, load_transport_key, log, pty,
     serve, state, transport_daemon, update, version,
 };
+
+/// Read-only executable API discovery; no control socket or identity-key access.
+fn bootstrap_capabilities_line() -> String {
+    let capabilities = daemon_bootstrap_protocol::BootstrapToolCapabilities {
+        schema: 1,
+        busy_decisions: true,
+    };
+    format!(
+        "{}\n",
+        serde_json::to_string(&capabilities).expect("static bootstrap capabilities")
+    )
+}
 
 /// Printed by `--version`. Carries the build stamp as well as the version:
 /// the stamp is what client and daemon compare when deciding which side is
@@ -117,6 +133,7 @@ fn help_text() -> String {
         "                    Long-lived daemon for a service manager (systemd/launchd); \
          see docs/qshd-service.md."
             .to_string(),
+        "  bootstrap-capabilities  Report executable bootstrap API support.".to_owned(),
         "  server-info       --challenge <hex> [--socket <PATH>]  Query running daemon metadata."
             .to_string(),
         "  helper-status     --socket <PATH>  Root-only local system-helper snapshot.".to_string(),
@@ -160,6 +177,13 @@ fn main() -> Result<()> {
         Some("serve") => serve::run_serve_command_os(&args),
         Some("server-info") => qshd::server_info::run_command(&args),
         Some("helper-status") => qshd::helper_status::run_command(&args),
+        Some("bootstrap-capabilities") => {
+            if args.len() != 1 {
+                bail!("bootstrap-capabilities takes no arguments");
+            }
+            print!("{}", bootstrap_capabilities_line());
+            Ok(())
+        }
         Some("self-check") => {
             print!("{}", state::SelfCheck::current().to_line());
             Ok(())
@@ -487,6 +511,9 @@ fn parse_transport_shell_args(args: &[OsString]) -> Result<ParsedTransportShellA
 /// allowlist -- via `ADD-CLIENT` if reusing a live daemon, or seeded into
 /// [`transport_daemon::build_server_allowlist`] if becoming the daemon.
 struct ParsedTransportEnsureArgs {
+    report_busy: bool,
+    busy_attempt: Option<BusyAttemptId>,
+    busy_decision: Option<BusyDecision>,
     restart_only: bool,
     name: String,
     port: u16,
@@ -512,6 +539,9 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
         bail!("expected command `transport-ensure`, got: {:?}", command);
     }
 
+    let mut report_busy = false;
+    let mut busy_attempt = None;
+    let mut busy_decision: Option<BusyDecision> = None;
     let mut restart_only = false;
     let mut name: Option<String> = None;
     let mut port: Option<u16> = None;
@@ -521,6 +551,36 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
     let mut i = 1;
     while i < args.len() {
         match argument_text(&args[i], i + 1)? {
+            "--report-busy" if !report_busy => {
+                report_busy = true;
+                i += 1;
+            }
+            "--busy-attempt" if busy_attempt.is_none() => {
+                let value = argument_text(
+                    args.get(i + 1).context("--busy-attempt requires a value")?,
+                    i + 2,
+                )?;
+                busy_attempt =
+                    Some(BusyAttemptId::try_from(value.to_owned()).map_err(anyhow::Error::msg)?);
+                i += 2;
+            }
+            "--busy-decision" if busy_decision.is_none() => {
+                let value = argument_text(
+                    args.get(i + 1)
+                        .context("--busy-decision requires a value")?,
+                    i + 2,
+                )?;
+                if value.len() > 4096 {
+                    bail!("busy decision exceeds limit");
+                }
+                let decision: BusyDecision =
+                    serde_json::from_str(value).context("invalid busy decision")?;
+                if !decision.valid() {
+                    bail!("invalid busy identity");
+                }
+                busy_decision = Some(decision);
+                i += 2;
+            }
             "--restart-only" => {
                 restart_only = true;
                 i += 1;
@@ -568,6 +628,14 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
         }
     }
 
+    if report_busy != busy_attempt.is_some()
+        || (report_busy && restart_only)
+        || busy_decision
+            .as_ref()
+            .is_some_and(|d| !report_busy || Some(&d.attempt) != busy_attempt.as_ref())
+    {
+        bail!("invalid busy-daemon decision options");
+    }
     let name = name.context("--name is required")?;
     let port = port.context("--port is required")?;
     let mut ports = vec![port];
@@ -578,6 +646,9 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
     }
 
     Ok(ParsedTransportEnsureArgs {
+        report_busy,
+        busy_attempt,
+        busy_decision,
         restart_only,
         name,
         port,
@@ -600,6 +671,8 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
 /// then `warning`.
 #[derive(Serialize)]
 struct TransportReadyBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serving_profiles: Option<Vec<[u8; 3]>>,
     version: String,
     /// The ports the daemon actually listens on -- for a live daemon, from
     /// its `STATUS`, not the ones this call asked for.
@@ -612,14 +685,140 @@ struct TransportReadyBody {
 }
 
 /// The ports to put in `TRANSPORT-READY` when reusing a live daemon: the
-/// ones it says it listens on. A status that lists no ports (a daemon
-/// that reports none, or a malformed answer) falls back to the requested
-/// ones, which is what the call reported before this fix.
-fn ready_ports(status: &control::StatusResponse, requested: &[u16]) -> Vec<u16> {
-    if status.ports.is_empty() {
-        requested.to_vec()
-    } else {
-        status.ports.iter().map(|p| p.port).collect()
+/// ones it says it listens on. Missing or zero listeners cannot establish
+/// readiness; do not guess from the originally requested ports.
+fn ready_ports(status: &control::StatusResponse) -> Result<Vec<u16>> {
+    let ports: Vec<_> = status.ports.iter().map(|p| p.port).collect();
+    if ports.is_empty() || ports.contains(&0) {
+        bail!("running qshd reported no valid listeners");
+    }
+    Ok(ports)
+}
+
+fn status_identity(
+    status: &control::StatusResponse,
+    generation: Option<String>,
+) -> BusyDaemonIdentity {
+    BusyDaemonIdentity {
+        version: status.version.clone(),
+        build: status.build,
+        checksum: status.checksum.clone(),
+        pid: status.pid,
+        generation,
+    }
+}
+fn validate_add_client_reply(
+    reply: control::ControlReply,
+    prior: &control::StatusResponse,
+) -> Result<control::StatusResponse> {
+    let control::ControlReply::Answered(line) = reply else {
+        bail!(
+            "client registration was not acknowledged by running qshd {}",
+            prior.version
+        );
+    };
+    let actual = control::StatusResponse::from_line(&line)
+        .context("invalid client registration acknowledgement")?;
+    if actual.version != prior.version
+        || actual.build != prior.build
+        || actual.checksum != prior.checksum
+        || (prior.pid != 0 && actual.pid != prior.pid)
+    {
+        bail!("daemon changed during client registration; rediscover and choose again");
+    }
+    ready_ports(&actual)?;
+    Ok(actual)
+}
+
+/// This read-only request reaches the actual serving process through the same
+/// retained, same-account control authority. Legacy silence is unknown.
+type LiveProfiles = (Option<String>, Option<Vec<[u8; 3]>>);
+
+fn live_profiles(
+    transaction: &control::EnsureLock,
+    status: &control::StatusResponse,
+    key: &[u8; 32],
+) -> Result<LiveProfiles> {
+    use rand_core::RngCore;
+    let mut challenge = [0; 32];
+    rand_core::OsRng.fill_bytes(&mut challenge);
+    match transaction.request(&control::ControlRequest::ServerInfo(challenge))? {
+        control::ControlReply::NoDaemon => Ok((None, None)),
+        control::ControlReply::TimedOut => {
+            bail!("running qshd metadata timed out; rediscover before choosing")
+        }
+        control::ControlReply::Answered(line) => {
+            let info: qshd::server_info::Response =
+                serde_json::from_str(&line).context("invalid running daemon metadata")?;
+            if info.challenge != hex::encode(challenge)
+                || info.core_version != status.version
+                || info.server_pubkey != hex::encode(key)
+            {
+                bail!("running daemon identity changed during discovery");
+            }
+            let generation: [u8; 16] = hex::decode(&info.generation)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid daemon generation"))?;
+            let checked = transport::bootstrap::ServerInfo {
+                generation,
+                core_version: info.core_version,
+                session_protocols: info
+                    .session_protocols
+                    .iter()
+                    .map(|p| transport::bootstrap::SessionProfile {
+                        wire: p[0],
+                        handshake: p[1],
+                        channel: p[2],
+                    })
+                    .collect(),
+            };
+            transport::bootstrap::encode_server_info(&checked)?;
+            Ok((Some(info.generation), Some(info.session_protocols)))
+        }
+    }
+}
+
+/// Negotiate independently of SERVER-INFO. Once advertised, any failure is fatal;
+/// it must never downgrade to unconditional registration.
+fn registration_request(
+    transaction: &control::EnsureLock,
+    status: &control::StatusResponse,
+    generation: Option<&str>,
+    key: [u8; 32],
+) -> Result<control::ControlRequest> {
+    use rand_core::RngCore;
+    let mut challenge = [0; 32];
+    rand_core::OsRng.fill_bytes(&mut challenge);
+    match transaction.request(&control::ControlRequest::RegistrationInfo(challenge))? {
+        control::ControlReply::NoDaemon => Ok(control::ControlRequest::AddClient(key)),
+        control::ControlReply::TimedOut => {
+            bail!("registration capability query timed out; no client registered")
+        }
+        control::ControlReply::Answered(line) => {
+            let response: control::RegistrationInfoResponse =
+                serde_json::from_str(&line).context("invalid registration capability response")?;
+            let expected = status_identity(status, generation.map(str::to_owned));
+            if response.schema != 1
+                || !response.conditional_add_client
+                || response.challenge != hex::encode(challenge)
+                || response.identity != expected
+                || !response.identity.valid()
+                || generation.is_none()
+            {
+                bail!("registration capability identity changed; rediscover before registering");
+            }
+            Ok(control::ControlRequest::AddClientIf {
+                generation: hex::decode(generation.unwrap())?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid generation"))?,
+                build: status.build,
+                checksum: hex::decode(&status.checksum)?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid checksum"))?,
+                pid: status.pid,
+                key,
+            })
+        }
     }
 }
 
@@ -634,13 +833,26 @@ fn ready_ports(status: &control::StatusResponse, requested: &[u16]) -> Vec<u16> 
 /// will pass `std::io::stdout()` -- in the parent process, BEFORE the fork.
 fn write_transport_ready(
     w: &mut impl Write,
+    version: &str,
     pubkey: &[u8; 32],
     ports: &[u16],
     warning: Option<&str>,
 ) -> Result<()> {
+    write_transport_ready_profiles(w, version, pubkey, ports, warning, None)
+}
+
+fn write_transport_ready_profiles(
+    w: &mut impl Write,
+    version: &str,
+    pubkey: &[u8; 32],
+    ports: &[u16],
+    warning: Option<&str>,
+    serving_profiles: Option<Vec<[u8; 3]>>,
+) -> Result<()> {
     writeln!(w, "server-pubkey: {}", BASE64.encode(pubkey)).context("printing server-pubkey")?;
     let body = TransportReadyBody {
-        version: state::QSHD_VERSION.to_string(),
+        serving_profiles,
+        version: version.to_owned(),
         ports: ports.to_vec(),
         warning: warning.map(str::to_string),
     };
@@ -748,31 +960,94 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
             } else {
                 version::reconcile(state::build_label(), &state::self_checksum()?, &status)
             };
-            // `KeepOldWarn` is a `Reuse` too (see `decide_reuse` below) --
-            // the reason is both logged to stderr (unchanged) and carried
-            // into `TRANSPORT-READY` so the app can surface it to the user.
-            let warning: Option<String> = match &action {
-                version::ReconcileAction::KeepOldWarn(reason) => {
-                    eprintln!("qshd: {reason}");
-                    Some(reason.clone())
+            let (generation, profiles) = live_profiles(&transaction, &status, &keypair.public)?;
+            let identity = status_identity(&status, generation.clone());
+            let needs_choice = parsed.report_busy
+                && matches!(action, version::ReconcileAction::KeepOldWarn(_))
+                && status.total_connections > 0;
+            // Current activity decides whether to report a new BUSY record, not
+            // whether an identity-scoped Continue still selects this daemon.
+            let accepted = if let Some(decision) =
+                parsed.busy_decision.as_ref().filter(|decision| {
+                    Some(&decision.attempt) == parsed.busy_attempt.as_ref()
+                        && decision.identity == identity
+                        && decision.valid()
+                }) {
+                match decision.choice {
+                    BusyChoice::Cancel => bail!("busy daemon startup cancelled"),
+                    BusyChoice::ContinueOld => true,
+                    BusyChoice::ForceUpdate => bail!("forced update unavailable: exact-instance restart authority is not qualified; no sessions were interrupted"),
                 }
+            } else {
+                false
+            };
+            if (needs_choice || parsed.busy_decision.is_some()) && !accepted {
+                if status.total_connections == 0 {
+                    bail!("selected daemon identity changed; rediscover before choosing again");
+                }
+                let info = BusyDaemonInfo {
+                    schema: 1,
+                    attempt: parsed
+                        .busy_attempt
+                        .clone()
+                        .context("missing busy attempt")?,
+                    identity,
+                    active_connections: status.total_connections,
+                    serving_profiles: profiles.clone(),
+                    preservation: PreservationCapability::Unknown,
+                };
+                if !info.valid() {
+                    bail!("invalid running daemon identity");
+                }
+                writeln!(
+                    std::io::stdout(),
+                    "TRANSPORT-BUSY {}",
+                    serde_json::to_string(&info)?
+                )?;
+                std::io::stdout().flush()?;
+                return Ok(());
+            }
+            let warning = match &action {
+                version::ReconcileAction::KeepOldWarn(reason) if !accepted => Some(reason.as_str()),
                 _ => None,
             };
-            match transport_daemon::decide_reuse(&action) {
+            let decision = if accepted {
+                transport_daemon::EnsureDecision::Reuse
+            } else {
+                transport_daemon::decide_reuse(&action)
+            };
+            match decision {
                 transport_daemon::EnsureDecision::Reuse => {
-                    // The live daemon is up to date: live-add the client
-                    // key to its IN-MEMORY allowlist, then print
-                    // `TRANSPORT-READY` and exit -- no fork.
-                    if let Some(pubkey) = parsed.client_pubkey {
-                        transaction.request(&control::ControlRequest::AddClient(pubkey))?;
+                    if transport_daemon::reuse_compatibility(profiles.as_deref())
+                        == transport_daemon::ReuseCompatibility::Incompatible
+                    {
+                        bail!("running qshd {} serves incompatible session profiles {:?}; required profile [{}, {}, {}]. The running daemon was left unchanged. Use a client with a matching profile, or finish active qsh sessions before updating the daemon", status.version, profiles, transport::wire::VERSION, transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION);
+                    }
+                    let actual = if let Some(pubkey) = parsed.client_pubkey {
+                        let request = registration_request(
+                            &transaction,
+                            &status,
+                            generation.as_deref(),
+                            pubkey,
+                        )?;
+                        validate_add_client_reply(transaction.request(&request)?, &status)?
+                    } else {
+                        ready_ports(&status)?;
+                        status.clone()
+                    };
+                    let (after_generation, after_profiles) =
+                        live_profiles(&transaction, &actual, &keypair.public)?;
+                    if after_generation != generation || after_profiles != profiles {
+                        bail!("daemon changed during registration; rediscover and choose again");
                     }
                     transaction.validate_route()?;
-                    write_transport_ready(
+                    write_transport_ready_profiles(
                         &mut std::io::stdout(),
+                        &actual.version,
                         &keypair.public,
-                        &ready_ports(&status, &parsed.ports),
-                        combined_warning(warning.as_deref(), status.logging_warning.as_deref())
-                            .as_deref(),
+                        &ready_ports(&actual)?,
+                        combined_warning(warning, actual.logging_warning.as_deref()).as_deref(),
+                        profiles,
                     )?;
                     return Ok(());
                 }
@@ -787,6 +1062,9 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
             }
         }
         control::ControlReply::NoDaemon => {
+            if parsed.busy_decision.is_some() {
+                bail!("selected daemon is gone; rediscover before choosing again");
+            }
             // No daemon -- falls through to the "become the daemon" branch below.
         }
         control::ControlReply::TimedOut => {
@@ -932,6 +1210,7 @@ fn become_transport_daemon(
     }
     write_transport_ready(
         &mut std::io::stdout(),
+        state::QSHD_VERSION,
         &keypair.public,
         std::slice::from_ref(&bound_port),
         prepared_log.warning(),
@@ -1295,7 +1574,8 @@ mod tests {
     use super::{
         ask_status_with, control, help_text, load_or_create_transport_key,
         parse_transport_echo_args, parse_transport_ensure_args, parse_transport_shell_args,
-        personal_server_auth, ready_ports, state, update, version_text, write_transport_ready,
+        personal_server_auth, ready_ports, state, update, validate_add_client_reply, version_text,
+        write_transport_ready,
     };
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
@@ -1716,37 +1996,124 @@ mod tests {
     }
 
     #[test]
-    fn ready_ports_are_the_ones_the_live_daemon_reports() {
-        let status = control::StatusResponse {
-            logging_warning: None,
-            cleanup: None,
-            version: "0.3.0".into(),
-            build: 1,
-            checksum: "x".into(),
-            ports: vec![control::PortStatus {
-                port: 60000,
-                default: true,
-                connections: 0,
-            }],
-            total_connections: 0,
-            pid: 1,
-        };
-        assert_eq!(ready_ports(&status, &[60022]), vec![60000]);
+    fn bootstrap_tool_capability_describes_flags_not_running_daemon_profiles() {
+        let value: serde_json::Value =
+            serde_json::from_str(&super::bootstrap_capabilities_line()).unwrap();
+        assert_eq!(value, serde_json::json!({"schema":1,"busy_decisions":true}));
     }
 
     #[test]
-    fn a_status_without_ports_falls_back_to_the_requested_ones() {
-        let status = control::StatusResponse {
+    fn busy_flags_require_explicit_report_mode_and_valid_scoped_identity() {
+        let decision = serde_json::json!({"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"choice":"continue_old"}).to_string();
+        let attempt = "12".repeat(16);
+        for suffix in [
+            vec!["--busy-decision", decision.as_str()],
+            vec!["--report-busy", "--restart-only"],
+            vec!["--report-busy", "--busy-attempt", "bad"],
+            vec![
+                "--report-busy",
+                "--busy-attempt",
+                &attempt,
+                "--busy-decision",
+                "{}",
+            ],
+        ] {
+            let mut input = vec!["transport-ensure", "--name", "main", "--port", "60022"];
+            input.extend(suffix);
+            assert!(parse_transport_ensure_args(&args(&input)).is_err());
+        }
+        let parsed = parse_transport_ensure_args(&args(&[
+            "transport-ensure",
+            "--name",
+            "main",
+            "--port",
+            "60022",
+            "--report-busy",
+            "--busy-attempt",
+            &attempt,
+            "--busy-decision",
+            &decision,
+        ]))
+        .unwrap();
+        assert!(parsed.report_busy);
+        assert_eq!(parsed.busy_decision.unwrap().identity.version, "0.5.0");
+    }
+
+    fn reusable_status() -> control::StatusResponse {
+        control::StatusResponse {
             logging_warning: None,
             cleanup: None,
-            version: "0.3.0".into(),
+            version: "0.5.99".into(),
             build: 1,
-            checksum: "x".into(),
-            ports: vec![],
-            total_connections: 0,
-            pid: 1,
-        };
-        assert_eq!(ready_ports(&status, &[60022]), vec![60022]);
+            checksum: "image".into(),
+            ports: vec![control::PortStatus {
+                port: 60000,
+                default: true,
+                connections: 1,
+            }],
+            total_connections: 1,
+            pid: 42,
+        }
+    }
+
+    #[test]
+    fn ready_ports_require_real_nonzero_listeners() {
+        let mut status = reusable_status();
+        assert_eq!(ready_ports(&status).unwrap(), vec![60000]);
+        status.ports[0].port = 0;
+        assert!(ready_ports(&status).is_err());
+        status.ports.clear();
+        assert!(ready_ports(&status).is_err());
+    }
+
+    #[test]
+    fn add_client_requires_a_valid_ack_from_the_same_compatible_daemon() {
+        let prior = reusable_status();
+        for reply in [
+            control::ControlReply::NoDaemon,
+            control::ControlReply::TimedOut,
+            control::ControlReply::Answered("not-json".into()),
+            control::ControlReply::Answered(r#"{"error":"denied"}"#.into()),
+        ] {
+            assert!(validate_add_client_reply(reply, &prior).is_err());
+        }
+        for changed in 0..6 {
+            let mut ack = prior.clone();
+            match changed {
+                0 => ack.checksum = "other".into(),
+                1 => ack.pid = 43,
+                2 => ack.version = "other".into(),
+                3 => ack.build = 2,
+                4 => ack.ports.clear(),
+                5 => ack.ports[0].port = 0,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_add_client_reply(
+                    control::ControlReply::Answered(ack.to_line().unwrap()),
+                    &prior
+                )
+                .is_err(),
+                "changed {changed}"
+            );
+        }
+        let mut ack = prior.clone();
+        ack.total_connections = 3;
+        let actual = validate_add_client_reply(
+            control::ControlReply::Answered(ack.to_line().unwrap()),
+            &prior,
+        )
+        .unwrap();
+        assert_eq!(actual.total_connections, 3);
+        // Legacy omission of PID is permitted only if the initial response
+        // itself supplied no identity to pin.
+        let mut legacy = prior.clone();
+        legacy.pid = 0;
+        assert!(validate_add_client_reply(
+            control::ControlReply::Answered(ack.to_line().unwrap()),
+            &legacy
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1821,7 +2188,7 @@ mod tests {
         assert!(warning.contains("file logging disabled: log-path"));
         assert!(warning.len() <= 1024 && !warning.contains('\x1b'));
         let mut output = Vec::new();
-        write_transport_ready(&mut output, &[7; 32], &[60000], Some(&warning)).unwrap();
+        write_transport_ready(&mut output, "0.5.99", &[7; 32], &[60000], Some(&warning)).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output.lines().count(), 2);
         let json: serde_json::Value = serde_json::from_str(
@@ -1841,7 +2208,7 @@ mod tests {
         let pubkey = [7u8; 32];
         let mut buf: Vec<u8> = Vec::new();
 
-        write_transport_ready(&mut buf, &pubkey, &[60000, 60999], None).unwrap();
+        write_transport_ready(&mut buf, "0.5.99", &pubkey, &[60000, 60999], None).unwrap();
 
         let text = String::from_utf8(buf).unwrap();
         let mut lines = text.lines();
@@ -1857,7 +2224,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&second[prefix.len()..]).unwrap();
         assert_eq!(
             value,
-            serde_json::json!({"version": state::QSHD_VERSION, "ports": [60000, 60999], "warning": null})
+            serde_json::json!({"version": "0.5.99", "ports": [60000, 60999], "warning": null})
         );
     }
 
@@ -1865,13 +2232,13 @@ mod tests {
     fn transport_ready_carries_optional_warning() {
         let mut buf = Vec::new();
         let pk = [0u8; 32];
-        write_transport_ready(&mut buf, &pk, &[60000], Some("daemon differs")).unwrap();
+        write_transport_ready(&mut buf, "0.5.99", &pk, &[60000], Some("daemon differs")).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("server-pubkey: "));
         assert!(s.contains("\"warning\":\"daemon differs\""));
 
         let mut buf2 = Vec::new();
-        write_transport_ready(&mut buf2, &pk, &[60000], None).unwrap();
+        write_transport_ready(&mut buf2, "0.5.99", &pk, &[60000], None).unwrap();
         let s2 = String::from_utf8(buf2).unwrap();
         assert!(s2.contains("TRANSPORT-READY "));
         // No warning -> field is null (client tolerates absence/null).

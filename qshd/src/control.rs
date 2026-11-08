@@ -41,6 +41,16 @@ pub enum ControlRequest {
     Status,
     /// Read actual running process metadata with a fresh caller challenge.
     ServerInfo([u8; 32]),
+    /// Read-only, generation-bound negotiation of conditional registration.
+    RegistrationInfo([u8; 32]),
+    /// Exact-generation executable identity guard, checked atomically with insertion.
+    AddClientIf {
+        generation: [u8; 16],
+        build: u64,
+        checksum: [u8; 32],
+        pid: u32,
+        key: [u8; 32],
+    },
     /// Start listening on one more QUIC port (without restarting the daemon).
     AddPort(u16),
     /// Add a client Noise key (32-byte X25519) to a live transport daemon's
@@ -52,6 +62,16 @@ pub enum ControlRequest {
     AddClient([u8; 32]),
     /// Shut the daemon down.
     Stop,
+}
+
+/// Separate from strict SERVER-INFO: generation is not a capability advertisement.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationInfoResponse {
+    pub schema: u8,
+    pub challenge: String,
+    pub conditional_add_client: bool,
+    pub identity: daemon_bootstrap_protocol::BusyDaemonIdentity,
 }
 
 /// State of a single port on which the daemon accepts QUIC connections --
@@ -184,6 +204,30 @@ pub fn parse_request(line: &str) -> Option<ControlRequest> {
             }
             Some(ControlRequest::ServerInfo(raw.try_into().ok()?))
         }
+        "REGISTRATION-INFO" => {
+            let raw = hex::decode(parts.next()?).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::RegistrationInfo(raw.try_into().ok()?))
+        }
+        "ADD-CLIENT-IF" => {
+            let generation = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+            let build = parts.next()?.parse().ok()?;
+            let checksum = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+            let pid = parts.next()?.parse().ok()?;
+            let key = BASE64.decode(parts.next()?).ok()?.try_into().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::AddClientIf {
+                generation,
+                build,
+                checksum,
+                pid,
+                key,
+            })
+        }
         "STATUS" => {
             if parts.next().is_some() {
                 return None;
@@ -224,6 +268,21 @@ pub fn format_request(req: &ControlRequest) -> String {
         ControlRequest::ServerInfo(challenge) => {
             format!("SERVER-INFO {}\n", hex::encode(challenge))
         }
+        ControlRequest::RegistrationInfo(challenge) => {
+            format!("REGISTRATION-INFO {}\n", hex::encode(challenge))
+        }
+        ControlRequest::AddClientIf {
+            generation,
+            build,
+            checksum,
+            pid,
+            key,
+        } => format!(
+            "ADD-CLIENT-IF {} {build} {} {pid} {}\n",
+            hex::encode(generation),
+            hex::encode(checksum),
+            BASE64.encode(key)
+        ),
         ControlRequest::AddPort(port) => format!("ADD-PORT {port}\n"),
         ControlRequest::AddClient(key) => format!("ADD-CLIENT {}\n", BASE64.encode(key)),
         ControlRequest::Stop => "STOP\n".to_string(),
@@ -356,12 +415,19 @@ fn client_request_at(
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let read_result = if matches!(req, ControlRequest::ServerInfo(_)) {
+    let read_result = if matches!(
+        req,
+        ControlRequest::ServerInfo(_) | ControlRequest::RegistrationInfo(_)
+    ) {
         std::io::Read::take(&mut reader, 4097).read_line(&mut line)
     } else {
         reader.read_line(&mut line)
     };
-    if matches!(req, ControlRequest::ServerInfo(_)) && line.len() > 4096 {
+    if matches!(
+        req,
+        ControlRequest::ServerInfo(_) | ControlRequest::RegistrationInfo(_)
+    ) && line.len() > 4096
+    {
         anyhow::bail!("server-info response exceeds limit");
     }
     let reply = match read_result {
@@ -1121,6 +1187,30 @@ mod tests {
         assert_eq!(parse_request("NONSENSE"), None);
         assert_eq!(parse_request("ADD-PORT x"), None);
         assert_eq!(parse_request("ADD-PORT"), None);
+    }
+
+    #[test]
+    fn conditional_registration_codec_is_explicit_and_bounded() {
+        let request = ControlRequest::AddClientIf {
+            generation: [1; 16],
+            build: 7,
+            checksum: [2; 32],
+            pid: 42,
+            key: [3; 32],
+        };
+        assert_eq!(
+            parse_request(format_request(&request).trim_end()),
+            Some(request)
+        );
+        for bad in [
+            "REGISTRATION-INFO bad",
+            "ADD-CLIENT-IF bad",
+            "REGISTRATION-INFO 0000 trailing",
+        ] {
+            assert!(parse_request(bad).is_none());
+        }
+        let info = ControlRequest::RegistrationInfo([8; 32]);
+        assert_eq!(parse_request(format_request(&info).trim_end()), Some(info));
     }
 
     #[test]

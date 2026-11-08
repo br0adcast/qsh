@@ -13,6 +13,7 @@ exceptions = [
     { crate = "bringup@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
     { crate = "client@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
     { crate = "connect@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
+    { crate = "daemon-bootstrap-protocol@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
     { crate = "knock@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
     { crate = "logging@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
     { crate = "prediction@0.6.0-rc1", allow = ["AGPL-3.0-only"] },

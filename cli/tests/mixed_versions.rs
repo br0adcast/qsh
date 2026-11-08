@@ -287,6 +287,16 @@ fn spawn_qsh(
     config_home: &std::path::Path,
     extra: &[&str],
 ) -> Client {
+    spawn_qsh_on_port(qsh, daemon.port, key_path, config_home, extra)
+}
+
+fn spawn_qsh_on_port(
+    qsh: &Path,
+    port: u16,
+    key_path: &Path,
+    config_home: &Path,
+    extra: &[&str],
+) -> Client {
     let pty = nix::pty::openpty(
         Some(&nix::pty::Winsize {
             ws_row: 24,
@@ -299,7 +309,7 @@ fn spawn_qsh(
     .expect("openpty");
 
     let slave = pty.slave;
-    let port = daemon.port.to_string();
+    let port = port.to_string();
     let mut args = vec![
         "--port",
         port.as_str(),
@@ -678,4 +688,263 @@ exit 1"#,
         outcome.is_err(),
         "unrelated exit 1 was accepted as protocol rejection"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[path = "../../qshd/tests/daemon_guard/mod.rs"]
+mod daemon_guard;
+
+/// A released personal daemon, owned through the same control guard used by
+/// the other real-daemon tests. Subreaping also lets this fixture reap the
+/// double-forked child rather than leaving that responsibility to PID 1.
+#[cfg(target_os = "linux")]
+struct PersonalDaemon {
+    guard: daemon_guard::DaemonGuard,
+    pid: u32,
+    previous_subreaper: libc::c_int,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PersonalDaemon {
+    fn drop(&mut self) {
+        let pid = self.pid;
+        let reaper = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(25);
+            loop {
+                let mut status = 0;
+                let result = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+                if result == pid as i32 {
+                    return true;
+                }
+                if result < 0 || Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let stopped = self.guard.finish();
+        let reaped = reaper.join().unwrap_or(false);
+        unsafe {
+            libc::prctl(libc::PR_SET_CHILD_SUBREAPER, self.previous_subreaper);
+        }
+        assert!(
+            matches!(stopped, daemon_guard::Finished::Stopped),
+            "{stopped:?}"
+        );
+        assert!(reaped, "owned personal daemon was not reaped");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn personal_status(socket: &Path) -> Option<qshd::control::StatusResponse> {
+    match qshd::control::client_request(socket, &qshd::control::ControlRequest::Status).ok()? {
+        qshd::control::ControlReply::Answered(line) => {
+            qshd::control::StatusResponse::from_line(&line).ok()
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_legacy_fixture_metadata(check: &serde_json::Value, version: &str) {
+    let mut fields = version
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_ascii_whitespace();
+    assert_eq!(fields.next(), Some("qshd"));
+    assert_eq!(fields.next(), Some("0.5.0"));
+    // SelfCheck reports channel protocol here, not transport wire compatibility.
+    assert_eq!(check["protocol"], 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn legacy_fixture_accepts_published_self_check_without_a_version_field() {
+    // Public v0.5 root 5a5f561 SelfCheck schema; build is synthetic.
+    let check = serde_json::json!({"build":0,"arch":"x86_64","protocol":1,"protocols":[1],"handover_versions":[1],"transport_features":[]});
+    assert_legacy_fixture_metadata(&check, "qshd 0.5.0 (build 0)\n");
+}
+
+#[cfg(target_os = "linux")]
+fn legacy_ensure_command(binary: &Path, port: u16, client_key: &str, report_busy: bool) -> Command {
+    let mut command = Command::new(binary);
+    command.arg("transport-ensure");
+    if report_busy {
+        command.args(["--report-busy", "--busy-attempt", &"12".repeat(16)]);
+    }
+    command.args([
+        "--name",
+        "legacy",
+        "--port",
+        &port.to_string(),
+        "--client-pubkey",
+        client_key,
+    ]);
+    command
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn busy_ensure_fixture_reaches_real_transport_dispatch_without_daemon_mutation() {
+    let home = tempfile::tempdir().unwrap();
+    let output = legacy_ensure_command(&qshd_path(), 60022, "invalid-key", true)
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("HISTFILE", "/dev/null")
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("--client-pubkey"),
+        "the dispatcher must reach transport-ensure argument validation: {error}"
+    );
+    assert!(!error.contains("unknown command"), "{error}");
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs unchanged published v0.5.0 QSH_OLD_QSH and QSH_OLD_QSHD"]
+fn current_ensure_reports_busy_published_v050_without_interrupting_shell() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = serialised();
+    let home = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let old_daemon = old_binary("QSH_OLD_QSHD");
+    let old_client = old_binary("QSH_OLD_QSH");
+    // The caller authenticates the archive digest using the release fixture
+    // helper; this check also catches a wrongly supplied daemon executable.
+    let check = Command::new(&old_daemon)
+        .arg("self-check")
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+    let check: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    let version = Command::new(&old_daemon).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert_legacy_fixture_metadata(&check, std::str::from_utf8(&version.stdout).unwrap());
+    let key = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
+    let key_path = home.path().join("id_ed25519");
+    support::write_private(
+        &key_path,
+        key.to_openssh(ssh_key::LineEnding::LF).unwrap().as_bytes(),
+    )
+    .unwrap();
+    std::fs::create_dir(home.path().join(".ssh")).unwrap();
+    std::fs::write(
+        home.path().join(".ssh/authorized_keys"),
+        key.public_key().to_openssh().unwrap(),
+    )
+    .unwrap();
+    let socket = home.path().join("qsh/control.sock");
+    let port = free_udp_port();
+    let mut previous_subreaper = 0;
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut previous_subreaper) },
+        0
+    );
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+    let run_ensure = |binary: &Path, client_key: &str, report_busy: bool| {
+        legacy_ensure_command(binary, port, client_key, report_busy)
+            .env("HOME", home.path())
+            .env("XDG_CACHE_HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("HISTFILE", "/dev/null")
+            .env("SHELL", "/bin/sh")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("SSH_AGENT_PID")
+            .output()
+            .unwrap()
+    };
+    let started = run_ensure(
+        &old_daemon,
+        "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        false,
+    );
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let guard = daemon_guard::DaemonGuard::new(socket.clone());
+    assert!(wait_until(|| personal_status(&socket).is_some()));
+    let before = personal_status(&socket).unwrap();
+    let _owned = PersonalDaemon {
+        guard,
+        pid: before.pid,
+        previous_subreaper,
+    };
+    let identity_path = home.path().join("qsh/transport_server_key.bin");
+    let identity = std::fs::read(&identity_path).unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_qsh_on_port(&old_client, port, &key_path, config.path(), &[]);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    drain_into(client.master.try_clone().unwrap(), seen.clone());
+    assert!(
+        wait_until(|| text(&seen).contains("Key fingerprint")),
+        "{}",
+        text(&seen)
+    );
+    client.master.write_all(b"yes\n").unwrap();
+    client
+        .master
+        .write_all(b"echo before-upgrade-$((37*19))\n")
+        .unwrap();
+    assert!(
+        wait_until(|| text(&seen).contains("before-upgrade-703")),
+        "{}",
+        text(&seen)
+    );
+    assert!(wait_until(
+        || personal_status(&socket).is_some_and(|s| s.total_connections > 0)
+    ));
+    let current = std::env::var_os("QSH_TEST_CURRENT_ENSURE")
+        .map(PathBuf::from)
+        .unwrap_or_else(qshd_path);
+    let rejected = run_ensure(
+        &current,
+        "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
+        true,
+    );
+    // Prove survival before asserting rejection, so even the baseline RED
+    // demonstrates an active real shell rather than merely a synthetic count.
+    let after = personal_status(&socket).unwrap();
+    assert_eq!(
+        (after.pid, &after.checksum, &after.version),
+        (before.pid, &before.checksum, &before.version)
+    );
+    assert_eq!(std::fs::read(&identity_path).unwrap(), identity);
+    client
+        .master
+        .write_all(b"echo after-upgrade-$((41*23))\n")
+        .unwrap();
+    assert!(
+        wait_until(|| text(&seen).contains("after-upgrade-943")),
+        "{}",
+        text(&seen)
+    );
+    leave(client);
+    let stdout = String::from_utf8_lossy(&rejected.stdout);
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        rejected.status.success(),
+        "busy report failed: {stdout}; {stderr}"
+    );
+    assert!(!stdout.contains("TRANSPORT-READY"), "{stdout}");
+    let info: bringup::BusyDaemonInfo =
+        serde_json::from_str(stdout.trim().strip_prefix("TRANSPORT-BUSY ").unwrap()).unwrap();
+    assert_eq!(info.identity.version, "0.5.0");
+    assert_eq!(info.serving_profiles, None);
+    assert_eq!(info.preservation, bringup::PreservationCapability::Unknown);
 }

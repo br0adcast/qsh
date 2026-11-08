@@ -186,8 +186,13 @@ impl ssh::AuthPrompter for Unanswered {
 }
 
 /// Why step 2 did not bring qshd up.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum SshStepError {
+    /// An explicit busy-daemon Cancel/dismissal ends the whole foreground attempt.
+    BusyCancelled,
+    /// A chosen busy-daemon operation failed. Preserve the backend error and
+    /// its disposition; this must never become ordinary route fallback.
+    SelectedBusyFailed(Box<SelectedBusyFailure>),
     /// The installation was offered and declined for this login.
     InstallDeclined,
     /// Background only: the step needed a question nobody may ask now.
@@ -195,6 +200,22 @@ pub enum SshStepError {
     /// What to say after "ssh: ", and whether it looks like a denied
     /// Local Network permission.
     Failed(::connect::SshFailure),
+}
+
+/// The selected daemon and the backend's actual result, without interpreting
+/// diagnostic text as transaction state.
+#[derive(Debug)]
+pub struct SelectedBusyFailure {
+    pub info: bringup::BusyDaemonInfo,
+    pub error: bringup::BringUpError,
+}
+
+/// Foreground-only selection belongs to the immediately following data attempt.
+/// It is neither wire state nor established-session recovery authority.
+#[derive(Debug)]
+pub(crate) struct ForegroundReady {
+    pub identified: bringup::IdentifiedReady,
+    pub selected: bool,
 }
 
 /// A failure that is only words.
@@ -322,6 +343,9 @@ impl SshStep<'_> {
             .map(default_key_files)
             .unwrap_or_default();
         bringup::BringUpRequest {
+            report_busy: false,
+            busy_decision: None,
+            destructive_consent: None,
             name: "console".into(),
             ssh: ssh::SshParams {
                 host: addr.host.clone(),
@@ -357,41 +381,91 @@ impl SshStep<'_> {
         client_pubkey: [u8; 32],
         keys: &HostKeys,
         cancel: &knock::Cancel,
-    ) -> Result<bringup::IdentifiedReady, Attempted> {
+    ) -> Result<ForegroundReady, Attempted> {
         let prompter = self.prompter();
-        let result = bringup::bring_up_identified(
-            self.request(addr, route, client_pubkey, keys, prompter.answers.clone()),
-            self.install_policy.clone(),
-            bringup::BringUpHooks {
-                source: Some(self.images.clone()),
-                approval: Arc::new(InstallQuestion(self.tty.clone())),
-                observer: Arc::new(InstallProgress::new(self.background)),
-                timing: bringup::InstallTiming::default(),
-            },
-            Arc::new(knock::NoBind),
-            cancel,
-        );
+        let mut decision = None;
+        let mut consent = None;
+        let mut selected = None;
+        let result = loop {
+            let mut request =
+                self.request(addr, route, client_pubkey, keys, prompter.answers.clone());
+            request.report_busy = !self.background
+                && !self.no_password
+                && self.install_policy != bringup::InstallPolicy::RestartOnly;
+            request.busy_decision = decision.take();
+            request.destructive_consent = consent.take();
+            let result = bringup::bring_up_identified(
+                request,
+                self.install_policy.clone(),
+                bringup::BringUpHooks {
+                    source: Some(self.images.clone()),
+                    approval: Arc::new(InstallQuestion(self.tty.clone())),
+                    observer: Arc::new(InstallProgress::new(self.background)),
+                    timing: bringup::InstallTiming::default(),
+                },
+                Arc::new(knock::NoBind),
+                cancel,
+            );
+            match result {
+                Err(bringup::BringUpError::BusyDaemon(info)) => {
+                    let (answer, confirmed) =
+                        crate::busy_daemon::ask(self.tty, (*info).clone(), cancel).map_err(
+                            |error| match selected.take() {
+                                Some(info) => {
+                                    Attempted::SelectedBusyFailed(Box::new(SelectedBusyFailure {
+                                        info,
+                                        error: bringup::BringUpError::Ssh(error),
+                                    }))
+                                }
+                                None => Attempted::Ssh(error),
+                            },
+                        )?;
+                    if answer.choice == bringup::BusyChoice::Cancel {
+                        return Err(Attempted::BusyCancelled);
+                    }
+                    // Fresh BUSY observations replace every prior decision and
+                    // consent on this route. Cancellation above performs no operation.
+                    selected = Some(*info);
+                    decision = Some(answer);
+                    consent = confirmed;
+                }
+                other => break other,
+            }
+        };
+        let result = match (result, selected) {
+            (Ok(identified), selected) => {
+                return Ok(ForegroundReady {
+                    identified,
+                    selected: selected.is_some(),
+                })
+            }
+            (Err(error), Some(info)) => {
+                return Err(Attempted::SelectedBusyFailed(Box::new(
+                    SelectedBusyFailure { info, error },
+                )))
+            }
+            (Err(error), None) => error,
+        };
         match result {
-            Ok(ready) => Ok(ready),
             // Only the login itself: a login that got in after an unanswered
             // passphrase (the agent had the key) and then failed later failed
             // for its own reason.
-            Err(bringup::BringUpError::Ssh(ssh::SshError::AuthFailed(_)))
+            bringup::BringUpError::Ssh(ssh::SshError::AuthFailed(_))
                 if prompter.went_unanswered() =>
             {
                 Err(Attempted::Unanswered)
             }
-            Err(bringup::BringUpError::Ssh(e)) => Err(Attempted::Ssh(e)),
-            Err(bringup::BringUpError::Declined) => Err(Attempted::InstallDeclined),
-            Err(bringup::BringUpError::InstallRequired)
+            bringup::BringUpError::Ssh(e) => Err(Attempted::Ssh(e)),
+            bringup::BringUpError::Declined => Err(Attempted::InstallDeclined),
+            bringup::BringUpError::InstallRequired
                 if self.install_policy == bringup::InstallPolicy::RestartOnly =>
             {
                 Err(Attempted::Other(
                     "qshd is missing; recovery will not install it".into(),
                 ))
             }
-            Err(bringup::BringUpError::InstallRequired) => Err(Attempted::Unanswered),
-            Err(other) => Err(Attempted::Other(other.to_string())),
+            bringup::BringUpError::InstallRequired => Err(Attempted::Unanswered),
+            other => Err(Attempted::Other(other.to_string())),
         }
     }
 
@@ -418,6 +492,17 @@ impl SshStep<'_> {
         client_pubkey: [u8; 32],
         cancel: &knock::Cancel,
     ) -> Result<bringup::IdentifiedReady, SshStepError> {
+        self.run_foreground(addr, route, client_pubkey, cancel)
+            .map(|ready| ready.identified)
+    }
+
+    pub(crate) fn run_foreground(
+        &self,
+        addr: &::connect::Address,
+        route: &::connect::SshRoute,
+        client_pubkey: [u8; 32],
+        cancel: &knock::Cancel,
+    ) -> Result<ForegroundReady, SshStepError> {
         if self.background {
             return Err(SshStepError::NeedsPrompt);
         }
@@ -475,7 +560,7 @@ impl SshStep<'_> {
         };
         started();
         self.attempt(addr, route, client_pubkey, &keys, cancel)
-            .map(|identified| identified.ready)
+            .map(|ready| ready.identified.ready)
             .map_err(Attempted::into_error)
     }
 
@@ -497,7 +582,7 @@ impl SshStep<'_> {
         route: &::connect::SshRoute,
         client_pubkey: [u8; 32],
         cancel: &knock::Cancel,
-    ) -> Result<bringup::IdentifiedReady, SshStepError> {
+    ) -> Result<ForegroundReady, SshStepError> {
         let name = entry_name(&addr.host, route.port);
         let mut keys = self
             .known_hosts
@@ -588,6 +673,8 @@ fn install_question(offer: &bringup::InstallOffer) -> String {
 
 /// How one `bring_up` did not work.
 enum Attempted {
+    BusyCancelled,
+    SelectedBusyFailed(Box<SelectedBusyFailure>),
     /// The ssh login itself; the host key may be what it is about.
     Ssh(ssh::SshError),
     /// A later stage of the bringup, as the line to print.
@@ -603,6 +690,8 @@ impl Attempted {
         match self {
             Attempted::Ssh(e) => SshStepError::Failed(ssh_failure(&e, cfg!(target_os = "macos"))),
             Attempted::Other(why) => plain(why),
+            Attempted::BusyCancelled => SshStepError::BusyCancelled,
+            Attempted::SelectedBusyFailed(failure) => SshStepError::SelectedBusyFailed(failure),
             Attempted::Unanswered => SshStepError::NeedsPrompt,
             Attempted::InstallDeclined => SshStepError::InstallDeclined,
         }
@@ -622,6 +711,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     use super::test_support as support_home;
+
+    #[test]
+    fn only_explicit_busy_choice_is_a_terminal_user_cancellation() {
+        assert!(matches!(
+            Attempted::BusyCancelled.into_error(),
+            SshStepError::BusyCancelled
+        ));
+        assert!(matches!(
+            Attempted::Ssh(ssh::SshError::Cancelled).into_error(),
+            SshStepError::Failed(_)
+        ));
+    }
 
     #[test]
     fn installation_approval_propagates_confirmation_cancellation() {

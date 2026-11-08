@@ -293,6 +293,7 @@ version = "0.6.0-rc1"
 dependencies = [
  "base64 0.22.1",
  "client",
+ "daemon-bootstrap-protocol",
  "knock",
  "libc",
  "log",
@@ -679,6 +680,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "daemon-bootstrap-protocol"
+version = "0.6.0-rc1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2323,6 +2332,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "cc",
+ "daemon-bootstrap-protocol",
  "dirs",
  "hex",
  "libc",

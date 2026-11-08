@@ -424,6 +424,39 @@ pub(crate) fn bring_up(
             ));
         }
     }
+    if (req.busy_decision.is_some() && !req.report_busy)
+        || (req.report_busy && matches!(policy, InstallPolicy::RestartOnly))
+        || req
+            .busy_decision
+            .as_ref()
+            .is_some_and(|decision| !decision.valid())
+    {
+        return Err(BringUpError::InvalidRequest(
+            "invalid busy-daemon decision options".into(),
+        ));
+    }
+    if let Some(decision) = &req.busy_decision {
+        if decision.choice == crate::BusyChoice::Cancel {
+            return Err(BringUpError::Declined);
+        }
+        if let Some(consent) = &req.destructive_consent {
+            if decision.choice != crate::BusyChoice::ForceUpdate
+                || consent.attempt != decision.attempt
+                || consent.identity != decision.identity
+            {
+                return Err(BringUpError::InvalidRequest(
+                    "stale destructive restart consent".into(),
+                ));
+            }
+        }
+        if decision.choice == crate::BusyChoice::ForceUpdate {
+            return Err(BringUpError::DestructiveRestartUnavailable);
+        }
+    } else if req.destructive_consent.is_some() {
+        return Err(BringUpError::InvalidRequest(
+            "destructive consent needs a force-update decision".into(),
+        ));
+    }
     if req.name.contains('\0') || req.qsh_port == 0 {
         return Err(BringUpError::InvalidRequest(
             "the name must not contain NUL and the port must be nonzero".into(),
@@ -448,6 +481,8 @@ pub(crate) fn bring_up(
         req.name,
         req.qsh_port,
         req.client_pubkey,
+        req.report_busy,
+        req.busy_decision,
         host,
         username,
         ssh_port,
@@ -467,6 +502,8 @@ fn on_session(
     name: String,
     qsh_port: u16,
     client_pubkey: [u8; 32],
+    report_busy: bool,
+    busy_decision: Option<crate::BusyDecision>,
     host: String,
     username: String,
     ssh_port: u16,
@@ -547,11 +584,40 @@ fn on_session(
         &hooks,
         cancel,
     )?;
+    if report_busy {
+        check_cancel(cancel)?;
+        let capabilities = session.command(
+            "qshd bootstrap-capabilities",
+            &format!("{} bootstrap-capabilities", shell::quote(&path)),
+            hooks.timing.verify,
+            cancel,
+        )?;
+        if !capabilities
+            .complete_stdout()
+            .is_ok_and(|stdout| ensure::tool_supports_busy(capabilities.code, stdout))
+        {
+            return Err(BringUpError::BusyReportingUnavailable);
+        }
+    }
     progress(hooks.observer.as_ref(), BringUpStage::Starting, false);
     check_cancel(cancel)?;
+    let attempt = report_busy.then(|| {
+        busy_decision
+            .as_ref()
+            .map(|d| d.attempt.clone())
+            .unwrap_or_else(|| crate::BusyAttemptId::from_bytes(rand::random()))
+    });
     let output = session.command(
         "qshd transport-ensure",
-        &ensure::command_for_policy(&path, &name, qsh_port, &client_pubkey, &policy),
+        &ensure::command_for_policy(
+            &path,
+            &name,
+            qsh_port,
+            &client_pubkey,
+            &policy,
+            attempt.as_ref(),
+            busy_decision.as_ref(),
+        )?,
         hooks.timing.ensure,
         cancel,
     )?;
@@ -559,7 +625,7 @@ fn on_session(
         return Err(output.failure("qshd transport-ensure"));
     }
     let stdout = output.complete_stdout().map_err(BringUpError::BadReady)?;
-    let ready = ensure::parse(output.code, stdout)?;
+    let ready = ensure::parse_for_attempt(output.code, stdout, attempt.as_ref())?;
     progress(hooks.observer.as_ref(), BringUpStage::Starting, true);
     check_cancel(cancel)?;
     Ok(ready)

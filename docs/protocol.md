@@ -2533,6 +2533,42 @@ new outcome. `transport-ensure` carries it in `TRANSPORT-READY.warning` on both
 fresh startup and reuse, alongside any version warning. Missing or null means
 no known initialization warning; this does not promise successful later writes.
 
+SSH bootstrap uses the actual running daemon's `SERVER-INFO` profiles for
+compatibility, independently of version/build/checksum replacement policy. Each
+profile includes wire, handshake and channel protocol numbers. A positively
+incompatible profile fails before client registration or readiness. Missing
+legacy metadata is unknown and permits the normal authenticated handshake;
+release age and version strings never establish compatibility.
+
+The SSH caller first queries the exact installed executable's read-only
+`bootstrap-capabilities` JSON command before requesting busy choices. This tool
+API support is separate from running-daemon compatibility. An older helper can
+have the same release version without supporting these flags; an explicitly
+requested decision then fails before ensure with guidance to update that helper.
+There is no fallback to unaware READY behavior. Ordinary/background callers that
+do not request decisions retain their existing command path.
+
+Foreground callers can request `TRANSPORT-BUSY` before client registration,
+readiness or a new session handshake. Its bounded schema binds a random caller
+attempt to the reported live daemon identity, generation when available, actual
+connection count and optional serving profiles. Cancel is the default. Continue
+with old daemon rechecks identity and requires a valid `ADD-CLIENT` acknowledgement
+before reporting the actual serving version and listeners in `TRANSPORT-READY`.
+Conditional registration is negotiated by a separate bounded, read-only
+`REGISTRATION-INFO <challenge>` query bound to the actual generation and identity;
+`SERVER-INFO` generation alone does not advertise support. A supporting daemon
+checks `ADD-CLIENT-IF` under its control gate before adding a key. A failed or
+changed advertised capability never downgrades to unconditional registration.
+Older peers permit trusted SSH Continue with identity checks and an acknowledged
+`ADD-CLIENT`. A swap inside that legacy RPC can register the authorized key
+before the changed identity is detected, but cannot produce READY or a new
+handshake once detected. This non-destructive legacy exception never permits
+STOP, process termination or forced restart.
+
+Force update is a distinct choice; it cannot imply the separate confirmation
+required to interrupt sessions. Forced restart remains unavailable until an
+exact-instance operation is qualified. No preservation support is advertised.
+
 Personal local-control status replies (`STATUS`, `ADD-CLIENT`, `ADD-PORT`) may
 include `cleanup`, with `domain: "personal_channels"` and a `phase` of
 `completed`, `pending`, `unresolved`, or `unknown`. `counts` reports healthy

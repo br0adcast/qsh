@@ -191,6 +191,7 @@ fn discovery_restart_does_not_publish_prestart_proof_or_uploaded_binary_version(
         || Ok(Some(authenticated_info(true))),
         || {
             Ok(bringup::Ready {
+                serving_profiles: None,
                 server_pubkey: [7; 32],
                 ports: vec![60022],
                 version: "99.0.0-uploaded-binary".into(),

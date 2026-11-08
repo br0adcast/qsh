@@ -160,6 +160,61 @@ impl Tty {
         Ok(false)
     }
 
+    /// A bounded foreground choice before raw terminal mode. Empty input,
+    /// missing terminal and EOF are left to the caller's cancel default.
+    pub fn read_choice(
+        &self,
+        question: &str,
+        cancel: &knock::Cancel,
+    ) -> Result<Option<String>, ssh::SshError> {
+        if cancel.is_cancelled() || crate::signals::termination_requested() {
+            return Err(ssh::SshError::Cancelled);
+        }
+        let Some(mut terminal) = self.open() else {
+            return Ok(None);
+        };
+        if write!(terminal, "{question} ")
+            .and_then(|_| terminal.flush())
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let mut answer = Vec::new();
+        let mut overflow = false;
+        loop {
+            if cancel.is_cancelled() || crate::signals::termination_requested() {
+                return Err(ssh::SshError::Cancelled);
+            }
+            let mut fd = libc::pollfd {
+                fd: terminal.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: terminal and this single pollfd stay live for the call.
+            let ready = unsafe { libc::poll(&mut fd, 1, 50) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Ok(None);
+            }
+            if ready == 0 {
+                continue;
+            }
+            let mut byte = [0];
+            match terminal.read(&mut byte) {
+                Ok(0) => return Ok(None),
+                Ok(_) if byte[0] == b'\n' => {
+                    return Ok((!overflow).then(|| String::from_utf8_lossy(&answer).into_owned()))
+                }
+                Ok(_) if answer.len() < 128 => answer.push(byte[0]),
+                Ok(_) => overflow = true,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+
     /// Reads a secret with echo off; an empty answer is `None`, and so is a
     /// terminal whose echo would not go off: a secret is never read on
     /// screen.

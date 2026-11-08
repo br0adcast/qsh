@@ -99,10 +99,16 @@ class AcceptanceTests(unittest.TestCase):
                     peer.run_case('qsh', 'wanted', True, {}, evidence)
             self.assertEqual((evidence / 'wanted.log').read_text(), result.stdout)
 
+    def test_busy_legacy_shell_scenario_is_selected_with_existing_cases(self):
+        self.assertEqual(len(peer.CASES), 7)
+        self.assertIn(('qsh', 'current_ensure_reports_busy_published_v050_without_interrupting_shell', True), peer.CASES)
+        self.assertIn(('qsh', 'protocol2_client_cannot_mutate_published_v050_daemon', True), peer.CASES)
+        self.assertEqual(len(set(peer.CASES)), len(peer.CASES))
+
     def test_pull_request_changes_run_the_real_gate_without_every_patch(self):
         workflow = (SCRIPT.parents[1] / '.github/workflows/released-peer-acceptance.yml').read_text()
         trigger = re.search(r'^  pull_request:\n    paths:\n((?:      - .*\n)+)', workflow, re.MULTILINE)
-        self.assertIsNotNone(trigger, 'PR acceptance changes must execute the actual six-case gate')
+        self.assertIsNotNone(trigger, 'PR acceptance changes must execute the actual seven-case gate')
         paths = [ast.literal_eval(line.strip()[2:]) for line in trigger.group(1).splitlines()]
         for changed in ('.github/workflows/released-peer-acceptance.yml',
                         '.github/workflows/release.yml',

@@ -1276,3 +1276,485 @@ fn path_diagnostics_relative_cache_route_survives_detach_and_status_reuse() {
         "the detached guard retains the original route too"
     );
 }
+
+/// Owns only a scripted local control peer; the real ensure executable must
+/// decide whether it can reuse it, and which requests it is allowed to send.
+#[allow(clippy::too_many_arguments)]
+fn reuse_transaction(
+    protocol: Option<u8>,
+    active: u64,
+    newer: bool,
+    restart_only: bool,
+    client_key: bool,
+    report_busy: bool,
+    accept_busy: Option<&str>,
+    acknowledgement: Option<&str>,
+) -> ((bool, String, String), Vec<String>) {
+    reuse_transaction_mode(
+        protocol,
+        active,
+        newer,
+        restart_only,
+        client_key,
+        report_busy,
+        accept_busy,
+        acknowledgement,
+        RegistrationFixture::Legacy,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistrationFixture {
+    Legacy,
+    Conditional,
+    ChangedCapability,
+    MalformedCapability,
+    RefusedConditional,
+    LegacySwap,
+    ForceChoice,
+    CancelChoice,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reuse_transaction_mode(
+    protocol: Option<u8>,
+    active: u64,
+    newer: bool,
+    restart_only: bool,
+    client_key: bool,
+    report_busy: bool,
+    accept_busy: Option<&str>,
+    acknowledgement: Option<&str>,
+    mode: RegistrationFixture,
+) -> ((bool, String, String), Vec<String>) {
+    use std::io::{BufRead, BufReader, Write};
+    let home = private_temp_home().unwrap();
+    let socket = home.path().join("qsh/control.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let (listener, _cleanup) = qshd::control::bind_private_owned(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let status = serde_json::json!({
+        "version": "0.5.99", "build": if newer { u64::MAX } else { 0 },
+        "checksum": "ab".repeat(32), "pid": std::process::id(),
+        "ports": [{"port": 60123, "default": true, "connections": active}],
+        "total_connections": active
+    });
+    let keypair =
+        qshd::load_or_create_transport_key(&home.path().join("qsh/transport_server_key.bin"))
+            .unwrap();
+    let stop = AtomicBool::new(false);
+    let requests = Mutex::new(Vec::new());
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(peer) => peer,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("scripted accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                requests.lock().unwrap().push(request.trim().to_owned());
+                let reply = if request.starts_with("ADD-CLIENT ") || request.starts_with("ADD-CLIENT-IF ") {
+                    if mode == RegistrationFixture::RefusedConditional { Some(r#"{"error":"generation changed"}"#.into()) } else { acknowledgement.map(str::to_owned) }
+                } else if request.starts_with("SERVER-INFO ") {
+                    protocol.map(|wire| serde_json::json!({
+                        "challenge":request.trim().strip_prefix("SERVER-INFO ").unwrap(),
+                        "server_pubkey":hex::encode(keypair.public), "generation":if mode == RegistrationFixture::LegacySwap && requests.lock().unwrap().iter().any(|r| r.starts_with("ADD-CLIENT ")) { "ef".repeat(16) } else { "cd".repeat(16) },
+                        "core_version":"0.5.99", "session_protocols":[[wire, transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION]]
+                    }).to_string())
+                } else if request.starts_with("REGISTRATION-INFO ") {
+                    if matches!(mode, RegistrationFixture::Legacy | RegistrationFixture::LegacySwap) { None }
+                    else if mode == RegistrationFixture::MalformedCapability { Some("bad".into()) }
+                    else { let mut identity=scripted_identity(newer); identity["generation"]=if mode == RegistrationFixture::ChangedCapability { "ef".repeat(16).into() } else { "cd".repeat(16).into() };
+                        Some(serde_json::json!({"schema":1,"challenge":request.trim().strip_prefix("REGISTRATION-INFO ").unwrap(),"conditional_add_client":true,"identity":identity}).to_string()) }
+                }
+                else { Some(status.to_string()) };
+
+                if let Some(reply) = reply {
+                    let _ = writeln!(stream, "{reply}");
+                }
+            }
+        });
+        let out = tempfile::tempfile().unwrap();
+        let err = tempfile::tempfile().unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_qshd"));
+        command.args(["transport-ensure", "--name", "reuse", "--port", "60022"]);
+        if report_busy {
+            command.args(["--report-busy", "--busy-attempt", &"12".repeat(16)]);
+        }
+        if let Some(identity) = accept_busy {
+            let mut identity: serde_json::Value = serde_json::from_str(identity).unwrap();
+            if protocol.is_some() {
+                identity["generation"] = "cd".repeat(16).into();
+            }
+            let decision = serde_json::json!({"attempt":"12".repeat(16), "identity":identity, "choice":match mode { RegistrationFixture::ForceChoice => "force_update", RegistrationFixture::CancelChoice => "cancel", _ => "continue_old" }}).to_string();
+            command.args(["--busy-decision", &decision]);
+        }
+        if restart_only {
+            command.arg("--restart-only");
+        }
+        if client_key {
+            command.args([
+                "--client-pubkey",
+                "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
+            ]);
+        }
+        // restart-only deliberately cannot create the key itself.
+        qshd::load_or_create_transport_key(&home.path().join("qsh/transport_server_key.bin"))
+            .unwrap();
+        let child = command
+            .env("HOME", home.path())
+            .env("XDG_CACHE_HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("HISTFILE", "/dev/null")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("SSH_AGENT_PID")
+            .stdin(Stdio::null())
+            .stdout(out.try_clone().unwrap())
+            .stderr(err.try_clone().unwrap())
+            .spawn()
+            .unwrap();
+        let result = Ensure {
+            child: Some(child),
+            out,
+            err,
+        }
+        .finish();
+        stop.store(true, Ordering::Release);
+        result
+    });
+    // Keep mutation expectations readable while checking discovery separately.
+    let requests = requests.into_inner().unwrap();
+    assert!(requests.iter().all(|r| r == "STATUS"
+        || r.starts_with("ADD-CLIENT ")
+        || r.starts_with("ADD-CLIENT-IF ")
+        || r.starts_with("SERVER-INFO ")
+        || r.starts_with("REGISTRATION-INFO ")));
+    (
+        result,
+        requests
+            .into_iter()
+            .filter(|r| !r.starts_with("SERVER-INFO ") && !r.starts_with("REGISTRATION-INFO "))
+            .collect(),
+    )
+}
+
+fn scripted_identity(newer: bool) -> serde_json::Value {
+    serde_json::json!({"version":"0.5.99","build":if newer {u64::MAX} else {0},"checksum":"ab".repeat(32),"pid":std::process::id()})
+}
+
+fn scripted_ack(protocol: Option<u8>) -> String {
+    let mut ack = scripted_identity(false);
+    ack["total_connections"] = 3.into();
+    ack["ports"] = serde_json::json!([{"port":60124,"default":true,"connections":3}]);
+    let _ = protocol;
+    ack.to_string()
+}
+
+#[test]
+fn report_mode_offers_busy_choice_before_compatibility_or_mutation() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for protocol in [None, Some(1), Some(2)] {
+        for key in [false, true] {
+            let ((success, out, err), requests) =
+                reuse_transaction(protocol, 2, false, false, key, true, None, None);
+            assert!(success, "{err}");
+            assert_eq!(out.lines().count(), 1, "{out}");
+            let busy: serde_json::Value =
+                serde_json::from_str(out.strip_prefix("TRANSPORT-BUSY ").unwrap().trim()).unwrap();
+            assert_eq!(busy["schema"], 1);
+            let mut expected = scripted_identity(false);
+            if protocol.is_some() {
+                expected["generation"] = "cd".repeat(16).into();
+            }
+            assert_eq!(busy["identity"], expected);
+            assert_eq!(busy["attempt"], "12".repeat(16));
+            assert_eq!(busy["active_connections"], 2);
+            assert_eq!(busy["preservation"], "unknown");
+            assert!(!out.contains("TRANSPORT-READY") && !out.contains("server-pubkey:"));
+            assert_eq!(requests, ["STATUS"]);
+        }
+    }
+}
+
+#[test]
+fn accepted_busy_reuse_checks_explicit_protocol_and_reports_actual_ready() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let identity = scripted_identity(false).to_string();
+    for protocol in [None, Some(1), Some(2)] {
+        let ack = scripted_ack(protocol);
+        let ((success, out, err), requests) = reuse_transaction(
+            protocol,
+            2,
+            false,
+            false,
+            true,
+            true,
+            Some(&identity),
+            Some(&ack),
+        );
+        if protocol == Some(1) {
+            assert!(!success, "{out}");
+            assert!(
+                err.contains("incompatible session profiles")
+                    && err.contains("required profile [2,"),
+                "{err}"
+            );
+            assert!(!out.contains("TRANSPORT-READY"));
+            assert_eq!(requests, ["STATUS"]);
+        } else {
+            assert!(success, "{err}");
+            let ready: serde_json::Value = serde_json::from_str(
+                out.lines()
+                    .find_map(|line| line.strip_prefix("TRANSPORT-READY "))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(ready["version"], "0.5.99");
+            assert_eq!(ready["ports"], serde_json::json!([60124]));
+            assert_eq!(
+                ready["serving_profiles"],
+                protocol
+                    .map(|wire| serde_json::json!([[
+                        wire,
+                        transport::handshake_payload::HS_VERSION,
+                        transport::channel::PROTOCOL_VERSION
+                    ]]))
+                    .unwrap_or(serde_json::Value::Null)
+            );
+            assert!(ready["warning"].is_null());
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].starts_with("ADD-CLIENT "));
+        }
+    }
+}
+
+#[test]
+fn changed_busy_identity_requires_a_fresh_choice() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let mut identity = scripted_identity(false);
+    identity["pid"] = 999.into();
+    let ((success, out, err), requests) = reuse_transaction(
+        Some(2),
+        2,
+        false,
+        false,
+        true,
+        true,
+        Some(&identity.to_string()),
+        None,
+    );
+    assert!(success, "{err}");
+    assert!(out.starts_with("TRANSPORT-BUSY "));
+    assert_eq!(requests, ["STATUS"]);
+}
+
+#[test]
+fn default_reuse_preserves_unknown_compatibility_and_never_reports_a_dialog() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for protocol in [None, Some(1), Some(2)] {
+        let ack = scripted_ack(protocol);
+        let ((success, out, err), requests) =
+            reuse_transaction(protocol, 2, false, false, true, false, None, Some(&ack));
+        assert!(!out.contains("TRANSPORT-BUSY"));
+        if protocol == Some(1) {
+            assert!(!success, "{out}");
+            assert!(err.contains("required profile [2,"), "{err}");
+            assert_eq!(requests, ["STATUS"]);
+        } else {
+            assert!(success, "{err}");
+            assert!(out.contains("TRANSPORT-READY"));
+            assert!(out.contains("0.5.99"));
+            assert!(out.contains("active sessions"));
+            assert_eq!(requests.len(), 2);
+        }
+    }
+}
+
+#[test]
+fn newer_incompatible_and_restart_only_peers_are_not_stopped() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for (active, newer, restart) in [(0, true, false), (2, false, true)] {
+        let ((success, out, err), requests) =
+            reuse_transaction(Some(1), active, newer, restart, true, false, None, None);
+        assert!(!success, "{out}");
+        assert!(err.contains("required profile [2,"), "{err}");
+        assert_eq!(requests, ["STATUS"]);
+    }
+}
+
+#[test]
+fn reuse_cannot_report_ready_after_a_missing_or_malformed_acknowledgement() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    for acknowledgement in [None, Some("not-json"), Some(r#"{"error":"denied"}"#)] {
+        let ((success, out, err), requests) =
+            reuse_transaction(Some(2), 2, false, false, true, false, None, acknowledgement);
+        assert!(!success, "{out}; {err}");
+        assert!(!out.contains("TRANSPORT-READY"));
+        assert_eq!(requests.len(), 2);
+        assert!(!requests.iter().any(|request| request == "STOP"));
+    }
+}
+
+#[test]
+fn negotiated_conditional_registration_never_downgrades_after_failure() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let identity = scripted_identity(false).to_string();
+    let ack = scripted_ack(Some(2));
+    for mode in [
+        RegistrationFixture::Conditional,
+        RegistrationFixture::ChangedCapability,
+        RegistrationFixture::MalformedCapability,
+        RegistrationFixture::RefusedConditional,
+    ] {
+        let ((success, out, err), requests) = reuse_transaction_mode(
+            Some(2),
+            2,
+            false,
+            false,
+            true,
+            true,
+            Some(&identity),
+            Some(&ack),
+            mode,
+        );
+        assert!(
+            !requests.iter().any(|r| r.starts_with("ADD-CLIENT ")),
+            "no unguarded downgrade: {requests:?}"
+        );
+        if mode == RegistrationFixture::Conditional {
+            assert!(success, "{err}");
+            assert!(out.contains("TRANSPORT-READY"));
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].starts_with("ADD-CLIENT-IF "));
+        } else {
+            assert!(!success, "{out}");
+            assert!(!out.contains("TRANSPORT-READY"));
+            assert_eq!(
+                requests.len(),
+                if mode == RegistrationFixture::RefusedConditional {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_generation_swap_during_registration_cannot_report_ready() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let identity = scripted_identity(false).to_string();
+    let ack = scripted_ack(Some(2));
+    let ((success, out, err), requests) = reuse_transaction_mode(
+        Some(2),
+        2,
+        false,
+        false,
+        true,
+        true,
+        Some(&identity),
+        Some(&ack),
+        RegistrationFixture::LegacySwap,
+    );
+    assert!(!success, "{out}");
+    assert!(err.contains("daemon changed"), "{err}");
+    assert!(!out.contains("TRANSPORT-READY"));
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("ADD-CLIENT "));
+}
+
+#[test]
+fn explicit_busy_cancel_and_unqualified_force_never_register_or_stop() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let identity = scripted_identity(false).to_string();
+    for mode in [
+        RegistrationFixture::ForceChoice,
+        RegistrationFixture::CancelChoice,
+    ] {
+        let ((success, out, err), requests) = reuse_transaction_mode(
+            Some(2),
+            2,
+            false,
+            false,
+            true,
+            true,
+            Some(&identity),
+            None,
+            mode,
+        );
+        assert!(!success, "{out}");
+        assert!(!out.contains("TRANSPORT-READY"));
+        assert_eq!(requests, ["STATUS"]);
+        assert!(!err.is_empty());
+    }
+}
+
+#[test]
+fn bootstrap_capability_query_is_read_only_before_any_daemon_state_exists() {
+    let home = private_temp_home().unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_qshd"))
+        .arg("bootstrap-capabilities")
+        .env("HOME", home.path())
+        .env("XDG_CACHE_HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("HISTFILE", "/dev/null")
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_AGENT_PID")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap(),
+        serde_json::json!({"schema":1,"busy_decisions":true})
+    );
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn continue_same_identity_after_busy_count_drops_to_zero_still_reuses_old_daemon() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let ((reported, output, error), requests) =
+        reuse_transaction(Some(2), 2, false, false, true, true, None, None);
+    assert!(reported, "{error}");
+    assert_eq!(requests, ["STATUS"]);
+    let info: serde_json::Value =
+        serde_json::from_str(output.trim().strip_prefix("TRANSPORT-BUSY ").unwrap()).unwrap();
+    assert_eq!(info["active_connections"], 2);
+    let identity = info["identity"].to_string();
+    let mut ack: serde_json::Value = serde_json::from_str(&scripted_ack(Some(2))).unwrap();
+    ack["total_connections"] = 0.into();
+    let ((reused, ready, error), requests) = reuse_transaction(
+        Some(2),
+        0,
+        false,
+        false,
+        true,
+        true,
+        Some(&identity),
+        Some(&ack.to_string()),
+    );
+    assert!(
+        reused,
+        "same reported identity became idle while choosing: {error}"
+    );
+    assert!(
+        ready.contains("TRANSPORT-READY") && ready.contains("0.5.99"),
+        "{ready}"
+    );
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], "STATUS");
+    assert!(requests[1].starts_with("ADD-CLIENT "));
+}
