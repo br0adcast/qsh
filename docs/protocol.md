@@ -449,7 +449,8 @@ connection will do (`enabled`, §2.2).
 | 3 (`0x0000_0008`) | `auth-accepted` | explicit committed session admission on server-direction stream 15 (§3.4); required by application channel peers |
 | 4 (`0x0000_0010`) | `channel-geometry` | ordered geometry and atomic channel lifecycle discovery; required by application channel peers |
 | 5 (`0x0000_0020`) | `resource-limits` | authenticated terminal session abort and explicit daemon capacity/provider failures |
-| 6–31 | — | reserved, sent as zero |
+| 6 (`0x0000_0040`) | `session-resume` | reserved retained-session contracts (§8.2); inactive and excluded from `Features::SUPPORTED` |
+| 7–31 | — | reserved, sent as zero |
 
 - A client offers what it implements (`Features::SUPPORTED`).
 - A server turns a bit on exactly when msg1 offered it, its configuration
@@ -2699,6 +2700,114 @@ address with the same pinned key and asks `ABOUT` once more; only a matching
 checksum counts as updated.
 
 ---
+
+### 8.2 Reserved retained-session and owner IPC contracts
+
+`transport::session_resume` and `qshd::session_owner::protocol` define pure
+contracts for future retained-session support. They do not preserve sessions,
+create owners, replace a frontend, or change current transport cleanup.
+`Features::SUPPORTED` remains `0x3f`: negotiation strips the reserved
+`SESSION_RESUME` bit even when both supplied masks contain it. Existing channel
+protocol 2, Noise payloads and strict authenticated bootstrap codecs are
+unchanged. No production dispatcher sends or consumes these new records.
+
+The intended runtime separates a stable host, one owner group per logical
+session, and a replaceable network frontend. Replacing a frontend would retain
+owners; maintaining the host or owners requires a separate deliberate drain
+and full restart. Runtime and native acceptance must be completed before
+advertising preservation.
+
+**Identity and byte positions.** Session, owner, host, frontend generation and
+input epoch are distinct nonzero 16-byte values. A `SessionLocator` consists of
+session and owner IDs and grants no authority. An `Attachment` adds frontend
+generation and a nonzero `u64` attach epoch. A channel reuses the existing
+nonzero `u64` `ChannelInstance`, scoped to the retained session and owner.
+Request IDs are nonzero `u64` values. Counter exhaustion fails rather than
+wrapping. An input position contains input epoch, accepted offset and committed
+offset, with `committed <= accepted`; committed means actually written to the
+PTY, not transport receipt. Every data end offset uses checked addition.
+
+All integers below are big-endian. External records use the existing envelope
+`kind:u8 | payload_length:u32 | payload`. A payload is at most 65,536 bytes;
+a data chunk is at most 16,384 bytes. The pure codecs require an explicitly
+supplied `SESSION_RESUME` feature set. Unknown kinds remain distinguishable
+from malformed known records; truncation, trailing bytes, zero identity or
+counter values, unknown enum codes and overflowing offsets are rejected.
+Use the bounded base record deframer at the stream boundary before allocation.
+Legacy raw channel input and existing output kinds 0–3 are never reinterpreted.
+
+| Kind | Record | Payload in field order |
+|---|---|---|
+| `0x30` | Attach | request ID, locator, frontend generation, last attach epoch (`u64`, zero means none) |
+| `0x31` | Attached | request ID, attachment |
+| `0x32` | AttachRefused | request ID, refusal (`u8`) |
+| `0x33` | Detach | attachment, detach reason (`u8`) |
+| `0x34` | Fence | request ID, attachment |
+| `0x35` | Fenced | request ID, attachment |
+| `0x40` | Input | attachment, channel instance, input epoch, offset (`u64`), data length (`u32`), data |
+| `0x41` | InputAck | attachment, channel instance, input epoch, accepted (`u64`), committed (`u64`) |
+| `0x42` | Output | attachment, channel instance, offset (`u64`), data length (`u32`), data |
+| `0x43` | OutputAck | attachment, channel instance, offset (`u64`) |
+
+Kinds `0x30`–`0x35` belong to control; `0x40`–`0x43` belong to channel streams.
+Attach refusals are Missing=1, Unsupported=2, AlreadyAttached=3, Unauthorized=4,
+StaleOwner=5. Detach reasons are TransportLost=1, FrontendReplacement=2,
+ClientUpdate=3. Destructive Close is a separate future message; its reason
+domain is ExplicitClient=1, Administrator=2, OwnerFailure=3. Detach or EOF never
+converts to Close. Kinds `0x36`–`0x3f` remain unallocated.
+
+The pure attachment validator moves through Detached, Attaching, Attached,
+Fencing and Fenced. Every transition binds the complete attachment identity;
+a replacement epoch must exceed the last revoked epoch. Attached alone does
+not enable input: the caller must explicitly mark channel recovery complete.
+Fencing immediately rejects further input, resize and close validation.
+The explicit local `abandon` transition handles peer loss and cancelled/refused
+attachment setup from Attaching, Attached or Fencing. It binds the complete
+current identity, revokes that epoch, clears recovery readiness and returns to
+Detached; only a greater epoch for the same locator may attach next. Duplicate
+abandonment from Detached or Fenced is rejected. Stale peer-loss events and late
+Attached/Fenced replies cannot alter a newer attachment. Local abandonment
+asserts neither a remote receipt nor completion of the owner's PTY write
+barrier. Remote Detach remains valid only from Attached. A Fenced receipt
+confirms revocation, not any fabricated per-channel input position. Positions use InputAck. This validator does not authenticate peers,
+verify grants or implement a PTY write ledger.
+
+**Owner IPC v1.** The separate owner-specific stream envelope is:
+
+```text
+QSHO:4 | version:u16=1 | role:u8 | kind:u8 | body_length:u32
+host_instance:16 | owner_instance:16 | request_id:u64 | body
+```
+
+The fixed header is 52 bytes. The complete frame, including that header, is
+at most 65,536 bytes. Host=1, Frontend=2 and Owner=3 are explicit sender roles.
+Every frame has a nonzero host and owner identity; global host/frontend
+administration needs a separate future contract. Kind 1 is Hello with
+`minimum_version:u16 | maximum_version:u16`, whose range must include 1.
+Kind 2 is HelloAck with `selected_version:u16=1`. Other defined kinds carry
+exactly the external record payloads above, without a nested record header.
+Unsupported versions, roles and kinds fail closed. The incremental decoder
+checks the header and exact or bounded kind-specific body length before
+reserving body storage; framing errors are terminal, and EOF inside a frame
+is rejected.
+
+Hello/HelloAck, Attach/Attached-or-AttachRefused and Fence/Fenced use nonzero
+request IDs. Control payload request IDs must equal their envelope IDs.
+Detach and all data events, including InputAck, use envelope request ID zero.
+A body locator's owner must match the envelope owner. The peer validator checks
+local and remote roles plus host and owner identities. It requires Hello
+negotiation before other operations, accepts Hello once, tracks at most 64
+pending requests in each direction, and requires strictly increasing request
+IDs within each direction. Replies must match an outstanding ID and reply kind;
+completed IDs cannot be reused. Rejected frames do not alter peer state.
+Bulk data events consume no control-request slots. Queue scheduling is future
+runtime work. Role and locator fields do not establish authentication or mint
+attach grants; trusted endpoint and grant verification remain mandatory.
+
+Open/channel catalog, canonical snapshots and replay selection, grant
+issuance/verification, status/replacement transactions and shared resource
+reservation messages remain unfinished dependent contracts. These foundations
+do not complete retained-session support.
 
 ## 9. Threat model
 
