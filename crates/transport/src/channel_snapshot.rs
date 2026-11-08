@@ -140,6 +140,9 @@ impl ChannelSnapshot {
             payload.push(u8::from(entry.open.screen));
         }
     }
+    pub(crate) fn decode_payload(payload: &[u8]) -> Result<Self, ChannelCodecError> {
+        Self::decode(payload)
+    }
     pub(super) fn decode(payload: &[u8]) -> Result<Self, ChannelCodecError> {
         // Preflight the entire attacker-owned payload without allocations,
         // including counts, uniqueness, dimensions and command lengths.

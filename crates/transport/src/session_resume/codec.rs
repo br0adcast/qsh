@@ -9,11 +9,11 @@ fn enabled(features: Features) -> Result<(), ResumeError> {
         Err(ResumeError::FeatureRequired)
     }
 }
-fn put_locator(out: &mut Vec<u8>, locator: SessionLocator) {
+pub(super) fn put_locator(out: &mut Vec<u8>, locator: SessionLocator) {
     out.extend_from_slice(locator.session.as_bytes());
     out.extend_from_slice(locator.owner.as_bytes());
 }
-fn put_attachment(out: &mut Vec<u8>, attachment: Attachment) {
+pub(super) fn put_attachment(out: &mut Vec<u8>, attachment: Attachment) {
     put_locator(out, attachment.locator);
     out.extend_from_slice(attachment.frontend.as_bytes());
     out.extend_from_slice(&attachment.epoch.get().to_be_bytes());
@@ -21,6 +21,9 @@ fn put_attachment(out: &mut Vec<u8>, attachment: Attachment) {
 
 pub fn encode_control(record: &ResumeControl, features: Features) -> Result<Vec<u8>, ResumeError> {
     enabled(features)?;
+    if record.kind() >= 0x36 {
+        return super::extension_codec::encode_control(record);
+    }
     let mut out = Vec::with_capacity(64);
     match record {
         ResumeControl::Attach {
@@ -57,14 +60,26 @@ pub fn encode_control(record: &ResumeControl, features: Features) -> Result<Vec<
             put_attachment(&mut out, *attachment);
             out.push(reason.to_wire());
         }
+        _ => unreachable!("extension dispatched above"),
     }
     Ok(encode_record(record.kind(), &out))
 }
 
 pub fn decode_control(raw: RawRecord, features: Features) -> Result<ResumeControl, ResumeError> {
+    decode_control_payload(raw.kind, &raw.payload, features)
+}
+
+pub fn decode_control_payload(
+    kind: u8,
+    payload: &[u8],
+    features: Features,
+) -> Result<ResumeControl, ResumeError> {
     enabled(features)?;
-    let mut r = Reader::new(&raw.payload)?;
-    let record = match raw.kind {
+    if kind >= 0x36 {
+        return super::extension_codec::decode_control(kind, payload);
+    }
+    let mut r = Reader::new(payload)?;
+    let record = match kind {
         0x30 => ResumeControl::Attach {
             request_id: r.request()?,
             locator: r.locator()?,
@@ -99,6 +114,9 @@ pub fn decode_control(raw: RawRecord, features: Features) -> Result<ResumeContro
 
 pub fn encode_data(record: &ResumeData, features: Features) -> Result<Vec<u8>, ResumeError> {
     enabled(features)?;
+    if record.kind() >= 0x44 {
+        return super::extension_codec::encode_data(record);
+    }
     let payload_len = match record {
         ResumeData::Input { data, offset, .. } | ResumeData::Output { data, offset, .. } => {
             if data.len() > MAX_RESUME_DATA {
@@ -117,6 +135,7 @@ pub fn encode_data(record: &ResumeData, features: Features) -> Result<Vec<u8>, R
             96
         }
         ResumeData::OutputAck { .. } => 72,
+        _ => unreachable!("extension dispatched above"),
     };
     let mut out = Vec::with_capacity(payload_len);
     put_attachment(&mut out, record.attachment());
@@ -153,6 +172,7 @@ pub fn encode_data(record: &ResumeData, features: Features) -> Result<Vec<u8>, R
             out.extend_from_slice(&cursor.channel.get().to_be_bytes());
             out.extend_from_slice(&cursor.offset.to_be_bytes());
         }
+        _ => unreachable!("extension dispatched above"),
     }
     Ok(encode_record(record.kind(), &out))
 }
@@ -163,14 +183,25 @@ fn put_chunk(out: &mut Vec<u8>, offset: u64, data: &[u8]) {
 }
 
 pub fn decode_data(raw: RawRecord, features: Features) -> Result<ResumeData, ResumeError> {
+    decode_data_payload(raw.kind, &raw.payload, features)
+}
+
+pub fn decode_data_payload(
+    kind: u8,
+    payload: &[u8],
+    features: Features,
+) -> Result<ResumeData, ResumeError> {
     enabled(features)?;
-    let mut r = Reader::new(&raw.payload)?;
-    if !matches!(raw.kind, 0x40..=0x43) {
-        return Err(ResumeError::UnknownKind(raw.kind));
+    if kind >= 0x44 {
+        return super::extension_codec::decode_data(kind, payload);
+    }
+    let mut r = Reader::new(payload)?;
+    if !matches!(kind, 0x40..=0x43) {
+        return Err(ResumeError::UnknownKind(kind));
     }
     let attachment = r.attachment()?;
     let channel = ChannelInstance::new(r.u64()?).ok_or(ResumeError::Malformed)?;
-    let record = match raw.kind {
+    let record = match kind {
         0x40 => {
             let epoch = InputEpoch::new(r.array()?).ok_or(ResumeError::Malformed)?;
             let offset = r.u64()?;
@@ -217,18 +248,18 @@ pub fn decode_data(raw: RawRecord, features: Features) -> Result<ResumeData, Res
     Ok(record)
 }
 
-struct Reader<'a> {
+pub(super) struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
 }
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Result<Self, ResumeError> {
+    pub(super) fn new(bytes: &'a [u8]) -> Result<Self, ResumeError> {
         if bytes.len() > MAX_RESUME_PAYLOAD {
             return Err(ResumeError::TooLarge);
         }
         Ok(Self { bytes, pos: 0 })
     }
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], ResumeError> {
+    pub(super) fn array<const N: usize>(&mut self) -> Result<[u8; N], ResumeError> {
         let end = self.pos.checked_add(N).ok_or(ResumeError::Overflow)?;
         let bytes = self
             .bytes
@@ -237,29 +268,29 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(bytes.try_into().expect("fixed slice length"))
     }
-    fn byte(&mut self) -> Result<u8, ResumeError> {
+    pub(super) fn byte(&mut self) -> Result<u8, ResumeError> {
         Ok(self.array::<1>()?[0])
     }
-    fn u64(&mut self) -> Result<u64, ResumeError> {
+    pub(super) fn u64(&mut self) -> Result<u64, ResumeError> {
         Ok(u64::from_be_bytes(self.array()?))
     }
-    fn request(&mut self) -> Result<RequestId, ResumeError> {
+    pub(super) fn request(&mut self) -> Result<RequestId, ResumeError> {
         RequestId::new(self.u64()?).ok_or(ResumeError::Malformed)
     }
-    fn locator(&mut self) -> Result<SessionLocator, ResumeError> {
+    pub(super) fn locator(&mut self) -> Result<SessionLocator, ResumeError> {
         Ok(SessionLocator {
             session: RetainedSessionId::new(self.array()?).ok_or(ResumeError::Malformed)?,
             owner: OwnerInstance::new(self.array()?).ok_or(ResumeError::Malformed)?,
         })
     }
-    fn attachment(&mut self) -> Result<Attachment, ResumeError> {
+    pub(super) fn attachment(&mut self) -> Result<Attachment, ResumeError> {
         Ok(Attachment {
             locator: self.locator()?,
             frontend: FrontendGeneration::new(self.array()?).ok_or(ResumeError::Malformed)?,
             epoch: AttachEpoch::new(self.u64()?).ok_or(ResumeError::Malformed)?,
         })
     }
-    fn chunk(&mut self, offset: u64) -> Result<Vec<u8>, ResumeError> {
+    pub(super) fn chunk(&mut self, offset: u64) -> Result<Vec<u8>, ResumeError> {
         let len = u32::from_be_bytes(self.array()?) as usize;
         if len > MAX_RESUME_DATA {
             return Err(ResumeError::TooLarge);
@@ -272,7 +303,16 @@ impl<'a> Reader<'a> {
         self.pos = self.bytes.len();
         Ok(data)
     }
-    fn finish(self) -> Result<(), ResumeError> {
+    pub(super) fn take(&mut self, len: usize) -> Result<&'a [u8], ResumeError> {
+        let end = self.pos.checked_add(len).ok_or(ResumeError::Overflow)?;
+        let bytes = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(ResumeError::Malformed)?;
+        self.pos = end;
+        Ok(bytes)
+    }
+    pub(super) fn finish(self) -> Result<(), ResumeError> {
         if self.pos == self.bytes.len() {
             Ok(())
         } else {
