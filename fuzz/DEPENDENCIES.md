@@ -40,7 +40,10 @@ LLVM 23.1.4). Use `rustup toolchain install nightly-2026-10-24 --profile minimal
 installing or updating rustup globally.
 
 The separate fuzz graph keeps every package shared with the product lock at
-the exact product-lock version. Relative to that lock it adds only
+the exact product-lock version and source. Its root `[patch.crates-io]` mirrors
+the product's local `vte`, `alacritty_terminal` and `ssh-key` maintenance sources;
+patches are not inherited from a dependency's workspace root. Relative to the
+product lock, the fuzz graph adds only
 `arbitrary 1.5.0`, `jobserver 0.1.35`, `libfuzzer-sys 0.4.13` and the local
 `qsh-channel-fuzz` package. `libfuzzer-sys` builds bundled C++17 through
 `cc`/`ar`. The graph now links `sshauth` and `terminal`, so the pinned native
@@ -64,7 +67,7 @@ RustSec database/index and never use offline/stale fallback.
 The reviewed tool lock SHA-256 is
 `cecadcdcb501fe5ac3bc979aede8b0dc7b48648dbb8cf1ede2c23e938e32d85c`.
 The standalone fuzz lock SHA-256 is
-`ce800f049a6f65e2eeb77bdfabafa9d32d424d92808128e496b7f6726219afe3`.
+`33b9a0edaa4ac8d247d18f3a8a11f218381500e7dbdfe781a994b8b52cb9200a`.
 At this checkpoint these graphs contain 101 and 185 package records respectively.
 
 Repeat security checks using the repository's pinned `cargo-audit 0.22.2` and
