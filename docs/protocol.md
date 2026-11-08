@@ -2749,12 +2749,12 @@ Legacy raw channel input and existing output kinds 0–3 are never reinterpreted
 | `0x42` | Output | attachment, channel instance, offset (`u64`), data length (`u32`), data |
 | `0x43` | OutputAck | attachment, channel instance, offset (`u64`) |
 
-Kinds `0x30`–`0x35` belong to control; `0x40`–`0x43` belong to channel streams.
+Kinds `0x30`–`0x3d` belong to control; `0x40`–`0x47` belong to channel streams.
 Attach refusals are Missing=1, Unsupported=2, AlreadyAttached=3, Unauthorized=4,
 StaleOwner=5. Detach reasons are TransportLost=1, FrontendReplacement=2,
-ClientUpdate=3. Destructive Close is a separate future message; its reason
+ClientUpdate=3. Destructive Close is a separate operation; its reason
 domain is ExplicitClient=1, Administrator=2, OwnerFailure=3. Detach or EOF never
-converts to Close. Kinds `0x36`–`0x3f` remain unallocated.
+converts to Close. Kinds `0x3e`–`0x3f` remain unallocated.
 
 The pure attachment validator moves through Detached, Attaching, Attached,
 Fencing and Fenced. Every transition binds the complete attachment identity;
@@ -2781,11 +2781,11 @@ host_instance:16 | owner_instance:16 | request_id:u64 | body
 
 The fixed header is 52 bytes. The complete frame, including that header, is
 at most 65,536 bytes. Host=1, Frontend=2 and Owner=3 are explicit sender roles.
-Every frame has a nonzero host and owner identity; global host/frontend
-administration needs a separate future contract. Kind 1 is Hello with
+Every owner frame has a nonzero host and owner identity. Global host/frontend
+administration uses the separate QSHH envelope below. Kind 1 is Hello with
 `minimum_version:u16 | maximum_version:u16`, whose range must include 1.
-Kind 2 is HelloAck with `selected_version:u16=1`. Other defined kinds carry
-exactly the external record payloads above, without a nested record header.
+Kind 2 is HelloAck with `selected_version:u16=1`. The external record kinds carry exactly the external payloads, without a
+nested record header. Local operation kinds use the contracts below.
 Unsupported versions, roles and kinds fail closed. The incremental decoder
 checks the header and exact or bounded kind-specific body length before
 reserving body storage; framing errors are terminal, and EOF inside a frame
@@ -2798,16 +2798,241 @@ A body locator's owner must match the envelope owner. The peer validator checks
 local and remote roles plus host and owner identities. It requires Hello
 negotiation before other operations, accepts Hello once, tracks at most 64
 pending requests in each direction, and requires strictly increasing request
-IDs within each direction. Replies must match an outstanding ID and reply kind;
+IDs within each direction. Replies must match an outstanding ID, reply kind and semantic request binding;
 completed IDs cannot be reused. Rejected frames do not alter peer state.
 Bulk data events consume no control-request slots. Queue scheduling is future
 runtime work. Role and locator fields do not establish authentication or mint
 attach grants; trusted endpoint and grant verification remain mandatory.
 
-Open/channel catalog, canonical snapshots and replay selection, grant
-issuance/verification, status/replacement transactions and shared resource
-reservation messages remain unfinished dependent contracts. These foundations
-do not complete retained-session support.
+**Lifecycle and atomic catalog contracts.** The following new external control
+kinds require `SESSION_RESUME`. Close acceptance requests cleanup; only an
+`ExitReceipt` reports the named channel's actual cleanup facts. Closing a
+session requires all named channel receipts; EOF and detach are insufficient.
+Late close requests must pass the complete attachment lease validator.
+
+| Kind | Record | Payload in field order |
+|---|---|---|
+| `0x36` | CatalogRequest | request ID, attachment |
+| `0x37` | Catalog | request ID, attachment, snapshot length (`u32`), existing ChannelSnapshot payload, position count (`u16`), positions |
+| `0x38` | RecoveryRequest | request ID, attachment, channel, parser continuity |
+| `0x39` | RecoveryReady | request ID, attachment |
+| `0x3a` | CloseChannel | request ID, attachment, channel, close reason (`u8`) |
+| `0x3b` | CloseSession | request ID, attachment, close reason (`u8`) |
+| `0x3c` | CloseAccepted | request ID, attachment, target tag (`u8`), channel (`u64`) |
+| `0x3d` | ExitReceipt | attachment, channel, cleanup receipt ID (`u64`), fact (`u8`), exit status (`i32`) |
+
+Close target Session=0 requires channel zero; Channel=1 requires a real
+channel instance. Cleanup facts are Reaped=1, NoChild=2, StatusUnavailable=3;
+only Reaped carries an exit status, and other statuses must be zero. A cleanup
+receipt ID is nonzero and is distinct from envelope correlation.
+
+A catalog position is exactly 79 bytes: channel (`u64`), input epoch (16),
+accepted and committed (`u64` each), output cursor (channel and offset, `u64`
+each), geometry (22), and lifecycle (`u8`: Active=1, Draining=2, Exited=3).
+Geometry is instance (`u64`), resize request ID (`u64`), outcome (`u8`:
+Established=0, Applied=1, Refused=2), refusal (`u8`, zero unless refused),
+columns and rows (`u16` each). It obeys the existing geometry/refusal domains.
+Every snapshot channel lifetime has exactly one position; duplicate, missing
+or foreign lifetimes fail. Active entries require Active positions; draining
+entries require Draining or Exited. Geometry must match OPEN classification.
+There are at most 8 active and 240 total identities. At all legal maxima the
+existing snapshot is 36,386 bytes, and the complete external Catalog record is
+55,421 bytes (55,416 payload). The QSHO form is 55,468 bytes including its
+header. It fits one frame without truncation or segmentation.
+
+**Recovery transaction contracts.** Recreated parser continuity is tag 0
+and the default. Retained is tag 1 followed by a nonzero parser-instance (16)
+and output cursor (16). DataCursor is tag 2 followed by an output cursor (16);
+it identifies retained NoScreen byte-consumer continuity, never a terminal
+parser. Screen Replay requires independently matching local parser identity.
+NoScreen Replay requires the explicit DataCursor and matching independently
+accepted receiver data-cursor/available-bytes evidence. Recreated supplies no
+such evidence. Both paths require checked cursor + total = boundary, no gap,
+ordered bytes and the precharged aggregate limit. A screen channel rejects a
+data-only claim; a recreated screen parser requires ScreenReset; NoScreen
+cannot use ScreenReset. Missing or unavailable data continuity is refused or
+reported blocked, never repaired by a new OPEN, invented parser or dropped
+bytes. The owner runtime must establish actual ring availability and screen
+classification. QSHO RecoveryRequest bodies are exactly 73/89/105 bytes for
+tags 0/2/1; these sizes are checked before body allocation.
+
+| Kind | Record | Payload after attachment and channel |
+|---|---|---|
+| `0x44` | RecoveryStart | recovery ID (16), mode (`u8`: Replay=1, ScreenReset=2), output cursor, gap (`u8` 0/1), geometry, total bytes (`u64`), snapshot version (`u16`) |
+| `0x45` | RecoveryChunk | recovery ID (16), byte offset (`u64`), length (`u32`), bytes |
+| `0x46` | RecoveryEnd | recovery ID (16), total bytes (`u64`), output cursor |
+| `0x47` | RecoveryBlocked | output cursor |
+
+Recovery IDs are nonzero random-instance values supplied by the eventual
+runtime. Chunk payloads are nonempty and at most 16,384 bytes, strictly ordered
+without overlap. Start/End bind the exact attachment, channel, total and output
+boundary; completion additionally binds catalog geometry. Replay uses snapshot
+version 0, no gap, and exact cursor arithmetic. ScreenReset currently uses
+version 1 and the existing replay format's analytic 41,457,964-byte payload
+upper bound from [terminal resource accounting](terminal-resources.md).
+This is not a measured maximum or a storage allowance. The receiver supplies
+an already charged aggregate payload limit; the pure receiver counts bytes and
+allocates no snapshot storage. Catalog plus exact completion of every channel
+is required before enabling input. Attached or RecoveryReady alone cannot
+produce a checked recovery completion. Serialization, canonical terminal reset,
+actual parser continuity and PTY input ordering remain runtime work.
+
+**Local owner operations.** QSHO adds the following distinct local kinds.
+Frontend requests are Open, Resize, CloseChannel, CloseSession, CatalogRequest
+and AttachWithGrant. Their lifecycle replies/events are sent by Owner.
+OwnerStatusRequest and Shutdown are sent by Host, with Owner replies.
+
+| Kind | Operation | Body |
+|---|---|---|
+| `0x10` | Open | attachment, checked existing OPEN payload |
+| `0x11` | Opened | attachment, channel, stream (`u8`), geometry, actual has-screen (`u8` 0/1) |
+| `0x12` | OpenRefused | attachment, stream (`u8`), refusal (`u8`) |
+| `0x13` | Resize | attachment, channel, resize request ID (`u64`), cols/rows (`u16`) |
+| `0x14` | ResizeResult | attachment, correlated geometry |
+| `0x15`–`0x1a` | CloseChannel, CloseSession, CloseAccepted, ExitReceipt, CatalogRequest, Catalog | exact corresponding external control payloads |
+| `0x20` | AttachWithGrant | foundation Attach payload, opaque grant (32), grant binding |
+| `0x21` | GrantRejected | locator, frontend, attach refusal (`u8`) |
+| `0x22` | OwnerStatusRequest | empty |
+| `0x23` | OwnerStatus | locator, build identity, IPC min/max (`u16`), active (`u8`), total (`u16`) |
+| `0x24` | Shutdown | transaction ID (`u64`), Administrator reason (`u8`=2) |
+| `0x25` | ShutdownReceipt | transaction ID (`u64`) |
+
+Opened requires initial Established geometry and cannot claim a screen for a
+no-PTY channel. Open refusal codes are InvalidOpen=1, ResourceLimit=2, BackendFailure=3,
+Restarting=4. Open accepts only an explicit OpenRequest, never opaque About or
+update commands. Local request IDs are in the envelope; reused external
+control payloads also carry the same request ID. ExitReceipt and data events
+use zero envelope IDs. Shutdown is a host-authorized destructive action;
+no detach/Drop/EOF path creates it. Typed status and shutdown are contracts,
+not a runtime administration endpoint.
+
+**Global host IPC v1 and grants.** Global operations cannot use a zero or
+invented owner instance. Their independent envelope has a 36-byte header:
+
+```text
+QSHH:4 | version:u16=1 | role:u8 | kind:u8 | body_length:u32
+host_instance:16 | request_id:u64 | body
+```
+
+QSHH and QSHO have separate strict decoders and never fall back to one another.
+The frame and outstanding-request limits remain 65,536 bytes and 64 per
+direction. All QSHH request IDs are nonzero and monotonically increasing;
+semantic replies cannot consume another session's pending request. Authorization,
+status and resource requests come from Frontend, and replies from Host.
+RevokeFrontend is Host to Frontend and its acknowledgement reverses that path.
+These claimed roles only validate routing; independently authenticated local
+endpoints remain mandatory.
+
+| Kind | Operation | Body |
+|---|---|---|
+| `0x10` | AuthorizeAttach | authenticated principal reference (16), locator, frontend |
+| `0x11` | AttachAuthorized | opaque grant (32), grant binding |
+| `0x12` | AttachAuthorizationRefused | principal reference, locator, frontend, attach refusal (`u8`) |
+| `0x13` | RevokeFrontend | frontend |
+| `0x14` | FrontendRevoked | frontend |
+| `0x20` | StatusRequest | frontend, cursor-present (`u8`), optional status cursor |
+| `0x21` | Status | content-free status page |
+| `0x22` | Reserve | reservation, expected cleanup ID (`u64`) |
+| `0x23` | Reserved | reservation, expected cleanup ID (`u64`) |
+| `0x24` | ReservationRefused | reservation, refusal (`u8`: ResourceLimit=1, InvalidRequest=2, Unauthorized=3) |
+| `0x25` | Release | reservation, exact cleanup receipt |
+| `0x26` | Released | reservation, exact cleanup receipt |
+
+A grant binding is principal reference (16), locator (32), frontend (16),
+owner (16), and monotonic expiry (`u64`). Its owner must match the locator.
+The pure bounded host ledger requires exact binding, unexpired grants and
+single consumption under a current `GrantAuthority`, containing checked
+principal and frontend registration handles. `register_fresh_principal` and
+`register_fresh_frontend` are trusted host lifecycle seams; inserting a grant
+never admits an unknown or retired identity. Each ledger construction requires
+a fresh nonzero host-generated `LedgerInstance`, never reused on reconstruction.
+Private handles bind that ledger incarnation, a checked monotonic serial and
+the public reference/generation; foreign-ledger and stale serials are inert.
+Fresh admission is a host authentication/supervision responsibility, not a
+verification performed by these pure types.
+
+Frontend revocation atomically retires its active registration and invalidates
+all its grant entries even at table capacity. Only that retired authority's
+invalid metadata is reclaimed; unrelated live grants remain. Principal grant
+retirement likewise revokes its grants without asserting PTY/login cleanup.
+No unbounded historical generation list or whole-ledger reset is used. Active
+registrations and grant entries remain finitely bounded, and consumed grants
+may remain until expiry while their authority remains live. Explicit trusted
+retire/admit cycles reuse capacity with fresh handles, including when the
+public bytes happen to be reused; the old handle never becomes current.
+Grant Debug is redacted. Successful decoding, a public principal reference, a locator,
+or foundation Attach intent does not authorize attachment. Only later trusted
+host authentication/policy integration can register principals, mint grants
+and establish actual authority. Grants belong only on inherited local IPC;
+external records, bootstrap, public catalogs and status have no grant fields.
+
+**Status and replacement facts.** A build identity is version length (`u8`,
+1–128), ASCII non-control version bytes, build (`u64`), and checksum (32).
+Frontend identity adds its generation. A status page carries host instance,
+host build, frontend identity, status epoch (16), cursor and total (`u64`
+each), owner count (`u8`, at most 64), OwnerStatus entries, next-present (`u8`),
+and optional next cursor (epoch plus `u64` index). All pages must share the
+host/build, frontend generation/build, epoch and total, with exact contiguous
+indices and no duplicate owners. A bounded collector publishes only after the
+entire enumeration completes. Changed identities invalidate the enumeration.
+IPC ranges are nonzero ordered `u16` min/max and require actual overlap.
+There are no terminal contents, bearer grants, keys or private paths in status.
+
+Replacement statuses are frozen as Prepared=1, Fenced=2, Retired=3, Activated=4,
+Recovered=5, DetachedFailure=6, bound to a random transaction ID and actual
+frontend identity. The pure checker requires Prepare → Fence → Retire →
+Activate. Every `ReplacementFact` binds the transaction ID; missing or foreign
+IDs refuse before mutation. Candidate identity is immutable and distinct from
+`serving()`, which remains absent during Prepared/Fenced/Retired. Activated
+requires the actual acknowledged serving identity to equal the full candidate
+identity. Recovered requires an explicit independently established actual
+serving identity, which may be a different rollback build under a fresh
+generation, and never overwrites candidate. DetachedFailure requires no
+serving identity. Missing/extra or mismatched terminal identities refuse.
+
+Recovery requires actual retirement or a transaction-bound independently
+established frontend failure; terminal duplicates/late changes refuse.
+Detached failure requires a fence/retirement or an actual failed frontend,
+so a failed Prepare cannot claim the old authoritative frontend was detached.
+The checker validates fact representation/order; it neither proves process
+readiness nor claims resident hosts/owners upgraded when a frontend activates.
+
+**Shared resource contracts.** A reservation contains nonzero ID (`u64`),
+principal (16), locator, channel (`u64`), kind (`u8`: ScreenModel=1,
+OutputHistory=2, SnapshotTransfer=3, ControlQueue=4), bytes (`u64`),
+screen-charge-present (`u8`), and optional cells/rows/models (`u64` each).
+ScreenModel has zero bytes, positive cells and rows, and models 0 or 1;
+models 0 permits resize scratch. Other kinds have positive bytes and no screen
+charge. Aggregate retained models remain at most one per channel.
+A cleanup receipt carries cleanup ID, reservation ID, locator and channel;
+release must match that receipt and the entire stored reservation. Duplicate,
+foreign or stale release does not reduce a charge.
+
+One host ledger shares output-history caps of 1 MiB/channel, 8 MiB/logical
+session, 32 MiB/canonical account and 128 MiB/host. Host-only trusted
+principal-to-canonical-UID mapping prevents aliases from obtaining new account
+budgets. Resource admission requires the current trusted principal registration
+handle from that resource ledger's fresh incarnation. `retire_principal`
+refuses while any of that principal's reservations remain; only exact final
+release permits retirement and reclamation. The pinned canonical UID cannot
+be rebound while registered. Retirement preserves all unrelated charges and
+the global reservation ID high-water mark, so stale reservations and cleanup
+receipts remain inert within that surviving ledger. Registration handles also
+reject use after reconstruction under a fresh `LedgerInstance`. Public
+reservation and cleanup receipt payloads do not carry that ledger identity.
+Runtime reconstruction must establish fresh host/session identities or
+otherwise prevent old receipts from entering a new lifetime; resetting a
+ledger while live accounting debt remains is not a recovery mechanism.
+Source-qualified screen cells/rows/models use supplied existing BudgetLimits,
+shared across owners. Snapshot backing/copies and control queues
+have separate explicitly supplied channel/session/account/host byte caps;
+zero disables admission and there is no default snapshot allowance. Snapshot
+payload size is distinct from actual backing, reallocations, encoded frames
+and IPC copies. All tables are finitely bounded; overflow, full capacity or
+unknown/rebound principals refuse without changing charges. Future runtime
+must reserve before allocating and issue actual cleanup receipts. Codec and
+ledger tests do not establish host authentication, process lifetime, canonical
+serialization or platform cleanup.
 
 ## 9. Threat model
 

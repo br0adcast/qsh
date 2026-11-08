@@ -2,11 +2,12 @@
 //!
 //! A matching role/instance is a routing check, not proof of authentication.
 //! Runtime callers must validate their inherited/credential-checked endpoints.
+use super::operations::OwnerOperation;
 use std::collections::BTreeMap;
 use transport::session_resume::{
     self, HostInstance, OwnerInstance, RequestId, ResumeControl, ResumeData, ResumeError,
 };
-use transport::{shell_frame::RawRecord, Features};
+use transport::Features;
 
 pub const OWNER_VERSION: u16 = 1;
 pub const OWNER_HEADER_LEN: usize = 52;
@@ -45,6 +46,7 @@ pub struct OwnerHeader {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnerMessage {
+    Operation(OwnerOperation),
     Hello { min_version: u16, max_version: u16 },
     HelloAck { selected_version: u16 },
     Control(ResumeControl),
@@ -53,6 +55,7 @@ pub enum OwnerMessage {
 impl OwnerMessage {
     pub const fn kind(&self) -> u8 {
         match self {
+            Self::Operation(op) => op.kind(),
             Self::Hello { .. } => 1,
             Self::HelloAck { .. } => 2,
             Self::Control(record) => record.kind(),
@@ -93,7 +96,21 @@ impl From<ResumeError> for OwnerProtocolError {
 
 fn validate_frame(frame: &OwnerFrame) -> Result<(), OwnerProtocolError> {
     let h = frame.header;
+    if required_role(frame.message.kind()).is_some_and(|role| role != h.role) {
+        return Err(OwnerProtocolError::Binding);
+    }
     match &frame.message {
+        OwnerMessage::Operation(op) => {
+            if h.role != op.role()
+                || op.owner().is_some_and(|owner| owner != h.owner)
+                || (op.kind() == 0x18) != (h.request_id == 0)
+            {
+                return Err(OwnerProtocolError::Binding);
+            }
+            if op.body_len()? > MAX_OWNER_FRAME - OWNER_HEADER_LEN {
+                return Err(OwnerProtocolError::TooLarge);
+            }
+        }
         OwnerMessage::Hello {
             min_version,
             max_version,
@@ -134,6 +151,7 @@ fn validate_frame(frame: &OwnerFrame) -> Result<(), OwnerProtocolError> {
 pub fn encode(frame: &OwnerFrame) -> Result<Vec<u8>, OwnerProtocolError> {
     validate_frame(frame)?;
     let body = match &frame.message {
+        OwnerMessage::Operation(op) => op.encode(frame.header.request_id)?,
         OwnerMessage::Hello {
             min_version,
             max_version,
@@ -178,6 +196,31 @@ fn parse_header(bytes: &[u8]) -> Result<(OwnerHeader, u8, usize), OwnerProtocolE
     let (min, max) = match kind {
         1 => (4, 4),
         2 => (2, 2),
+        0x10 => (65, 65 + transport::channel::MAX_COMMAND_LEN),
+        0x11 => (88, 88),
+        0x12 => (58, 58),
+        0x13 => (76, 76),
+        0x14 => (78, 78),
+        0x15 | 0x17 => (73, 73),
+        0x16 => (65, 65),
+        0x18 => (77, 77),
+        0x19 => (64, 64),
+        0x1a | 0x37 => (72, 8 + session_resume::MAX_CATALOG_BODY),
+        0x20 => (184, 184),
+        0x21 => (49, 49),
+        0x22 => (0, 0),
+        0x23 => (81, 208),
+        0x24 => (9, 9),
+        0x25 => (8, 8),
+        0x36 | 0x39 => (64, 64),
+        0x38 => (73, 105),
+        0x3a | 0x3c => (73, 73),
+        0x3b => (65, 65),
+        0x3d => (77, 77),
+        0x44 => (130, 130),
+        0x45 => (93, 92 + session_resume::MAX_RESUME_DATA),
+        0x46 => (104, 104),
+        0x47 => (80, 80),
         0x30 | 0x31 | 0x34 | 0x35 => (64, 64),
         0x32 => (9, 9),
         0x33 => (57, 57),
@@ -193,12 +236,19 @@ fn parse_header(bytes: &[u8]) -> Result<(OwnerHeader, u8, usize), OwnerProtocolE
     if body_len > max {
         return Err(OwnerProtocolError::TooLarge);
     }
+    // Continuity tags0/1/2 have exactly these body sizes, before allocation.
+    if kind == 0x38 && !matches!(body_len, 73 | 89 | 105) {
+        return Err(OwnerProtocolError::Malformed);
+    }
     let host = HostInstance::new(bytes[12..28].try_into().unwrap())
         .ok_or(OwnerProtocolError::Malformed)?;
     let owner = OwnerInstance::new(bytes[28..44].try_into().unwrap())
         .ok_or(OwnerProtocolError::Malformed)?;
     let request_id = u64::from_be_bytes(bytes[44..52].try_into().unwrap());
-    let is_event = matches!(kind, 0x33 | 0x40..=0x43);
+    let is_event = matches!(kind, 0x18 | 0x33 | 0x3d | 0x40..=0x47);
+    if required_role(kind).is_some_and(|expected| role != expected) {
+        return Err(OwnerProtocolError::Binding);
+    }
     if is_event != (request_id == 0) {
         return Err(OwnerProtocolError::Binding);
     }
@@ -227,18 +277,17 @@ fn decode(bytes: &[u8]) -> Result<OwnerFrame, OwnerProtocolError> {
         2 => OwnerMessage::HelloAck {
             selected_version: u16::from_be_bytes(body.try_into().unwrap()),
         },
-        0x30..=0x35 => OwnerMessage::Control(session_resume::decode_control(
-            RawRecord {
-                kind,
-                payload: body.to_vec(),
-            },
+        0x10..=0x25 => {
+            OwnerMessage::Operation(OwnerOperation::decode(kind, header.request_id, body)?)
+        }
+        0x30..=0x3d => OwnerMessage::Control(session_resume::decode_control_payload(
+            kind,
+            body,
             Features::SESSION_RESUME,
         )?),
-        0x40..=0x43 => OwnerMessage::Data(session_resume::decode_data(
-            RawRecord {
-                kind,
-                payload: body.to_vec(),
-            },
+        0x40..=0x47 => OwnerMessage::Data(session_resume::decode_data_payload(
+            kind,
+            body,
             Features::SESSION_RESUME,
         )?),
         other => return Err(OwnerProtocolError::UnknownKind(other)),
@@ -323,9 +372,29 @@ enum RequestKind {
     Hello,
     Attach,
     Fence,
+    Extension(u8),
 }
 fn request_kind(message: &OwnerMessage) -> Option<RequestKind> {
     match message {
+        OwnerMessage::Operation(op) => op.request_kind().map(|k| {
+            if k == 0x20 {
+                RequestKind::Attach
+            } else {
+                RequestKind::Extension(k)
+            }
+        }),
+        OwnerMessage::Control(ResumeControl::CatalogRequest { .. }) => {
+            Some(RequestKind::Extension(0x36))
+        }
+        OwnerMessage::Control(ResumeControl::RecoveryRequest { .. }) => {
+            Some(RequestKind::Extension(0x38))
+        }
+        OwnerMessage::Control(ResumeControl::CloseChannel { .. }) => {
+            Some(RequestKind::Extension(0x3a))
+        }
+        OwnerMessage::Control(ResumeControl::CloseSession { .. }) => {
+            Some(RequestKind::Extension(0x3b))
+        }
         OwnerMessage::Hello { .. } => Some(RequestKind::Hello),
         OwnerMessage::Control(ResumeControl::Attach { .. }) => Some(RequestKind::Attach),
         OwnerMessage::Control(ResumeControl::Fence { .. }) => Some(RequestKind::Fence),
@@ -334,6 +403,23 @@ fn request_kind(message: &OwnerMessage) -> Option<RequestKind> {
 }
 fn reply_kind(message: &OwnerMessage) -> Option<RequestKind> {
     match message {
+        OwnerMessage::Operation(op) => op.reply_kind().map(|k| {
+            if k == 0x20 {
+                RequestKind::Attach
+            } else {
+                RequestKind::Extension(k)
+            }
+        }),
+        OwnerMessage::Control(ResumeControl::Catalog { .. }) => Some(RequestKind::Extension(0x36)),
+        OwnerMessage::Control(ResumeControl::RecoveryReady { .. }) => {
+            Some(RequestKind::Extension(0x38))
+        }
+        OwnerMessage::Control(ResumeControl::CloseAccepted { accepted, .. }) => {
+            Some(RequestKind::Extension(match accepted.target {
+                session_resume::CloseTarget::Channel(_) => 0x3a,
+                session_resume::CloseTarget::Session => 0x3b,
+            }))
+        }
         OwnerMessage::HelloAck { .. } => Some(RequestKind::Hello),
         OwnerMessage::Control(
             ResumeControl::Attached { .. } | ResumeControl::AttachRefused { .. },
@@ -351,8 +437,8 @@ pub struct PeerState {
     peer_role: OwnerRole,
     host: HostInstance,
     owner: OwnerInstance,
-    outgoing: BTreeMap<u64, RequestKind>,
-    incoming: BTreeMap<u64, RequestKind>,
+    outgoing: BTreeMap<u64, OwnerMessage>,
+    incoming: BTreeMap<u64, OwnerMessage>,
     last_sent: u64,
     last_received: u64,
     hello_sent: bool,
@@ -402,6 +488,9 @@ impl PeerState {
         validate_frame(frame)?;
         // Validate nested lengths/offsets on typed frames as well as decoded ones.
         match &frame.message {
+            OwnerMessage::Operation(op) => {
+                op.body_len()?;
+            }
             OwnerMessage::Data(record) => {
                 session_resume::encode_data(record, Features::SESSION_RESUME)?;
             }
@@ -447,7 +536,7 @@ impl PeerState {
             if table.len() >= MAX_OWNER_REQUESTS {
                 return Err(OwnerProtocolError::RequestLimit);
             }
-            table.insert(id, kind);
+            table.insert(id, frame.message.clone());
             *last = id;
             if kind == RequestKind::Hello {
                 if sending {
@@ -465,7 +554,9 @@ impl PeerState {
             } else {
                 &mut self.outgoing
             };
-            if table.get(&id) != Some(&kind) {
+            if table.get(&id).is_none_or(|request| {
+                request_kind(request) != Some(kind) || !reply_matches(request, &frame.message)
+            }) {
                 return Err(OwnerProtocolError::UnexpectedReply);
             }
             table.remove(&id);
@@ -476,5 +567,94 @@ impl PeerState {
             return Err(OwnerProtocolError::InvalidState);
         }
         Ok(())
+    }
+}
+
+fn reply_matches(request: &OwnerMessage, reply: &OwnerMessage) -> bool {
+    use session_resume::ResumeControl as C;
+    match (request, reply) {
+        (OwnerMessage::Hello { .. }, OwnerMessage::HelloAck { .. }) => true,
+        (OwnerMessage::Operation(a), OwnerMessage::Operation(b)) => a.matches_reply(b),
+        (
+            OwnerMessage::Operation(OwnerOperation::AttachWithGrant {
+                locator,
+                frontend,
+                last_epoch,
+                ..
+            }),
+            OwnerMessage::Control(C::Attached { attachment, .. }),
+        ) => {
+            *locator == attachment.locator
+                && *frontend == attachment.frontend
+                && attachment.epoch.get() > *last_epoch
+        }
+        (
+            OwnerMessage::Control(C::Attach {
+                locator,
+                frontend,
+                last_epoch,
+                ..
+            }),
+            OwnerMessage::Control(C::Attached { attachment, .. }),
+        ) => {
+            *locator == attachment.locator
+                && *frontend == attachment.frontend
+                && attachment.epoch.get() > *last_epoch
+        }
+        (
+            OwnerMessage::Control(C::Attach { .. }),
+            OwnerMessage::Control(C::AttachRefused { .. }),
+        ) => true,
+        (
+            OwnerMessage::Control(C::Fence { attachment: a, .. }),
+            OwnerMessage::Control(C::Fenced { attachment: b, .. }),
+        ) => a == b,
+        (
+            OwnerMessage::Control(C::CatalogRequest { attachment, .. }),
+            OwnerMessage::Control(C::Catalog { catalog, .. }),
+        ) => *attachment == catalog.attachment(),
+        (
+            OwnerMessage::Control(C::RecoveryRequest { request, .. }),
+            OwnerMessage::Control(C::RecoveryReady { attachment, .. }),
+        ) => request.attachment == *attachment,
+        (
+            OwnerMessage::Control(C::CloseChannel { close, .. }),
+            OwnerMessage::Control(C::CloseAccepted { accepted, .. }),
+        ) => {
+            close.attachment == accepted.attachment
+                && accepted.target == session_resume::CloseTarget::Channel(close.channel)
+        }
+        (
+            OwnerMessage::Control(C::CloseSession { close, .. }),
+            OwnerMessage::Control(C::CloseAccepted { accepted, .. }),
+        ) => {
+            close.attachment == accepted.attachment
+                && accepted.target == session_resume::CloseTarget::Session
+        }
+        _ => false,
+    }
+}
+
+fn required_role(kind: u8) -> Option<OwnerRole> {
+    match kind {
+        0x10 | 0x13 | 0x15 | 0x16 | 0x19 | 0x20 | 0x36 | 0x38 | 0x3a | 0x3b => {
+            Some(OwnerRole::Frontend)
+        }
+        0x22 | 0x24 => Some(OwnerRole::Host),
+        0x11
+        | 0x12
+        | 0x14
+        | 0x17
+        | 0x18
+        | 0x1a
+        | 0x21
+        | 0x23
+        | 0x25
+        | 0x37
+        | 0x39
+        | 0x3c
+        | 0x3d
+        | 0x44..=0x47 => Some(OwnerRole::Owner),
+        _ => None,
     }
 }

@@ -6,7 +6,10 @@ use crate::Features;
 use std::num::NonZeroU64;
 
 mod codec;
-pub use codec::{decode_control, decode_data, encode_control, encode_data};
+pub use codec::{
+    decode_control, decode_control_payload, decode_data, decode_data_payload, encode_control,
+    encode_data,
+};
 #[cfg(test)]
 mod tests;
 
@@ -55,6 +58,10 @@ macro_rules! counter {
 }
 counter!(AttachEpoch);
 counter!(RequestId);
+mod catalog;
+pub use catalog::*;
+mod recovery;
+pub use recovery::*;
 
 /// A public locator is never an authorization capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,6 +181,35 @@ impl AttachRefusal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeControl {
+    CatalogRequest {
+        request_id: RequestId,
+        attachment: Attachment,
+    },
+    Catalog {
+        request_id: RequestId,
+        catalog: RetainedCatalog,
+    },
+    RecoveryRequest {
+        request_id: RequestId,
+        request: RecoveryRequest,
+    },
+    RecoveryReady {
+        request_id: RequestId,
+        attachment: Attachment,
+    },
+    CloseChannel {
+        request_id: RequestId,
+        close: OwnerCloseChannel,
+    },
+    CloseSession {
+        request_id: RequestId,
+        close: OwnerCloseSession,
+    },
+    CloseAccepted {
+        request_id: RequestId,
+        accepted: CloseAccepted,
+    },
+    ExitReceipt(ExitReceipt),
     Attach {
         request_id: RequestId,
         locator: SessionLocator,
@@ -204,6 +240,14 @@ pub enum ResumeControl {
 impl ResumeControl {
     pub const fn kind(&self) -> u8 {
         match self {
+            Self::CatalogRequest { .. } => 0x36,
+            Self::Catalog { .. } => 0x37,
+            Self::RecoveryRequest { .. } => 0x38,
+            Self::RecoveryReady { .. } => 0x39,
+            Self::CloseChannel { .. } => 0x3a,
+            Self::CloseSession { .. } => 0x3b,
+            Self::CloseAccepted { .. } => 0x3c,
+            Self::ExitReceipt(_) => 0x3d,
             Self::Attach { .. } => 0x30,
             Self::Attached { .. } => 0x31,
             Self::AttachRefused { .. } => 0x32,
@@ -219,7 +263,14 @@ impl ResumeControl {
             | Self::AttachRefused { request_id, .. }
             | Self::Fence { request_id, .. }
             | Self::Fenced { request_id, .. } => Some(*request_id),
-            Self::Detach { .. } => None,
+            Self::CatalogRequest { request_id, .. }
+            | Self::Catalog { request_id, .. }
+            | Self::RecoveryRequest { request_id, .. }
+            | Self::RecoveryReady { request_id, .. }
+            | Self::CloseChannel { request_id, .. }
+            | Self::CloseSession { request_id, .. }
+            | Self::CloseAccepted { request_id, .. } => Some(*request_id),
+            Self::Detach { .. } | Self::ExitReceipt(_) => None,
         }
     }
     pub const fn locator(&self) -> Option<SessionLocator> {
@@ -229,12 +280,25 @@ impl ResumeControl {
             | Self::Detach { attachment, .. }
             | Self::Fence { attachment, .. }
             | Self::Fenced { attachment, .. } => Some(attachment.locator),
+            Self::CatalogRequest { attachment, .. } | Self::RecoveryReady { attachment, .. } => {
+                Some(attachment.locator)
+            }
+            Self::Catalog { catalog, .. } => Some(catalog.attachment().locator),
+            Self::RecoveryRequest { request, .. } => Some(request.attachment.locator),
+            Self::CloseChannel { close, .. } => Some(close.attachment.locator),
+            Self::CloseSession { close, .. } => Some(close.attachment.locator),
+            Self::CloseAccepted { accepted, .. } => Some(accepted.attachment.locator),
+            Self::ExitReceipt(receipt) => Some(receipt.attachment.locator),
             Self::AttachRefused { .. } => None,
         }
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeData {
+    RecoveryStart(RecoveryStart),
+    RecoveryChunk(RecoveryChunk),
+    RecoveryEnd(RecoveryEnd),
+    RecoveryBlocked(RecoveryBlocked),
     Input {
         attachment: Attachment,
         channel: ChannelInstance,
@@ -261,6 +325,10 @@ pub enum ResumeData {
 impl ResumeData {
     pub const fn kind(&self) -> u8 {
         match self {
+            Self::RecoveryStart(_) => 0x44,
+            Self::RecoveryChunk(_) => 0x45,
+            Self::RecoveryEnd(_) => 0x46,
+            Self::RecoveryBlocked(_) => 0x47,
             Self::Input { .. } => 0x40,
             Self::InputAck { .. } => 0x41,
             Self::Output { .. } => 0x42,
@@ -269,6 +337,10 @@ impl ResumeData {
     }
     pub const fn attachment(&self) -> Attachment {
         match self {
+            Self::RecoveryStart(r) => r.attachment,
+            Self::RecoveryChunk(r) => r.attachment,
+            Self::RecoveryEnd(r) => r.attachment,
+            Self::RecoveryBlocked(r) => r.attachment,
             Self::Input { attachment, .. }
             | Self::InputAck { attachment, .. }
             | Self::Output { attachment, .. }
@@ -423,3 +495,8 @@ impl AttachmentState {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod extension_tests;
+
+mod extension_codec;
