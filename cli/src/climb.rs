@@ -738,7 +738,7 @@ impl<'a> Climb<'a> {
                         .contains(&addr)
                     {
                         action = self.advance(&mut ladder, Outcome::Ssh(SshOutcome::Failed(
-                            ::connect::SshFailure::plain("authenticated server excludes this client's session profile; daemon was left unchanged"))), None);
+                            ::connect::SshFailure::plain("authenticated server excludes this client's session profile; no update was requested"))), None);
                         continue;
                     }
                     let expected_key = self
@@ -815,7 +815,7 @@ impl<'a> Climb<'a> {
                         }
                         Err(SshStepError::BusyCancelled) => {
                             self.end_selected_operation(cancel);
-                            self.say("qsh: connection cancelled; running daemon unchanged");
+                            self.say("qsh: connection cancelled; no restart requested");
                             return Climbed::Exit(1);
                         }
                         Err(SshStepError::SelectedBusyFailed(failure)) => {

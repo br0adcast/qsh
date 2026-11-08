@@ -589,6 +589,73 @@ jobs:
           do
             grep -F "test $name ... ok" "$runtime/results.log"
           done
+          # Qualify the account-bound connection and exclusive publisher on
+          # the native kernel; this alone does not enable Darwin service Force.
+          cargo test -p qshd --lib --locked -- control::service_tests:: service_restart::tests:: \
+            service_restart::authority_tests:: service_restart::selected_stage_tests:: \
+            update::tests::service_ control::tests::confirmed_restart_publication_ \
+            --nocapture --test-threads=1 --color=never 2>&1 | tee "$runtime/service-control-results.log"
+          for name in \
+            control::service_tests::service_stop_requires_exact_ack_and_never_retries_lost_or_malformed_replies \
+            control::service_tests::service_stop_refuses_absent_route_and_wrong_peer_before_sending_bytes \
+            control::service_tests::service_stop_timeout_after_write_is_uncertain \
+            service_restart::tests::modern_metadata_failure_never_becomes_a_legacy_service_offer \
+            service_restart::tests::confirmed_service_dispatches_once_and_requires_acknowledged_release \
+            service_restart::tests::unqualified_service_or_candidate_has_zero_dispatch_or_observation \
+            service_restart::authority_tests::service_authority_uses_the_local_account_route_and_requested_port \
+            service_restart::selected_stage_tests::installed_destination_allows_safe_leaf_replacement_but_refuses_symlinks_and_aliases \
+            service_restart::selected_stage_tests::installed_destination_parent_replacement_is_refused \
+            service_restart::selected_stage_tests::selected_helper_cannot_target_a_private_service_stage_or_exceed_installer_bound \
+            service_restart::selected_stage_tests::selected_stage_route_hash_and_private_mode_are_rechecked \
+            update::tests::service_self_check_reader_panic_refuses_launch_eligibility \
+            update::tests::service_stage_update_handover_retains_persistent_install_destination \
+            control::tests::confirmed_restart_publication_never_replaces_a_new_endpoint \
+            control::tests::confirmed_restart_publication_preserves_non_utf8_leaf_bytes \
+            control::tests::confirmed_restart_publication_refuses_race_and_unsupported_primitive; do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 { seen++; pending=1; if ($0 == expected "ok") { passed++; pending=0 }; next }
+              pending && $0 == "ok" { passed++; pending=0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/service-control-results.log"
+          done
+          grep -F 'test result: ok. 16 passed; 0 failed; 0 ignored;' "$runtime/service-control-results.log"
+          if grep -Fq 'SKIPPED' "$runtime/service-control-results.log"; then exit 1; fi
+          cargo test -p qshd --locked --test service_stage_contract -- \
+            --nocapture --test-threads=1 --color=never 2>&1 | tee "$runtime/service-stage-results.log"
+          for name in \
+            service_stage::tests::wrong_digest_does_not_reach_self_check_or_leave_stage \
+            service_stage::tests::self_check_rejects_wrong_build_arch_protocol_and_failed_execution \
+            service_stage::tests::self_check_can_report_new_preference_while_accepting_required_protocol \
+            service_stage::tests::empty_oversized_and_unsafe_source_are_rejected \
+            service_stage::tests::operation_and_candidate_are_bounded_before_stage_creation \
+            service_stage::tests::private_root_rejects_symlink_non_directory_mode_and_route_replacement \
+            service_stage::tests::staged_tamper_and_operation_mismatch_are_detected \
+            service_stage::tests::self_check_tampering_is_detected_after_callback \
+            service_stage::tests::replaced_source_path_does_not_change_selected_stage_bytes \
+            service_stage::tests::cleanup_preserves_replacement_leaf_and_foreign_extra_file \
+            service_stage::tests::cleanup_preserves_replaced_stage_directory \
+            service_stage::tests::parse_rejects_unknown_duplicate_fields_and_invalid_bounded_metadata \
+            service_stage::tests::failed_adoption_never_consumes_unrelated_or_mismatched_descriptors \
+            service_stage::tests::adopted_custody_closes_validated_inherited_descriptors_and_cleans_explicitly \
+            service_stage::tests::maximum_operation_round_trips_inside_bounded_launch_context \
+            service_stage::tests::failed_exec_cleans_stage_without_changing_internal_environment \
+            service_stage::tests::caller_cannot_inject_launch_context_through_arguments \
+            service_stage::tests::disarm_transfers_cleanup_without_removing_child_custody \
+            service_stage::tests::streamed_hash_enforces_cap_without_relying_on_initial_file_size_check \
+            service_stage::tests::selected_source_adapter_refuses_symlink_and_stage_rejects_directory \
+            service_stage::tests::substituted_fifo_is_rejected_without_blocking_validation \
+            service_stage::tests::adoption_rechecks_context_even_when_deserialized_without_parse \
+            selected_open_file_is_copied_verified_and_removed_on_drop \
+            single_threaded_helper_reexec_adopts_and_transfers_cleanup_across_fork \
+            actual_selected_qshd_self_check_runs_from_closed_writable_stage; do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 { seen++; pending=1; if ($0 == expected "ok") { passed++; pending=0 }; next }
+              pending && $0 == "ok" { passed++; pending=0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/service-stage-results.log"
+          done
+          grep -F 'test result: ok. 25 passed; 0 failed; 0 ignored;' "$runtime/service-stage-results.log"
+          if grep -Fq 'SKIPPED' "$runtime/service-stage-results.log"; then exit 1; fi
           cargo test -p qshd --lib --locked log280_ -- --nocapture --test-threads=1 --color=never \
             2>&1 | tee "$runtime/log-permission-results.log"
           for name in \
@@ -785,6 +852,7 @@ jobs:
             climb::bootstrap_tests::selected_continue_uncertain_ssh_command_stops_all_routes_and_joins_probes \
             climb::bootstrap_tests::selected_confirmed_force_unavailable_stops_all_routes_and_joins_probes \
             climb::bootstrap_tests::selected_confirmed_modern_force_uncertainty_stops_all_routes_and_joins_probes \
+            climb::bootstrap_tests::selected_confirmed_service_force_uncertainty_stops_all_routes_and_joins_probes \
             climb::bootstrap_tests::selected_ready_unknown_profile_timeout_stops_all_routes_and_joins_probes \
             climb::bootstrap_tests::selected_ready_known_profile_data_failure_stops_all_routes_and_joins_probes \
             climb::bootstrap_tests::unselected_foreground_helper_failure_still_advances_to_the_next_route \
@@ -802,11 +870,21 @@ jobs:
               END { exit !(seen == 1 && passed == 1) }
             ' "$runtime/results.log"
           done
-          grep -F 'test result: ok. 24 passed; 0 failed; 0 ignored;' "$runtime/results.log"
+          grep -F 'test result: ok. 25 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           if grep -Fq 'SKIPPED' "$runtime/results.log"; then
             echo '::error::portable inline SSH bootstrap tests reported a runtime skip' >&2
             exit 1
           fi
+      - name: Native Darwin legacy account-service restart acceptance
+        shell: bash
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          export HISTFILE=/dev/null
+          python3 -m unittest discover -s scripts/tests -p test_released_peer_acceptance.py
+          python3 scripts/released-peer-acceptance.py --service-only \
+            --evidence "$RUNNER_TEMP/legacy-service-arm64-evidence"
+          grep -Fx '2 selected tests; 2 passed; 0 skipped' "$RUNNER_TEMP/legacy-service-arm64-evidence/passed.txt"
       - name: Portable pin-store and private-key file tests
         run: |
           set -euo pipefail

@@ -23,6 +23,7 @@ struct Session {
     events: exec::Events,
     stream: u8,
     temporary: Option<(String, Arc<AtomicBool>)>,
+    selected_helper: Option<String>,
 }
 
 /// Private transport seam: production SSH and deterministic command fixtures
@@ -45,6 +46,7 @@ trait Remote {
         cancel: &knock::Cancel,
     ) -> Result<(), BringUpError>;
     fn temporary(&mut self, value: Option<(String, Arc<AtomicBool>)>);
+    fn selected_helper(&mut self, _: &str) {}
 
     fn trusted_path(
         &mut self,
@@ -384,6 +386,9 @@ impl Remote for Session {
     fn temporary(&mut self, value: Option<(String, Arc<AtomicBool>)>) {
         self.temporary = value;
     }
+    fn selected_helper(&mut self, path: &str) {
+        self.selected_helper = Some(path.to_owned());
+    }
 }
 
 impl Drop for Session {
@@ -408,7 +413,7 @@ fn cleanup_temporary(remote: &mut impl Remote, temporary: Option<(String, Arc<At
 }
 
 pub(crate) fn bring_up(
-    req: BringUpRequest,
+    mut req: BringUpRequest,
     policy: InstallPolicy,
     hooks: BringUpHooks,
     bind: Arc<dyn knock::SocketBind>,
@@ -435,6 +440,35 @@ pub(crate) fn bring_up(
             "invalid busy-daemon decision options".into(),
         ));
     }
+    if req.destructive_consent.is_some() && req.service_restart_consent.is_some() {
+        return Err(BringUpError::InvalidRequest(
+            "conflicting restart consent scopes".into(),
+        ));
+    }
+    if let Some(consent) = &req.service_restart_consent {
+        if !req.busy_decision.as_ref().is_some_and(|decision| {
+            decision.choice == crate::BusyChoice::ForceUpdate
+                && decision.attempt == consent.attempt
+                && decision.candidate == consent.candidate
+                && decision.service_restart.as_ref() == Some(&consent.service)
+        }) || req.pending_busy_target.is_none()
+        {
+            return Err(BringUpError::InvalidRequest(
+                "service restart needs its observed SSH target and force decision".into(),
+            ));
+        }
+    }
+    if let Some(target) = &req.pending_busy_target {
+        if target.host != req.ssh.host
+            || target.port != req.ssh.port
+            || target.username != req.ssh.username
+        {
+            return Err(BringUpError::InvalidRequest(
+                "selected SSH target changed".into(),
+            ));
+        }
+        req.ssh.known_host_keys = vec![target.host_key.key.clone()];
+    }
     if let Some(decision) = &req.busy_decision {
         if decision.choice == crate::BusyChoice::Cancel {
             return Err(BringUpError::Declined);
@@ -451,6 +485,7 @@ pub(crate) fn bring_up(
             }
         }
         if decision.choice == crate::BusyChoice::ForceUpdate
+            && req.service_restart_consent.is_none()
             && (req.destructive_consent.is_none() || decision.identity.generation.is_none())
         {
             return Err(BringUpError::DestructiveRestartUnavailable);
@@ -472,12 +507,23 @@ pub(crate) fn bring_up(
     let (collector, events) = exec::collector(Arc::clone(&hooks.observer));
     let (conn, sub) = ssh::connect(req.ssh, req.auth, bind, Arc::new(collector), cancel)
         .map_err(BringUpError::Ssh)?;
+    if req
+        .pending_busy_target
+        .as_ref()
+        .is_some_and(|target| target.host_key != conn.server_host_key())
+    {
+        conn.close();
+        return Err(BringUpError::InvalidRequest(
+            "selected SSH host key changed".into(),
+        ));
+    }
     let mut session = Session {
         conn,
         sub,
         events,
         stream: 0,
         temporary: None,
+        selected_helper: None,
     };
     let ready = on_session(
         &mut session,
@@ -487,13 +533,30 @@ pub(crate) fn bring_up(
         req.report_busy,
         req.busy_decision,
         req.destructive_consent,
-        host,
-        username,
+        req.service_restart_consent,
+        req.pending_busy_target.as_ref(),
+        host.clone(),
+        username.clone(),
         ssh_port,
         policy,
         hooks,
         cancel,
-    )?;
+    )
+    .map_err(|error| match error {
+        BringUpError::BusyDaemon(info) => {
+            BringUpError::ObservedBusy(Box::new(crate::ObservedBusy {
+                info: *info,
+                target: crate::BusySshTarget {
+                    host,
+                    port: ssh_port,
+                    username,
+                    host_key: session.conn.server_host_key(),
+                    helper_path: session.selected_helper.clone().unwrap_or_default(),
+                },
+            }))
+        }
+        other => other,
+    })?;
     Ok(IdentifiedReady {
         ready,
         ssh_host_key: session.conn.server_host_key(),
@@ -509,6 +572,8 @@ fn on_session(
     report_busy: bool,
     busy_decision: Option<crate::BusyDecision>,
     destructive_consent: Option<crate::DestructiveRestartConsent>,
+    service_restart_consent: Option<crate::ServiceRestartConsent>,
+    pending_busy_target: Option<&crate::BusySshTarget>,
     host: String,
     username: String,
     ssh_port: u16,
@@ -591,6 +656,10 @@ fn on_session(
         &hooks,
         cancel,
     )?;
+    if pending_busy_target.is_some_and(|target| target.helper_path != path) {
+        return Err(BringUpError::Verify("selected helper path changed".into()));
+    }
+    session.selected_helper(&path);
     if report_busy {
         check_cancel(cancel)?;
         let capabilities = session.command(
@@ -599,6 +668,13 @@ fn on_session(
             hooks.timing.verify,
             cancel,
         )?;
+        if service_restart_consent.is_some()
+            && !capabilities.complete_stdout().is_ok_and(|stdout| {
+                ensure::tool_supports_service_restart(capabilities.code, stdout)
+            })
+        {
+            return Err(BringUpError::DestructiveRestartUnavailable);
+        }
         if !capabilities
             .complete_stdout()
             .is_ok_and(|stdout| ensure::tool_supports_busy(capabilities.code, stdout))
@@ -627,13 +703,14 @@ fn on_session(
                     attempt: attempt.as_ref(),
                     decision: busy_decision.as_ref(),
                     destructive_consent: destructive_consent.as_ref(),
+                    service_restart_consent: service_restart_consent.as_ref(),
                 },
             )?,
             hooks.timing.ensure,
             cancel,
         )
         .map_err(|error| {
-            if destructive_consent.is_some() {
+            if destructive_consent.is_some() || service_restart_consent.is_some() {
                 BringUpError::DestructiveRestartUncertain {
                     cause: Some(Box::new(error)),
                 }
@@ -642,16 +719,18 @@ fn on_session(
             }
         })?;
     if output.code != 0 {
-        return Err(if destructive_consent.is_some() {
-            BringUpError::DestructiveRestartUncertain {
-                cause: Some(Box::new(output.failure("qshd transport-ensure"))),
-            }
-        } else {
-            output.failure("qshd transport-ensure")
-        });
+        return Err(
+            if destructive_consent.is_some() || service_restart_consent.is_some() {
+                BringUpError::DestructiveRestartUncertain {
+                    cause: Some(Box::new(output.failure("qshd transport-ensure"))),
+                }
+            } else {
+                output.failure("qshd transport-ensure")
+            },
+        );
     }
     let stdout = output.complete_stdout().map_err(|error| {
-        if destructive_consent.is_some() {
+        if destructive_consent.is_some() || service_restart_consent.is_some() {
             BringUpError::DestructiveRestartUncertain {
                 cause: Some(Box::new(BringUpError::BadReady(error))),
             }
@@ -669,7 +748,9 @@ fn on_session(
                 "reported candidate differs from verified provider bytes".into(),
             ));
         }
-        Err(error @ BringUpError::BadReady(_)) if destructive_consent.is_some() => {
+        Err(error @ BringUpError::BadReady(_))
+            if (destructive_consent.is_some() || service_restart_consent.is_some()) =>
+        {
             return Err(BringUpError::DestructiveRestartUncertain {
                 cause: Some(Box::new(error)),
             })

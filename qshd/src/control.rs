@@ -700,6 +700,17 @@ pub struct EnsureLock {
     _file: std::fs::File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceStopDispatch {
+    Refused,
+    Acknowledged,
+    Uncertain,
+}
+
+#[cfg(test)]
+#[path = "control_service_tests.rs"]
+mod service_tests;
+
 impl EnsureLock {
     /// Attempt immediately, even for a zero budget, then bound contention by
     /// `patience`. This does not bound filesystem operations or the transaction
@@ -796,12 +807,120 @@ impl EnsureLock {
         )
     }
 
+    pub fn stop_service_once(&self) -> ServiceStopDispatch {
+        self.stop_service_once_checked(CLIENT_READ_TIMEOUT, check_control_peer)
+    }
+    fn stop_service_once_checked(
+        &self,
+        timeout: Duration,
+        check: impl FnOnce(&UnixStream) -> Result<()>,
+    ) -> ServiceStopDispatch {
+        let connect = || -> Result<UnixStream> {
+            self.authority.validate_route()?;
+            anyhow::ensure!(
+                self.authority.entry()?.is_some(),
+                "personal service endpoint absent"
+            );
+            let stream = UnixStream::connect(&self.authority.syscall_path)?;
+            self.authority.validate_route()?;
+            check(&stream)?;
+            self.authority.validate_route()?;
+            anyhow::ensure!(
+                self.authority.entry()?.is_some(),
+                "personal service endpoint disappeared before dispatch"
+            );
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+            Ok(stream)
+        };
+        let Ok(mut stream) = connect() else {
+            return ServiceStopDispatch::Refused;
+        };
+        // Once a write is attempted, every failure is possibly committed.
+        // Never reconnect, retry STOP, or infer absence from EOF.
+        if stream.write_all(b"STOP\n").is_err() {
+            return ServiceStopDispatch::Uncertain;
+        }
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream);
+        if std::io::Read::take(&mut reader, 4097)
+            .read_line(&mut line)
+            .is_err()
+            || line.len() > 4096
+            || !line.ends_with('\n')
+            || self.authority.validate_route().is_err()
+        {
+            return ServiceStopDispatch::Uncertain;
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Ack {
+            Legacy { stopped: bool },
+            Current { stopping: bool },
+        }
+        if serde_json::from_str::<Ack>(line.trim_end()).is_ok_and(|ack| match ack {
+            Ack::Legacy { stopped } => stopped,
+            Ack::Current { stopping } => stopping,
+        }) {
+            ServiceStopDispatch::Acknowledged
+        } else {
+            ServiceStopDispatch::Uncertain
+        }
+    }
+
+    /// The consent describes this independently derived personal route only.
+    pub fn personal_service_selector(
+        &self,
+        port: u16,
+    ) -> Option<daemon_bootstrap_protocol::PersonalServiceSelector> {
+        let uid = nix::unistd::geteuid().as_raw();
+        if uid == 0 || uid != nix::unistd::getuid().as_raw() || self.validate_route().is_err() {
+            return None;
+        }
+        let selector = daemon_bootstrap_protocol::PersonalServiceSelector {
+            profile: daemon_bootstrap_protocol::PersonalServiceProfile::PersonalTransportV1,
+            uid,
+            endpoint: self.authority.route.to_str()?.to_owned(),
+            port,
+        };
+        selector.valid().then_some(selector)
+    }
+
+    /// Exercise the actual filesystem primitive on an operation-owned absent
+    /// name before STOP. Cleanup retains only this probe's inode.
+    pub fn preflight_absent_publication(&self) -> std::io::Result<()> {
+        use rand_core::RngCore;
+        use std::os::fd::AsRawFd;
+        self.validate_route()?;
+        let mut random = [0u8; 16];
+        rand_core::OsRng
+            .try_fill_bytes(&mut random)
+            .map_err(std::io::Error::other)?;
+        let route = self
+            .authority
+            .route
+            .with_file_name(format!(".restart-probe-{}", hex::encode(random)));
+        let authority = path::EndpointAuthority::open(&route, false)?;
+        if !path::same(
+            &nix::sys::stat::fstat(self.authority.parent.as_raw_fd())?,
+            &nix::sys::stat::fstat(authority.parent.as_raw_fd())?,
+        ) {
+            return Err(path::refused("the restart preflight parent changed"));
+        }
+        self.validate_route()?;
+        let (_listener, cleanup) = bind_prepared_mode(&authority, |_| {}, false)?;
+        self.validate_route()?;
+        drop(cleanup);
+        Ok(())
+    }
+
     pub fn bind_private_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
         bind_with_authority(&self.authority)
     }
     /// A confirmed destructive restart may publish only into an absent leaf.
     /// A competing endpoint is never removed under the old consent.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn bind_private_absent_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
         bind_prepared_mode(&self.authority, |_| {}, false)
     }
@@ -990,9 +1109,9 @@ fn bind_prepared_mode(
     if replace {
         stage.publish(authority)?;
     } else {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         stage.publish_absent(authority)?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "no-replace restart publication is unavailable",
@@ -1397,7 +1516,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn confirmed_restart_publication_never_replaces_a_new_endpoint() {
         let dir = tempfile::tempdir().unwrap();
@@ -1419,7 +1538,7 @@ mod tests {
         let (_listener, _cleanup) = transaction.bind_private_absent_owned().unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn confirmed_restart_publication_preserves_non_utf8_leaf_bytes() {
         use std::os::unix::ffi::OsStringExt;
@@ -1438,7 +1557,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn confirmed_restart_publication_refuses_race_and_unsupported_primitive() {
         let dir = tempfile::tempdir().unwrap();

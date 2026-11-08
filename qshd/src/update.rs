@@ -1213,6 +1213,24 @@ pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck
 /// Non-Linux cleanup remains a separate platform acceptance requirement.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck, String> {
+    run_threaded_self_check(path, timeout, |stdout, line_tx| {
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(stdout.take(4096)).read_line(&mut line);
+            let _ = line_tx.send(line);
+        })
+    })
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn run_threaded_self_check(
+    path: &Path,
+    timeout: Duration,
+    spawn_reader: impl FnOnce(
+        std::process::ChildStdout,
+        std::sync::mpsc::Sender<String>,
+    ) -> std::thread::JoinHandle<()>,
+) -> Result<SelfCheck, String> {
     let mut child = spawn_self_check(path)?;
     let deadline = Instant::now() + timeout;
     // Read on a thread of its own, up to the first line: a process the
@@ -1221,13 +1239,10 @@ pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck
     // with it. A reader still blocked past the deadline is left to finish
     // on its own.
     let (line_tx, line_rx) = std::sync::mpsc::channel();
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(stdout.take(4096)).read_line(&mut line);
-            let _ = line_tx.send(line);
-        });
-    }
+    let reader = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_reader(stdout, line_tx));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1254,6 +1269,14 @@ pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck
                 timeout.as_secs()
             )
         })?;
+    // The bounded read already completed and the reader has dropped its
+    // BufReader before sending. Join its remaining nonblocking tail before a
+    // caller can reexec or fork a staged candidate. Error/timeout paths above
+    // never grant that eligibility and do not wait on an unfinished read.
+    reader
+        .ok_or_else(|| "self-check reader was not started".to_owned())?
+        .join()
+        .map_err(|_| "self-check reader failed after its output".to_owned())?;
     SelfCheck::from_line(out.lines().next().unwrap_or(""))
         .map_err(|e| format!("self-check printed something else: {e:#}"))
 }
@@ -1570,6 +1593,62 @@ mod tests {
             admission,
         };
         (base, udp, control)
+    }
+
+    #[test]
+    fn service_stage_update_handover_retains_persistent_install_destination() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let _fds = crate::test_support::fd_flags_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed/qshd");
+        std::fs::create_dir(installed.parent().unwrap()).unwrap();
+        let executing = dir.path().join("service-staging/stage-owned/qshd");
+        std::fs::create_dir_all(executing.parent().unwrap()).unwrap();
+        std::fs::write(&executing, b"retained selected stage").unwrap();
+        let expected = installed.clone();
+        let selected = executing.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        let exec: ExecFn = Arc::new(move |staged, fd| {
+            assert_eq!(staged.parent(), expected.parent());
+            assert_ne!(staged.parent(), selected.parent());
+            let copy = unsafe { nix::libc::fcntl(fd, nix::libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(copy >= 0);
+            // SAFETY: fcntl returned a fresh descriptor owned by this read.
+            let description =
+                handover::read_handover(unsafe { OwnedFd::from_raw_fd(copy) }).unwrap();
+            assert_eq!(description.binary_path, expected);
+            assert_eq!(description.staged_path, staged);
+            assert_ne!(description.binary_path, selected);
+            called.fetch_add(1, Ordering::SeqCst);
+            Errno::ENOENT
+        });
+        let (base, _udp, _control) = handover_base(dir.path());
+        let own = OwnImage {
+            checksum: hex::encode(sha2::Sha256::digest(b"retained selected stage")),
+            ..own_image()
+        };
+        let daemon = DaemonSelf::personal(
+            ChannelOpenRegistry::new(Default::default()),
+            Some(own.clone()),
+            installed.clone(),
+            uid(),
+            Arc::new(AtomicUsize::new(1)),
+            Some(base),
+        )
+        .with_exec(exec);
+        assert_eq!(daemon.own.get(), Some(&Some(own)));
+        let image = script_image(101, 0);
+        let mut transfer = daemon.offer(&me(), &offer_for(&image, 101)).unwrap();
+        transfer.write(&image).unwrap();
+        transfer.verify().unwrap();
+        assert!(matches!(transfer.restart(), UpdateResult::Rejected { .. }));
+        assert!(calls.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            std::fs::read(&executing).unwrap(),
+            b"retained selected stage"
+        );
+        assert!(!installed.exists());
     }
 
     #[test]
@@ -2090,6 +2169,30 @@ mod tests {
         ));
         drop(first);
         assert!(daemon.offer(&me(), &offer_for(&image, 101)).is_ok());
+    }
+
+    #[test]
+    fn service_self_check_reader_panic_refuses_launch_eligibility() {
+        use std::io::{BufRead, Read};
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("self-check");
+        std::fs::write(&path, script_image(101, 0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = run_threaded_self_check(&path, Duration::from_secs(2), |stdout, line_tx| {
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                std::io::BufReader::new(stdout.take(4096))
+                    .read_line(&mut line)
+                    .unwrap();
+                line_tx.send(line).unwrap();
+                panic!("owned self-check reader failed after delivering its line");
+            })
+        });
+        assert!(
+            result.is_err(),
+            "a self-check is not reexec-eligible before its reader joins"
+        );
     }
 
     /// Another thread forking while the staged file is still open for

@@ -15,6 +15,10 @@ on:
       - 'vendor/alacritty_terminal/**'
       - '.github/workflows/ci.yml'
       - 'cli/Cargo.toml'
+      - 'cli/tests/mixed_versions.rs'
+      - 'crates/daemon-bootstrap-protocol/**'
+      - 'scripts/released-peer-acceptance.py'
+      - 'scripts/tests/test_released_peer_acceptance.py'
       - 'packaging/build-server-packages.sh'
       - 'packaging/acceptance.sh'
       - 'scripts/check-pam-linkage.sh'
@@ -47,6 +51,10 @@ on:
       - 'vendor/alacritty_terminal/**'
       - '.github/workflows/ci.yml'
       - 'cli/Cargo.toml'
+      - 'cli/tests/mixed_versions.rs'
+      - 'crates/daemon-bootstrap-protocol/**'
+      - 'scripts/released-peer-acceptance.py'
+      - 'scripts/tests/test_released_peer_acceptance.py'
       - 'packaging/build-server-packages.sh'
       - 'packaging/acceptance.sh'
       - 'scripts/check-pam-linkage.sh'
@@ -589,6 +597,23 @@ jobs:
           grep -F 'ledger_before_setsid=true pending_interval=true refund=false replacement_refused=true foreign_signal=false voluntary_exit=true rescue=false' "$runtime/keeper-integrated-results.log"
           grep -F 'wire_STOP=ack_then_actual_exit_watch_and_consumed_wait' "$runtime/keeper-integrated-results.log"
           grep -F 'keeper223 replacement_routes old_image=' "$runtime/keeper-integrated-results.log"
+
+      - name: Native Intel Darwin legacy account-service restart acceptance
+        shell: bash
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export CARGO_BUILD_TARGET="$NATIVE_TARGET" HISTFILE=/dev/null
+          cargo_home="$CARGO_HOME"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/ -Dwarnings"
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
+          python3 -m unittest discover -s scripts/tests -p test_released_peer_acceptance.py
+          python3 scripts/released-peer-acceptance.py --service-only \
+            --evidence "$RUNNER_TEMP/legacy-service-intel-evidence"
+          grep -Fx '2 selected tests; 2 passed; 0 skipped' "$RUNNER_TEMP/legacy-service-intel-evidence/passed.txt"
 
   system-floors:
     if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}

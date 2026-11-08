@@ -346,6 +346,8 @@ impl SshStep<'_> {
             report_busy: false,
             busy_decision: None,
             destructive_consent: None,
+            service_restart_consent: None,
+            pending_busy_target: None,
             name: "console".into(),
             ssh: ssh::SshParams {
                 host: addr.host.clone(),
@@ -385,6 +387,8 @@ impl SshStep<'_> {
         let prompter = self.prompter();
         let mut decision = None;
         let mut consent = None;
+        let mut service_consent = None;
+        let mut pending_target = None;
         let mut selected = None;
         let result = loop {
             let mut request =
@@ -394,6 +398,8 @@ impl SshStep<'_> {
                 && self.install_policy != bringup::InstallPolicy::RestartOnly;
             request.busy_decision = decision.take();
             request.destructive_consent = consent.take();
+            request.service_restart_consent = service_consent.take();
+            request.pending_busy_target = pending_target.clone();
             let result = bringup::bring_up_identified(
                 request,
                 self.install_policy.clone(),
@@ -407,27 +413,46 @@ impl SshStep<'_> {
                 cancel,
             );
             match result {
-                Err(bringup::BringUpError::BusyDaemon(info)) => {
-                    let (answer, confirmed) =
-                        crate::busy_daemon::ask(self.tty, (*info).clone(), cancel).map_err(
-                            |error| match selected.take() {
-                                Some(info) => {
-                                    Attempted::SelectedBusyFailed(Box::new(SelectedBusyFailure {
-                                        info,
-                                        error: bringup::BringUpError::Ssh(error),
-                                    }))
-                                }
-                                None => Attempted::Ssh(error),
-                            },
-                        )?;
+                Err(bringup::BringUpError::ObservedBusy(observation)) => {
+                    let bringup::ObservedBusy { info, target } = *observation;
+                    let (answer, confirmed) = crate::busy_daemon::ask_for_target(
+                        self.tty,
+                        info.clone(),
+                        self.login,
+                        &format!("{}:{}", target.host, target.port),
+                        cancel,
+                    )
+                    .map_err(|error| match selected.take() {
+                        Some(info) => {
+                            Attempted::SelectedBusyFailed(Box::new(SelectedBusyFailure {
+                                info,
+                                error: bringup::BringUpError::Ssh(error),
+                            }))
+                        }
+                        None => Attempted::Ssh(error),
+                    })?;
                     if answer.choice == bringup::BusyChoice::Cancel {
                         return Err(Attempted::BusyCancelled);
                     }
                     // Fresh BUSY observations replace every prior decision and
                     // consent on this route. Cancellation above performs no operation.
-                    selected = Some(*info);
+                    selected = Some(info);
+                    pending_target = Some(target);
                     decision = Some(answer);
-                    consent = confirmed;
+                    match confirmed {
+                        Some(crate::busy_daemon::RestartConsent::Exact(value)) => {
+                            consent = Some(value);
+                            service_consent = None;
+                        }
+                        Some(crate::busy_daemon::RestartConsent::Service(value)) => {
+                            service_consent = Some(value);
+                            consent = None;
+                        }
+                        None => {
+                            consent = None;
+                            service_consent = None;
+                        }
+                    }
                 }
                 other => break other,
             }

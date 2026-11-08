@@ -136,6 +136,8 @@ impl Fixture {
             false,
             None,
             None,
+            None,
+            None,
             "fixture.invalid".into(),
             "fixture".into(),
             22,
@@ -225,7 +227,7 @@ impl Remote for Fixture {
                     .next()
                     .unwrap()
                     .trim_matches('\'');
-                let info = serde_json::json!({"schema":1,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":candidate,"active_connections":2,"serving_profiles":null,"preservation":"unknown"});
+                let info = serde_json::json!({"schema":2,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":candidate,"active_connections":2,"serving_profiles":null,"preservation":"unknown"});
                 return Ok(exec::test_support::output(
                     0,
                     &format!("TRANSPORT-BUSY {info}\n"),
@@ -687,6 +689,8 @@ fn busy_opt_in_requires_explicit_tool_capability_without_mutating_legacy_daemon(
         true,
         None,
         None,
+        None,
+        None,
         "fixture.invalid".into(),
         "fixture".into(),
         22,
@@ -737,6 +741,8 @@ fn advertised_tool_capability_allows_scoped_busy_flags_without_version_inference
         true,
         None,
         None,
+        None,
+        None,
         "fixture.invalid".into(),
         "fixture".into(),
         22,
@@ -776,6 +782,8 @@ fn reported_candidate_must_match_verified_provider_bytes_before_prompting() {
             true,
             None,
             None,
+            None,
+            None,
             "fixture.invalid".into(),
             "fixture".into(),
             22,
@@ -810,7 +818,7 @@ fn confirmed_destructive_command_loss_is_uncertain_without_retry_or_ready() {
         fixture.bootstrap_capabilities = Some(r#"{"schema":1,"busy_decisions":true}"#.into());
         fixture.ensure_fault = Some(fault);
         let busy = BusyDaemonInfo {
-            schema: 1,
+            schema: 2,
             attempt: BusyAttemptId::from_bytes([1; 16]),
             identity: BusyDaemonIdentity {
                 version: "0.6.0-rc1".into(),
@@ -826,6 +834,7 @@ fn confirmed_destructive_command_loss_is_uncertain_without_retry_or_ready() {
             active_connections: 2,
             serving_profiles: None,
             preservation: PreservationCapability::Unknown,
+            service_restart: None,
         };
         let consent = busy.confirm_destructive_restart();
         let decision = PendingBusy::new(busy)
@@ -840,6 +849,8 @@ fn confirmed_destructive_command_loss_is_uncertain_without_retry_or_ready() {
             true,
             Some(decision),
             Some(consent),
+            None,
+            None,
             "fixture.invalid".into(),
             "fixture".into(),
             22,

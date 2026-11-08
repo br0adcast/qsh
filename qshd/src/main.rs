@@ -86,6 +86,7 @@ fn bootstrap_capabilities_line() -> String {
     let capabilities = daemon_bootstrap_protocol::BootstrapToolCapabilities {
         schema: 1,
         busy_decisions: true,
+        account_service_restart_v1: cfg!(any(target_os = "linux", target_os = "macos")),
     };
     format!(
         "{}\n",
@@ -164,7 +165,24 @@ fn help_text() -> String {
 // `transport-echo`/`transport-shell` -- each subcommand brings it up
 // itself.
 fn main() -> Result<()> {
+    // Remove the reserved handoff before any parser, worker entry or child
+    // command can inherit it. Only the checked service entry consumes it.
+    let service_stage = std::env::var_os(qshd::service_stage::LAUNCH_ENV);
+    std::env::remove_var(qshd::service_stage::LAUNCH_ENV);
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().map(OsString::as_os_str) != Some(OsStr::new("transport-ensure")) {
+        anyhow::ensure!(
+            service_stage.is_none(),
+            "service stage requires transport-ensure"
+        );
+        anyhow::ensure!(
+            !args
+                .iter()
+                .any(|arg| arg == "--service-installed-helper"
+                    || arg == "--service-candidate-helper"),
+            "service staging options require checked transport-ensure"
+        );
+    }
     #[cfg(target_os = "macos")]
     if let Some(result) = qshd::darwin_keeper_entry(&args) {
         return result.map_err(Into::into);
@@ -181,7 +199,7 @@ fn main() -> Result<()> {
     match args.first().map(|arg| argument_text(arg, 1)).transpose()? {
         Some("transport-echo") => run_transport_echo_command(&args),
         Some("transport-shell") => run_transport_shell_command(&args),
-        Some("transport-ensure") => run_transport_ensure(&args),
+        Some("transport-ensure") => run_transport_ensure(&args, service_stage),
         Some("serve") => serve::run_serve_command_os(&args),
         Some("server-info") => qshd::server_info::run_command(&args),
         Some("helper-status") => qshd::helper_status::run_command(&args),
@@ -523,6 +541,9 @@ struct ParsedTransportEnsureArgs {
     busy_attempt: Option<BusyAttemptId>,
     busy_decision: Option<BusyDecision>,
     destructive_consent: Option<daemon_bootstrap_protocol::DestructiveRestartConsent>,
+    service_restart_consent: Option<daemon_bootstrap_protocol::ServiceRestartConsent>,
+    service_candidate_helper: Option<PathBuf>,
+    service_installed_helper: Option<PathBuf>,
     restart_only: bool,
     name: String,
     port: u16,
@@ -553,6 +574,10 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
     let mut busy_decision: Option<BusyDecision> = None;
     let mut destructive_consent: Option<daemon_bootstrap_protocol::DestructiveRestartConsent> =
         None;
+    let mut service_restart_consent: Option<daemon_bootstrap_protocol::ServiceRestartConsent> =
+        None;
+    let mut service_candidate_helper = None;
+    let mut service_installed_helper = None;
     let mut restart_only = false;
     let mut name: Option<String> = None;
     let mut port: Option<u16> = None;
@@ -601,6 +626,31 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
                 anyhow::ensure!(value.len() <= 4096, "destructive consent exceeds limit");
                 destructive_consent =
                     Some(serde_json::from_str(value).context("invalid destructive consent")?);
+                i += 2;
+            }
+            "--service-restart-consent" if service_restart_consent.is_none() => {
+                let value = argument_text(
+                    args.get(i + 1)
+                        .context("--service-restart-consent requires a value")?,
+                    i + 2,
+                )?;
+                anyhow::ensure!(value.len() <= 4096, "service consent exceeds limit");
+                service_restart_consent =
+                    Some(serde_json::from_str(value).context("invalid service consent")?);
+                i += 2;
+            }
+            "--service-candidate-helper" if service_candidate_helper.is_none() => {
+                service_candidate_helper = Some(PathBuf::from(
+                    args.get(i + 1)
+                        .context("--service-candidate-helper requires a path")?,
+                ));
+                i += 2;
+            }
+            "--service-installed-helper" if service_installed_helper.is_none() => {
+                service_installed_helper = Some(PathBuf::from(
+                    args.get(i + 1)
+                        .context("--service-installed-helper requires a path")?,
+                ));
                 i += 2;
             }
             "--restart-only" => {
@@ -669,6 +719,32 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
             "destructive consent does not match a force decision"
         );
     }
+    anyhow::ensure!(
+        destructive_consent.is_none() || service_restart_consent.is_none(),
+        "conflicting restart consent scopes"
+    );
+    if let Some(consent) = &service_restart_consent {
+        anyhow::ensure!(
+            !restart_only
+                && consent.service.valid()
+                && busy_decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.choice == BusyChoice::ForceUpdate
+                        && decision.attempt == consent.attempt
+                        && decision.candidate == consent.candidate
+                        && decision.service_restart.as_ref() == Some(&consent.service)),
+            "service consent does not match a force decision"
+        );
+    }
+    anyhow::ensure!(
+        service_restart_consent.is_some()
+            || (service_candidate_helper.is_none() && service_installed_helper.is_none()),
+        "service helper paths require service consent"
+    );
+    anyhow::ensure!(
+        service_restart_consent.is_none() || service_candidate_helper.is_some(),
+        "service consent requires the selected trusted helper path"
+    );
     let name = name.context("--name is required")?;
     let port = port.context("--port is required")?;
     let mut ports = vec![port];
@@ -683,6 +759,9 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
         busy_attempt,
         busy_decision,
         destructive_consent,
+        service_restart_consent,
+        service_candidate_helper,
+        service_installed_helper,
         restart_only,
         name,
         port,
@@ -938,6 +1017,42 @@ fn absolute_cache_route(cache_dir: PathBuf) -> std::io::Result<PathBuf> {
 
 /// The `transport-ensure` subcommand: a self-installing SELF-DAEMONIZING
 /// server for the NEW transport, that survives the SSH `exec` closing.
+fn service_operation(
+    parsed: &ParsedTransportEnsureArgs,
+    helper: &qshd::service_restart::SelectedHelper,
+) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    // Recreated from the same checked fields and current trusted parent after
+    // reexec. A changed destination parent changes the bound operation bytes.
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "consent":parsed.service_restart_consent,"decision":parsed.busy_decision,
+        "name":parsed.name,"port":parsed.port,"ports":parsed.ports,"default_port":parsed.default_port,"client_pubkey":parsed.client_pubkey,
+        "installed_helper":BASE64.encode(helper.path().as_os_str().as_bytes()),
+        "installed_parent":helper.parent_identity(),
+    }))?)
+}
+fn write_service_failure(
+    attempt: &BusyAttemptId,
+    outcome: qshd::service_restart::ServiceRestartOutcome,
+) -> Result<()> {
+    use daemon_bootstrap_protocol::{DestructiveRestartDisposition, DestructiveRestartFailure};
+    let failure = DestructiveRestartFailure {
+        attempt: attempt.clone(),
+        disposition: if outcome == qshd::service_restart::ServiceRestartOutcome::Refused {
+            DestructiveRestartDisposition::Refused
+        } else {
+            DestructiveRestartDisposition::Uncertain
+        },
+    };
+    writeln!(
+        std::io::stdout(),
+        "TRANSPORT-RESTART-FAILED {}",
+        serde_json::to_string(&failure)?
+    )?;
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
 /// Mirrors the structure of the removed qsh path's
 /// `run_ensure`, but on the transport's UDP socket and with a Noise key
 /// allowlist instead of quinn/mTLS:
@@ -954,8 +1069,12 @@ fn absolute_cache_route(cache_dir: PathBuf) -> std::io::Result<PathBuf> {
 ///    `--client-pubkey` alone ([`transport_daemon::build_server_allowlist`]
 ///    -- there is no on-disk set to union with anymore), prints ready in the
 ///    parent, and daemonizes.
-fn run_transport_ensure(args: &[OsString]) -> Result<()> {
+fn run_transport_ensure(args: &[OsString], stage_context: Option<OsString>) -> Result<()> {
     let parsed = parse_transport_ensure_args(args)?;
+    anyhow::ensure!(
+        stage_context.is_none() || parsed.service_restart_consent.is_some(),
+        "service stage requires explicit service consent"
+    );
 
     let cache_dir = absolute_cache_route(serve::cache_dir(false)?)
         .context("resolving the personal cache directory")?;
@@ -969,11 +1088,120 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
     // daemon's key byte-for-byte (same file), so the client sees a stable
     // `server-pubkey`, like an SSH host key.
     let key_path = default_transport_key_path(&cache_dir);
-    let keypair = if parsed.restart_only {
+    let keypair = if parsed.restart_only || parsed.service_restart_consent.is_some() {
         load_transport_key(&key_path)?
     } else {
         load_or_create_transport_key(&key_path)?
     };
+
+    if let Some(consent) = &parsed.service_restart_consent {
+        use qshd::service_restart::{
+            self, SelectedHelper, SelectedStage, ServiceRestartOutcome, ValidatedCandidate,
+            ValidatedPersonalService,
+        };
+        use qshd::service_stage::StageLaunchContext;
+        let Some(service) = ValidatedPersonalService::current(&transaction, consent, parsed.port)
+        else {
+            return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+        };
+        let source = parsed
+            .service_candidate_helper
+            .as_ref()
+            .context("selected helper missing")?;
+        let mut helper = match SelectedHelper::open(source, &cache_dir) {
+            Ok(helper) => helper,
+            Err(error) => {
+                eprintln!("qshd: service candidate refused: {error}");
+                return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+            }
+        };
+        let operation = service_operation(&parsed, &helper)?;
+        let live = || matches!(ask_status(&transaction,&sock_path),Ok(control::ControlReply::Answered(line)) if control::StatusResponse::from_line(&line).is_ok());
+        let stage = if let Some(encoded) = stage_context {
+            if parsed.service_installed_helper.as_ref() != Some(source) {
+                return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+            }
+            let context = encoded
+                .to_str()
+                .ok_or(qshd::service_stage::StageError::Invalid)
+                .and_then(StageLaunchContext::parse);
+            let executable = std::env::args_os()
+                .next()
+                .map(PathBuf::from)
+                .context("staged executable route missing")?;
+            match context.and_then(|context| {
+                SelectedStage::adopt(
+                    context,
+                    &consent.candidate,
+                    &operation,
+                    &cache_dir,
+                    &executable,
+                    helper,
+                )
+            }) {
+                Ok(stage) => stage,
+                Err(error) => {
+                    eprintln!("qshd: staged service launch refused: {error}");
+                    return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+                }
+            }
+        } else {
+            if parsed.service_installed_helper.is_some() || !live() {
+                return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+            }
+            let prepared = match service_restart::prepare_selected_stage(
+                &cache_dir,
+                &mut helper,
+                &consent.candidate,
+                &operation,
+            ) {
+                Ok(stage) => stage,
+                Err(error) => {
+                    eprintln!("qshd: service candidate staging refused: {error}");
+                    return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+                }
+            };
+            let mut staged_args = args.to_vec();
+            staged_args.push("--service-installed-helper".into());
+            staged_args.push(helper.path().as_os_str().to_owned());
+            // The staged process reacquires the canonical lock and rechecks
+            // the current service. Process changes remain within this consent.
+            drop(transaction);
+            match prepared.reexec(&staged_args) {
+                Err(error) => {
+                    eprintln!("qshd: staged service exec refused: {error}");
+                    return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+                }
+                Ok(never) => match never {},
+            }
+        };
+        let candidate = ValidatedCandidate::staged(&stage, &consent.candidate);
+        let outcome = match (candidate, live()) {
+            (Some(candidate), true) => service_restart::restart_personal_service(
+                &transaction,
+                consent,
+                &service,
+                &candidate,
+            ),
+            _ => ServiceRestartOutcome::Refused,
+        };
+        if outcome != ServiceRestartOutcome::Released {
+            write_service_failure(&consent.attempt, outcome)?;
+            if let Err(error) = stage.cleanup() {
+                eprintln!("qshd: private service-stage cleanup failed: {error}");
+            }
+            return Ok(());
+        }
+        return become_transport_daemon(
+            &parsed,
+            &cache_dir,
+            &sock_path,
+            keypair,
+            transport_daemon::build_server_allowlist(parsed.client_pubkey),
+            transaction,
+            Some(stage),
+        );
+    }
 
     // Try the control socket BEFORE binding our own sockets -- like
     // `run_ensure`: is a daemon already alive.
@@ -1014,7 +1242,10 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
                     BusyChoice::Cancel => bail!("busy daemon startup cancelled"),
                     BusyChoice::ContinueOld => true,
                     BusyChoice::ForceUpdate => {
-                        anyhow::ensure!(parsed.destructive_consent.is_some(),"forced update unavailable without separate exact-instance destructive consent; no sessions were interrupted");
+                        anyhow::ensure!(
+                            parsed.destructive_consent.is_some(),
+                            "forced update requires separate exact-instance destructive consent"
+                        );
                         let outcome = match (&parsed.destructive_consent, &candidate) {
                             (Some(consent), Some(candidate)) => {
                                 qshd::interrupt_selected(&transaction, consent, candidate)
@@ -1062,16 +1293,22 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
                     bail!("selected daemon identity changed; rediscover before choosing again");
                 }
                 let info = BusyDaemonInfo {
-                    schema: 1,
+                    schema: 2,
                     attempt: parsed
                         .busy_attempt
                         .clone()
                         .context("missing busy attempt")?,
-                    identity,
+                    identity: identity.clone(),
                     candidate: candidate.clone().context("missing selected candidate")?,
                     active_connections: status.total_connections,
                     serving_profiles: profiles.clone(),
                     preservation: PreservationCapability::Unknown,
+                    service_restart: qshd::service_restart::offered_service(
+                        &transaction,
+                        parsed.port,
+                        &status.version,
+                        identity.generation.as_deref(),
+                    ),
                 };
                 if !info.valid() {
                     bail!("invalid running daemon identity");
@@ -1101,7 +1338,7 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
                         if transport_daemon::reuse_compatibility(profiles.as_deref())
                             == transport_daemon::ReuseCompatibility::Incompatible
                         {
-                            bail!("running qshd {} serves incompatible session profiles {:?}; required profile [{}, {}, {}]. The running daemon was left unchanged. Use a client with a matching profile, or finish active qsh sessions before updating the daemon", status.version, profiles, transport::wire::VERSION, transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION);
+                            bail!("running qshd {} serves incompatible session profiles {:?}; required profile [{}, {}, {}]. No daemon restart was requested. Use a client with a matching profile, or finish active qsh sessions before updating the daemon", status.version, profiles, transport::wire::VERSION, transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION);
                         }
                         let actual = if let Some(pubkey) = parsed.client_pubkey {
                             let request = registration_request(
@@ -1181,6 +1418,7 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
         keypair,
         allowlist,
         transaction,
+        None,
     )
 }
 
@@ -1244,6 +1482,7 @@ fn become_transport_daemon(
     keypair: transport::handshake::Keypair,
     allowlist: Vec<[u8; 32]>,
     transaction: control::EnsureLock,
+    mut stage: Option<qshd::service_restart::SelectedStage>,
 ) -> Result<()> {
     // The transport's UDP socket -- synchronously, before the fork (like `become_daemon`).
     let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, parsed.port)) {
@@ -1271,13 +1510,14 @@ fn become_transport_daemon(
     // from its first instant (spec §4.16, QSH-14). By this point there is
     // definitely no live daemon (see `run_transport_ensure`), so a file at
     // the name is a stale one, and `bind_private` replaces it.
-    #[cfg(target_os = "linux")]
-    let bound = if parsed.destructive_consent.is_some() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let bound = if parsed.destructive_consent.is_some() || parsed.service_restart_consent.is_some()
+    {
         transaction.bind_private_absent_owned()
     } else {
         transaction.bind_private_owned()
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let bound = transaction.bind_private_owned();
     let (listener, mut cleanup) =
         bound.with_context(|| format!("binding the control socket {}", sock_path.display()))?;
@@ -1318,6 +1558,9 @@ fn become_transport_daemon(
             // Even a parent wait error does not prove that its forked child
             // failed. Only the child's own guard may now unlink publication.
             cleanup.leave_to_child();
+            if let Some(stage) = stage.as_mut() {
+                stage.disarm_cleanup();
+            }
             let parent = result.context("daemonizing qshd (transport parent)")?;
             std::process::exit(parent);
         }
@@ -1336,14 +1579,18 @@ fn become_transport_daemon(
         log::error("qshd", &format!("PANIC: {info}"));
     }));
 
-    let binary_path = state::own_binary_path().unwrap_or_else(|e| {
-        log::warn(
-            "qshd",
-            &format!("cannot tell where its own binary is ({e:#}); updates over qsh are off"),
-        );
-        PathBuf::new()
-    });
-    run_personal_daemon(PersonalStart {
+    let binary_path = if let Some(stage) = stage.as_ref() {
+        stage.installed_helper().to_owned()
+    } else {
+        state::own_binary_path().unwrap_or_else(|e| {
+            log::warn(
+                "qshd",
+                &format!("cannot tell where its own binary is ({e:#}); updates over qsh are off"),
+            );
+            PathBuf::new()
+        })
+    };
+    let outcome = run_personal_daemon(PersonalStart {
         socket,
         listener,
         keypair,
@@ -1365,7 +1612,16 @@ fn become_transport_daemon(
             .collect(),
         name: parsed.name.clone(),
         binary_path,
-    })
+    });
+    if let Some(stage) = stage {
+        if let Err(error) = stage.cleanup() {
+            log::warn(
+                "qshd",
+                &format!("private service-stage cleanup failed: {error}"),
+            );
+        }
+    }
+    outcome
 }
 
 /// Everything the personal daemon's body starts from: a fresh daemon after
@@ -1381,9 +1637,10 @@ struct PersonalStart {
     port: u16,
     ports: Vec<u16>,
     name: String,
-    /// Where this daemon's binary lives -- read from `/proc/self/exe` by the
-    /// daemon itself (directly, or by the process it replaced), never taken
-    /// from a client. Empty when that could not be read: no updates then.
+    /// Persistent update destination: ordinary own path, checked inherited
+    /// handover path, or the trusted helper bound before a service-stage exec.
+    /// OwnImage and STATUS still inspect the actual executing artifact.
+    /// Empty when unavailable: no updates then.
     binary_path: PathBuf,
 }
 
@@ -2105,7 +2362,48 @@ mod tests {
     fn bootstrap_tool_capability_describes_flags_not_running_daemon_profiles() {
         let value: serde_json::Value =
             serde_json::from_str(&super::bootstrap_capabilities_line()).unwrap();
-        assert_eq!(value, serde_json::json!({"schema":1,"busy_decisions":true}));
+        assert_eq!(
+            value,
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                serde_json::json!({"schema":1,"busy_decisions":true,"account_service_restart_v1":true})
+            } else {
+                serde_json::json!({"schema":1,"busy_decisions":true})
+            }
+        );
+    }
+
+    #[test]
+    fn service_confirmation_is_explicit_and_cannot_enter_recovery_or_exact_scope() {
+        let selector = serde_json::json!({"profile":"personal_transport_v1","uid":1000,"endpoint":"/fixture/qsh/control.sock","port":60022});
+        let candidate = serde_json::json!({"build":2,"checksum":"ef".repeat(32)});
+        let decision = serde_json::json!({"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":candidate,"choice":"force_update","service_restart":selector});
+        let consent = serde_json::json!({"attempt":"12".repeat(16),"service":selector,"candidate":candidate,"action":"restart_account_service"});
+        let base = args(&[
+            "transport-ensure",
+            "--name",
+            "fixture",
+            "--port",
+            "60022",
+            "--report-busy",
+            "--busy-attempt",
+            &"12".repeat(16),
+            "--busy-decision",
+            &decision.to_string(),
+            "--service-candidate-helper",
+            "/fixture/qshd",
+            "--service-restart-consent",
+            &consent.to_string(),
+        ]);
+        assert!(
+            parse_transport_ensure_args(&base).is_ok(),
+            "separate service consent must parse"
+        );
+        let mut recovery = base.clone();
+        recovery.push("--restart-only".into());
+        assert!(parse_transport_ensure_args(&recovery).is_err());
+        let mut conflicting = base;
+        conflicting.extend(args(&["--destructive-consent", "{}"]));
+        assert!(parse_transport_ensure_args(&conflicting).is_err());
     }
 
     #[test]

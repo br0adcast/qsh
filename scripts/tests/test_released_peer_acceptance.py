@@ -41,6 +41,36 @@ class AcceptanceTests(unittest.TestCase):
             self.assertEqual([p.read_bytes() for p in pair], [b'x', b'x'])
             self.assertTrue(all(p.stat().st_mode & 0o100 for p in pair))
 
+    def test_native_fixture_selection_and_manifest_are_explicit(self):
+        expected = {
+            ('Linux', 'x86_64'): ('qsh-0.5.0-x86_64-unknown-linux-musl', peer.SHA256, 6282319),
+            ('Darwin', 'arm64'): ('qsh-0.5.0-aarch64-apple-darwin', 'db31e4a123459a9fd8151585301f7e0142c340cd1d9473a8e86d1f5be3f072cb', 5433857),
+            ('Darwin', 'x86_64'): ('qsh-0.5.0-x86_64-apple-darwin', '38b40b631ebd0a4fce856c7763cf4793c55e625cb404e2a93c4a3d391786d599', 5866506),
+        }
+        for host, fixture in expected.items():
+            self.assertEqual(peer.fixture_for_host(*host), fixture)
+        for host in [('Darwin', 'unknown'), ('Linux', 'aarch64'), ('Windows', 'AMD64')]:
+            with self.assertRaises(ValueError):
+                peer.fixture_for_host(*host)
+        prefix, digest, _ = expected['Darwin', 'arm64']
+        data = (digest + '  ' + prefix + '.tar.gz\n').encode()
+        with mock.patch.object(peer, 'MANIFEST_SIZE', len(data)), mock.patch.object(peer, 'MANIFEST_SHA256', hashlib.sha256(data).hexdigest()):
+            peer.verify_published_manifest(data, prefix, digest)
+            for changed, selected, checksum in [(data+b'x', prefix, digest), (data, prefix+'-other', digest), (data, prefix, '00'*32)]:
+                with self.assertRaises(ValueError):
+                    peer.verify_published_manifest(changed, selected, checksum)
+
+    def test_platform_archive_prefix_cannot_be_confused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            prefix='qsh-0.5.0-aarch64-apple-darwin'
+            archive=self.archive(root, [(prefix+'/'+name,tarfile.REGTYPE) for name in ('qsh','qshd')])
+            digest=hashlib.sha256(archive.read_bytes()).hexdigest()
+            with self.assertRaises(ValueError):
+                peer.extract_pair(archive,root/'wrong',digest)
+            pair=peer.extract_pair(archive,root/'correct',digest,prefix)
+            self.assertTrue(all(path.read_bytes()==b'x' for path in pair))
+
     def test_bad_digest_precedes_extraction(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -100,15 +130,16 @@ class AcceptanceTests(unittest.TestCase):
             self.assertEqual((evidence / 'wanted.log').read_text(), result.stdout)
 
     def test_busy_legacy_shell_scenario_is_selected_with_existing_cases(self):
-        self.assertEqual(len(peer.CASES), 7)
+        self.assertEqual(len(peer.CASES), 8)
         self.assertIn(('qsh', 'current_ensure_reports_busy_published_v050_without_interrupting_shell', True), peer.CASES)
+        self.assertIn(('qsh', 'published_v050_force_restarts_account_service_even_after_instance_change', True), peer.CASES)
         self.assertIn(('qsh', 'protocol2_client_cannot_mutate_published_v050_daemon', True), peer.CASES)
         self.assertEqual(len(set(peer.CASES)), len(peer.CASES))
 
     def test_pull_request_changes_run_the_real_gate_without_every_patch(self):
         workflow = (SCRIPT.parents[1] / '.github/workflows/released-peer-acceptance.yml').read_text()
         trigger = re.search(r'^  pull_request:\n    paths:\n((?:      - .*\n)+)', workflow, re.MULTILINE)
-        self.assertIsNotNone(trigger, 'PR acceptance changes must execute the actual seven-case gate')
+        self.assertIsNotNone(trigger, 'PR acceptance changes must execute the actual eight-case gate')
         paths = [ast.literal_eval(line.strip()[2:]) for line in trigger.group(1).splitlines()]
         for changed in ('.github/workflows/released-peer-acceptance.yml',
                         '.github/workflows/release.yml',
@@ -119,7 +150,8 @@ class AcceptanceTests(unittest.TestCase):
                         'crates/bringup/src/ensure.rs', 'crates/bringup/src/install.rs',
                         'qshd/src/main.rs', 'qshd/src/control.rs', 'qshd/src/control/path.rs',
                         'qshd/src/transport_daemon.rs', 'qshd/src/destructive_restart.rs',
-                        'qshd/src/modern_restart.rs', 'cli/src/ssh_step.rs',
+                        'qshd/src/modern_restart.rs', 'qshd/src/service_restart.rs',
+                        'qshd/src/control_service_tests.rs', 'cli/src/ssh_step.rs',
                         'cli/src/busy_daemon.rs', 'cli/src/climb.rs'):
             self.assertTrue(any(fnmatch.fnmatchcase(changed, pattern) for pattern in paths), changed)
         self.assertFalse(any(fnmatch.fnmatchcase('README.md', pattern) for pattern in paths))

@@ -2550,12 +2550,13 @@ There is no fallback to unaware READY behavior. Ordinary/background callers that
 do not request decisions retain their existing command path.
 
 Foreground callers can request `TRANSPORT-BUSY` before client registration,
-readiness or a new session handshake. Its bounded schema binds a random caller
+readiness or a new session handshake. Its bounded schema2 binds a random caller
 attempt to the reported live daemon identity, generation when available, actual
 connection count, optional serving profiles and the selected actual helper's
-`candidate: {build, checksum}`. Candidate build is a build stamp; its checksum
-names the executing image, not whichever file later occupies its path. Verified
-provider bytes must match that digest. Cancel is the default. Continue
+`candidate: {build, checksum}`. Candidate build is a build stamp. The modern
+exact-instance operation binds executing bytes on its qualified platform;
+service restart binds the selected verified artifact under its private launch
+profile. Verified provider bytes must match the selected digest. Cancel is the default. Continue
 with old daemon rechecks identity and requires a valid `ADD-CLIENT` acknowledgement
 before reporting the actual serving version and listeners in `TRANSPORT-READY`.
 Conditional registration is negotiated by a separate bounded, read-only
@@ -2570,9 +2571,10 @@ handshake once detected. This non-destructive legacy exception never permits
 STOP, process termination or forced restart.
 
 Force update is a distinct choice; it cannot imply the separate confirmation
-required to interrupt sessions. Consent binds attempt, full daemon identity,
-candidate and explicit `action: "stop_and_restart"`. No preservation support is
-advertised.
+required to interrupt sessions. Exact-instance consent binds attempt, full
+daemon identity, candidate and explicit `action: "stop_and_restart"`.
+Account-service consent is a separate type and warning, described below.
+Neither form advertises session preservation.
 
 Supporting Linux personal daemons separately advertise schema1
 `DESTRUCTIVE-RESTART-INFO <random32 challenge>` with the echoed challenge,
@@ -2605,13 +2607,60 @@ unsupported syscall/filesystem refuses startup without overwriting it.
 `refused` or `uncertain`; it cannot coexist with readiness. A caller
 must rediscover after uncertainty rather than retry destruction or another route.
 
-Released peers without explicit receipt support remain refused for Force.
-Darwin has an exit-only full-identity/cookie observer, but full destructive Force
-is refused before commit: the existing proc_pidpath-to-open candidate checksum
-route does not bind executing bytes across replacement. Native Darwin observer
-qualification and an immutable candidate-artifact binding remain separate gates.
-Neither limitation changes ordinary Continue, old-helper capability refusal or
-session-protocol compatibility.
+Exact-instance Force remains unavailable on Darwin: its exit-only observer
+does not qualify the proc_pidpath-to-open checksum as executing-byte evidence.
+The account-service operation does not weaken or replace this receipt contract.
+
+A helper can explicitly advertise `account_service_restart_v1` in its bounded
+schema1 bootstrap capabilities. For the published generation-less v0.5.0 peer,
+an eligible schema2 BUSY record can additionally offer `service_restart` with
+`profile: "personal_transport_v1"`, effective `uid`, absolute personal
+`endpoint`, and requested UDP `port`. Missing service scope never authorizes a
+service restart. A failed modern metadata or receipt query does not downgrade
+to service scope. Continue still binds the originally observed daemon identity.
+
+After a separate warning naming the verified SSH host and account, the caller
+can supply `--service-restart-consent` containing `attempt`, `service`,
+`candidate`, and `action: "restart_account_service"`. This is mutually exclusive
+with exact-instance consent. It authorizes one restart of that account's
+unmanaged personal service even if its PID, generation, build, version or active
+connection count changes during the dialog. It does not authorize another SSH
+host key, login, route, service selector or selected candidate. The caller pins
+the authenticated SSH host key and selected trusted helper path across the
+pending choice. Established recovery accepts neither destructive consent nor
+installation.
+
+The helper derives its own non-root real/effective account and canonical
+personal control route; consent cannot select an arbitrary socket or UID.
+Managed `serve` installations, system/user service-manager jobs, root and
+setuid profiles are excluded. The retained route, socket owner and connected
+peer UID must validate before a single STOP is written. Both the legacy
+`{"stopped":true}` and current `{"stopping":true}` acknowledgements mean accepted
+work, not process exit. A lost, partial, timed-out or malformed response is
+terminal uncertainty; it permits no second STOP, fallback route or candidate
+startup. A valid ACK permits only bounded observation of endpoint and UDP
+resource release. Actual exclusive UDP binding and no-replace control
+publication must then succeed; a later contender is neither adopted nor
+stopped. Release is not evidence of exact process exit or preserved sessions.
+
+Service Force on Linux and Darwin copies the verified selected helper into an
+exclusive `0500` executable inside a trusted private `0700` service staging
+directory. The product retains its 32 MiB installer bound. Bounded self-check,
+candidate hash, opaque operation and retained descriptor custody validate the
+launch before the single STOP. On Darwin this is selected-artifact launch
+custody; a pathname checksum does not prove exact executing-image identity.
+The modern exact-instance Darwin refusal remains unchanged.
+
+The daemon keeps this private stage for its serving lifetime. `STATUS` and
+`About` describe the executing stage; subsequent updates stage beside and hand
+over the separately checked persistent installed helper path. Replacing that
+installed leaf does not change the running selected artifact. A changed parent,
+symlink, unsafe owner/mode or private-stage destination is refused before STOP.
+Graceful service shutdown removes its owned stage. A crash or a later successful
+update exec may leave a private orphan; no background sweeper is implied.
+These limits do not change old-helper capability refusal or session-protocol
+compatibility. Native release-fixture acceptance is required on each supported
+platform before integration.
 
 Personal local-control status replies (`STATUS`, `ADD-CLIENT`, `ADD-PORT`) may
 include `cleanup`, with `domain: "personal_channels"` and a `phase` of
