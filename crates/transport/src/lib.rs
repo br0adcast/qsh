@@ -110,3 +110,5 @@ mod session_deadline;
 
 #[cfg(all(feature = "tokio-driver", any(test, feature = "testnet")))]
 pub mod qualification305;
+
+pub mod session_resume;

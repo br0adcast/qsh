@@ -36,6 +36,9 @@ impl Features {
     pub const CHANNEL_GEOMETRY: Features = Features(1 << 4);
     /// Bit 5: authenticated resource-limit aborts and explicit control failures.
     pub const RESOURCE_LIMITS: Features = Features(1 << 5);
+    /// Bit 6 is reserved for retained-session contracts. Runtime support is not
+    /// implemented yet, so this bit is deliberately excluded from SUPPORTED.
+    pub const SESSION_RESUME: Features = Features(1 << 6);
     /// What this build implements: what it offers as a client and may
     /// enable as a server.
     pub const SUPPORTED: Features = Features(
@@ -48,13 +51,14 @@ impl Features {
     );
 
     /// The names the logs and `qshd self-check` use, bit by bit.
-    const NAMES: [(Features, &'static str); 6] = [
+    const NAMES: [(Features, &'static str); 7] = [
         (Features::HEADER_AAD, "header-aad"),
         (Features::STREAM_CREDIT, "stream-credit"),
         (Features::OFFSET_WRAP, "offset-wrap"),
         (Features::AUTH_ACCEPTED, "auth-accepted"),
         (Features::CHANNEL_GEOMETRY, "channel-geometry"),
         (Features::RESOURCE_LIMITS, "resource-limits"),
+        (Features::SESSION_RESUME, "session-resume"),
     ];
 
     /// The set these bits say, known or not.
@@ -127,6 +131,19 @@ impl fmt::Debug for Features {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_resume_reservation_is_named_but_never_advertised_or_negotiated() {
+        let reserved = Features::from_bits(0x40);
+        assert_eq!(reserved.names(), vec!["session-resume"]);
+        assert_eq!(Features::SUPPORTED.bits(), 0x3f);
+        assert!(!Features::SUPPORTED.contains(reserved));
+        assert_eq!(Features::negotiate(reserved, reserved), Features::NONE);
+        assert_eq!(
+            Features::negotiate(Features::NONE, reserved),
+            Features::NONE
+        );
+    }
 
     /// Spec §5.1: the bit numbers are the wire's, fixed for good.
     #[test]
