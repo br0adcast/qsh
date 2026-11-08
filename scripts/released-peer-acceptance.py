@@ -9,6 +9,7 @@ internal transient side effect. A future protocol boundary needs explicit tests.
 import argparse
 import hashlib
 import codecs
+import errno
 from contextlib import contextmanager
 import json
 import os
@@ -156,32 +157,161 @@ KILL_REAP_TIMEOUT = 2
 CANCELLATION_SIGNALS = {signal.SIGINT, signal.SIGTERM}
 
 
-def stop_owned(child):
-    # Only this single-threaded harness consumes the Popen child's status.
-    # Its unreaped PID reserves our start_new_session group through the final
-    # killpg, even when the leader has exited but a descendant ignores TERM.
+class OwnedCleanupError(RuntimeError):
+    def __init__(self, report):
+        self.report = report
+        super().__init__('owned cleanup: '+json.dumps(report, sort_keys=True))
+
+
+def cleanup_error(operation, error):
+    return {'operation': operation, 'failure': type(error).__name__,
+            'errno': getattr(error, 'errno', None), 'reason': str(error)[:1024]}
+
+
+def parse_zombie_group(output, leader):
+    if type(leader) is not int or leader <= 0:
+        raise ValueError('invalid owned group')
+    text = output.decode('ascii')
+    if not text or not text.endswith('\n'):
+        raise ValueError('incomplete group census')
+    rows = text[:-1].split('\n')
+    seen = set()
+    for row in rows:
+        # Documented Darwin ps state modifiers only; an unknown byte refuses
+        # classification instead of being discarded or treated as a zombie.
+        match = re.fullmatch(r'[ \t]*([1-9][0-9]*)[ \t]+([1-9][0-9]*)[ \t]+(Z[+<AELNSsVWX>]*)[ \t]*', row)
+        if match is None:
+            raise ValueError('malformed or non-zombie group row')
+        pid, group = int(match[1]), int(match[2])
+        if pid in seen or group != leader:
+            raise ValueError('duplicate or foreign group row')
+        seen.add(pid)
+    if leader not in seen:
+        raise ValueError('owned leader missing from group census')
+    return len(seen)
+
+
+def observe_zombie_group(leader, cleanup_deadline):
+    # Reserve observer kill/reap inside its one-second cap and leave the
+    # remainder of the unchanged post-KILL deadline for the group leader.
+    deadline = min(cleanup_deadline-0.1, time.monotonic()+1)
+    read_deadline = deadline-0.1
+    report = {'classification': 'unknown', 'rows': 0, 'observer_reaped': False,
+              'status': None, 'stdout_bytes': 0, 'stderr_bytes': 0, 'errors': []}
+    observer = None
+    buffers = {'stdout': bytearray(), 'stderr': bytearray()}
+    try:
+        if type(leader) is not int or leader <= 0:
+            raise ValueError('invalid owned group')
+        if time.monotonic() >= read_deadline:
+            raise TimeoutError('no group census budget remains')
+        environment = os.environ.copy()
+        environment.update(LC_ALL='C', COMMAND_MODE='unix2003')
+        observer = subprocess.Popen(
+            ['/bin/ps', '-x', '-g', str(leader), '-o', 'pid=,pgid=,stat='],
+            env=environment, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # The observer may inherit cleanup's deferred INT/TERM mask. It is
+        # exclusively owned and is killed directly with SIGKILL on failure.
+        with selectors.DefaultSelector() as selector:
+            selector.register(observer.stdout, selectors.EVENT_READ, ('stdout', 65536))
+            selector.register(observer.stderr, selectors.EVENT_READ, ('stderr', 4096))
+            while selector.get_map():
+                remaining = read_deadline-time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('group census exceeded one second')
+                for key, _ in selector.select(remaining):
+                    name, cap = key.data
+                    data = os.read(key.fileobj.fileno(), min(4096, cap-len(buffers[name])+1))
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        continue
+                    remaining_cap = cap-len(buffers[name])
+                    buffers[name].extend(data[:remaining_cap])
+                    if len(data) > remaining_cap:
+                        raise ValueError('group census '+name+' exceeds bound')
+        observer.wait(timeout=max(0, read_deadline-time.monotonic()))
+        report['status'] = observer.returncode
+        if observer.returncode != 0 or buffers['stderr']:
+            raise ValueError('group census failed or wrote stderr')
+        report['rows'] = parse_zombie_group(bytes(buffers['stdout']), leader)
+        report['classification'] = 'zombie-only'
+    except BaseException as error:
+        report['errors'].append(cleanup_error('census', error))
+    finally:
+        if observer is not None:
+            if observer.returncode is None:
+                try:
+                    observer.kill()  # Only this unreaped direct observer PID.
+                except OSError as error:
+                    report['errors'].append(cleanup_error('observer-kill', error))
+                try:
+                    observer.wait(timeout=max(0, deadline-time.monotonic()))
+                except BaseException as error:
+                    report['errors'].append(cleanup_error('observer-reap', error))
+            report['status'] = observer.returncode
+            report['observer_reaped'] = observer.returncode is not None
+            for pipe in (observer.stdout, observer.stderr):
+                try:
+                    pipe.close()
+                except BaseException as error:
+                    report['errors'].append(cleanup_error('observer-pipe-close', error))
+        report['stdout_bytes'] = len(buffers['stdout'])
+        report['stderr_bytes'] = len(buffers['stderr'])
+        if report['errors'] or not report['observer_reaped']:
+            report['classification'] = 'unknown'
+    return report
+
+
+def stop_owned(child, report=None):
+    # Sole-reaper custody reserves the original start_new_session group until
+    # final escalation and any census finish. Never poll/reap before KILL.
+    if report is None:
+        report = {}
+    report.update(outcome='unresolved', signals=[], census=None,
+                  leader_reaped=False, status=child.returncode, errors=[])
     if child.returncode is not None:
-        raise RuntimeError('owned group leader was reaped before escalation')
+        raise OwnedCleanupError(report)
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
     try:
         try:
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            os.killpg(child.pid, signal.SIGTERM)
+            report['signals'].append({'operation': 'TERM', 'errno': None})
+        except OSError as error:
+            report['signals'].append(cleanup_error('TERM', error))
+        try:
             time.sleep(TERM_GRACE)
+        except BaseException as error:
+            report['errors'].append(cleanup_error('TERM-grace', error))
+        deadline = time.monotonic()+KILL_REAP_TIMEOUT
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+            report['signals'].append({'operation': 'KILL', 'errno': None})
+            report['outcome'] = 'group-kill-sent'
+        except ProcessLookupError as error:
+            report['signals'].append(cleanup_error('KILL', error))
+            report['outcome'] = 'group-absent'
+        except OSError as error:
+            report['signals'].append(cleanup_error('KILL', error))
+            if error.errno == errno.EPERM and platform.system() == 'Darwin':
+                report['census'] = observe_zombie_group(child.pid, deadline)
+                if report['census']['classification'] == 'zombie-only':
+                    report['outcome'] = 'observed-zombie-only'
         finally:
             try:
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            finally:
-                child.wait(timeout=KILL_REAP_TIMEOUT)
+                child.wait(timeout=max(0, deadline-time.monotonic()))
+            except BaseException as error:
+                report['errors'].append(cleanup_error('leader-reap', error))
+            report['status'] = child.returncode
+            report['leader_reaped'] = child.returncode is not None
     finally:
-        # Repeated cancellation is deferred only through bounded escalation
-        # and reap, never across launch or the command's ordinary execution.
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        except BaseException as error:
+            report['errors'].append(cleanup_error('mask-restore', error))
+    if report['outcome'] == 'unresolved' or not report['leader_reaped'] or report['errors']:
+        raise OwnedCleanupError(report)
+    return report
 
 
 def stream_command(command, env, path, *, timeout=None, limit=MAX_COMMAND_OUTPUT):
@@ -197,87 +327,106 @@ def stream_command(command, env, path, *, timeout=None, limit=MAX_COMMAND_OUTPUT
     completion_mask = None
     decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
     total = 0
-    with path.open('xb') as log:
-        try:
-            child = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     start_new_session=True)
-            with selectors.DefaultSelector() as selector:
-                selector.register(child.stdout, selectors.EVENT_READ)
-                while True:
-                    remaining = None if timeout is None else timeout - (time.monotonic() - started)
-                    if remaining is not None and remaining <= 0:
-                        raise subprocess.TimeoutExpired(command, timeout)
-                    events = selector.select(0.1 if remaining is None else min(remaining, 0.1))
-                    if not events:
-                        continue
-                    chunk = os.read(child.stdout.fileno(), 64 * 1024)
-                    if not chunk:
-                        break
-                    retained = chunk[:max(0, limit-total)]
-                    log.write(retained)
-                    log.flush()
-                    total += len(chunk)
-                    forward(decoder.decode(retained))
-                    if total > limit:
-                        raise ValueError(f'command output exceeds {limit} byte evidence limit')
-            forward(decoder.decode(b'', final=True))
-            # EOF need not mean exit; retain the same optional command budget.
-            while not completed:
-                previous = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
+    primary = None
+    primary_traceback = None
+    secondary = []
+    cleanup = None
+    log = path.open('xb')
+    try:
+        child = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = None if timeout is None else timeout - (time.monotonic() - started)
+                if remaining is not None and remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                events = selector.select(0.1 if remaining is None else min(remaining, 0.1))
+                if not events:
+                    continue
+                chunk = os.read(child.stdout.fileno(), 64 * 1024)
+                if not chunk:
+                    break
+                retained = chunk[:max(0, limit-total)]
+                log.write(retained)
+                log.flush()
+                total += len(chunk)
+                forward(decoder.decode(retained))
+                if total > limit:
+                    raise ValueError(f'command output exceeds {limit} byte evidence limit')
+        forward(decoder.decode(b'', final=True))
+        # EOF need not mean exit; retain the same optional command budget.
+        while not completed:
+            previous = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
+            try:
+                pid, status = os.waitpid(child.pid, os.WNOHANG)
+                if pid == child.pid:
+                    # From this consuming boundary onward, no exception or
+                    # finally path may signal the old numeric group ID.
+                    completion_mask = previous
+                    consumed = True
+                    child.returncode = os.waitstatus_to_exitcode(status)
+                    completed = True
+            finally:
+                if not consumed:
+                    # A pending signal here still owns the unreaped group
+                    # and must enter the failure/escalation path below.
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            if not completed:
+                remaining = None if timeout is None else timeout-(time.monotonic()-started)
+                if remaining is not None and remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                time.sleep(0.05 if remaining is None else min(remaining, 0.05))
+    except BaseException as error:
+        primary, primary_traceback = error, error.__traceback__
+        if child is not None and not consumed:
+            cleanup = {}
+            try:
+                stop_owned(child, cleanup)
+            except BaseException as cleanup_failure:
+                secondary.append(cleanup_failure)
+                cleanup.setdefault('outcome', 'unresolved')
+                cleanup.setdefault('errors', []).append(cleanup_error('cleanup', cleanup_failure))
+    finally:
+        # Housekeeping and receipt failures are secondary to the command's
+        # original exception. Nothing here can restart group escalation.
+        for pipe in (None if child is None else child.stdout, log):
+            if pipe is not None:
                 try:
-                    pid, status = os.waitpid(child.pid, os.WNOHANG)
-                    if pid == child.pid:
-                        # From this consuming boundary onward, no exception or
-                        # finally path may signal the old numeric group ID.
-                        completion_mask = previous
-                        consumed = True
-                        child.returncode = os.waitstatus_to_exitcode(status)
-                        completed = True
-                finally:
-                    if not consumed:
-                        # A pending signal here still owns the unreaped group
-                        # and must enter the failure/escalation path below.
-                        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
-                if not completed:
-                    remaining = None if timeout is None else timeout-(time.monotonic()-started)
-                    if remaining is not None and remaining <= 0:
-                        raise subprocess.TimeoutExpired(command, timeout)
-                    time.sleep(0.05 if remaining is None else min(remaining, 0.05))
+                    pipe.close()
+                except BaseException as error:
+                    if primary is None:
+                        primary, primary_traceback = error, error.__traceback__
+                    else:
+                        secondary.append(error)
+        if consumed:
+            try:
+                # Restore outside the escalation scope after completion commit.
+                signal.pthread_sigmask(signal.SIG_SETMASK, completion_mask)
+            except BaseException as error:
+                if primary is None:
+                    primary, primary_traceback = error, error.__traceback__
+                else:
+                    secondary.append(error)
+    if primary is not None:
+        primary.returncode = None if child is None else child.returncode
+        record = {
+            'failure': type(primary).__name__, 'reason': str(primary),
+            'status': primary.returncode,
+            'leader_reaped': child is not None and child.returncode is not None,
+            'output_bytes': min(total, limit), 'cleanup': cleanup,
+            'secondary_errors': [cleanup_error('secondary', error) for error in secondary]}
+        try:
+            path.with_suffix(path.suffix+'.failure.json').write_text(json.dumps(record, sort_keys=True)+'\n')
         except BaseException as error:
-            try:
-                if child is not None and not consumed:
-                    stop_owned(child)
-            finally:
-                if child is not None:
-                    error.returncode = child.returncode
-                # Preserve the original failure even if bounded cleanup itself
-                # fails; no acceptance is possible on either failure path.
-                path.with_suffix(path.suffix+'.failure.json').write_text(json.dumps({
-                    'failure': type(error).__name__, 'reason': str(error),
-                    'status': None if child is None else child.returncode,
-                    'leader_reaped': child is not None and child.returncode is not None,
-                    'output_bytes': min(total, limit)}, sort_keys=True)+'\n')
-            raise
-        finally:
-            try:
-                if child is not None and child.stdout is not None:
-                    child.stdout.close()
-            finally:
-                if consumed:
-                    # Restoration is outside the group-escalation scope.
-                    # Cancellation after normal completion is still a failure,
-                    # but cannot authorize a kill of the reaped group identity.
-                    try:
-                        signal.pthread_sigmask(signal.SIG_SETMASK, completion_mask)
-                    except BaseException as error:
-                        error.returncode = child.returncode
-                        path.with_suffix(path.suffix+'.failure.json').write_text(json.dumps({
-                            'failure': type(error).__name__, 'reason': str(error),
-                            'status': child.returncode, 'leader_reaped': True,
-                            'output_bytes': min(total, limit)}, sort_keys=True)+'\n')
-                        raise
-        return child.returncode
+            secondary.append(error)
+        if secondary:
+            primary.add_note('Owned command secondary failures: '+json.dumps(
+                [cleanup_error('secondary', error) for error in secondary], sort_keys=True))
+            raise primary.with_traceback(primary_traceback) from secondary[0]
+        raise primary.with_traceback(primary_traceback)
+    return child.returncode
 
 
 class Evidence:

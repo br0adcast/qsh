@@ -610,7 +610,8 @@ jobs:
             update::tests::service_self_check_reader_panic_refuses_launch_eligibility \
             update::tests::service_stage_update_handover_retains_persistent_install_destination \
             control::tests::confirmed_restart_publication_never_replaces_a_new_endpoint \
-            control::tests::confirmed_restart_publication_preserves_non_utf8_leaf_bytes \
+            control::tests::confirmed_restart_publication_obeys_native_non_utf8_leaf_contract \
+            control::tests::confirmed_restart_publication_preserves_non_ascii_utf8_leaf_bytes \
             control::tests::confirmed_restart_publication_refuses_race_and_unsupported_primitive; do
             awk -v expected="test $name ... " '
               index($0, expected) == 1 { seen++; pending=1; if ($0 == expected "ok") { passed++; pending=0 }; next }
@@ -618,7 +619,17 @@ jobs:
               END { exit !(seen == 1 && passed == 1) }
             ' "$runtime/service-control-results.log"
           done
-          grep -F 'test result: ok. 16 passed; 0 failed; 0 ignored;' "$runtime/service-control-results.log"
+          grep -F 'test result: ok. 17 passed; 0 failed; 0 ignored;' "$runtime/service-control-results.log"
+          awk '
+            /^test .* \.\.\. / { tests++ }
+            /^test result:/ { summaries++ }
+            /^NATIVE_LEAF_CONTRACT/ {
+              branches++
+              if ($0 != "NATIVE_LEAF_CONTRACT eilseq-refusal-no-mutation" &&
+                  $0 != "NATIVE_LEAF_CONTRACT raw-byte-publication") invalid=1
+            }
+            END { exit !(tests == 17 && summaries == 1 && branches == 1 && !invalid) }
+          ' "$runtime/service-control-results.log"
           if grep -Fq 'SKIPPED' "$runtime/service-control-results.log"; then exit 1; fi
           cargo test -p qshd --locked --test service_stage_contract -- \
             --nocapture --test-threads=1 --color=never 2>&1 | tee "$runtime/service-stage-results.log"

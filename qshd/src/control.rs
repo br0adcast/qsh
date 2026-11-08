@@ -1538,7 +1538,7 @@ mod tests {
         let (_listener, _cleanup) = transaction.bind_private_absent_owned().unwrap();
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn confirmed_restart_publication_preserves_non_utf8_leaf_bytes() {
         use std::os::unix::ffi::OsStringExt;
@@ -1555,6 +1555,139 @@ mod tests {
             !path.exists(),
             "cleanup retains the exact non-UTF8 endpoint"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct PublicationFixture {
+        directory: tempfile::TempDir,
+        parent: std::fs::File,
+        parent_identity: (u64, u64),
+        sentinel_identity: (u64, u64, u32),
+        names: std::collections::BTreeSet<Vec<u8>>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl PublicationFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::MetadataExt;
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("sentinel"), b"unrelated sentinel").unwrap();
+            let parent = std::fs::File::open(directory.path()).unwrap();
+            let parent_metadata = parent.metadata().unwrap();
+            let sentinel = std::fs::metadata(directory.path().join("sentinel")).unwrap();
+            let mut fixture = Self {
+                directory,
+                parent,
+                parent_identity: (parent_metadata.dev(), parent_metadata.ino()),
+                sentinel_identity: (sentinel.dev(), sentinel.ino(), sentinel.mode()),
+                names: Default::default(),
+            };
+            fixture.names = fixture.current_names();
+            fixture
+        }
+
+        fn current_names(&self) -> std::collections::BTreeSet<Vec<u8>> {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::read_dir(self.directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().as_bytes().to_vec())
+                .collect()
+        }
+
+        fn assert_sentinel_and_parent(&self) {
+            use std::os::unix::fs::MetadataExt;
+            for metadata in [
+                self.parent.metadata().unwrap(),
+                std::fs::metadata(self.directory.path()).unwrap(),
+            ] {
+                assert_eq!((metadata.dev(), metadata.ino()), self.parent_identity);
+            }
+            let sentinel_path = self.directory.path().join("sentinel");
+            let sentinel = std::fs::symlink_metadata(&sentinel_path).unwrap();
+            assert_eq!(
+                (sentinel.dev(), sentinel.ino(), sentinel.mode()),
+                self.sentinel_identity
+            );
+            assert_eq!(std::fs::read(sentinel_path).unwrap(), b"unrelated sentinel");
+        }
+
+        fn assert_unchanged(&self) {
+            assert_eq!(self.current_names(), self.names);
+            self.assert_sentinel_and_parent();
+        }
+
+        fn assert_publication(&self, leaf: &std::ffi::OsStr) {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let endpoint = self.directory.path().join(leaf);
+            let transaction = EnsureLock::acquire(&endpoint, Duration::from_secs(1))
+                .expect("acquiring the exact leaf's ensure lock");
+            let (listener, cleanup) = transaction
+                .bind_private_absent_owned()
+                .expect("exclusively publishing the exact leaf");
+            let mut lock_name = leaf.to_owned();
+            lock_name.push(".lock");
+            let mut expected = self.names.clone();
+            expected.insert(lock_name.as_bytes().to_vec());
+            expected.insert(leaf.as_bytes().to_vec());
+            assert_eq!(self.current_names(), expected);
+            let _client = UnixStream::connect(&endpoint).expect("connecting to the exact leaf");
+            let _accepted = listener.accept().unwrap();
+            self.assert_sentinel_and_parent();
+            drop(cleanup);
+            assert!(matches!(
+                nix::sys::stat::fstatat(
+                    Some(self.parent.as_raw_fd()),
+                    leaf,
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                ),
+                Err(nix::errno::Errno::ENOENT)
+            ));
+            expected.remove(leaf.as_bytes());
+            // Ensure locks intentionally persist after endpoint cleanup.
+            assert_eq!(self.current_names(), expected);
+            self.assert_sentinel_and_parent();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confirmed_restart_publication_obeys_native_non_utf8_leaf_contract() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = PublicationFixture::new();
+        let leaf = std::ffi::OsString::from_vec(b"control-\xff.sock".to_vec());
+        let probe = nix::sys::stat::fstatat(
+            Some(fixture.parent.as_raw_fd()),
+            leaf.as_os_str(),
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        );
+        fixture.assert_unchanged();
+        match probe {
+            Err(nix::errno::Errno::EILSEQ) => {
+                let endpoint = fixture.directory.path().join(&leaf);
+                let error = EnsureLock::acquire(&endpoint, Duration::from_secs(1))
+                    .err()
+                    .expect("native malformed-leaf rejection must refuse acquisition");
+                assert_eq!(error.raw_os_error(), Some(nix::libc::EILSEQ));
+                fixture.assert_unchanged();
+                println!("\nNATIVE_LEAF_CONTRACT eilseq-refusal-no-mutation");
+            }
+            Err(nix::errno::Errno::ENOENT) => {
+                fixture.assert_publication(&leaf);
+                println!("\nNATIVE_LEAF_CONTRACT raw-byte-publication");
+            }
+            other => panic!("unexpected native malformed-leaf fstatat result: {other:?}"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn confirmed_restart_publication_preserves_non_ascii_utf8_leaf_bytes() {
+        // These characters have stable canonical spelling, without combining marks.
+        let fixture = PublicationFixture::new();
+        fixture.assert_unchanged();
+        fixture.assert_publication(std::ffi::OsStr::new("control-東京.sock"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

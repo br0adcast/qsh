@@ -366,7 +366,8 @@ class StreamingTests(unittest.TestCase):
 
                 def spawn(*args, **kwargs):
                     child = original(*args, **kwargs)
-                    children.append(child)
+                    if args[0][0] != '/bin/ps':
+                        children.append(child)
                     return child
                 script = "import os,time;os.write(1,b'owned-prefix\\n'+b'x'*2048);time.sleep(30)"
                 options = {'timeout': 0.15} if failure == 'timeout' else {'limit': 32}
@@ -544,6 +545,8 @@ def until(predicate, seconds=3):
         time.sleep(0.01)
 
 def spawn(command, **kwargs):
+    if command[0] == '/bin/ps':
+        return original(command, **kwargs)
     assert command[0:2] == ['cargo', 'test']
     child = original([sys.executable, '-u', fixture, str(root), variant], **kwargs)
     leaders.append(child)
@@ -686,6 +689,9 @@ elif mode == 'consumed':
     script = "import os;os.write(1,b'completion-prefix\\n')"
 
 def spawn(command, **kwargs):
+    if command[0] == '/bin/ps':
+        assert {signal.SIGINT, signal.SIGTERM} <= signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        return original_spawn(command, **kwargs)
     # The temporary cancellation mask must never be inherited at launch.
     assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == initial_mask
     child = original_spawn(command, **kwargs)
@@ -777,3 +783,522 @@ class CompletionBoundaryTests(unittest.TestCase):
                 self.assertTrue(receipt['child_reaped'])
                 self.assertTrue(receipt['waitid_absent'])
                 print('OWNED_COMPLETION '+json.dumps(receipt, sort_keys=True), flush=True)
+
+
+class CleanupFailurePreservationTests(unittest.TestCase):
+    def test_original_exception_survives_cleanup_or_evidence_failure(self):
+        for kind in (ValueError, KeyboardInterrupt, subprocess.TimeoutExpired):
+            for evidence_failure in (False, True):
+                with self.subTest(kind=kind.__name__, evidence_failure=evidence_failure), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    primary = kind('owned-command', 1) if kind is subprocess.TimeoutExpired else kind('original command failure')
+                    cleanup_error = PermissionError(1, 'controlled cleanup denial')
+                    children = []
+                    original_spawn, original_stop, original_write = subprocess.Popen, peer.stop_owned, Path.write_text
+
+                    def spawn(command, **kwargs):
+                        child = original_spawn(command, **kwargs)
+                        if command[0] != '/bin/ps':
+                            children.append(child)
+                        return child
+
+                    def stop(child, report):
+                        original_stop(child, report)
+                        raise cleanup_error
+
+                    def write(path, *args, **kwargs):
+                        if evidence_failure and path.name.endswith('.failure.json'):
+                            raise OSError('controlled evidence write failure')
+                        return original_write(path, *args, **kwargs)
+
+                    try:
+                        with mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn), mock.patch.object(peer, 'stop_owned', side_effect=stop), mock.patch.object(peer, 'forward', side_effect=primary), mock.patch.object(Path, 'write_text', write):
+                            try:
+                                peer.stream_command([sys.executable, '-u', '-c', "import os,time;os.write(1,b'failure-ready\\n');time.sleep(30)"], os.environ.copy(), root/'command.log')
+                            except BaseException as actual:
+                                self.assertIs(actual, primary)
+                                self.assertIsNotNone(actual.__cause__)
+                            else:
+                                self.fail('original failure was lost')
+                        if not evidence_failure:
+                            failure = json.loads((root/'command.log.failure.json').read_text())
+                            self.assertEqual(failure['failure'], kind.__name__)
+                            self.assertTrue(failure['leader_reaped'])
+                            self.assertTrue(failure['secondary_errors'])
+                        self.assertFalse((root/'passed.txt').exists())
+                    finally:
+                        for child in children:
+                            if child.returncode is None:
+                                child.kill()
+                                child.wait(timeout=2)
+
+
+class ZombieCensusTests(unittest.TestCase):
+    def test_only_complete_original_group_all_zombie_rows_are_accepted(self):
+        self.assertEqual(peer.parse_zombie_group(b' 41 41 Zs\n42 41 Z+\n', 41), 2)
+        self.assertEqual(peer.parse_zombie_group(b'41 41 Z+<>AELNSsVWX\n', 41), 1)
+        for leader in (0, -1, True, '41'):
+            with self.assertRaises(ValueError):
+                peer.parse_zombie_group(b'41 41 Z\n', leader)
+        for data in (b'', b'42 41 Z\n', b'41 41 Z\n41 41 Z\n', b'41 42 Z\n', b'0 41 Z\n', b'41 41 ?\n', b'41 41 S\n', b'41 41 T\n', b'41 41 Zbad\n', b'41 41 Z\n42 41 R\n', b'41 41 Z extra\n', b'41 41 Z\xff\n', b'41 41 Z', b'41 41 Z\r\n', b'41 41 Z\n\n'):
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                peer.parse_zombie_group(data, 41)
+
+    def test_observer_exact_argv_private_environment_and_rejection_bounds(self):
+        original = subprocess.Popen
+        for mode in ('valid', 'stderr', 'nonzero', 'timeout', 'stdout-cap', 'stderr-cap', 'missing', 'live', 'foreign'):
+            with self.subTest(mode=mode):
+                children = []
+                previous = os.environ.get('COMMAND_MODE')
+                deadline = peer.time.monotonic()+2
+
+                def spawn(command, **kwargs):
+                    self.assertEqual(command, ['/bin/ps', '-x', '-g', '41', '-o', 'pid=,pgid=,stat='])
+                    self.assertEqual(kwargs['env']['LC_ALL'], 'C')
+                    self.assertEqual(kwargs['env']['COMMAND_MODE'], 'unix2003')
+                    self.assertEqual(kwargs['stdin'], subprocess.DEVNULL)
+                    self.assertEqual(kwargs['stdout'], subprocess.PIPE)
+                    self.assertEqual(kwargs['stderr'], subprocess.PIPE)
+                    if mode == 'missing':
+                        raise FileNotFoundError('controlled absent observer')
+                    output = b'41 41 Zs\n'
+                    if mode == 'live': output += b'42 41 S\n'
+                    if mode == 'foreign': output += b'42 43 Z\n'
+                    code = f'import os,time;os.write(1,{output!r});'
+                    if mode == 'stderr': code += "os.write(2,b'error');"
+                    if mode == 'stdout-cap': code += "os.write(1,b'x'*70000);"
+                    if mode == 'stderr-cap': code += "os.write(2,b'x'*5000);"
+                    if mode == 'timeout': code += 'time.sleep(30);'
+                    if mode == 'nonzero': code += 'raise SystemExit(4);'
+                    child = original([sys.executable, '-u', '-c', code], **kwargs)
+                    children.append(child)
+                    return child
+
+                with mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn):
+                    result = peer.observe_zombie_group(41, deadline)
+                self.assertEqual(result['classification'] == 'zombie-only', mode == 'valid', result)
+                self.assertEqual(os.environ.get('COMMAND_MODE'), previous)
+                self.assertLess(peer.time.monotonic(), deadline)
+                self.assertEqual(len(children), 0 if mode == 'missing' else 1)
+                for child in children:
+                    self.assertIsNotNone(child.returncode, result)
+                    with self.assertRaises(ChildProcessError):
+                        os.waitpid(child.pid, os.WNOHANG)
+
+    def test_eperm_is_not_classified_on_linux_and_term_error_does_not_prevent_kill(self):
+        for term_denied in (False, True):
+            with self.subTest(term_denied=term_denied):
+                child = mock.Mock(pid=41, returncode=None)
+                def wait(timeout):
+                    child.returncode = -9
+                    return -9
+                child.wait.side_effect = wait
+                errors = [PermissionError(1, 'TERM denied') if term_denied else None, PermissionError(1, 'KILL denied')]
+                with mock.patch.object(peer.platform, 'system', return_value='Linux'), mock.patch.object(peer.os, 'killpg', side_effect=errors) as kill, mock.patch.object(peer.time, 'sleep'), mock.patch.object(peer, 'observe_zombie_group') as observe:
+                    with self.assertRaises(peer.OwnedCleanupError) as failure:
+                        peer.stop_owned(child)
+                self.assertEqual(kill.call_count, 2)
+                observe.assert_not_called()
+                self.assertEqual(failure.exception.report['outcome'], 'unresolved')
+                self.assertTrue(failure.exception.report['leader_reaped'])
+
+
+DARWIN_CLEANUP_CONTROL = r'''
+from contextlib import redirect_stdout
+import ctypes
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+from unittest import mock
+if sys.platform.startswith('linux'):
+    assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+spec = importlib.util.spec_from_file_location('darwin_cleanup_peer', sys.argv[1])
+peer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(peer)
+root, mode, fixture = Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+native = sys.platform == 'darwin'
+original_spawn, original_killpg = subprocess.Popen, os.killpg
+original_parse, original_observe = peer.parse_zombie_group, peer.observe_zombie_group
+initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+leaders, observers, signals, censuses = [], [], [], []
+descendant = None
+primary = KeyboardInterrupt('owned native cleanup characterization')
+sentinel = original_spawn([sys.executable, '-c', 'import time;time.sleep(60)'],
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    start_new_session=True)
+capture = io.StringIO()
+result = {}
+
+def state(pid):
+    if not native:
+        try:
+            return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0]
+        except FileNotFoundError:
+            return None
+    utility = original_spawn(['/bin/ps', '-o', 'stat=', '-p', str(pid)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        output, _ = utility.communicate(timeout=1)
+    finally:
+        if utility.returncode is None:
+            utility.kill()
+            utility.wait(timeout=1)
+    return output.decode().strip()[:1] or None
+
+def until(predicate):
+    deadline = time.monotonic()+3
+    while not predicate():
+        assert time.monotonic() < deadline, 'owned readiness deadline'
+        time.sleep(.01)
+
+def parse(output, leader):
+    rows = [line.split() for line in output.decode('ascii').splitlines()]
+    assert rows and any(int(row[0]) == leader for row in rows)
+    assert all(int(row[1]) == leader for row in rows)
+    assert all(int(row[0]) != sentinel.pid for row in rows)
+    if mode == 'live':
+        assert any(int(row[0]) == descendant and row[2][0] != 'Z' for row in rows)
+    censuses.append({'members':len(rows), 'has_live_member':any(row[2][0] != 'Z' for row in rows)})
+    return original_parse(output, leader)
+
+def spawn(command, **kwargs):
+    if command[0] == '/bin/ps':
+        assert command == ['/bin/ps', '-x', '-g', str(leaders[0].pid), '-o', 'pid=,pgid=,stat=']
+        assert kwargs['env']['LC_ALL'] == 'C' and kwargs['env']['COMMAND_MODE'] == 'unix2003'
+        assert {signal.SIGINT, signal.SIGTERM} <= signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        if native:
+            child = original_spawn(command, **kwargs)
+        else:
+            # Linux emulation supplies actual /proc-observed states to the
+            # Darwin-format adapter; it does not claim native ps semantics.
+            rows = f'{leaders[0].pid} {leaders[0].pid} {state(leaders[0].pid)}\n'
+            if descendant is not None:
+                rows += f'{descendant} {leaders[0].pid} {state(descendant)}\n'
+            child = original_spawn([sys.executable, '-c', f'import os;os.write(1,{rows.encode()!r})'], **kwargs)
+        observers.append(child)
+        return child
+    assert command[0:2] == ['cargo', 'test']
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == initial_mask
+    if mode == 'live':
+        child = original_spawn([sys.executable, '-u', fixture, str(root), 'exit-on-term'], **kwargs)
+    else:
+        child = original_spawn([sys.executable, '-u', '-c', "import os,signal;os.write(1,b'owned-zombie-ready\\n');signal.pause()"], **kwargs)
+    leaders.append(child)
+    return child
+
+def killpg(pid, sig):
+    assert pid == leaders[0].pid and leaders[0].returncode is None
+    try:
+        if sig == signal.SIGKILL and mode != 'actual-signal':
+            raise PermissionError(1, 'controlled final KILL denial')
+        return original_killpg(pid, sig)
+    except OSError as error:
+        signals.append({'signal':sig,'errno':error.errno})
+        raise
+    finally:
+        if not signals or signals[-1]['signal'] != sig:
+            signals.append({'signal':sig,'errno':None})
+
+def observe(leader, deadline):
+    if mode == 'cancel-census':
+        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGINT)
+    return original_observe(leader, deadline)
+
+def trigger(text):
+    global descendant
+    capture.write(text)
+    if 'owned-stubborn-ready' in text:
+        descendant = int((root/'descendant.pid').read_text())
+        assert state(descendant) not in (None,'Z','X')
+    raise primary
+
+peer.subprocess.Popen, peer.os.killpg = spawn, killpg
+peer.parse_zombie_group, peer.observe_zombie_group = parse, observe
+peer.forward = trigger
+peer.current_source, peer.current_input = lambda:'owned-source',lambda:'owned-input'
+started = time.monotonic()
+try:
+    with redirect_stdout(capture), peer.termination_as_interrupt(), mock.patch.object(peer.platform,'system',return_value='Darwin'):
+        try:
+            peer.run_case('qsh','controlled_native_cleanup',True,os.environ.copy(),root)
+        except BaseException as actual:
+            assert actual is primary, (type(actual), actual)
+        else:
+            raise AssertionError('original failure did not propagate')
+    elapsed = time.monotonic()-started
+    failure = json.loads((root/'controlled_native_cleanup.log.failure.json').read_text())
+    cleanup = failure['cleanup']
+    assert failure['failure'] == 'KeyboardInterrupt' and failure['leader_reaped']
+    assert leaders[0].returncode is not None
+    try:
+        os.waitpid(leaders[0].pid,os.WNOHANG)
+    except ChildProcessError:
+        pass
+    else:
+        raise AssertionError('leader not actually reaped')
+    if mode == 'live':
+        assert cleanup['outcome'] == 'unresolved' and state(descendant) not in (None,'Z','X')
+        assert censuses[-1]['has_live_member'] and primary.__cause__ is not None
+    elif mode != 'actual-signal' or any(row['errno'] == 1 for row in signals if row['signal'] == signal.SIGKILL):
+        assert cleanup['outcome'] == 'observed-zombie-only', cleanup
+        assert censuses[-1]['members'] >= 1 and not censuses[-1]['has_live_member']
+        if mode == 'cancel-census':
+            assert primary.__cause__ is not None and cleanup['errors']
+    else:
+        assert cleanup['outcome'] in ('group-kill-sent','group-absent')
+    # Native selector characterization also runs when KILL had no EPERM:
+    # keep a separate explicitly owned zombie as the exact group anchor.
+    if mode == 'actual-signal':
+        anchor = original_spawn([sys.executable,'-c','pass'], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        try:
+            until(lambda: state(anchor.pid) == 'Z')
+            # This exact adapter must execute the real native ps on Darwin.
+            with mock.patch.object(peer.subprocess,'Popen',original_spawn), mock.patch.object(peer,'parse_zombie_group',original_parse):
+                if native:
+                    native_census = original_observe(anchor.pid,time.monotonic()+2)
+                    assert native_census['classification'] == 'zombie-only', native_census
+        finally:
+            anchor.wait(timeout=1)
+    assert signal.pthread_sigmask(signal.SIG_BLOCK,set()) == initial_mask
+    assert sentinel.poll() is None and elapsed < 5
+    assert all(observer.returncode is not None for observer in observers)
+    assert 'ACCEPTED' not in capture.getvalue() and not (root/'passed.txt').exists()
+    result=dict(mode=mode,native_ps=native,emulated_policy=not native or mode!='actual-signal',
+        signals=signals,outcome=cleanup['outcome'],leader_status=leaders[0].returncode,
+        leader_reaped=True,observer_count=len(observers),observers_reaped=True,
+        sentinel_alive=True,mask_restored=True,no_pass=True,elapsed=elapsed,
+        census_members=censuses[-1]['members'] if censuses else 0,
+        census_classification=None if cleanup['census'] is None else cleanup['census']['classification'],
+        observer_statuses=[observer.returncode for observer in observers],
+        live_denial_refused=mode=='live')
+finally:
+    if descendant is not None:
+        if state(descendant) not in (None,'Z','X'):
+            os.kill(descendant,signal.SIGKILL)
+        until(lambda: state(descendant) in (None,'Z','X'))
+    for child in leaders+observers:
+        if child.returncode is None:
+            child.kill()
+            child.wait(timeout=2)
+    if descendant is not None and not native:
+        until(lambda: os.waitpid(descendant,os.WNOHANG)[0] == descendant)
+    sentinel.kill()
+    sentinel.wait(timeout=2)
+    result['test_owned_fallback_completed']=True
+    print(json.dumps(result,sort_keys=True),flush=True)
+'''
+
+
+class DarwinCleanupCustodyTests(unittest.TestCase):
+    def test_retained_zombie_live_denial_cancellation_and_actual_system_census(self):
+        for mode in ('zombie', 'live', 'cancel-census', 'actual-signal'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                worker = root/'darwin-control.py'
+                worker.write_text(DARWIN_CLEANUP_CONTROL)
+                fixture = root/'stubborn.py'
+                fixture.write_text(STUBBORN_COMMAND)
+                result = subprocess.run([sys.executable,'-u',str(worker),str(SCRIPT),str(root),mode,str(fixture)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=15)
+                self.assertEqual(result.returncode,0,result.stdout)
+                receipt=json.loads(result.stdout.splitlines()[-1])
+                self.assertTrue(receipt['leader_reaped'])
+                self.assertTrue(receipt['observers_reaped'])
+                self.assertTrue(receipt['test_owned_fallback_completed'])
+                print('OWNED_DARWIN_CLEANUP '+json.dumps(receipt,sort_keys=True),flush=True)
+
+
+class SecondaryCustodyFailureTests(unittest.TestCase):
+    def test_leader_reap_failure_does_not_claim_reaped_or_replace_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original_spawn, original_wait = subprocess.Popen, subprocess.Popen.wait
+            children = []
+            primary = ValueError('original output failure')
+
+            def spawn(command, **kwargs):
+                child = original_spawn(command, **kwargs)
+                if command[0] != '/bin/ps':
+                    children.append(child)
+                    child.wait = mock.Mock(side_effect=subprocess.TimeoutExpired('owned reap', 0))
+                return child
+
+            try:
+                with mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn), mock.patch.object(peer, 'forward', side_effect=primary):
+                    try:
+                        peer.stream_command([sys.executable,'-u','-c',"import os,time;os.write(1,b'reap-ready\\n');time.sleep(30)"],os.environ.copy(),root/'command.log')
+                    except BaseException as actual:
+                        self.assertIs(actual, primary)
+                        self.assertIsInstance(actual.__cause__, peer.OwnedCleanupError)
+                    else:
+                        self.fail('reap failure hid original exception')
+                failure = json.loads((root/'command.log.failure.json').read_text())
+                self.assertFalse(failure['leader_reaped'])
+                self.assertIsNone(failure['status'])
+                self.assertFalse(failure['cleanup']['leader_reaped'])
+                self.assertTrue(failure['cleanup']['errors'])
+            finally:
+                for child in children:
+                    original_wait(child,timeout=2)
+
+    def test_pipe_close_error_is_secondary_to_original_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            original_spawn=subprocess.Popen
+            primary=KeyboardInterrupt('original close control')
+            class Pipe:
+                def __init__(self, pipe): self.pipe=pipe
+                def fileno(self): return self.pipe.fileno()
+                def close(self):
+                    self.pipe.close()
+                    raise OSError('controlled pipe close failure')
+            def spawn(command,**kwargs):
+                child=original_spawn(command,**kwargs)
+                if command[0] != '/bin/ps':child.stdout=Pipe(child.stdout)
+                return child
+            with mock.patch.object(peer.subprocess,'Popen',side_effect=spawn),mock.patch.object(peer,'forward',side_effect=primary):
+                try:
+                    peer.stream_command([sys.executable,'-u','-c',"import os,time;os.write(1,b'close-ready\\n');time.sleep(30)"],os.environ.copy(),root/'command.log')
+                except BaseException as actual:
+                    self.assertIs(actual,primary)
+                    self.assertIsNotNone(actual.__cause__)
+                else:self.fail('close failure hid original exception')
+            failure=json.loads((root/'command.log.failure.json').read_text())
+            self.assertTrue(failure['leader_reaped'])
+            self.assertTrue(failure['secondary_errors'])
+
+
+class FinalKillDenialTests(unittest.TestCase):
+    def test_real_final_kill_eperm_preserves_each_original_failure(self):
+        for kind in (ValueError, KeyboardInterrupt, subprocess.TimeoutExpired):
+            with self.subTest(kind=kind.__name__), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory)
+                primary=kind('owned command',1) if kind is subprocess.TimeoutExpired else kind('original KILL-denial failure')
+                original_killpg,original_spawn=os.killpg,subprocess.Popen
+                children=[]
+                def spawn(command,**kwargs):
+                    child=original_spawn(command,**kwargs)
+                    children.append(child)
+                    return child
+                def killpg(pid,sig):
+                    if sig==peer.signal.SIGKILL:raise PermissionError(1,'controlled final group KILL denial')
+                    return original_killpg(pid,sig)
+                try:
+                    with mock.patch.object(peer.subprocess,'Popen',side_effect=spawn),mock.patch.object(peer.os,'killpg',side_effect=killpg),mock.patch.object(peer.platform,'system',return_value='Linux'),mock.patch.object(peer,'forward',side_effect=primary):
+                        try:
+                            peer.stream_command([sys.executable,'-u','-c',"import os,time;os.write(1,b'kill-denial-ready\\n');time.sleep(30)"],os.environ.copy(),root/'command.log')
+                        except BaseException as actual:
+                            self.assertIs(actual,primary)
+                            self.assertIsNotNone(actual.__cause__)
+                        else:self.fail('KILL denial replaced original failure')
+                    failure=json.loads((root/'command.log.failure.json').read_text())
+                    self.assertEqual(failure['cleanup']['outcome'],'unresolved')
+                    self.assertEqual(failure['cleanup']['signals'][-1]['errno'],1)
+                    self.assertTrue(failure['leader_reaped'])
+                finally:
+                    for child in children:
+                        if child.returncode is None:
+                            child.kill()
+                            child.wait(timeout=2)
+
+    def test_observer_reap_failure_is_unknown_and_owned_fallback_reaps_it(self):
+        original_spawn,original_wait=subprocess.Popen,subprocess.Popen.wait
+        children=[]
+        def spawn(command,**kwargs):
+            child=original_spawn([sys.executable,'-c','import time;time.sleep(30)'],**kwargs)
+            child.wait=mock.Mock(side_effect=subprocess.TimeoutExpired('owned observer reap',0))
+            children.append(child)
+            return child
+        try:
+            with mock.patch.object(peer.subprocess,'Popen',side_effect=spawn):
+                result=peer.observe_zombie_group(41,peer.time.monotonic()+.3)
+            self.assertEqual(result['classification'],'unknown')
+            self.assertFalse(result['observer_reaped'])
+            self.assertTrue(any(error['operation']=='observer-reap' for error in result['errors']))
+        finally:
+            for child in children:original_wait(child,timeout=2)
+
+
+class ObserverExitReserveTests(unittest.TestCase):
+    def test_closed_pipes_stalled_observer_retains_kill_and_reap_capacity(self):
+        original_spawn, original_clock = subprocess.Popen, peer.time.monotonic
+        children, waits, kills, clocks = [], [], [], []
+        returned = None
+        fallback_completed = False
+        started = original_clock()
+        outer_deadline = started+2
+
+        def clock():
+            value = original_clock()
+            clocks.append(value)
+            return value
+
+        def spawn(command, **kwargs):
+            self.assertEqual(command, ['/bin/ps', '-x', '-g', '41', '-o', 'pid=,pgid=,stat='])
+            # EOF on BOTH pipes must not be confused with process completion.
+            code = "import os,time;os.write(1,b'41 41 Z\\n');os.close(1);os.close(2);time.sleep(30)"
+            child = original_spawn([sys.executable, '-u', '-c', code], **kwargs)
+            real_wait, real_kill = child.wait, child.kill
+            children.append((child, real_wait, real_kill))
+
+            def wait(timeout):
+                # The source calls its monotonic clock immediately before
+                # passing this timeout. Record the requested absolute cutoff
+                # so the reserve assertion cannot pass through scheduling luck.
+                call = {'timeout': timeout, 'cutoff': clocks[-1]+timeout, 'status': None}
+                waits.append(call)
+                call['status'] = real_wait(timeout=timeout)
+                return call['status']
+
+            def kill():
+                self.assertIsNone(child.returncode, 'observer identity consumed before kill')
+                kills.append(original_clock())
+                return real_kill()
+
+            child.wait, child.kill = wait, kill
+            return child
+
+        try:
+            with mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn), mock.patch.object(peer.time, 'monotonic', side_effect=clock):
+                returned = peer.observe_zombie_group(41, outer_deadline)
+        finally:
+            # Independent test custody also cleans the expected RED path.
+            for child, real_wait, real_kill in children:
+                if child.returncode is None:
+                    try:
+                        real_kill()
+                    except OSError:
+                        pass
+                    real_wait(timeout=2)
+            fallback_completed = True
+            print('OWNED_OBSERVER_RESERVE '+json.dumps({
+                'fallback_completed': fallback_completed,
+                'observer_reaped_on_return': None if returned is None else returned['observer_reaped'],
+                'requested_normal_reserve': None if not waits else min(outer_deadline-.1, clocks[0]+1)-waits[0]['cutoff'],
+                'cleanup_wait_positive': len(waits)>1 and waits[1]['timeout']>0,
+                'kill_before_consumption': bool(kills),
+                'actual_cleanup_status': None if len(waits)<2 else waits[1]['status'],
+            },sort_keys=True),flush=True)
+        self.assertTrue(fallback_completed)
+        self.assertEqual(returned['classification'], 'unknown')
+        self.assertEqual(len(children), 1)
+        self.assertEqual(len(kills), 1)
+        self.assertEqual(len(waits), 2)
+        # Source cutoff equality proves the normal wait leaves the explicit
+        # .1-second reserve, independently of whether a zero-time reap wins.
+        observer_deadline = min(outer_deadline-.1, clocks[0]+1)
+        self.assertAlmostEqual(waits[0]['cutoff'], observer_deadline-.1, places=6)
+        self.assertGreater(waits[1]['timeout'], 0)
+        self.assertEqual(waits[1]['status'], -peer.signal.SIGKILL)
+        self.assertEqual(returned['status'], -peer.signal.SIGKILL)
+        self.assertTrue(returned['observer_reaped'])
+        self.assertLess(original_clock(), outer_deadline)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(children[0][0].pid, os.WNOHANG)
