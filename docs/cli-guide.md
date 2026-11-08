@@ -271,8 +271,9 @@ and wire format are in [the protocol specification](protocol.md).
 ## Client installation and updates
 
 These commands describe `main` and require a later installer-capable release.
-Published `0.6.0-rc.1` lacks `--self-install` and `--self-update`; the bootstrap
-refuses an older executable rather than falling back to another release.
+No published release has `--self-install` or `--self-update`, and neither did
+the withdrawn `0.6.0-rc1`; the bootstrap refuses an older executable rather than
+falling back to another release.
 
 The [README installer instructions](../README.md#installing) download
 `scripts/install.sh` directly from official GitHub HTTPS. The script selects the

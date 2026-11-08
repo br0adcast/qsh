@@ -24,12 +24,13 @@ Latest-stable discovery is release selection, not artifact authentication. Exact
 `--version` selection is forwarded unchanged, including an explicitly chosen RC.
 
 Activation requires a later release containing `--self-install` and
-`--self-update`; published `0.6.0-rc.1` lacks those commands. Old bootstraps fail
-closed. The shell script stays on GitHub and is not an additional asset in the
+`--self-update`; no published release has those commands, and neither did the
+withdrawn `0.6.0-rc1`. Old bootstraps fail closed. The shell script stays on GitHub and is not an additional asset in the
 fixed twelve-product signed manifest. Release validation must check the safe
 `--self-install --help` capability probe and exercise first installation from
 the exact candidate artifacts before claiming live bootstrap support. Existing
-published tags and assets must remain unchanged.
+published tags and assets must remain unchanged; the owner's withdrawal of
+`v0.6.0-rc1` (see [Release versions](#release-versions)) is the only exception.
 
 ## Authority
 
@@ -102,6 +103,28 @@ compromised anchor invalidates its evidence on the updated client. Unknown new
 anchors fail and require an updated client. Old clients cannot acquire automatic
 revocation or freshness guarantees. Root provenance and actual cryptographic
 controls are documented in [release-auth](../crates/release-auth/README.md).
+
+## Release versions
+
+Release tags are `v` followed by the SemVer version of the shipped pair. A
+prerelease is spelled `alpha.N`, `beta.N` or `rc.N`, where `N` is a numeric
+identifier, for example `v0.6.0-rc.2`. SemVer compares a dot-separated number
+numerically but an attached one as text, so `rc10` orders before `rc2` and every
+`rc.N` before `rc1`. Update offers, the managed installer's downgrade refusal
+and the remote daemon cache selection all use SemVer precedence.
+
+On a tag run, every job that validates the shipped pair version refuses another
+prerelease spelling. Before signing, the publish job also lists the repository's
+version tags. It refuses the tag unless it has greater precedence than every
+other tag of the same `major.minor.patch`, including that version's final
+release. Tags of other versions do not constrain it, so a patch release of an
+older line remains possible, and a re-run on the same tag is accepted.
+
+`v0.6.0-rc1` was published before this rule and withdrawn by the owner, because
+it orders above every `0.6.0-rc.N`. A host that still caches
+`~/.cache/qsh/qshd-0.6.0-rc1-<arch>` (with a `-darwin` suffix on macOS) keeps
+selecting it over a later `0.6.0-rc.N` until that file is removed. Distribution
+packages are unaffected: `dpkg` and `rpm` order `0.6.0~rc.2` above `0.6.0~rc1`.
 
 ## Compatibility and publication
 

@@ -105,8 +105,8 @@ manager. Download packages or archives and `SHA256SUMS` from the
 [releases page](https://github.com/br0adcast/qsh/releases).
 
 The managed home installer described on `main` requires a later release containing
-`--self-install`; published `0.6.0-rc.1` does not contain it. It fails closed with
-older binaries. No existing release is changed by this work.
+`--self-install`; no published release contains it, and neither did the
+withdrawn `0.6.0-rc1`. It fails closed with older binaries.
 
 Once an installer-capable release is published, download and inspect the script:
 

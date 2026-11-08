@@ -7,7 +7,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [0.6.0-rc1]
+### Changed
+
+- Spell prerelease tags `alpha.N`, `beta.N` or `rc.N`, and refuse a release tag
+  that does not outrank every other tag of its version. The next candidate is
+  `0.6.0-rc.2`.
+
+### Removed
+
+- Withdraw `0.6.0-rc1`: SemVer orders it above every `0.6.0-rc.N`. Remove any
+  cached `~/.cache/qsh/qshd-0.6.0-rc1-*` daemon from servers, or later
+  candidates keep selecting it.
+
+## [0.6.0-rc1] [YANKED]
 
 ### Changed
 
