@@ -429,6 +429,12 @@ impl AttachmentState {
         self.phase = AttachmentPhase::Attached;
         Ok(())
     }
+    /// Trusted catalog changes revoke recovery while retaining the exact lease.
+    pub fn invalidate_recovery(&mut self, attachment: Attachment) -> Result<(), ResumeError> {
+        self.require(attachment, AttachmentPhase::Attached)?;
+        self.recovered = false;
+        Ok(())
+    }
     pub fn mark_recovery_complete(&mut self, attachment: Attachment) -> Result<(), ResumeError> {
         self.require(attachment, AttachmentPhase::Attached)?;
         if self.recovered {

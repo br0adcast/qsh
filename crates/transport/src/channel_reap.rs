@@ -59,6 +59,7 @@ pub(crate) struct State {
     retiring: bool,
     registering: bool,
     leader_status: Option<Option<i32>>,
+    leader_running: bool,
     leader_published: bool,
 }
 
@@ -215,11 +216,11 @@ struct Lease {
 }
 impl Lease {
     fn unknown(&self, kind: ObservationFailure, detail: &str) {
-        self.owner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .signal_allowed = false;
+        {
+            let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.signal_allowed = false;
+            state.leader_running = false;
+        }
         if let Some(registry) = self.owner.registry.upgrade() {
             registry.record_observation(&self.owner, kind);
         }
@@ -295,9 +296,19 @@ impl Lease {
                 .poll_leader_status()
             {
                 match status {
-                    LeaderStatus::Running => {}
+                    LeaderStatus::Running => {
+                        let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        if state.leader_status.is_none()
+                            && state.observation.is_none()
+                            && state.terminal.is_none()
+                            && !state.retiring
+                        {
+                            state.leader_running = true;
+                        }
+                    }
                     LeaderStatus::Exited { code } => {
                         let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state.leader_running = false;
                         if state.leader_status.is_none() {
                             state.leader_status = Some(code);
                             self.owner.ready.notify_one();
@@ -374,18 +385,18 @@ impl Drop for Lease {
     }
 }
 
-pub(super) struct Completion {
+pub(crate) struct Completion {
     pub stream: u8,
     pub instance: u64,
     pub code: Option<i32>,
 }
 
-pub(super) enum ReapEvent {
+pub(crate) enum ReapEvent {
     LeaderExited(Completion),
     Complete(Completion),
 }
 
-pub(super) struct ReapSet {
+pub(crate) struct ReapSet {
     registry: Arc<ChannelOpenRegistry>,
     owners: HashMap<u64, Arc<Capsule>>,
     ready: Arc<Notify>,
@@ -516,6 +527,7 @@ impl ReapSet {
                 retiring: false,
                 registering: false,
                 leader_status: None,
+                leader_running: false,
                 leader_published: false,
             }),
         });
@@ -527,6 +539,59 @@ impl ReapSet {
         if !active {
             owner.retire(stop_now);
         }
+    }
+    pub(crate) fn prepare_active(
+        &mut self,
+        stream: u8,
+        instance: u64,
+        uid: u32,
+    ) -> Option<PreparedActive<'_>> {
+        self.owners.try_reserve(1).ok()?;
+        let owner = Arc::new(Capsule {
+            stream,
+            instance,
+            uid,
+            ready: self.ready.clone(),
+            runtime: Handle::current(),
+            registry: Arc::downgrade(&self.registry),
+            changed: Condvar::new(),
+            state: Mutex::new(State {
+                resources: Some(Resources {
+                    child: None,
+                    _slot: None,
+                    notifier_installed: false,
+                }),
+                leased: false,
+                retry: false,
+                stop: false,
+                stop_seen: false,
+                signal_allowed: true,
+                active_poll: true,
+                observation: None,
+                terminal: None,
+                published: false,
+                retiring: false,
+                registering: false,
+                leader_status: None,
+                leader_running: false,
+                leader_published: false,
+            }),
+        });
+        let std::collections::hash_map::Entry::Vacant(entry) = self.owners.entry(instance) else {
+            return None;
+        };
+        Some(PreparedActive { entry, owner })
+    }
+    pub(crate) fn catalog_active(&self, instance: u64) -> bool {
+        self.owners.get(&instance).is_some_and(|owner| {
+            let state = owner.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.leader_running
+                && state.leader_status.is_none()
+                && state.observation.is_none()
+                && state.terminal.is_none()
+                && !state.retiring
+                && !state.registering
+        })
     }
     pub fn stop(&self, instance: u64) {
         if let Some(owner) = self.owners.get(&instance) {
@@ -572,6 +637,22 @@ impl ReapSet {
             }
             ready.await;
         }
+    }
+}
+/// Allocations and map capacity are prepared before registry/capsule adoption.
+pub(crate) struct PreparedActive<'a> {
+    entry: std::collections::hash_map::VacantEntry<'a, u64, Arc<Capsule>>,
+    owner: Arc<Capsule>,
+}
+impl PreparedActive<'_> {
+    pub(crate) fn commit(self, child: Box<dyn ChannelWait>, slot: InstalledSlot) {
+        // Unpublished fresh capsule has no observer. No callback or scheduling.
+        let mut state = self.owner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let resources = state.resources.as_mut().expect("prepared resources");
+        resources.child = Some(child);
+        resources._slot = Some(slot);
+        drop(state);
+        self.entry.insert(self.owner);
     }
 }
 impl Drop for ReapSet {

@@ -9,6 +9,10 @@ pub mod channel_geometry;
 #[cfg(feature = "tokio-driver")]
 mod channel_input;
 #[cfg(feature = "tokio-driver")]
+pub use channel_input::{
+    ChannelInputBudget, InputChunk, InputLimit, InputOrigin, InputScope, SessionInputBudget,
+};
+#[cfg(feature = "tokio-driver")]
 pub mod channel_open;
 #[cfg(feature = "tokio-driver")]
 mod channel_reply_delivery;
@@ -112,3 +116,6 @@ mod session_deadline;
 pub mod qualification305;
 
 pub mod session_resume;
+
+#[cfg(feature = "tokio-driver")]
+pub mod channel_owner;

@@ -678,3 +678,65 @@ fn abandonment_never_wraps_epoch_or_reopens_a_completed_fence() {
     assert_eq!(state.phase(), AttachmentPhase::Fenced);
     state.begin_attach(attachment(6)).unwrap();
 }
+
+#[test]
+fn runtime_recovery_invalidation_revokes_same_attached_lease_until_new_gate() {
+    let a = attachment(1);
+    let mut state = AttachmentState::new();
+    state.begin_attach(a).unwrap();
+    state.attached(a).unwrap();
+    let catalog = RetainedCatalog::new(
+        a,
+        crate::channel::ChannelSnapshot::new(Vec::new(), Vec::new()).unwrap(),
+        Vec::new(),
+    )
+    .unwrap();
+    RecoveryGate::new(&catalog)
+        .enable_input(&mut state)
+        .unwrap();
+    assert!(state.validate_input(a).is_ok());
+    let identity = (state.current, state.phase, state.revoked);
+    state.invalidate_recovery(a).unwrap();
+    assert!(
+        state.validate_input(a).is_err(),
+        "catalog invalidation left canonical input authority enabled"
+    );
+    assert!(state.validate_resize(a).is_err());
+    assert!(state.validate_close(a).is_err());
+    state.invalidate_recovery(a).unwrap();
+    assert_eq!((state.current, state.phase, state.revoked), identity);
+    RecoveryGate::new(&catalog)
+        .enable_input(&mut state)
+        .unwrap();
+    assert!(state.validate_input(a).is_ok());
+    assert!(RecoveryGate::new(&catalog)
+        .enable_input(&mut state)
+        .is_err());
+}
+#[test]
+fn runtime_recovery_invalidation_rejects_stale_identity_and_all_other_phases_without_mutation() {
+    for phase in 0..5 {
+        let a = attachment(1);
+        let mut state = AttachmentState::new();
+        if phase > 0 {
+            state.begin_attach(a).unwrap();
+        }
+        if phase > 1 {
+            state.attached(a).unwrap();
+            state.mark_recovery_complete(a).unwrap();
+        }
+        if phase > 2 {
+            state.begin_fence(a).unwrap();
+        }
+        if phase > 3 {
+            state.fenced(a).unwrap();
+        }
+        let before = (state.current, state.phase, state.revoked, state.recovered);
+        let request = if phase == 2 { attachment(2) } else { a };
+        assert!(state.invalidate_recovery(request).is_err());
+        assert_eq!(
+            (state.current, state.phase, state.revoked, state.recovered),
+            before
+        );
+    }
+}
