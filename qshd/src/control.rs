@@ -1407,7 +1407,9 @@ mod tests {
         std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
             .unwrap();
         let prior = std::fs::symlink_metadata(&path).unwrap();
-        assert!(transaction.bind_private_absent_owned().is_err());
+        assert!(
+            matches!(transaction.bind_private_absent_owned(),Err(error) if error.raw_os_error()==Some(nix::libc::EEXIST))
+        );
         use std::os::unix::fs::MetadataExt;
         assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), prior.ino());
         let _client = UnixStream::connect(&path).unwrap();
@@ -1415,6 +1417,25 @@ mod tests {
         drop(competitor);
         std::fs::remove_file(&path).unwrap();
         let (_listener, _cleanup) = transaction.bind_private_absent_owned().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_restart_publication_preserves_non_utf8_leaf_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"control-\xff.sock".to_vec()));
+        let transaction = EnsureLock::acquire(&path, Duration::from_secs(1)).unwrap();
+        let (listener, cleanup) = transaction.bind_private_absent_owned().unwrap();
+        let _client = UnixStream::connect(&path).unwrap();
+        let _accepted = listener.accept().unwrap();
+        drop(cleanup);
+        assert!(
+            !path.exists(),
+            "cleanup retains the exact non-UTF8 endpoint"
+        );
     }
 
     #[cfg(target_os = "linux")]

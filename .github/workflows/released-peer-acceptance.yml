@@ -10,6 +10,17 @@ on:
       - 'scripts/tests/test_released_peer_acceptance.py'
       - 'cli/tests/mixed_versions.rs'
       - 'qshd/tests/mixed_versions.rs'
+      - 'crates/daemon-bootstrap-protocol/**'
+      - 'crates/bringup/src/**'
+      - 'qshd/src/main.rs'
+      - 'qshd/src/control.rs'
+      - 'qshd/src/control/**'
+      - 'qshd/src/transport_daemon.rs'
+      - 'qshd/src/destructive_restart.rs'
+      - 'qshd/src/modern_restart.rs'
+      - 'cli/src/ssh_step.rs'
+      - 'cli/src/busy_daemon.rs'
+      - 'cli/src/climb.rs'
   workflow_dispatch:
   workflow_call:
 

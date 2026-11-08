@@ -255,6 +255,21 @@ jobs:
           ! grep -F 'SKIPPED' "$runtime/results.log"
           grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
+          observer_name=darwin_process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session
+          timed observer-runtime "$ordinary_harness" --exact "$observer_name" \
+            --nocapture --test-threads=1 --color=never 2>&1 | tee "$runtime/observer-results.log"
+          awk -v expected="test $observer_name ... " '
+            index($0, expected) == 1 {
+              seen++; pending = 1
+              if ($0 == expected "ok") { passed++; pending = 0 }
+              next
+            }
+            pending && $0 == "ok" { passed++; pending = 0 }
+            END { exit !(seen == 1 && passed == 1) }
+          ' "$runtime/observer-results.log"
+          test "$(grep -Fc 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$runtime/observer-results.log")" -eq 1
+          ! grep -F 'SKIPPED' "$runtime/observer-results.log"
+          verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
           timed keeper-runtime "$ordinary_harness" darwin_process_scope::keeper_tests::keeper_native_ \
             --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-results.log"
           for name in \
@@ -1563,9 +1578,11 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 74` is the exact compiled system-library body count:
-          # the prior 73 plus the owned worker stage-barrier fixture body.
-          # Its four required parent regressions below drive that body.
+          # `--ignored 75` is the exact compiled system-library body count:
+          # the prior 74 plus native_observer_process, an isolated exit-only
+          # observer role. Its required native_observer_retains_unrelated_process
+          # parent below drives marker/liveness, drop-without-kill and exact exit.
+          # The owned worker stage-barrier body's four parents remain required.
           # The deleted-cwd body is in qshd's binary test target, not this
           # library binary. Keep the strict count and require both library
           # wrappers below so a missing body or wrapper fails visibly.
@@ -1602,12 +1619,13 @@ jobs:
           # could still vanish from a `399 passed` run unnoticed -- just
           # smaller by the one test this line now does cover.
           #
-          # The 74 isolated bodies are a separate matter and get no
+          # The 75 isolated bodies are a separate matter and get no
           # --require: each is #[ignore]d here BY DESIGN and re-run as a
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 74 \
+          run_suite lib qshd --ignored 75 \
+            --require process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session \
             --require control::peer_tests::control_peer_root_client_rejects_foreign_server \
             --require control::peer_tests::control_peer_foreign_client_rejects_root_server \
             --require transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \
