@@ -93,6 +93,22 @@ pub(crate) use lifecycle::WorkerReceipt;
 pub(crate) mod fixture;
 pub use lifecycle::{Shutdown, ShutdownError};
 
+/// Actual join supervisors for a stable owner independent of any SessionIo.
+#[derive(Default)]
+pub(crate) struct RetainedWorkerOwner(Lifecycle);
+impl RetainedWorkerOwner {
+    pub(crate) fn spawn_blocking(
+        &self,
+        receipt: WorkerReceipt,
+        work: impl FnOnce() + Send + 'static,
+    ) {
+        self.0.spawn_blocking_with(receipt, work)
+    }
+    pub(crate) async fn drain(&self) -> Result<(), ShutdownError> {
+        self.0.drain().await
+    }
+}
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;

@@ -1,5 +1,5 @@
-//! Inactive stable-owner IPC contracts. No owner process or retained-session
-//! runtime is created by this module.
+//! Stable-owner contracts and independently constructed engine.
+//! Production daemon routing does not construct or advertise this runtime.
 #[cfg(test)]
 mod extension_tests;
 pub mod protocol;
@@ -13,3 +13,14 @@ mod wire;
 
 pub mod operations;
 pub mod resource_contract;
+
+pub mod engine;
+#[cfg(all(test, target_os = "linux"))]
+mod engine_native_tests;
+pub mod resources;
+#[cfg(test)]
+mod resources_tests;
+
+pub mod input;
+pub mod recovery_runtime;
+mod writer;
