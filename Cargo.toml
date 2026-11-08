@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["vendor/vte", "vendor/alacritty_terminal", "vendor/russh"]
+exclude = ["vendor/vte", "vendor/alacritty_terminal", "vendor/russh", "vendor/ssh-key"]
 resolver = "2"
 members = ["crates/daemon-bootstrap-protocol", "crates/release-auth", "crates/terminal-size", "qshd", "crates/transport", "crates/terminal", "crates/prediction", "crates/client", "crates/render", "crates/sshauth", "crates/knock", "crates/ssh", "crates/bringup", "crates/connect", "crates/logging", "cli"]
 
@@ -25,3 +25,4 @@ overflow-checks = true
 vte = { path = "vendor/vte" }
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
 russh = { path = "vendor/russh" }
+ssh-key = { path = "vendor/ssh-key" }

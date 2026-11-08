@@ -12,10 +12,11 @@ cargo-fuzz = true
 members = ["."]
 resolver = "2"
 
-# Match the product parser, including qsh's bounded OSC handling.
+# Match the product parser and key-decoder maintenance patches.
 [patch.crates-io]
 vte = { path = "../vendor/vte" }
 alacritty_terminal = { path = "../vendor/alacritty_terminal" }
+ssh-key = { path = "../vendor/ssh-key" }
 
 [dependencies]
 # Observe OSC dispatch at the exact shipped parser boundary.

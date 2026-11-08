@@ -1,0 +1,81 @@
+# qsh maintenance patch: GNU diff -n / RCS line edits
+# Not unified diff or git-apply input; see README.qsh.md.
+# Pristine ssh-key 0.7.0-rc.11 archive SHA-256:
+# f9a32fae177b74a22aa9c5b01bf7e68b33545be32d9e381e248058d2adc15ce3
+# file: Cargo.toml
+a0 1
+# qsh modification: production source subset; see README.qsh.md.
+d135 40
+d287 11
+# file: src/ppk.rs
+a0 1
+// qsh modification: validate nonnegative Ed25519 magnitudes; see README.qsh.md.
+d496 1
+a496 7
+            // Canonical zero has an empty encoding. Positive magnitudes may
+            // need an integer sign byte, which is not part of the seed.
+            let e_bytes = if e.as_bytes().is_empty() {
+                e.as_bytes()
+            } else {
+                e.as_positive_bytes().ok_or(Error::Crypto)?
+            };
+# file: src/lib.rs
+a0 1
+// qsh modification: caller-provided private-key documentation; see README.qsh.md.
+d64 1
+a64 2
+//! Pass an encoded key obtained by the caller rather than embedding private
+//! key material in source code:
+d67 1
+d70 35
+a104 2
+//! fn parse_private_key(encoded_key: &str) -> Result<PrivateKey, ssh_key::Error> {
+//!     PrivateKey::from_openssh(encoded_key)
+d106 2
+# file: src/private.rs
+a0 1
+// qsh modification: caller-provided private-key/password documentation; see README.qsh.md.
+d11 1
+a11 2
+//! decrypt keys which have been encrypted under a password. Obtain both the
+//! encoded key and password from the caller rather than hardcoding them:
+d15 1
+d18 22
+a39 7
+//! fn decrypt_private_key(
+//!     encoded_key: &str,
+//!     password: &str,
+//! ) -> Result<PrivateKey, ssh_key::Error> {
+//!     let encrypted_key = PrivateKey::from_openssh(encoded_key)?;
+//!     encrypted_key.decrypt(password)
+//! }
+d45 1
+a45 1
+//! encrypt plaintext private keys under a caller-provided password.
+d57 2
+a58 1
+//! use ssh_key::{PrivateKey, getrandom::SysRng};
+d60 11
+a70 7
+//! fn encrypt_private_key(
+//!     encoded_key: &str,
+//!     password: &str,
+//! ) -> Result<PrivateKey, ssh_key::Error> {
+//!     let unencrypted_key = PrivateKey::from_openssh(encoded_key)?;
+//!     unencrypted_key.encrypt(&mut SysRng, password)
+//! }
+d325 5
+a329 1
+    /// use ssh_key::{HashAlg, PrivateKey, SshSig};
+d331 20
+a350 10
+    /// fn sign_message(
+    ///     encoded_key: &str,
+    ///     namespace: &str,
+    ///     message: &[u8],
+    /// ) -> Result<SshSig, ssh_key::Error> {
+    ///     let private_key = encoded_key.parse::<PrivateKey>()?;
+    ///     let signature = private_key.sign(namespace, HashAlg::default(), message)?;
+    ///     private_key.public_key().verify(namespace, message, &signature)?;
+    ///     Ok(signature)
+    /// }
