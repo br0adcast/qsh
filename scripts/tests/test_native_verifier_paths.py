@@ -706,8 +706,30 @@ elif name == 'python3':
         self.assertEqual(owner.count('cargo test -p qshd --lib'), 2)
         self.assertEqual(owner.count('--no-run --message-format=json-render-diagnostics'), 2)
         self.assertEqual(owner.count('--bin qshd --profile test'), 2)
-        self.assertEqual(owner.count('verify_harness "$ordinary_harness"'), 2)
-        self.assertEqual(owner.count('verify_harness "$feature_harness"'), 2)
+        # Modern, observer and keeper runs share the ordinary harness. The
+        # post-observer verification before keeper makes three hash checks.
+        ordinary_check = 'verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"'
+        observer_assignment = ('observer_name=darwin_process_scope::observation::tests::'
+                               'native_observer_retains_unrelated_process_in_another_session\n')
+        observer_skip_gate = '! grep -F \'SKIPPED\' "$runtime/observer-results.log"'
+        for body in (owner, arm):
+            self.assertEqual(body.count('verify_harness "$ordinary_harness"'), 3)
+            self.assertEqual(body.count('verify_harness "$feature_harness"'), 2)
+            self.assertEqual(body.count(observer_assignment), 1)
+            self.assertIn(observer_skip_gate, body)
+            start = body.index(observer_assignment)
+            end = body.index(observer_skip_gate, start) + len(observer_skip_gate)
+            observer = body[start:end]
+            self.assertIn(ordinary_check + '\n' + observer + '\n' + ordinary_check, body,
+                          'observer runtime must remain between ordinary-harness hash checks')
+            self.assertIn('timed observer-runtime "$ordinary_harness" --exact "$observer_name" \\\n'
+                          '  --nocapture --test-threads=1 --color=never 2>&1 | tee "$runtime/observer-results.log"', observer)
+            self.assertIn('seen == 1 && passed == 1', observer)
+            self.assertIn('test "$(grep -Fc \'test result: ok. 1 passed; 0 failed; 0 ignored;\' '
+                          '"$runtime/observer-results.log")" -eq 1', observer)
+            self.assertNotIn('--ignored', observer)
+            self.assertLess(body.index('timed modern-runtime'), body.index('timed observer-runtime'))
+            self.assertLess(body.index('timed observer-runtime'), body.index('timed keeper-runtime'))
         for required in ('--features test-build-labels', '--features test-darwin-keeper',
                          'timed feature-check cargo check', 'timed feature-clippy cargo clippy',
                          '-- -D warnings', '--target "$NATIVE_TARGET"',
