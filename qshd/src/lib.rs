@@ -165,6 +165,13 @@ pub fn darwin_keeper_entry(args: &[std::ffi::OsString]) -> Option<std::io::Resul
     darwin_process_scope::keeper_helper_entry(args)
 }
 
+/// Refuse to start a daemon on a Darwin runtime without a qualified process
+/// ownership contract, naming the observed kernel (#551).
+#[cfg(target_os = "macos")]
+pub fn darwin_runtime_admission() -> anyhow::Result<()> {
+    darwin_process_scope::require_admitted_runtime().map_err(anyhow::Error::msg)
+}
+
 pub mod server_info;
 
 pub mod session_owner;
