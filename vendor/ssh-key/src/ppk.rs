@@ -1,4 +1,4 @@
-// qsh modification: validate nonnegative Ed25519 magnitudes; see README.qsh.md.
+// qsh modification: decode PuTTY's Ed25519 seed string; see README.qsh.md.
 // Format documentation:
 // https://tartarus.org/~simon/putty-snapshots/htmldoc/AppendixC.html
 
@@ -486,30 +486,28 @@ fn decode_private_key_as(
 
         #[cfg(feature = "ed25519")]
         (Algorithm::Ed25519, KeyData::Ed25519(pk)) => {
-            // PPK encodes Ed25519 private exponent as an mpint
-            use crate::Mpint;
+            // PuTTY documents an mpint, but writes the seed's little-endian
+            // integer as a plain string: exactly 32 bytes since 0.75, with
+            // high zero bytes trimmed before that. Copy it unchanged and
+            // restore trimmed bytes at the little-endian high end.
             use crate::private::{Ed25519Keypair, Ed25519PrivateKey};
+            use crate::public::Ed25519PublicKey;
             use zeroize::Zeroizing;
 
-            // Copy and pad exponent
             let mut buf = Zeroizing::new([0u8; Ed25519PrivateKey::BYTE_SIZE]);
-            let e = Mpint::decode(reader)?;
-            // Canonical zero has an empty encoding. Positive magnitudes may
-            // need an integer sign byte, which is not part of the seed.
-            let e_bytes = if e.as_bytes().is_empty() {
-                e.as_bytes()
-            } else {
-                e.as_positive_bytes().ok_or(Error::Crypto)?
-            };
-
-            if e_bytes.len() > buf.len() {
-                return Err(Error::Crypto);
-            }
-
-            #[allow(clippy::arithmetic_side_effects)] // length checked
-            buf[Ed25519PrivateKey::BYTE_SIZE - e_bytes.len()..].copy_from_slice(e_bytes);
+            reader.read_prefixed(|reader| {
+                let seed = buf
+                    .get_mut(..reader.remaining_len())
+                    .ok_or(Error::Crypto)?;
+                reader.read(seed)?;
+                Ok::<_, Error>(())
+            })?;
 
             let private = Ed25519PrivateKey::from_bytes(&buf);
+            // As for OpenSSH keys, the seed must derive the stored public key.
+            if Ed25519PublicKey::from(&private) != *pk {
+                return Err(Error::Crypto);
+            }
             Ok(KeypairData::Ed25519(Ed25519Keypair {
                 public: *pk,
                 private,
