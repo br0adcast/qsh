@@ -411,6 +411,7 @@ pub(crate) fn bring_up(
     req: BringUpRequest,
     policy: InstallPolicy,
     hooks: BringUpHooks,
+    server_info: Option<crate::ServerInfoProbe<'_>>,
     bind: Arc<dyn knock::SocketBind>,
     cancel: &knock::Cancel,
 ) -> Result<IdentifiedReady, BringUpError> {
@@ -492,6 +493,7 @@ pub(crate) fn bring_up(
         ssh_port,
         policy,
         hooks,
+        server_info,
         cancel,
     )?;
     Ok(IdentifiedReady {
@@ -514,6 +516,7 @@ fn on_session(
     ssh_port: u16,
     policy: InstallPolicy,
     hooks: BringUpHooks,
+    server_info: Option<crate::ServerInfoProbe<'_>>,
     cancel: &knock::Cancel,
 ) -> Result<crate::Ready, BringUpError> {
     progress(hooks.observer.as_ref(), BringUpStage::Connecting, true);
@@ -535,6 +538,39 @@ fn on_session(
     check_cancel(cancel)?;
     if let locate::Located::Service(kind) = probe.located {
         return Err(BringUpError::ServiceRunning(kind));
+    }
+    // Read-only and before anything is installed or started: the running
+    // daemon's server info, through the located qshd once trust.sh accepts it.
+    let mut trusted_found = None;
+    if let Some((before, expected)) =
+        server_info.and_then(|p| p.before.map(|b| (b, p.expected_key)))
+    {
+        let proof = match &probe.located {
+            locate::Located::Found(found) => match session.trusted_path(
+                found,
+                probe.platform.os,
+                trust::Purpose::Execute,
+                &hooks,
+                cancel,
+            ) {
+                Ok(trusted) => {
+                    let proof = query_server_info(session, &trusted, &expected, &hooks, cancel)?;
+                    trusted_found = Some((found.clone(), trusted));
+                    proof
+                }
+                // An unsafe lookup result is never executed for metadata; the
+                // ordinary trust check below reports it where it is used.
+                Err(_) => {
+                    check_cancel(cancel)?;
+                    None
+                }
+            },
+            _ => None,
+        };
+        if !before(proof.as_ref()) {
+            return Err(BringUpError::ServerInfoRefused);
+        }
+        check_cancel(cancel)?;
     }
     let mut verified_candidate_digest = None;
     let path = match (&policy, probe.located) {
@@ -584,13 +620,16 @@ fn on_session(
             session.install(&path, image, &hooks, cancel)?
         }
     };
-    let path = session.trusted_path(
-        &path,
-        probe.platform.os,
-        trust::Purpose::Execute,
-        &hooks,
-        cancel,
-    )?;
+    let path = match trusted_found {
+        Some((found, trusted)) if found == path => trusted,
+        _ => session.trusted_path(
+            &path,
+            probe.platform.os,
+            trust::Purpose::Execute,
+            &hooks,
+            cancel,
+        )?,
+    };
     if report_busy {
         check_cancel(cancel)?;
         let capabilities = session.command(
@@ -678,7 +717,46 @@ fn on_session(
     };
     progress(hooks.observer.as_ref(), BringUpStage::Starting, true);
     check_cancel(cancel)?;
+    if let Some(probe) = server_info {
+        if let Some(after) = probe.after_ready {
+            let proof = query_server_info(session, &path, &probe.expected_key, &hooks, cancel)?;
+            after(proof.as_ref());
+        }
+    }
     Ok(ready)
+}
+
+/// One `server-info` exchange with the trusted `path`. An older helper, a
+/// missing control endpoint or an unverifiable reply is unknown metadata,
+/// never a failed bring-up; only cancellation ends it.
+fn query_server_info(
+    session: &mut impl Remote,
+    path: &str,
+    expected: &[u8; 32],
+    hooks: &BringUpHooks,
+    cancel: &knock::Cancel,
+) -> Result<Option<ssh::VerifiedSshServerInfo>, BringUpError> {
+    check_cancel(cancel)?;
+    let challenge = ssh::server_info::challenge();
+    let output = session.command(
+        "qshd server-info",
+        &format!(
+            "{} {}",
+            shell::quote(path),
+            ssh::server_info::arguments(&challenge)
+        ),
+        hooks.timing.verify,
+        cancel,
+    );
+    check_cancel(cancel)?;
+    Ok(output
+        .ok()
+        .filter(|output| output.code == 0)
+        .and_then(|output| {
+            output.complete_stdout().ok().and_then(|stdout| {
+                ssh::server_info::verify(stdout.as_bytes(), &challenge, expected)
+            })
+        }))
 }
 
 fn validate_image(

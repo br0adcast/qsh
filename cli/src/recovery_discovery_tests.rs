@@ -157,6 +157,29 @@ fn discovery_udp_only_proof_waits_for_all_addresses_without_retiring_other_route
     assert!(recovery.discovered_server_info().is_some());
 }
 
+type Gate<'a> = Option<&'a dyn Fn(Option<AuthenticatedServerInfo>) -> bool>;
+
+/// One recovery login as `bringup` runs it: the query and the gate, then the
+/// mutating phase only when the gate permits it. A current proof (no gate)
+/// performs no query.
+fn login<'a>(
+    query: impl FnOnce() -> Option<AuthenticatedServerInfo> + 'a,
+    mutate: impl FnOnce() -> Result<bringup::Ready, crate::ssh_step::SshStepError> + 'a,
+) -> impl FnOnce(Gate<'_>) -> Result<bringup::Ready, crate::ssh_step::SshStepError> + 'a {
+    move |gate| {
+        if let Some(gate) = gate {
+            if !gate(query()) {
+                return Err(crate::ssh_step::SshStepError::Failed(
+                    ::connect::SshFailure::plain(
+                        bringup::BringUpError::ServerInfoRefused.to_string(),
+                    ),
+                ));
+            }
+        }
+        mutate()
+    }
+}
+
 #[test]
 fn discovery_phase_runs_restart_only_for_unknown_and_never_for_proven_incompatible() {
     use std::cell::Cell;
@@ -168,11 +191,15 @@ fn discovery_phase_runs_restart_only_for_unknown_and_never_for_proven_incompatib
         Err(crate::ssh_step::SshStepError::NeedsPrompt)
     };
     assert!(recovery
-        .recover_after_discovery(&attempt, 0, || Ok(None), restart)
+        .recover_after_discovery(&attempt, 0, login(|| None, restart))
         .is_some());
     assert_eq!(restart_calls.get(), 1);
     assert!(recovery
-        .recover_after_discovery(&attempt, 0, || Ok(Some(authenticated_info(false))), restart)
+        .recover_after_discovery(
+            &attempt,
+            0,
+            login(|| Some(authenticated_info(false)), restart)
+        )
         .is_none());
     assert_eq!(
         restart_calls.get(),
@@ -188,16 +215,18 @@ fn discovery_restart_does_not_publish_prestart_proof_or_uploaded_binary_version(
     let result = recovery.recover_after_discovery(
         &attempt,
         0,
-        || Ok(Some(authenticated_info(true))),
-        || {
-            Ok(bringup::Ready {
-                serving_profiles: None,
-                server_pubkey: [7; 32],
-                ports: vec![60022],
-                version: "99.0.0-uploaded-binary".into(),
-                warning: None,
-            })
-        },
+        login(
+            || Some(authenticated_info(true)),
+            || {
+                Ok(bringup::Ready {
+                    serving_profiles: None,
+                    server_pubkey: [7; 32],
+                    ports: vec![60022],
+                    version: "99.0.0-uploaded-binary".into(),
+                    warning: None,
+                })
+            },
+        ),
     );
     assert!(matches!(result, Some(Ok(_))));
     assert!(
@@ -236,11 +265,13 @@ fn discovery_previous_udp_sweep_cannot_suppress_a_new_ssh_query_or_restart() {
         .recover_after_discovery(
             &attempt,
             0,
-            || Ok(None),
-            || {
-                calls.set(calls.get() + 1);
-                Err(crate::ssh_step::SshStepError::NeedsPrompt)
-            }
+            login(
+                || None,
+                || {
+                    calls.set(calls.get() + 1);
+                    Err(crate::ssh_step::SshStepError::NeedsPrompt)
+                }
+            )
         )
         .is_some());
     assert_eq!(calls.get(), 1);
@@ -256,20 +287,9 @@ fn discovery_completed_unknown_retires_update_authority_but_keeps_display_contex
     let attempt = ssh_attempt(&recovery);
     assert!(recovery.publish_server_info(&attempt, 0, authenticated_info(false)));
     assert!(recovery.discovered_server_info().is_some());
-    let calls = std::cell::Cell::new(0);
-    let result = recovery.recover_after_discovery(
-        &attempt,
-        0,
-        || Ok(None),
-        || {
-            calls.set(calls.get() + 1);
-            Err(crate::ssh_step::SshStepError::NeedsPrompt)
-        },
-    );
-    assert!(result.is_some());
-    assert_eq!(
-        calls.get(),
-        1,
+    // The restart login's own query completed as unknown.
+    assert!(
+        recovery.permits_after_query(&attempt, 0, None),
         "unknown discovery preserves normal RestartOnly"
     );
     assert!(recovery.discovered_server_info().is_none());
@@ -280,6 +300,46 @@ fn discovery_completed_unknown_retires_update_authority_but_keeps_display_contex
 }
 
 #[test]
+fn discovery_current_ssh_proof_needs_no_query_and_blocks_an_incompatible_restart() {
+    let recovery = Recovery::new(EPOCH, 2);
+    let attempt = ssh_attempt(&recovery);
+    assert!(recovery.publish_server_info(&attempt, 0, authenticated_info(false)));
+    let gated = std::cell::Cell::new(false);
+    let result = recovery.recover_after_discovery(&attempt, 0, |gate| {
+        gated.set(gate.is_some());
+        Err(crate::ssh_step::SshStepError::NeedsPrompt)
+    });
+    assert!(result.is_none());
+    assert!(!gated.get(), "a refused current proof starts no login");
+}
+
+#[test]
+fn discovery_login_that_never_reached_its_query_settles_as_unknown() {
+    let recovery = Recovery::new(EPOCH, 2);
+    let attempt = ssh_attempt(&recovery);
+    assert!(recovery.publish_qsh_server_info(
+        recovery.revision(),
+        EPOCH,
+        SweepId(1),
+        0,
+        authenticated_info(true)
+    ));
+    recovery.begin_sweep(SweepId(2));
+    assert!(recovery.server_info_for(&attempt, 0).is_none());
+    assert!(recovery.discovered_server_info().is_some());
+    // Authentication failed before the query: the result stands and the old
+    // proof no longer authorizes an update.
+    let result = recovery.recover_after_discovery(&attempt, 0, |_| {
+        Err(crate::ssh_step::SshStepError::NeedsPrompt)
+    });
+    assert!(matches!(
+        result,
+        Some(Err(crate::ssh_step::SshStepError::NeedsPrompt))
+    ));
+    assert!(recovery.discovered_server_info().is_none());
+}
+
+#[test]
 fn discovery_current_qsh_incompatibility_arriving_during_ssh_unknown_prevents_restart() {
     let recovery = Recovery::new(EPOCH, 2);
     let attempt = ssh_attempt(&recovery);
@@ -287,20 +347,22 @@ fn discovery_current_qsh_incompatibility_arriving_during_ssh_unknown_prevents_re
     let result = recovery.recover_after_discovery(
         &attempt,
         0,
-        || {
-            assert!(recovery.publish_qsh_server_info(
-                recovery.revision(),
-                EPOCH,
-                SweepId(1),
-                0,
-                authenticated_info(false)
-            ));
-            Ok(None)
-        },
-        || {
-            calls.set(calls.get() + 1);
-            Err(crate::ssh_step::SshStepError::NeedsPrompt)
-        },
+        login(
+            || {
+                assert!(recovery.publish_qsh_server_info(
+                    recovery.revision(),
+                    EPOCH,
+                    SweepId(1),
+                    0,
+                    authenticated_info(false)
+                ));
+                None
+            },
+            || {
+                calls.set(calls.get() + 1);
+                Err(crate::ssh_step::SshStepError::NeedsPrompt)
+            },
+        ),
     );
     assert!(result.is_none());
     assert_eq!(
@@ -363,11 +425,13 @@ fn discovery_prior_ssh_result_never_suppresses_a_fresh_query_or_normal_restart()
         .recover_after_discovery(
             &current,
             0,
-            || Ok(None),
-            || {
-                calls.set(calls.get() + 1);
-                Err(crate::ssh_step::SshStepError::NeedsPrompt)
-            }
+            login(
+                || None,
+                || {
+                    calls.set(calls.get() + 1);
+                    Err(crate::ssh_step::SshStepError::NeedsPrompt)
+                }
+            )
         )
         .is_some());
     assert_eq!(calls.get(), 1);

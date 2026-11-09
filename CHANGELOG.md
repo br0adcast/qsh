@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Read a pinned daemon's server info on the SSH bootstrap's own login, through
+  the located and trust-checked `qshd`, instead of a separate SSH login and a
+  `PATH` lookup. Agent and FIDO keys sign once per SSH attempt, including during
+  recovery.
+
 ## [0.6.0-rc1]
 
 ### Changed

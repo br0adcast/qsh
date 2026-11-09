@@ -333,12 +333,18 @@ again before atomic activation. Cancellation observed before activation leaves
 the previous active client in place. A signal after activation commits does not
 undo the installation; relaunch is still explicit.
 
-If UDP discovery is unavailable, an already configured and trusted SSH route
-may execute read-only `qshd server-info --challenge HEX64`. Its response must
-echo the fresh challenge and match the pinned qsh key. Discovery never accepts
-a new SSH host key, installs a daemon, or authorizes a client. Unsupported
-legacy commands and daemon modes without an available local control socket
-remain unknown; the executable's `--version` is not running-server evidence.
+If UDP discovery is unavailable for a pinned daemon, the SSH bootstrap reads
+its server info on the same SSH login, so an agent or FIDO key signs once per
+attempt. After the lookup and the `trust.sh` checks accept the located `qshd`,
+and before anything is installed or started, that login runs read-only
+`<qshd> server-info --challenge HEX64`. Background recovery reads it again on
+the same login after readiness. The response must echo the fresh challenge and
+match the pinned qsh key; it is authenticated only by the SSH account that
+returned it. The query never prompts, installs a daemon, or authorizes a
+client. Its host key is the one that login verified. A lookup that `trust.sh`
+refuses is never executed. Unsupported legacy commands and daemon modes
+without an available local control socket remain unknown. The executable's
+`--version` is not running-server evidence.
 
 Release authentication, destination validation or cancellation failures before
 publication leave the prior active generation in place. Updates retain the old

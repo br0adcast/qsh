@@ -3517,6 +3517,11 @@ transport or changing its paths; obsolete replies cannot satisfy the new round.
 
 For a configured, verified SSH path, `qshd server-info --challenge <64 hex digits>`
 queries the running personal daemon's dedicated `SERVER-INFO` control request.
+The client runs it only inside the bring-up's own SSH session, never on a login
+of its own. It uses the path the lookup found, once `trust.sh` accepts it for
+execution, and runs before installation, `bootstrap-capabilities` and
+`transport-ensure`. A positively incompatible reply ends the bring-up there.
+Recovery repeats the query on the same session after `TRANSPORT-READY`.
 An optional `--socket` chooses an existing local control endpoint. It never
 loads or creates server keys, installs a daemon, or uses the invoked binary's
 version as evidence. The bounded JSON response contains `challenge`,

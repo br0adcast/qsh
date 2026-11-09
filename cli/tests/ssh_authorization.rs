@@ -41,6 +41,63 @@ fn direct_qsh_without_flag_does_not_probe_ssh_or_create_bindings() {
         0
     );
 }
+#[test]
+fn unlisted_key_bootstrap_reads_server_info_on_its_single_ssh_login() {
+    use std::{os::unix::fs::PermissionsExt, sync::atomic::Ordering};
+    let _serial = serialised();
+    // A real daemon whose key is pinned, and a client key it does not list:
+    // the first connection from a new machine.
+    let (daemon, _) = start_daemon();
+    let home = tempfile::tempdir().unwrap();
+    let ssh = fake::Server::start();
+    let peer_key = sshauth::discover::discover(
+        ([127, 0, 0, 1], daemon.port).into(),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    sshauth::known_hosts::KnownHosts::open(home.path().join("qsh/known_hosts"))
+        .pin("127.0.0.1", daemon.port, &peer_key)
+        .unwrap();
+    let ssh_dir = home.path().join(".ssh");
+    std::fs::create_dir(&ssh_dir).unwrap();
+    std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    qsh::known_hosts::KnownHosts::new(ssh_dir.join("known_hosts"), None)
+        .add("127.0.0.1", ssh.port, "ssh-ed25519", &ssh.wire())
+        .unwrap();
+    let unlisted = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
+    let identity = home.path().join("unlisted");
+    support::write_private(
+        &identity,
+        unlisted
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let address = format!("127.0.0.1:{},ssh={}", daemon.port, ssh.port);
+    let mut client = spawn_qsh(
+        &["--no-password", "-i", identity.to_str().unwrap(), &address],
+        home.path(),
+    );
+    let screen = screen(&client);
+    let status = wait_for_exit(&mut client.child).unwrap();
+    assert!(!status.success(), "{}", text(&screen));
+    // The fake reports no installed qshd, so the bring-up ends at its lookup.
+    // Its server-info query would have used the same login.
+    let activity = &ssh.activity;
+    assert_eq!(
+        activity.connections.load(Ordering::SeqCst),
+        1,
+        "{}",
+        text(&screen)
+    );
+    assert_eq!(activity.sign.load(Ordering::SeqCst), 1);
+    assert_eq!(activity.exec.load(Ordering::SeqCst), 1);
+}
 fn screen(client: &Client) -> Arc<Mutex<Vec<u8>>> {
     let out = Arc::new(Mutex::new(Vec::new()));
     drain_into(client.master.try_clone().unwrap(), out.clone());

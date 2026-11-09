@@ -47,6 +47,25 @@ pub struct BringUpRequest {
     pub client_pubkey: [u8; 32],
 }
 
+/// Decides whether a bring-up continues, given the running daemon's server info.
+pub type ServerInfoGate<'a> = &'a dyn Fn(Option<&ssh::VerifiedSshServerInfo>) -> bool;
+/// Receives the ready daemon's server info.
+pub type ServerInfoSink<'a> = &'a dyn Fn(Option<&ssh::VerifiedSshServerInfo>);
+
+/// The running daemon's `server-info`, read inside the bring-up's own SSH
+/// session through the located, trust-checked `qshd`; never a second login.
+#[derive(Clone, Copy)]
+pub struct ServerInfoProbe<'a> {
+    /// The pinned qsh key the reply must name.
+    pub expected_key: [u8; 32],
+    /// Called once, after lookup and before installation or startup, with
+    /// the verified reply or `None` when it is unknown. `false` ends the
+    /// bring-up with [`BringUpError::ServerInfoRefused`], the daemon unchanged.
+    pub before: Option<ServerInfoGate<'a>>,
+    /// Called once after readiness with a fresh query in the same session.
+    pub after_ready: Option<ServerInfoSink<'a>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ready {
     /// Reported complete [wire, handshake, channel] profiles; None is unknown.
@@ -110,6 +129,9 @@ pub enum BringUpError {
     EnsureFailed(String),
     /// `transport-ensure` said it succeeded but its answer does not parse.
     BadReady(String),
+    /// The caller's [`ServerInfoProbe`] stopped the bring-up before any
+    /// installation or startup.
+    ServerInfoRefused,
 }
 
 impl fmt::Display for BringUpError {
@@ -146,6 +168,11 @@ impl fmt::Display for BringUpError {
                  bringing it up over SSH will not help"
             ),
             BringUpError::EnsureFailed(t) | BringUpError::BadReady(t) => write!(f, "{t}"),
+            BringUpError::ServerInfoRefused => write!(
+                f,
+                "the running qshd's authenticated server info stopped the bring-up; \
+                 the daemon was left unchanged"
+            ),
         }
     }
 }
@@ -215,7 +242,20 @@ pub fn bring_up_identified(
     bind: std::sync::Arc<dyn knock::SocketBind>,
     cancel: &knock::Cancel,
 ) -> Result<IdentifiedReady, BringUpError> {
-    install::bring_up(req, policy, hooks, bind, cancel)
+    install::bring_up(req, policy, hooks, None, bind, cancel)
+}
+
+/// `bring_up_identified` that also reads the running daemon's server info
+/// on the same SSH login, as `probe` asks.
+pub fn bring_up_probed(
+    req: BringUpRequest,
+    policy: InstallPolicy,
+    hooks: BringUpHooks,
+    probe: Option<ServerInfoProbe<'_>>,
+    bind: std::sync::Arc<dyn knock::SocketBind>,
+    cancel: &knock::Cancel,
+) -> Result<IdentifiedReady, BringUpError> {
+    install::bring_up(req, policy, hooks, probe, bind, cancel)
 }
 
 /// What the lookup's run says: the qshd to start, or why there is none. The

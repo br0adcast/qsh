@@ -55,6 +55,7 @@ fn attempt_sources(
         background: true,
         install_policy: bringup::InstallPolicy::RestartOnly,
         images: Arc::new(crate::releases::GitHubImages::new(Some(home.join("cache")))),
+        server_info: None,
     };
     let route = ::connect::SshRoute {
         port: server.port,
