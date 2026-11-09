@@ -358,6 +358,30 @@ jobs:
           grep -F 'ledger_before_setsid=true pending_interval=true refund=false replacement_refused=true foreign_signal=false voluntary_exit=true rescue=false' "$runtime/keeper-integrated-results.log"
           grep -F 'wire_STOP=ack_then_actual_exit_watch_and_consumed_wait' "$runtime/keeper-integrated-results.log"
           grep -F 'keeper223 replacement_routes old_image=' "$runtime/keeper-integrated-results.log"
+      # #548: a failed keeper fixture's last manager wait is bounded. A blocked
+      # wait must end the harness with native stacks from `sample`. Reuses the
+      # ordinary harness features built above.
+      - name: Keeper failure settlement bound
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-keeper548.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export HOME="$runtime/home"
+          export XDG_CONFIG_HOME="$runtime/config"
+          export XDG_CACHE_HOME="$runtime/cache"
+          export HISTFILE=/dev/null
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          cargo test -p qshd --lib --features test-build-labels --locked -- \
+            darwin_process_scope::keeper_integration_tests::keeper548_ --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/results.log"
+          scripts/no-silent-skips.sh "$runtime/results.log" \
+            --require darwin_process_scope::keeper_integration_tests::keeper548_blocked_wait_returns_a_settled_task_without_diagnostics \
+            --require darwin_process_scope::keeper_integration_tests::keeper548_blocked_wait_reports_and_ends_the_harness \
+            --require darwin_process_scope::keeper_integration_tests::keeper548_descendants_follow_parents_and_reduce_names
+          grep -F 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$runtime/results.log"
       - name: Compile safe libraries and inline tests
         run: >-
           cargo test --lib --no-run --locked
