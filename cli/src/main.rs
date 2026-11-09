@@ -746,8 +746,10 @@ impl Links {
                 transport::handshake_payload::HS_VERSION,transport::channel::PROTOCOL_VERSION));
         }
         let view = qsh::upgrade_offer::presentation(
-            qsh::client_install::update_eligibility()
-                .unwrap_or(qsh::client_install::UpdateEligibility::Unmanaged),
+            || {
+                qsh::client_install::update_eligibility()
+                    .unwrap_or(qsh::client_install::UpdateEligibility::Unmanaged)
+            },
             policy.compatibility == ::connect::upgrade::Compatibility::Incompatible,
             policy.offer.as_ref().map(|offer| offer.version.as_str()),
         );
@@ -2066,10 +2068,11 @@ fn interactive(
                 && offered.insert((info.generation, info.core_version.clone(), actionable))
             {
                 let policy = qsh::server_discovery::decision(Some(info));
-                let eligibility = qsh::client_install::update_eligibility()
-                    .unwrap_or(qsh::client_install::UpdateEligibility::Unmanaged);
                 let view = qsh::upgrade_offer::presentation(
-                    eligibility,
+                    || {
+                        qsh::client_install::update_eligibility()
+                            .unwrap_or(qsh::client_install::UpdateEligibility::Unmanaged)
+                    },
                     policy.compatibility == ::connect::upgrade::Compatibility::Incompatible,
                     policy.offer.as_ref().map(|offer| offer.version.as_str()),
                 );
