@@ -2344,6 +2344,10 @@ pub(super) mod native {
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert_eq!(input, b"keeper-input-proof\n");
+            // #548: fds 0-2 share one description. XNU discards unread PTY
+            // output when the last slave close is non-blocking, so restore
+            // blocking mode before writing the marker and closing stdio.
+            assert_eq!(unsafe { nix::libc::fcntl(0, nix::libc::F_SETFL, flags) }, 0);
             assert_eq!(
                 unsafe { nix::libc::ioctl(0, nix::libc::TIOCGWINSZ, &mut size) },
                 0
