@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- Release publication waits for approval in the `release` environment and
+  refuses to sign without a tag ruleset protecting `v*` tags. Releases are
+  created as drafts and published after their last asset, and must be
+  immutable once published.
+
 ## [0.6.0-rc1]
 
 ### Changed
