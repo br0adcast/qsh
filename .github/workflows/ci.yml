@@ -377,10 +377,24 @@ jobs:
           cargo test -p qshd --lib --features test-build-labels --locked -- \
             darwin_process_scope::keeper_integration_tests::keeper548_ --nocapture --test-threads=1 \
             2>&1 | tee "$runtime/results.log"
-          scripts/no-silent-skips.sh "$runtime/results.log" \
-            --require darwin_process_scope::keeper_integration_tests::keeper548_blocked_wait_returns_a_settled_task_without_diagnostics \
-            --require darwin_process_scope::keeper_integration_tests::keeper548_blocked_wait_reports_and_ends_the_harness \
-            --require darwin_process_scope::keeper_integration_tests::keeper548_descendants_follow_parents_and_reduce_names
+          # Filtered on purpose, so each test is required by name instead of
+          # scripts/no-silent-skips.sh, which rejects any filter.
+          for name in \
+            darwin_process_scope::keeper_integration_tests::keeper548_blocked_wait_returns_a_settled_task_without_diagnostics \
+            darwin_process_scope::keeper_integration_tests::keeper548_blocked_wait_reports_and_ends_the_harness \
+            darwin_process_scope::keeper_integration_tests::keeper548_descendants_follow_parents_and_reduce_names
+          do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/results.log"
+          done
+          if grep -F 'SKIPPED' "$runtime/results.log"; then exit 1; fi
           grep -F 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$runtime/results.log"
       - name: Compile safe libraries and inline tests
         run: >-
