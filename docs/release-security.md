@@ -14,7 +14,8 @@ official GitHub release and executes only its temporary `qsh` member. Initial
 trust covers both the script and that executable through GitHub HTTPS; neither
 checksums served beside it nor its later signature verification can authenticate
 that executable before it runs. There is no downloaded verifier or mutable root
-bootstrap.
+bootstrap. To authenticate that executable yourself before it runs, use the
+[first-installation recipe](#first-installation-from-a-verified-archive).
 
 The temporary client delegates to the Rust installation engine. That engine
 re-downloads and authenticates the selected release manifest and bundle under
@@ -30,6 +31,55 @@ fixed twelve-product signed manifest. Release validation must check the safe
 `--self-install --help` capability probe and exercise first installation from
 the exact candidate artifacts before claiming live bootstrap support. Existing
 published tags and assets must remain unchanged.
+
+## Independent verification
+
+A person can authenticate a release without qsh. The
+[README recipe](../README.md#installing) runs `gh attestation verify` on the
+local bundle. GitHub CLI checks the certificate chain, transparency-log entry and
+signature against its own Sigstore trust root, not qsh's compiled roots. It
+requires:
+
+- issuer `https://token.actions.githubusercontent.com`;
+- SAN `https://github.com/br0adcast/qsh/.github/workflows/release.yml@refs/tags/v<VERSION>`,
+  that is, the release workflow at the exact tag;
+- repository `br0adcast/qsh` and a GitHub-hosted runner;
+- predicate type `https://github.com/br0adcast/qsh/release-manifest/v1`.
+
+It does not check the repository ID, or that the predicate's version, tag and
+source commit agree with the certificate; qsh's verifier does. To check them,
+add this to the same command:
+
+```sh
+--format json --jq '.[].verificationResult | [.signature.certificate.sourceRepositoryIdentifier,
+  .statement.predicate.version, .statement.predicate.tag,
+  .statement.predicate.source_commit, .signature.certificate.sourceRepositoryDigest] | @tsv'
+```
+
+Expect `1423663657`, `<VERSION>`, `v<VERSION>` and two equal commit hashes.
+A file is authenticated only through its line in the verified `SHA256SUMS`.
+
+### First installation from a verified archive
+
+This replaces the bootstrap script. The first executable is then trusted through
+the verified manifest rather than GitHub HTTPS alone. It requires an
+installer-capable release (see [Client bootstrap trust](#client-bootstrap-trust)).
+
+```sh
+VERSION=0.6.0
+TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
+STEM=qsh-$VERSION-$TARGET
+base=https://github.com/br0adcast/qsh/releases/download/v$VERSION
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  -O "$base/SHA256SUMS" -O "$base/SHA256SUMS.sigstore.json" -O "$base/$STEM.tar.gz"
+# Authenticate SHA256SUMS and check $STEM.tar.gz as in the README.
+tar xzf "$STEM.tar.gz"
+"$STEM/qsh" --self-install --version "$VERSION"
+```
+
+The installation engine then downloads and authenticates the release again under
+the compiled policy, as it does for the script. `--prefix PATH` works as with the
+script.
 
 ## Authority
 
