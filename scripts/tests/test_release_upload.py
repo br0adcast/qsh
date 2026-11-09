@@ -55,7 +55,8 @@ elif a[:2] == ['release', 'upload']:
     if s.get('race'):
         s['assets'][f.name] = s['race']; save(); fail()
     if s.get('error') == 'upload' or f.name in s['assets']: fail()
-    s['assets'][f.name] = f.read_bytes().decode('latin1')
+    # GitHub may store an upload under another name and still succeed.
+    s['assets'][s.get('rename', {}).get(f.name, f.name)] = f.read_bytes().decode('latin1')
     s['mutations'].append('upload:'+f.name); save()
 else: raise AssertionError(a)
 '''
@@ -172,13 +173,21 @@ class ReleaseUploadTests(unittest.TestCase):
         self.assertEqual(s['mutations'], ['create','upload:a.tar.gz','upload:b.deb'])
 
     def test_prerelease_rpm_asset_name_uploads_and_retries(self):
-        name='qsh-1.2.3~rc1-1.x86_64.rpm'
+        name='qsh-1.2.3-rc1-1.x86_64.rpm'
         result,state,_=self.run_upload(files={name:'rpm fixture'})
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(state['mutations'],['upload:'+name])
         result,state,initial=self.run_upload({name:'rpm fixture'},files={name:'rpm fixture'})
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(state,initial)
+
+    def test_renamed_upload_fails_instead_of_reporting_publication(self):
+        renamed = {'b.deb': 'b.renamed.deb'}
+        result, state, _ = self.run_upload(rename=renamed)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not published under their names: b.deb', result.stderr)
+        self.assertEqual(state['assets'], {'a.tar.gz': 'aaa', 'b.renamed.deb': 'bbb'})
+        self.assertEqual(state['mutations'], ['upload:a.tar.gz', 'upload:b.deb'])
 
     def test_binary_identical_retry_and_same_size_conflict(self):
         for remote, success in [('\x00\xffa', True), ('\x00\xffb', False)]:
@@ -262,7 +271,9 @@ class ReleaseUploadTests(unittest.TestCase):
                 self.assertEqual(json.loads(self.state.read_text()), initial)
 
     def test_invalid_names_and_duplicates_fail_before_mutation(self):
-        for files in [{'bad#label':'x'}, {'bad~name;cmd.rpm':'x'}, {'~leading.rpm':'x'}, {'one/a':'x','two/a':'y'}]:
+        for files in [{'bad#label':'x'}, {'bad~name;cmd.rpm':'x'}, {'~leading.rpm':'x'}, {'one/a':'x','two/a':'y'},
+                      {'qsh-1.2.3~rc1-1.x86_64.rpm':'x'}, {'qsh-1.2.3+build-1.x86_64.rpm':'x'},
+                      {'.leading':'x'}, {'trailing.':'x'}]:
             with self.subTest(files=files):
                 r, s, initial = self.run_upload(files=files)
                 self.assertNotEqual(r.returncode, 0)

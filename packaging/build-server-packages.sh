@@ -27,8 +27,8 @@
 #
 # Usage: packaging/build-server-packages.sh [deb|rpm|all]
 #
-#   deb   Ubuntu 20.04 container:  qshd_<version>_amd64.deb, _arm64.deb
-#   rpm   Rocky Linux 8 container: qshd-<version>.x86_64.rpm, .aarch64.rpm
+#   deb   Ubuntu 20.04 container:  qshd_<version>-1_amd64.deb, _arm64.deb
+#   rpm   Rocky Linux 8 container: qshd-<version>-1.x86_64.rpm, .aarch64.rpm
 #   all   both, which is also what no argument means
 #
 # Environment:
@@ -250,6 +250,21 @@ check_floor() {
   ok "$what: glibc floor $found, within the $floor this image promises"
 }
 
+# The generators name a package after its metadata version, whose '~' GitHub
+# rewrites on upload (#526). Publish it under the release-version name, which
+# check-release-output.py then requires. Callers use `pkg=$(publish_name ...)`,
+# where errexit does not reach, hence the explicit `|| die`.
+publish_name() {
+  local pkg=$1 format=$2 arch=$3 name
+  name=$(python3 "$root/scripts/check-release-output.py" package-name --format "$format" \
+    --program qshd --version "$version" --arch "$arch") ||
+    die "$(basename "$pkg"): no publishable $format name for version $version"
+  if [[ $(basename "$pkg") != "$name" ]]; then
+    mv -- "$pkg" "$dist/$name" || die "cannot rename $(basename "$pkg") to $name"
+  fi
+  printf '%s\n' "$dist/$name"
+}
+
 for row in "${targets[@]}"; do
   read -r triple deb_arch rpm_arch strip_tool machine <<<"$row"
 
@@ -302,6 +317,7 @@ for row in "${targets[@]}"; do
       pkg=$(tail -n 1 <<<"$out")
       [[ -f $pkg ]] || pkg=$(find "$dist" -maxdepth 1 -name "qshd_*_$deb_arch.deb" | head -n 1)
       [[ -n $pkg && -f $pkg ]] || die "cargo deb produced no package for $triple: $out"
+      pkg=$(publish_name "$pkg" deb "$deb_arch")
 
       python3 "$root/scripts/check-release-output.py" package --format deb --program qshd \
         --version "$version" --arch "$deb_arch" "$pkg"
@@ -360,6 +376,7 @@ for row in "${targets[@]}"; do
       pkg=$(tail -n 1 <<<"$out")
       [[ -f $pkg ]] || pkg=$(find "$dist" -maxdepth 1 -name "qshd-*.$rpm_arch.rpm" | head -n 1)
       [[ -n $pkg && -f $pkg ]] || die "cargo generate-rpm produced no package for $triple: $out"
+      pkg=$(publish_name "$pkg" rpm "$rpm_arch")
 
       python3 "$root/scripts/check-release-output.py" package --format rpm --program qshd \
         --version "$version" --arch "$rpm_arch" "$pkg"

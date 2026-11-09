@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Name prerelease DEB and RPM files after the release version, such as
+  `qsh_0.6.0-rc.2-1_amd64.deb`, so the signed `SHA256SUMS` matches the names
+  GitHub publishes. Package metadata keeps `0.6.0~rc.2`.
+
 ## [0.6.0-rc1]
 
 ### Changed

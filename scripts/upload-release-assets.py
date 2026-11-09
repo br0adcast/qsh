@@ -13,6 +13,9 @@ import time
 
 
 RELEASE_VISIBILITY_DELAYS = (1, 2, 4, 8, 16, 32)
+# GitHub rewrites other characters in asset names, and leading or trailing
+# periods; the signed manifest must name exactly what is published (#526).
+ASSET_NAME = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?')
 
 
 class UploadError(Exception):
@@ -76,7 +79,7 @@ def publish(args):
     names = set()
     paths = [Path(value) for value in args.assets]
     for path in paths:
-        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+~-]*', path.name):
+        if not ASSET_NAME.fullmatch(path.name):
             raise UploadError('Unsafe asset name: ' + path.name)
         if path.name in names:
             raise UploadError('Duplicate asset name: ' + path.name)
@@ -100,9 +103,8 @@ def publish(args):
             gh(*command)
             release = created_release(endpoint, args.tag)
         release_id = release['id']
-        assets = pages(f'{endpoint}/{release_id}/assets')
         remote = {}
-        for asset in assets:
+        for asset in pages(f'{endpoint}/{release_id}/assets'):
             name = asset['name']
             if name in remote:
                 raise UploadError('Duplicate remote asset name: ' + name)
@@ -124,6 +126,11 @@ def publish(args):
                 # GitHub rejects collisions; never pass --clobber or delete assets.
                 gh('release', 'upload', args.tag, '--repo', args.repo, str(snapshot))
                 print('Uploaded missing asset: ' + snapshot.name)
+        published = {asset['name'] for asset in pages(f'{endpoint}/{release_id}/assets')}
+        renamed = [snapshot.name for snapshot in snapshots if snapshot.name not in published]
+        if renamed:
+            raise UploadError('Release assets are not published under their names: '
+                              + ', '.join(renamed))
 
 
 def main():
