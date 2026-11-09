@@ -289,6 +289,11 @@ fn execute_with_cancel(
         selected,
         installed.executable.display()
     );
+    if let Some(error) = installed.retention_error {
+        message.push_str(&format!(
+            "\nOlder installed generations were not all removed: {error}"
+        ));
+    }
     if !competing.is_empty() {
         message.push_str(&format!(
             "\nExisting PATH copy: {}. PATH was not changed.",

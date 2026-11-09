@@ -7,6 +7,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep only the active and the replaced managed client generation after an
+  update, and document how to remove a managed installation.
+
 ## [0.6.0-rc1]
 
 ### Changed
