@@ -524,6 +524,8 @@ elif name == 'python3':
                          'timeout-minutes: 45', 'NATIVE_TARGET: x86_64-apple-darwin',
                          'ref: ${{ github.sha }}', 'checkout_sha=$(git rev-parse HEAD)',
                          'test "$checkout_sha" = "$GITHUB_SHA"',
+                         'shim_sha=$(/usr/bin/git rev-parse HEAD)',
+                         'test "$shim_sha" = "$checkout_sha"',
                          '"$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
                          'key: native-owner-x86_64-apple-darwin${{ matrix.cache_suffix }}'):
             self.assertIn(required, job)

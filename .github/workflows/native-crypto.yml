@@ -289,38 +289,13 @@ jobs:
           set -euo pipefail
           checkout_sha=$(git rev-parse HEAD)
           test "$checkout_sha" = "$GITHUB_SHA"
+          # The preflight bounds each query to ten seconds. On a fresh macOS 26
+          # Intel image the first /usr/bin/git call (an xcrun shim) took 7.6s
+          # and a repeat 0.6s; an earlier preflight refused that first query
+          # after 12s (#551). Pay the one-time cost here, unbounded and checked.
+          shim_sha=$(/usr/bin/git rev-parse HEAD)
+          test "$shim_sha" = "$checkout_sha"
           printf 'darwin223 checkout=%s event=%s run=%s attempt=%s\n' "$checkout_sha" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
-      # TEMPORARY (#551 diagnosis): time each preflight metadata query with the
-      # preflight's environment, report status and the first stderr line, and
-      # never fail. Removed once the macOS 26 Intel refusal is explained.
-      - name: Diagnose Intel runtime metadata queries
-        shell: bash
-        timeout-minutes: 3
-        run: |
-          python3 -I -B - <<'PY' || true
-          import os, subprocess, tempfile, time
-          for argv in (['/usr/bin/git', 'rev-parse', 'HEAD'], ['/usr/bin/git', 'rev-parse', 'HEAD'],
-                       ['/usr/sbin/sysctl', '-n', 'kern.version'], ['/usr/sbin/sysctl', '-n', 'kern.osrelease'],
-                       ['/usr/sbin/sysctl', '-n', 'kern.osversion'], ['/usr/sbin/sysctl', '-n', 'hw.machine'],
-                       ['/usr/bin/uname', '-m'], ['/usr/bin/sw_vers', '-productVersion']):
-              with tempfile.TemporaryDirectory(prefix='qsh-diag-') as home:
-                  env = os.environ.copy()
-                  env.update(HOME=home, XDG_CACHE_HOME=home + '/cache', XDG_CONFIG_HOME=home + '/config',
-                             HISTFILE='/dev/null', LANG='C', LC_ALL='C')
-                  for name in ('SSH_AUTH_SOCK', 'RUSTUP_HOME', 'CARGO_HOME'):
-                      env.pop(name, None)
-                  start = time.monotonic()
-                  try:
-                      result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
-                                              env=env, timeout=60, start_new_session=True)
-                      status, out, err = result.returncode, result.stdout, result.stderr
-                  except subprocess.TimeoutExpired:
-                      status, out, err = 'timeout', b'', b''
-                  elapsed = time.monotonic() - start
-                  first = err.decode('ascii', 'replace').splitlines()[:1]
-                  print('DIAG argv=%s seconds=%.2f status=%s stdout_lines=%d stderr_bytes=%d stderr_first=%r'
-                        % (' '.join(argv), elapsed, status, out.count(b'\n'), len(err), (first[0][:160] if first else '')))
-          PY
       - name: Observe the Intel Darwin runtime
         shell: bash
         timeout-minutes: 2
