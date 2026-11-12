@@ -24,7 +24,7 @@ libc = "0.2"
 nix = { version = "0.28", features = ["term", "signal"] }
 prediction = { path = "../crates/prediction" }
 rand = "0.8"
-rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }
 render = { path = "../crates/render" }
 release-auth = { path = "../crates/release-auth" }
 sha1 = "0.10"
