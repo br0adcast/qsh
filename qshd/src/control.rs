@@ -1542,10 +1542,12 @@ mod tests {
     #[test]
     fn confirmed_restart_publication_preserves_non_utf8_leaf_bytes() {
         use std::os::unix::ffi::OsStringExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .join(std::ffi::OsString::from_vec(b"control-\xff.sock".to_vec()));
+        let fixture = PublicationFixture::new();
+        let leaf = std::ffi::OsString::from_vec(b"control-\xff.sock".to_vec());
+        fixture
+            .probe_lock_creation(&leaf)
+            .expect("Linux must create the exact raw lock leaf");
+        let path = fixture.directory.path().join(leaf);
         let transaction = EnsureLock::acquire(&path, Duration::from_secs(1)).unwrap();
         let (listener, cleanup) = transaction.bind_private_absent_owned().unwrap();
         let _client = UnixStream::connect(&path).unwrap();
@@ -1616,6 +1618,55 @@ mod tests {
             self.assert_sentinel_and_parent();
         }
 
+        fn probe_lock_creation(&self, leaf: &std::ffi::OsStr) -> std::io::Result<()> {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            self.assert_unchanged();
+            let mut lock = leaf.to_owned();
+            lock.push(".lock");
+            let descriptor = nix::fcntl::openat(
+                Some(self.parent.as_raw_fd()),
+                lock.as_os_str(),
+                nix::fcntl::OFlag::O_WRONLY
+                    | nix::fcntl::OFlag::O_CREAT
+                    | nix::fcntl::OFlag::O_EXCL
+                    | nix::fcntl::OFlag::O_NOFOLLOW
+                    | nix::fcntl::OFlag::O_CLOEXEC
+                    | nix::fcntl::OFlag::O_NONBLOCK,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )?;
+            // SAFETY: openat returned this fixture's newly owned descriptor.
+            let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+            let held = nix::sys::stat::fstat(file.as_raw_fd()).unwrap();
+            assert_eq!(held.st_mode & nix::libc::S_IFMT, nix::libc::S_IFREG);
+            assert_eq!(held.st_mode & 0o7777, 0o600);
+            assert_eq!(held.st_uid, nix::unistd::geteuid().as_raw());
+            assert_eq!(held.st_nlink, 1);
+            let mut expected = self.names.clone();
+            expected.insert(lock.as_bytes().to_vec());
+            assert_eq!(self.current_names(), expected);
+            self.assert_sentinel_and_parent();
+            let named = nix::sys::stat::fstatat(
+                Some(self.parent.as_raw_fd()),
+                lock.as_os_str(),
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+            assert!(
+                path::same(&held, &named),
+                "only unlink this probe's exact inode"
+            );
+            nix::unistd::unlinkat(
+                Some(self.parent.as_raw_fd()),
+                lock.as_os_str(),
+                nix::unistd::UnlinkatFlags::NoRemoveDir,
+            )
+            .unwrap();
+            drop(file);
+            self.assert_unchanged();
+            Ok(())
+        }
+
         fn assert_publication(&self, leaf: &std::ffi::OsStr) {
             use std::os::fd::AsRawFd;
             use std::os::unix::ffi::OsStrExt;
@@ -1653,18 +1704,14 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn confirmed_restart_publication_obeys_native_non_utf8_leaf_contract() {
-        use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStringExt;
         let fixture = PublicationFixture::new();
         let leaf = std::ffi::OsString::from_vec(b"control-\xff.sock".to_vec());
-        let probe = nix::sys::stat::fstatat(
-            Some(fixture.parent.as_raw_fd()),
-            leaf.as_os_str(),
-            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
-        );
-        fixture.assert_unchanged();
-        match probe {
-            Err(nix::errno::Errno::EILSEQ) => {
+        // An absent lookup does not establish native creation support. Probe
+        // the exact raw lock leaf, then exercise acquisition from absence.
+        match fixture.probe_lock_creation(&leaf) {
+            Err(error) if error.raw_os_error() == Some(nix::libc::EILSEQ) => {
+                fixture.assert_unchanged();
                 let endpoint = fixture.directory.path().join(&leaf);
                 let error = EnsureLock::acquire(&endpoint, Duration::from_secs(1))
                     .err()
@@ -1673,11 +1720,11 @@ mod tests {
                 fixture.assert_unchanged();
                 println!("\nNATIVE_LEAF_CONTRACT eilseq-refusal-no-mutation");
             }
-            Err(nix::errno::Errno::ENOENT) => {
+            Ok(()) => {
                 fixture.assert_publication(&leaf);
                 println!("\nNATIVE_LEAF_CONTRACT raw-byte-publication");
             }
-            other => panic!("unexpected native malformed-leaf fstatat result: {other:?}"),
+            Err(error) => panic!("unexpected native malformed-lock creation error: {error}"),
         }
     }
 

@@ -12,11 +12,15 @@ import codecs
 import errno
 from contextlib import contextmanager
 import json
+import math
 import os
 import platform
 from pathlib import Path
 import re
 import selectors
+import shutil
+import stat
+import uuid
 import signal
 import subprocess
 import tarfile
@@ -426,6 +430,8 @@ def stream_command(command, env, path, *, timeout=None, limit=MAX_COMMAND_OUTPUT
                 [cleanup_error('secondary', error) for error in secondary], sort_keys=True))
             raise primary.with_traceback(primary_traceback) from secondary[0]
         raise primary.with_traceback(primary_traceback)
+    path.with_suffix(path.suffix+'.completion.json').write_text(json.dumps(dict(
+        status=child.returncode, child_reaped=consumed, output_eof=True, mask_restored=True), sort_keys=True)+'\n')
     return child.returncode
 
 
@@ -518,15 +524,17 @@ def select_artifact(log, package, kind, env, *, optional=False):
             or parsed.scheme != 'file' or Path(unquote(parsed.path)).resolve() != folder.resolve()
             or parsed.fragment not in expected_fragment or record.get('features') != []
             or record.get('profile', {}).get('test') is not (kind == 'test')
+            or record.get('profile', {}).get('opt_level') != '1'
             or Path(record.get('target', {}).get('src_path', '')).resolve() != source.resolve()
             or not executable.is_absolute() or not executable.is_file()
             or not os.access(executable, os.X_OK)
             or executable.resolve().parent != (profile_dir if kind == 'bin' else profile_dir/'deps').resolve()
             or (kind == 'bin' and executable.name != package)):
         raise ValueError(f'{package}/{name}: unexpected current artifact identity or location')
+    identity = file_identity(executable, MAX_ARTIFACT_BYTES)
     return dict(package=package, target=name, kind=kind, command_log=log.name,
-                executable=str(executable), bytes=executable.stat().st_size,
-                sha256=hashlib.sha256(executable.read_bytes()).hexdigest(), record=record)
+                executable=str(executable), bytes=identity['bytes'],
+                sha256=identity['sha256'], record=record)
 
 
 def prepare(cases, env, evidence, context=None):
@@ -559,9 +567,10 @@ def prepare(cases, env, evidence, context=None):
     if Path(pair[0]['executable']).parent != Path(pair[1]['executable']).parent:
         raise ValueError('current pair is not adjacent')
     for artifact in pair+harnesses:
-        if hashlib.sha256(Path(artifact['executable']).read_bytes()).hexdigest() != artifact['sha256']:
+        if file_identity(artifact['executable'], MAX_ARTIFACT_BYTES)['sha256'] != artifact['sha256']:
             raise ValueError('prepared artifact changed during preparation')
     context.artifacts = dict(pair=pair, harnesses=harnesses)
+    artifact_custody(context.artifacts, env, evidence)
     (evidence/'prepared.json').write_text(json.dumps(dict(source=context.source,
         tracked_input_sha256=context.input_digest, cases=cases, profile='test', toolchain=toolchain,
         target=env.get('CARGO_BUILD_TARGET') or re.search(r'^host: (\S+)$', toolchain, re.MULTILINE)[1],
@@ -571,44 +580,456 @@ def prepare(cases, env, evidence, context=None):
 
 
 def run_case(package, name, ignored, env, evidence, context=None):
-    command = ['cargo', 'test', '--locked', '-p', package, '--test', 'mixed_versions',
-               name, '--', '--exact', '--nocapture', '--test-threads=1', '--color=never']
-    if ignored:
-        command.append('--ignored')
-    context = context or Evidence(current_source(), ((package, name, ignored),), env, evidence)
+    if context is None or not hasattr(context, 'artifacts'):
+        raise ValueError('runtime requires verified prepared artifacts')
     context.verify(context.cases, env)
     if (package, name, ignored) not in context.cases:
         raise ValueError('runtime case differs from prepared selection')
+    if hasattr(context, 'validate_prepared'):
+        context.validate_prepared()
+    else:
+        validate_artifacts(context.artifacts, env)
+    harnesses = [a for a in context.artifacts['harnesses'] if a['package'] == package]
+    if len(harnesses) != 1:
+        raise ValueError('runtime requires one exact prepared harness')
+    command = [harnesses[0]['executable'], name, '--exact', '--nocapture',
+               '--test-threads=1', '--color=never']
+    if ignored:
+        command.append('--ignored')
     with context.phase('runtime-'+name, command) as outcome:
         path = evidence/(name+'.log')
         status = stream_command(command, env, path)
         outcome['status'] = status
         check_result(name, path.read_text(errors='replace'), status)
     context.verify(context.cases, env)
+    if hasattr(context, 'validate_prepared'):
+        context.validate_prepared()
     print(f'ACCEPTED {package}::{name}: 1 passed; exit 0', flush=True)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--archive', type=Path, help='already downloaded archive; still verified against the committed digest')
-    parser.add_argument('--evidence', type=Path, required=True, help='new evidence directory outside the source tree')
-    parser.add_argument('--service-only', action='store_true', help='run the two actual personal-service scenarios in an existing native lane')
-    args = parser.parse_args()
+BUNDLE_SCHEMA = 1
+CI_IDENTITY = ('GITHUB_REPOSITORY', 'GITHUB_RUN_ID', 'GITHUB_JOB', 'GITHUB_RUN_ATTEMPT')
+MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+
+
+def directory_identity(path):
+    path = Path(path).absolute()
+    info = path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700 or path.is_symlink()):
+        raise ValueError('prepared backing is not a private owned directory')
+    return dict(path=str(path), resolved=str(path.resolve(strict=True)),
+                device=info.st_dev, inode=info.st_ino, uid=info.st_uid, mode=stat.S_IMODE(info.st_mode))
+
+
+def file_identity(path, limit=MAX_ARTIFACT_BYTES):
+    path = Path(path).absolute()
+    before = path.lstat()
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+            or before.st_mode & 0o022 or before.st_size > limit):
+        raise ValueError('prepared file is not bounded regular owned backing')
+    digest = hashlib.sha256()
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(descriptor, 'rb') as source:
+        opened = os.fstat(source.fileno())
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError('prepared file changed while opening')
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(chunk)
+        after = os.fstat(source.fileno())
+    facts = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode, st.st_uid)
+    if facts(before) != facts(after) or facts(path.lstat()) != facts(after):
+        raise ValueError('prepared file changed while hashing')
+    return dict(path=str(path), resolved=str(path.resolve(strict=True)), device=after.st_dev,
+                inode=after.st_ino, uid=after.st_uid, mode=stat.S_IMODE(after.st_mode),
+                bytes=after.st_size, mtime_ns=after.st_mtime_ns, ctime_ns=after.st_ctime_ns,
+                sha256=digest.hexdigest())
+
+
+def atomic_record(path, record):
+    temporary = path.with_name('.'+path.name+'-'+uuid.uuid4().hex)
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, 'w') as output:
+        json.dump(record, output, sort_keys=True)
+        output.write('\n')
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
+
+
+def create_bundle(path):
+    path = Path(path).absolute()
+    path = path.parent.resolve(strict=True) / path.name
+    if path.is_relative_to(WORKSPACE.resolve()):
+        raise ValueError('prepared bundle must be outside the source tree')
+    path.mkdir(mode=0o700)
+    directory_identity(path)
+    return path
+
+
+def artifact_custody(artifacts, env, directory):
+    for artifact in artifacts['pair'] + artifacts['harnesses']:
+        artifact['identity'] = file_identity(artifact['executable'])
+        artifact['command_path'] = str((directory / artifact['command_log']).absolute())
+        artifact['command_identity'] = file_identity(artifact['command_path'], MAX_COMMAND_OUTPUT)
+    validate_artifacts(artifacts, env)
+
+
+def validate_artifacts(artifacts, env):
+    if (len(artifacts['pair']) != 2
+            or {a['package'] for a in artifacts['pair']} != {'qsh', 'qshd'}
+            or len({a['package'] for a in artifacts['harnesses']}) != len(artifacts['harnesses'])):
+        raise ValueError('ambiguous prepared artifact set')
+    if (any(a['kind'] != 'bin' for a in artifacts['pair'])
+            or any(a['kind'] != 'test' for a in artifacts['harnesses'])):
+        raise ValueError('prepared normal binary and harness roles differ')
+    for artifact in artifacts['pair'] + artifacts['harnesses']:
+        if (file_identity(artifact['executable']) != artifact['identity']
+                or file_identity(artifact['command_path'], MAX_COMMAND_OUTPUT) != artifact['command_identity']):
+            raise ValueError('prepared artifact or Cargo record backing changed')
+        selected = select_artifact(Path(artifact['command_path']), artifact['package'], artifact['kind'], env)
+        if any(selected[key] != artifact[key] for key in selected):
+            raise ValueError('prepared Cargo artifact identity changed')
+    if len({Path(a['executable']).resolve().parent for a in artifacts['pair']}) != 1:
+        raise ValueError('prepared pair is not adjacent')
+
+
+def validate_preparation_phases(record, cases):
+    expected = [('toolchain', ['rustc', '-vV']),
+                ('pair', ['cargo', 'build', '--locked', '--profile', 'test', '-p', 'qsh', '-p', 'qshd',
+                          '--bins', '--message-format=json-render-diagnostics']),
+                ('pair-artifacts', None)]
+    for package in dict.fromkeys(case[0] for case in cases):
+        expected += [('harness-'+package, ['cargo', 'test', '--locked', '-p', package, '--test',
+                                          'mixed_versions', '--no-run', '--message-format=json-render-diagnostics']),
+                     ('harness-artifacts-'+package, None)]
+    phases = record['phases']
+    if phases and phases[0].get('phase') == 'fixture':
+        expected.insert(0, ('fixture', None))
+    if len(phases) != 2 * len(expected):
+        raise ValueError('incomplete preparation phase receipts')
+    for index, (name, command) in enumerate(expected):
+        start, end = phases[2*index:2*index+2]
+        elapsed = end.get('elapsed')
+        if (start.get('phase') != name or start.get('event') != 'start' or start.get('command') != command
+                or end.get('phase') != name or end.get('event') != 'end'
+                or type(end.get('status')) is not int or end['status'] != 0
+                or type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0
+                or any(phase.get(key) != record[key] for phase in (start, end)
+                       for key in ('source', 'platform', 'machine'))):
+            raise ValueError('preparation phase identity or completion differs')
+
+
+def seal_bundle(context, bundle, runtime, old_pair, env):
+    root = directory_identity(bundle)
+    runtime = Path(runtime)
+    if runtime != bundle / 'runtime':
+        raise ValueError('prepared runtime is outside its owned bundle')
+    context.verify(context.cases, env)
+    records = bundle / 'records'
+    records.mkdir(mode=0o700)
+    for artifact in context.artifacts['pair'] + context.artifacts['harnesses']:
+        source = Path(artifact['command_path'])
+        destination = records / source.name
+        if not destination.exists():
+            # Logs were already output-bounded by the owned command runner.
+            with destination.open('xb') as output:
+                output.write(source.read_bytes())
+            destination.chmod(0o600)
+        artifact['command_path'] = str(destination)
+        artifact['command_identity'] = file_identity(destination, MAX_COMMAND_OUTPUT)
+    validate_artifacts(context.artifacts, env)
+    if [Path(p) for p in old_pair] != [runtime / 'old/qsh', runtime / 'old/qshd']:
+        raise ValueError('released pair is outside owned backing')
+    shim = runtime / 'no-build'
+    shim.write_text('#!/bin/sh\nprintf "%s\\n" "prepared runtime forbids build fallback" >&2\nexit 125\n')
+    shim.chmod(0o700)
+    toolchain = (context.directory / 'toolchain.log').read_text()
+    host = re.search(r'^host: (\S+)$', toolchain, re.MULTILINE)
+    if host is None:
+        raise ValueError('prepared toolchain lacks a host')
+    target = env.get('CARGO_BUILD_TARGET') or host[1]
+    machine = {'arm64': 'aarch64'}.get(platform.machine(), platform.machine())
+    if target.split('-')[0] != machine:
+        raise ValueError('prepared target does not match native machine')
+    fixture = fixture_for_host()
+    record = dict(schema=BUNDLE_SCHEMA, identity=uuid.uuid4().hex, root=root,
+                  source=context.source, tracked_input_sha256=context.input_digest,
+                  cases=context.cases, registry=CASES, environment=context.environment,
+                  ci={key: env.get(key) for key in CI_IDENTITY}, platform=platform.system(),
+                  machine=platform.machine(), target=target, toolchain=toolchain,
+                  profile='test', explicit_features=[], phases=context.phases,
+                  artifacts=context.artifacts,
+                  fixture=dict(prefix=fixture[0], archive_sha256=fixture[1],
+                               files=[file_identity(path) for path in old_pair]),
+                  shim=file_identity(shim),
+                  backing=[directory_identity(path) for path in
+                           [runtime, records] + [runtime / name for name in ('home', 'config', 'cache', 'tmp', 'old')]])
+    validate_preparation_phases(record, context.cases)
+    # Complete is the last publication, never an executable partial preparation.
+    atomic_record(bundle / 'complete.json', record)
+    return record
+
+
+def load_record(bundle):
+    directory_identity(bundle)
+    marker = bundle / 'complete.json'
+    file_identity(marker, 4 * 1024 * 1024)
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('ambiguous prepared marker')
+            result[key] = value
+        return result
+    return json.loads(marker.read_text(), object_pairs_hook=unique)
+
+
+def verify_bundle(bundle, record, cases, env, context):
+    if (record.get('schema') != BUNDLE_SCHEMA
+            or not re.fullmatch('[0-9a-f]{32}', record.get('identity', ''))
+            or record.get('root') != directory_identity(bundle)
+            or record.get('source') != current_source()
+            or record.get('tracked_input_sha256') != current_input()
+            or record.get('cases') != [list(case) for case in cases]
+            or record.get('registry') != [list(case) for case in CASES]
+            or record.get('environment') != {key: env.get(key) for key in BUILD_ENVIRONMENT}
+            or record.get('ci') != {key: env.get(key) for key in CI_IDENTITY}
+            or record.get('platform') != platform.system() or record.get('machine') != platform.machine()
+            or record.get('profile') != 'test' or record.get('explicit_features') != []):
+        raise ValueError('foreign or stale prepared bundle binding')
+    validate_preparation_phases(record, cases)
+    toolchain = context.command('runtime-toolchain-'+str(len(context.phases)), ['rustc', '-vV'], env).read_text()
+    host = re.search(r'^host: (\S+)$', toolchain, re.MULTILINE)
+    if (toolchain != record['toolchain'] or host is None
+            or record['target'] != (env.get('CARGO_BUILD_TARGET') or host[1])):
+        raise ValueError('prepared toolchain or target changed')
+    expected_backing = [bundle / 'runtime', bundle / 'records'] + [bundle / 'runtime' / name for name in ('home', 'config', 'cache', 'tmp', 'old')]
+    if [item['path'] for item in record['backing']] != list(map(str, expected_backing)):
+        raise ValueError('foreign prepared backing paths')
+    for artifact in record['artifacts']['pair'] + record['artifacts']['harnesses']:
+        name = artifact['command_log']
+        if name not in ('pair.log', 'harness-qsh.log', 'harness-qshd.log') or artifact['command_path'] != str(bundle / 'records' / name):
+            raise ValueError('foreign prepared Cargo log path')
+    for backing in record['backing']:
+        if directory_identity(backing['path']) != backing:
+            raise ValueError('prepared directory backing changed')
+    if record['backing'][0]['path'] != str(bundle / 'runtime'):
+        raise ValueError('prepared runtime backing identity is foreign')
+    fixture = fixture_for_host()
+    if (record['fixture']['prefix'], record['fixture']['archive_sha256']) != fixture[:2]:
+        raise ValueError('prepared released fixture authority changed')
+    for path, captured in zip((bundle / 'runtime/old/qsh', bundle / 'runtime/old/qshd'), record['fixture']['files'], strict=True):
+        if file_identity(path) != captured:
+            raise ValueError('prepared released fixture changed')
+    if file_identity(bundle / 'runtime/no-build') != record['shim']:
+        raise ValueError('prepared build refusal backing changed')
+    if {a['package'] for a in record['artifacts']['harnesses']} != {case[0] for case in cases}:
+        raise ValueError('prepared harness selection differs from actual cases')
+    validate_artifacts(record['artifacts'], env)
+
+
+def claim_bundle(bundle, record):
+    if directory_identity(bundle) != record['root']:
+        raise ValueError('refusing execution claim on substituted backing')
+    try:
+        descriptor = os.open(bundle / 'execution.claim', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise ValueError('prepared execution is already claimed') from error
+    with os.fdopen(descriptor, 'w') as output:
+        output.write(record['identity']+'\n')
+    return file_identity(bundle / 'execution.claim')
+
+
+class CleanupUnresolved(ValueError):
+    """Owned payload/namespace completion could not be established."""
+
+
+def require_captured_directory(info, captured):
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+            or any(actual != captured[key] for key, actual in
+                   [('device', info.st_dev), ('inode', info.st_ino),
+                    ('uid', info.st_uid), ('mode', stat.S_IMODE(info.st_mode))])):
+        raise CleanupUnresolved('cleanup descriptor differs from captured directory')
+
+
+def open_captured_directory(path, captured, *, dir_fd=None):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=dir_fd)
+    try:
+        require_captured_directory(os.fstat(descriptor), captured)
+    except BaseException as primary:
+        try:
+            closing, descriptor = descriptor, None
+            os.close(closing)
+        except BaseException as secondary:
+            primary.add_note('cleanup descriptor close failed: '+type(secondary).__name__)
+        raise
+    return descriptor
+
+
+def atomic_record_at(directory_fd, name, record):
+    # The already verified directory capability, not a newly resolved ancestor,
+    # supplies authority for every marker creation and atomic publication.
+    temporary = '.'+name+'-'+uuid.uuid4().hex
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory_fd)
+    with os.fdopen(descriptor, 'w') as output:
+        json.dump(record, output, sort_keys=True)
+        output.write('\n')
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+
+
+def verify_cleanup_namespace(bundle, record, bundle_fd, runtime_fd=None):
+    require_captured_directory(os.fstat(bundle_fd), record['root'])
+    if runtime_fd is not None:
+        require_captured_directory(os.fstat(runtime_fd), record['backing'][0])
+    try:
+        if directory_identity(bundle) != record['root']:
+            raise CleanupUnresolved('captured cleanup bundle namespace changed')
+        require_captured_directory(os.stat('runtime', dir_fd=bundle_fd, follow_symlinks=False),
+                                   record['backing'][0])
+        if directory_identity(bundle / 'runtime') != record['backing'][0]:
+            raise CleanupUnresolved('captured cleanup runtime alias changed')
+    except OSError as error:
+        raise CleanupUnresolved('captured cleanup namespace is unavailable') from error
+
+
+def dispose_runtime_payload(bundle, record, completions):
+    # Public fd-relative operations are mandatory. A pathname-only fallback
+    # would turn a concurrent rename into authority over a different directory.
+    if (not shutil.rmtree.avoids_symlink_attacks
+            or any(not hasattr(os, name) for name in ('O_DIRECTORY', 'O_NOFOLLOW', 'O_CLOEXEC'))
+            or os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd
+            or os.stat not in os.supports_follow_symlinks or os.listdir not in os.supports_fd):
+        raise CleanupUnresolved('platform lacks captured-descriptor cleanup primitives')
+    descriptors = []
+    primary = None
+    disposition = None
+    try:
+        bundle_fd = open_captured_directory(bundle, record['root'])
+        descriptors.append(bundle_fd)
+        runtime_fd = open_captured_directory('runtime', record['backing'][0], dir_fd=bundle_fd)
+        descriptors.append(runtime_fd)
+        verify_cleanup_namespace(bundle, record, bundle_fd, runtime_fd)
+        atomic_record_at(bundle_fd, 'settled.json', dict(identity=record['identity'], commands=completions))
+        verify_cleanup_namespace(bundle, record, bundle_fd, runtime_fd)
+        dot_refusal = False
+        def final_dot_only(function, path, exception_info):
+            nonlocal dot_refusal
+            error = exception_info[1]
+            # EINVAL for final '.' is documented by rmdir(2). The public
+            # callback identifies the exact operation; no other failure is
+            # suppressed, including the same errno on a descendant operation.
+            if (function is not os.rmdir or path != '.' or not isinstance(error, OSError)
+                    or error.errno != errno.EINVAL or error.filename != '.' or dot_refusal):
+                raise error.with_traceback(exception_info[2])
+            verify_cleanup_namespace(bundle, record, bundle_fd, runtime_fd)
+            if os.listdir(runtime_fd):
+                raise CleanupUnresolved('captured runtime is not empty at final dot refusal') from error
+            dot_refusal = True
+        # '.' cannot be redirected by replacing runtime or any pathname ancestor.
+        # Its final alias is deliberately never removed without atomic inode authority.
+        shutil.rmtree('.', dir_fd=runtime_fd, onerror=final_dot_only)
+        verify_cleanup_namespace(bundle, record, bundle_fd, runtime_fd)
+        if not dot_refusal or os.listdir(runtime_fd):
+            raise CleanupUnresolved('captured runtime payload disposal is incomplete')
+        descriptors.remove(runtime_fd)
+        os.close(runtime_fd)
+        disposition = dict(identity=record['identity'], payload_disposed=True,
+                           retained_owned_metadata=record['backing'][0],
+                           state='payload-disposed-owned-metadata-retained',
+                           runtime_descriptor_closed=True, commands_settled=len(completions))
+        verify_cleanup_namespace(bundle, record, bundle_fd)
+        atomic_record_at(bundle_fd, 'payload-disposition.json', disposition)
+        verify_cleanup_namespace(bundle, record, bundle_fd)
+        # Publication remains anchored to captured bundle custody. Its descriptor
+        # closes below, and only then may execute_bundle publish acceptance.
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        close_errors = []
+        while descriptors:
+            descriptor = descriptors.pop()  # Invalidate numeric authority before close, even on EINTR.
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                close_errors.append(error)
+        if close_errors:
+            if primary is not None:
+                for error in close_errors:
+                    primary.add_note('cleanup descriptor close failed: '+type(error).__name__)
+            else:
+                raise close_errors[0]
+    return dict(**disposition, cleanup_directory_descriptors_closed=True)
+
+
+def execute_bundle(bundle, cases, env, evidence):
+    bundle = Path(bundle).absolute()
+    bundle = bundle.parent.resolve(strict=True) / bundle.name
+    try:
+        record = load_record(bundle)
+        context = Evidence(current_source(), cases, env, evidence)
+        verify_bundle(bundle, record, cases, env, context)
+        # Claim only an already verified exact directory; never follow a claim link.
+        claim_identity = claim_bundle(bundle, record)
+    except (OSError, KeyError, TypeError) as error:
+        raise ValueError('prepared bundle is incomplete, unavailable or already claimed') from error
+    marker_hash = file_identity(bundle / 'complete.json', 4 * 1024 * 1024)
+    runtime = bundle / 'runtime'
+    runtime_env = env.copy()
+    runtime_env.update(HOME=str(runtime / 'home'), XDG_CONFIG_HOME=str(runtime / 'config'),
+                       XDG_CACHE_HOME=str(runtime / 'cache'), TMPDIR=str(runtime / 'tmp'),
+                       HISTFILE='/dev/null', CARGO=str(runtime / 'no-build'),
+                       QSH_OLD_QSH=str(runtime / 'old/qsh'), QSH_OLD_QSHD=str(runtime / 'old/qshd'))
+    runtime_env.pop('SSH_AUTH_SOCK', None)
+    runtime_env.pop('SSH_AGENT_PID', None)
+    context.artifacts = record['artifacts']
+    def verify():
+        if (file_identity(bundle / 'execution.claim') != claim_identity
+                or file_identity(bundle / 'complete.json', 4 * 1024 * 1024) != marker_hash):
+            raise ValueError('prepared marker changed after execution claim')
+        verify_bundle(bundle, record, cases, runtime_env, context)
+    context.validate_prepared = verify
+    try:
+        for case in cases:
+            run_case(*case, runtime_env, evidence, context)
+        verify()
+        completions = []
+        for _, name, _ in cases:
+            receipt = json.loads((evidence / (name+'.log.completion.json')).read_text())
+            if receipt != dict(status=0, child_reaped=True, output_eof=True, mask_restored=True):
+                raise ValueError('runtime command custody is unresolved')
+            completions.append(dict(case=name, **receipt))
+        # Exact command waits/pipe EOF/mask restoration precede payload disposal.
+        disposition = dispose_runtime_payload(bundle, record, completions)
+        atomic_record(evidence / 'cleanup-completion.json', disposition)
+    except BaseException as error:
+        # Never replace a primary command/cleanup error with diagnostic trouble.
+        try:
+            atomic_record(evidence / 'retained.json', dict(identity=record['identity'],
+                          state='retained-unresolved', failure=type(error).__name__,
+                          runtime=str(runtime), root=record['root']))
+        except BaseException as secondary:
+            error.add_note('retained-state receipt failed: '+type(secondary).__name__)
+        raise
+    (evidence / 'passed.txt').write_text(f'{len(cases)} selected tests; {len(cases)} passed; 0 skipped\n')
+
+
+def prepare_bundle(bundle, cases, env, evidence, archive=None):
     fixture = fixture_for_host()
     prefix, digest, _ = fixture
-    fixture_url = URL.rsplit("/", 1)[0] + "/" + prefix + ".tar.gz"
-    cases = CASES[-2:] if args.service_only else CASES
+    root = bundle / 'runtime'
+    root.mkdir(mode=0o700)
     source = current_source()
-    args.evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
-    (args.evidence / 'identity.txt').write_text(f'source={source}\nfixture={fixture_url}\nsha256={digest}\n')
+    context = Evidence(source, cases, env, evidence)
+    (evidence / 'identity.txt').write_text(f'source={source}\nfixture={prefix}\nsha256={digest}\n')
     print(f'Source: {source}\nFixture SHA-256: {digest}', flush=True)
-    with tempfile.TemporaryDirectory(prefix='qsh-released-peer-') as runtime:
-        root = Path(runtime)
-        archive = args.archive
-        env = os.environ.copy()
-        env['CARGO_HOME'] = env.get('CARGO_HOME', str(Path.home() / '.cargo'))
-        env['RUSTUP_HOME'] = env.get('RUSTUP_HOME', str(Path.home() / '.rustup'))
-        context = Evidence(source, cases, env, args.evidence)
+    try:
         with context.phase('fixture'):
             if archive is None:
                 archive = root / 'published.tar.gz'
@@ -619,18 +1040,65 @@ def main():
                                 '--connect-timeout', '20', '--max-time', '180', '--max-filesize', '4096',
                                 URL.rsplit('/', 1)[0] + '/SHA256SUMS', '--output', str(manifest)], check=True)
                 verify_published_manifest(manifest.read_bytes(), prefix, digest)
-            old_qsh, old_qshd = extract_pair(archive, root / 'old', digest, prefix)
-        for key, folder in (('HOME', 'home'), ('XDG_CONFIG_HOME', 'config'), ('XDG_CACHE_HOME', 'cache')):
+            old_pair = extract_pair(archive, root / 'old', digest, prefix)
+        runtime_env = env.copy()
+        for key, folder in (('HOME', 'home'), ('XDG_CONFIG_HOME', 'config'),
+                            ('XDG_CACHE_HOME', 'cache'), ('TMPDIR', 'tmp')):
             (root / folder).mkdir(mode=0o700)
-            env[key] = str(root / folder)
-        env.update(HISTFILE='/dev/null', QSH_OLD_QSH=str(old_qsh), QSH_OLD_QSHD=str(old_qshd), CARGO_TERM_COLOR='never')
-        env.pop('SSH_AUTH_SOCK', None)
-        env.pop('SSH_AGENT_PID', None)
-        # HOME changes do not alter the captured compiler/build configuration.
-        context = prepare(cases, env, args.evidence, context)
-        for case in cases:
-            run_case(*case, env, args.evidence, context)
-    (args.evidence / 'passed.txt').write_text(f'{len(cases)} selected tests; {len(cases)} passed; 0 skipped\n')
+            runtime_env[key] = str(root / folder)
+        runtime_env.update(HISTFILE='/dev/null', QSH_OLD_QSH=str(old_pair[0]),
+                           QSH_OLD_QSHD=str(old_pair[1]), CARGO_TERM_COLOR='never')
+        runtime_env.pop('SSH_AUTH_SOCK', None)
+        runtime_env.pop('SSH_AGENT_PID', None)
+        context = prepare(cases, runtime_env, evidence, context)
+        record = seal_bundle(context, bundle, root, old_pair, runtime_env)
+        print('PREPARED '+record['identity']+'; runtime acceptance still required', flush=True)
+        return record
+    except BaseException as error:
+        try:
+            atomic_record(evidence / 'preparation-retained.json', dict(
+                state='partial-preparation-retained', root=directory_identity(bundle),
+                failure=type(error).__name__))
+        except BaseException as secondary:
+            error.add_note('partial preparation receipt failed: '+type(secondary).__name__)
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--archive', type=Path, help='already downloaded archive; still authenticated')
+    parser.add_argument('--evidence', type=Path, required=True, help='new private evidence directory outside source')
+    parser.add_argument('--service-only', action='store_true', help='select the two actual personal-service scenarios')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--prepare-only', action='store_true', help='prepare without claiming runtime acceptance')
+    modes.add_argument('--execute-prepared', type=Path, help='consume one verified same-job prepared bundle')
+    parser.add_argument('--prepared-bundle', type=Path, help='new private retained backing for --prepare-only')
+    args = parser.parse_args()
+    if (args.prepare_only != (args.prepared_bundle is not None)
+            or (args.execute_prepared is not None and args.archive is not None)):
+        parser.error('prepare-only requires prepared-bundle; execution cannot take an archive')
+    previous_umask = os.umask(0o077)
+    try:
+        evidence = args.evidence.absolute()
+        if evidence.resolve().is_relative_to(WORKSPACE.resolve()):
+            raise ValueError('evidence must be outside the source tree')
+        evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
+        directory_identity(evidence)
+        cases = CASES[-2:] if args.service_only else CASES
+        env = os.environ.copy()
+        env['CARGO_HOME'] = env.get('CARGO_HOME', str(Path.home() / '.cargo'))
+        env['RUSTUP_HOME'] = env.get('RUSTUP_HOME', str(Path.home() / '.rustup'))
+        if args.execute_prepared is not None:
+            execute_bundle(args.execute_prepared, cases, env, evidence)
+            return
+        path = args.prepared_bundle or Path(tempfile.gettempdir()) / ('qsh-prepared-'+uuid.uuid4().hex)
+        bundle = create_bundle(path)
+        (evidence / 'bundle-path.txt').write_text(str(bundle)+'\n')
+        prepare_bundle(bundle, cases, env, evidence, args.archive)
+        if not args.prepare_only:
+            execute_bundle(bundle, cases, env, evidence)
+    finally:
+        os.umask(previous_umask)
 
 
 @contextmanager

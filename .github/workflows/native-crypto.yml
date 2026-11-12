@@ -598,11 +598,11 @@ jobs:
           grep -F 'wire_STOP=ack_then_actual_exit_watch_and_consumed_wait' "$runtime/keeper-integrated-results.log"
           grep -F 'keeper223 replacement_routes old_image=' "$runtime/keeper-integrated-results.log"
 
-      - name: Native Intel Darwin legacy account-service restart acceptance
+      - name: Prepare native Intel Darwin legacy account-service restart artifacts
         shell: bash
-        timeout-minutes: 12
         run: |
           set -euo pipefail
+          umask 077
           export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           export CARGO_BUILD_TARGET="$NATIVE_TARGET" HISTFILE=/dev/null
@@ -610,10 +610,51 @@ jobs:
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/ -Dwarnings"
           export AWS_LC_SYS_USE_SYSTEM=0
           export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
+          started=$(date +%s)
           python3 -m unittest discover -s scripts/tests -p test_released_peer_acceptance.py
+          python3 scripts/released-peer-acceptance.py --service-only --prepare-only \
+            --prepared-bundle "$RUNNER_TEMP/legacy-service-intel-bundle" \
+            --evidence "$RUNNER_TEMP/legacy-service-intel-preparation-evidence"
+          printf 'legacy-service preparation elapsed_seconds=%s\n' "$(( $(date +%s) - started ))"
+      - name: Native Intel Darwin legacy account-service restart acceptance
+        shell: bash
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export CARGO_BUILD_TARGET="$NATIVE_TARGET" HISTFILE=/dev/null
+          cargo_home="$CARGO_HOME"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/ -Dwarnings"
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
           python3 scripts/released-peer-acceptance.py --service-only \
+            --execute-prepared "$RUNNER_TEMP/legacy-service-intel-bundle" \
             --evidence "$RUNNER_TEMP/legacy-service-intel-evidence"
           grep -Fx '2 selected tests; 2 passed; 0 skipped' "$RUNNER_TEMP/legacy-service-intel-evidence/passed.txt"
+      - name: Report native Intel Darwin legacy-service bundle lifecycle
+        if: always()
+        shell: bash
+        run: |
+          python3 -I -B - "$RUNNER_TEMP/legacy-service-intel-bundle" <<'PY_STATE'
+          import json, os, stat, sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          record = dict(state='not-created')
+          try:
+              info = root.lstat()
+              if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                  record = dict(state='unverified-backing-retained')
+              else:
+                  record = dict(state='owned-backing-retained')
+                  for name in ('complete.json', 'execution.claim', 'settled.json', 'payload-disposition.json'):
+                      path = root / name
+                      record[name] = path.is_file() and not path.is_symlink()
+          except FileNotFoundError:
+              pass
+          print('LEGACY_SERVICE_BUNDLE '+json.dumps(record, sort_keys=True))
+          PY_STATE
 
   system-floors:
     if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}

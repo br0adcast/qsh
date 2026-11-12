@@ -132,9 +132,12 @@ class AcceptanceTests(unittest.TestCase):
             def failed(command, env, path):
                 path.write_text(result.stdout)
                 return result.returncode
-            with mock.patch.object(peer, 'stream_command', side_effect=failed), redirect_stdout(io.StringIO()):
+            context = peer.Evidence(peer.current_source(), (('qsh', 'wanted', True),), {}, evidence)
+            context.artifacts = {'harnesses': [{'package': 'qsh', 'executable': '/owned/harness'}]}
+            with (mock.patch.object(peer, 'stream_command', side_effect=failed),
+                  mock.patch.object(peer, 'validate_artifacts'), redirect_stdout(io.StringIO())):
                 with self.assertRaises(ValueError):
-                    peer.run_case('qsh', 'wanted', True, {}, evidence)
+                    peer.run_case('qsh', 'wanted', True, {}, evidence, context)
             phases = [json.loads(line) for line in (evidence/'phases.jsonl').read_text().splitlines()]
             self.assertEqual(phases[-1]['status'], 23)
             self.assertEqual((evidence / 'wanted.log').read_text(), result.stdout)
@@ -194,9 +197,10 @@ class PreparationTests(unittest.TestCase):
         name = package if kind == 'bin' else 'mixed_versions'
         exe = self.root / 'target/debug' / (name if kind == 'bin' else Path('deps') / (package + '-mixed'))
         exe.parent.mkdir(parents=True, exist_ok=True)
+        if exe.is_symlink(): exe.unlink()
         exe.write_bytes(package.encode())
         exe.chmod(448)
-        return dict(reason='compiler-artifact', package_id='path+' + (self.root / folder).as_uri() + f'#{package}@1.0.0', manifest_path=str(self.root / folder / 'Cargo.toml'), features=[], target=dict(name=name, kind=[kind], src_path=str(self.root / folder / ('src/main.rs' if kind == 'bin' else 'tests/mixed_versions.rs'))), profile=dict(test=kind == 'test'), executable=str(exe))
+        return dict(reason='compiler-artifact', package_id='path+' + (self.root / folder).as_uri() + f'#{package}@1.0.0', manifest_path=str(self.root / folder / 'Cargo.toml'), features=[], target=dict(name=name, kind=[kind], src_path=str(self.root / folder / ('src/main.rs' if kind == 'bin' else 'tests/mixed_versions.rs'))), profile=dict(test=kind == 'test', opt_level='1'), executable=str(exe))
 
     def runner(self, command, env, path, **kwargs):
         self.commands.append(command)
@@ -207,6 +211,7 @@ class PreparationTests(unittest.TestCase):
         else:
             text = json.dumps(self.record(command[command.index('-p') + 1], 'test')) + '\n'
         path.write_text(text)
+        path.chmod(0o600)
         return 0
 
     def preparation(self, cases=None):
@@ -402,7 +407,7 @@ class StreamingTests(unittest.TestCase):
 
 class OrchestrationTests(unittest.TestCase):
 
-    def test_runtime_remains_cargo_driven_exact_and_compilation_is_not_a_pass(self):
+    def test_runtime_executes_only_recorded_harness_and_compilation_is_not_a_pass(self):
         name = 'wanted'
         good = f'running 1 test\ntest {name} ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
         for transcript in [good, 'Finished test profile\nExecutable mixed_versions\n']:
@@ -418,55 +423,46 @@ class OrchestrationTests(unittest.TestCase):
                 with (
                     mock.patch.object(peer, 'stream_command', side_effect=runner),
                     mock.patch.object(peer, 'current_source', return_value='ab' * 20),
+                    mock.patch.object(peer, 'validate_artifacts'),
                     redirect_stdout(capture),
                 ):
+                    context = peer.Evidence('ab' * 20, (('qsh', name, True),), {}, root)
+                    context.artifacts = {'harnesses': [{'package': 'qsh', 'executable': '/owned/harness'}]}
                     if transcript == good:
-                        peer.run_case('qsh', name, True, {}, root)
+                        peer.run_case('qsh', name, True, {}, root, context)
                     else:
                         with self.assertRaises(ValueError):
-                            peer.run_case('qsh', name, True, {}, root)
-                self.assertEqual(commands, [['cargo', 'test', '--locked', '-p', 'qsh', '--test', 'mixed_versions', name, '--', '--exact', '--nocapture', '--test-threads=1', '--color=never', '--ignored']])
+                            peer.run_case('qsh', name, True, {}, root, context)
+                self.assertEqual(commands, [['/owned/harness', name, '--exact', '--nocapture', '--test-threads=1', '--color=never', '--ignored']])
                 self.assertEqual('ACCEPTED' in capture.getvalue(), transcript == good)
                 self.assertFalse((root / 'passed.txt').exists())
 
-    def test_main_prepares_before_two_exact_cases_and_only_complete_run_writes_receipt(self):
-        for failed in [False, True]:
-            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory:
+    def test_main_routes_default_eight_service_two_and_prepare_only_without_acceptance(self):
+        for service, prepare_only in [(False, False), (True, False), (True, True)]:
+            with self.subTest(service=service, prepare_only=prepare_only), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 evidence = root / 'evidence'
+                bundle = root / 'bundle'
                 events = []
-
-                def prepare(cases, env, destination, context):
-                    self.assertEqual(cases, peer.CASES[-2:])
+                def prepare(path, cases, env, destination, archive):
+                    self.assertEqual(cases, peer.CASES[-2:] if service else peer.CASES)
                     events.append('prepare')
-                    return context
-
-                def run_case(package, name, ignored, env, destination, context):
-                    events.append(name)
-                    if failed:
-                        raise ValueError('controlled runtime failure')
-                args = [str(SCRIPT), '--service-only', '--archive', str(root / 'old.tar.gz'), '--evidence', str(evidence)]
-                with (
-                    mock.patch.object(peer.sys if hasattr(peer, 'sys') else sys, 'argv', args),
-                    mock.patch.object(peer, 'current_source', return_value='ab' * 20),
-                    mock.patch.object(peer, 'fixture_for_host', return_value=(peer.PREFIX, peer.SHA256, peer.ARCHIVE_SIZE)),
-                    mock.patch.object(peer.platform, 'system', return_value='Linux'),
-                    mock.patch.object(peer, 'extract_pair', return_value=(root / 'old-qsh', root / 'old-qshd')),
-                    mock.patch.object(peer, 'prepare', side_effect=prepare),
-                    mock.patch.object(peer, 'run_case', side_effect=run_case),
-                    redirect_stdout(io.StringIO()),
-                ):
-                    if failed:
-                        with self.assertRaises(ValueError):
-                            peer.main()
-                    else:
-                        peer.main()
-                self.assertEqual(events[0], 'prepare')
-                if failed:
-                    self.assertFalse((evidence / 'passed.txt').exists())
-                else:
-                    self.assertEqual(events[1:], [case[1] for case in peer.CASES[-2:]])
-                    self.assertEqual((evidence / 'passed.txt').read_text(), '2 selected tests; 2 passed; 0 skipped\n')
+                def execute(path, cases, env, destination):
+                    events.append('execute')
+                    (destination / 'passed.txt').write_text(f'{len(cases)} selected tests; {len(cases)} passed; 0 skipped\n')
+                args = [str(SCRIPT), '--evidence', str(evidence)]
+                if service: args.append('--service-only')
+                if prepare_only: args += ['--prepare-only', '--prepared-bundle', str(bundle)]
+                def create(path):
+                    bundle.mkdir(mode=0o700)
+                    return bundle
+                with (mock.patch.object(sys, 'argv', args),
+                      mock.patch.object(peer, 'create_bundle', side_effect=create),
+                      mock.patch.object(peer, 'prepare_bundle', side_effect=prepare),
+                      mock.patch.object(peer, 'execute_bundle', side_effect=execute)):
+                    peer.main()
+                self.assertEqual(events, ['prepare'] if prepare_only else ['prepare', 'execute'])
+                self.assertEqual((evidence / 'passed.txt').exists(), not prepare_only)
 
 
 STUBBORN_COMMAND = r'''
@@ -547,7 +543,7 @@ def until(predicate, seconds=3):
 def spawn(command, **kwargs):
     if command[0] == '/bin/ps':
         return original(command, **kwargs)
-    assert command[0:2] == ['cargo', 'test']
+    assert command[0:2] == ['owned-prepared-harness', 'controlled_group']
     child = original([sys.executable, '-u', fixture, str(root), variant], **kwargs)
     leaders.append(child)
     return child
@@ -576,7 +572,10 @@ started = time.monotonic()
 try:
     with redirect_stdout(capture):
         try:
-            peer.run_case('qsh', 'controlled_group', True, os.environ.copy(), root)
+            context = peer.Evidence('controlled-source', (('qsh', 'controlled_group', True),), os.environ.copy(), root)
+            context.artifacts = {'harnesses': [{'package': 'qsh', 'executable': 'owned-prepared-harness'}]}
+            peer.validate_artifacts = lambda artifacts, env: None
+            peer.run_case('qsh', 'controlled_group', True, os.environ.copy(), root, context)
         except KeyboardInterrupt:
             pass
         else:
@@ -983,7 +982,7 @@ def spawn(command, **kwargs):
             child = original_spawn([sys.executable, '-c', f'import os;os.write(1,{rows.encode()!r})'], **kwargs)
         observers.append(child)
         return child
-    assert command[0:2] == ['cargo', 'test']
+    assert command[0:2] == ['owned-prepared-harness', 'controlled_native_cleanup']
     assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == initial_mask
     if mode == 'live':
         child = original_spawn([sys.executable, '-u', fixture, str(root), 'exit-on-term'], **kwargs)
@@ -1027,7 +1026,10 @@ started = time.monotonic()
 try:
     with redirect_stdout(capture), peer.termination_as_interrupt(), mock.patch.object(peer.platform,'system',return_value='Darwin'):
         try:
-            peer.run_case('qsh','controlled_native_cleanup',True,os.environ.copy(),root)
+            context = peer.Evidence('owned-source', (('qsh','controlled_native_cleanup',True),), os.environ.copy(), root)
+            context.artifacts = {'harnesses': [{'package': 'qsh', 'executable': 'owned-prepared-harness'}]}
+            peer.validate_artifacts = lambda artifacts, env: None
+            peer.run_case('qsh','controlled_native_cleanup',True,os.environ.copy(),root,context)
         except BaseException as actual:
             assert actual is primary, (type(actual), actual)
         else:
@@ -1302,3 +1304,567 @@ class ObserverExitReserveTests(unittest.TestCase):
         self.assertLess(original_clock(), outer_deadline)
         with self.assertRaises(ChildProcessError):
             os.waitpid(children[0][0].pid, os.WNOHANG)
+
+
+class PreparedBundleTests(PreparationTests):
+    def setUp(self):
+        super().setUp()
+        # These are architecture-binding models with inert Python harnesses;
+        # native Darwin behavior remains qualified by the separate real gates.
+        for name, value in [('system', 'Linux'), ('machine', 'x86_64')]:
+            patcher = mock.patch.object(peer.platform, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    TOOLCHAIN = 'rustc 1.98.1\nhost: x86_64-unknown-linux-gnu\n'
+
+    def record(self, package, kind):
+        record = super().record(package, kind)
+        if kind == 'test':
+            Path(record['executable']).write_text(getattr(self, 'harness_script', '#!' + sys.executable + '\n'
+                'import sys\nname=sys.argv[1]\n'
+                'assert sys.argv[2:6] == ["--exact","--nocapture","--test-threads=1","--color=never"]\n'
+                'print("test " + name + " ... ok")\n'
+                'print("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s")\n'))
+        return record
+
+    def bundle(self, cases=None):
+        outer = tempfile.TemporaryDirectory(prefix='peer-bundle-control-')
+        self.addCleanup(outer.cleanup)
+        bundle = peer.create_bundle(Path(outer.name) / 'bundle')
+        runtime = bundle / 'runtime'
+        runtime.mkdir(mode=0o700)
+        for name in ('home', 'config', 'cache', 'tmp', 'old'):
+            (runtime / name).mkdir(mode=0o700)
+        old = [runtime / 'old' / name for name in ('qsh', 'qshd')]
+        for path in old:
+            path.write_bytes(b'authenticated fixture control')
+            path.chmod(0o700)
+        with (mock.patch.object(peer, 'WORKSPACE', self.root),
+              mock.patch.object(peer, 'current_source', return_value='ab' * 20),
+              mock.patch.object(peer, 'current_input', return_value='cd' * 32),
+              mock.patch.object(peer, 'stream_command', side_effect=self.runner),
+              redirect_stdout(io.StringIO())):
+            context = peer.prepare(cases or peer.CASES[-2:], {}, self.evidence)
+            peer.seal_bundle(context, bundle, runtime, old, {})
+        self.assertFalse((self.evidence / 'passed.txt').exists())
+        return bundle
+
+    def execute(self, bundle, cases=None, env=None, source=None, tracked=None):
+        evidence = bundle.parent / ('execution-' + str(len(list(bundle.parent.glob('execution-*')))))
+        evidence.mkdir(mode=0o700)
+        actual_stream = peer.stream_command
+        commands = []
+        def stream(command, environment, log, **kwargs):
+            commands.append(command)
+            if command == ['rustc', '-vV']:
+                log.write_text(self.TOOLCHAIN)
+                return 0
+            if hasattr(self, 'command_timeout'): kwargs['timeout'] = self.command_timeout
+            return actual_stream(command, environment, log, **kwargs)
+        with (mock.patch.object(peer, 'WORKSPACE', self.root),
+              mock.patch.object(peer, 'current_source', return_value=source or 'ab' * 20),
+              mock.patch.object(peer, 'current_input', return_value=tracked or 'cd' * 32),
+              mock.patch.object(peer, 'stream_command', side_effect=stream),
+              redirect_stdout(io.StringIO())):
+            peer.execute_bundle(bundle, cases or peer.CASES[-2:], env or {}, evidence)
+        return evidence, commands
+
+    def test_direct_two_case_execution_is_one_shot_and_disposes_only_owned_runtime(self):
+        bundle = self.bundle()
+        evidence, commands = self.execute(bundle)
+        self.assertEqual((evidence / 'passed.txt').read_text(), '2 selected tests; 2 passed; 0 skipped\n')
+        self.assertEqual(len([c for c in commands if c[0] != 'rustc']), 2)
+        self.assertFalse(any(c[0] == 'cargo' for c in commands))
+        self.assertTrue((bundle / 'runtime').is_dir())
+        self.assertEqual(list((bundle / 'runtime').iterdir()), [])
+        self.assertTrue((bundle / 'payload-disposition.json').is_file())
+        with self.assertRaises(ValueError):
+            self.execute(bundle)
+
+    def test_bundle_binding_mutations_refuse_before_any_case(self):
+        for key, value in [('source', 'ef' * 20), ('tracked_input_sha256', 'ef' * 32),
+                           ('cases', []), ('registry', []), ('toolchain', 'foreign'),
+                           ('target', 'aarch64-apple-darwin'), ('schema', 999),
+                           ('ci', {'GITHUB_RUN_ID': 'foreign'})]:
+            with self.subTest(key=key):
+                bundle = self.bundle()
+                marker = bundle / 'complete.json'
+                record = json.loads(marker.read_text())
+                record[key] = value
+                marker.write_text(json.dumps(record))
+                with self.assertRaises(ValueError):
+                    self.execute(bundle)
+                self.assertFalse((bundle / 'execution.claim').exists())
+                self.assertTrue((bundle / 'runtime').is_dir())
+
+    def test_wrong_configuration_selection_partial_and_replaced_backing_refuse(self):
+        bundle = self.bundle()
+        with self.assertRaises(ValueError): self.execute(bundle, env={'RUSTFLAGS': 'foreign'})
+        with self.assertRaises(ValueError): self.execute(bundle, cases=peer.CASES)
+        (bundle / 'complete.json').unlink()
+        with self.assertRaises(ValueError): self.execute(bundle)
+        bundle = self.bundle()
+        runtime = bundle / 'runtime'
+        runtime.rename(bundle / 'retained-runtime')
+        runtime.symlink_to(bundle / 'retained-runtime', target_is_directory=True)
+        with self.assertRaises(ValueError): self.execute(bundle)
+        self.assertTrue((bundle / 'retained-runtime').is_dir())
+
+    def test_current_or_fixture_artifact_mutation_or_loss_refuses_before_launch(self):
+        for kind in ('hash', 'missing', 'symlink', 'same-bytes-replacement', 'fixture'):
+            with self.subTest(kind=kind):
+                bundle = self.bundle()
+                path = self.root / 'target/debug/qshd'
+                if kind == 'fixture': path = bundle / 'runtime/old/qshd'
+                if kind in ('hash', 'fixture'): path.write_bytes(b'changed')
+                elif kind == 'missing': path.unlink()
+                else:
+                    saved = path.with_suffix('.saved')
+                    path.rename(saved)
+                    if kind == 'symlink': path.symlink_to(saved)
+                    else: path.write_bytes(saved.read_bytes()); path.chmod(0o700)
+                with self.assertRaises(ValueError): self.execute(bundle)
+                self.assertFalse((bundle / 'execution.claim').exists())
+                self.assertTrue((bundle / 'runtime').is_dir())
+
+    def test_default_selection_retains_all_eight_and_both_required_harnesses(self):
+        bundle = self.bundle(peer.CASES)
+        evidence, commands = self.execute(bundle, peer.CASES)
+        self.assertEqual(len([c for c in commands if c[0] != 'rustc']), 8)
+        self.assertEqual((evidence / 'passed.txt').read_text(), '8 selected tests; 8 passed; 0 skipped\n')
+
+
+    def test_changed_live_head_input_ci_and_toolchain_refuse_without_claim(self):
+        for options in ({'source':'ef'*20}, {'tracked':'ef'*32}, {'env':{'GITHUB_RUN_ID':'foreign'}}):
+            bundle = self.bundle()
+            with self.assertRaises(ValueError): self.execute(bundle, **options)
+            self.assertFalse((bundle / 'execution.claim').exists())
+        bundle = self.bundle()
+        self.TOOLCHAIN = 'rustc other\nhost: x86_64-unknown-linux-gnu\n'
+        with self.assertRaises(ValueError): self.execute(bundle)
+        self.assertFalse((bundle / 'execution.claim').exists())
+
+    def test_mutated_cargo_role_features_profile_and_ambiguity_are_not_trusted(self):
+        for change in ('features', 'profile', 'ambiguous', 'role'):
+            bundle = self.bundle()
+            marker = bundle / 'complete.json'
+            record = json.loads(marker.read_text())
+            artifact = record['artifacts']['pair'][0]
+            if change == 'features': artifact['record']['features'] = ['test-build-labels']
+            if change == 'profile': artifact['record']['profile']['opt_level'] = '0'
+            if change == 'role': artifact['kind'] = 'test'
+            if change == 'ambiguous': record['artifacts']['harnesses'] *= 2
+            marker.write_text(json.dumps(record))
+            with self.assertRaises(ValueError): self.execute(bundle)
+            self.assertFalse((bundle / 'execution.claim').exists())
+
+    def test_failure_cancel_timeout_and_cleanup_error_retain_backing_without_pass(self):
+        for mode in ('fallback', 'cancel', 'timeout', 'cleanup'):
+            with self.subTest(mode=mode):
+                self.harness_script = '#!' + sys.executable + '\n'
+                if mode == 'fallback':
+                    self.harness_script += 'import os,subprocess,sys\nsys.exit(subprocess.call([os.environ["CARGO"]]))\n'
+                elif mode in ('cancel', 'timeout'):
+                    self.harness_script += 'import time\nprint("owned-ready",flush=True)\ntime.sleep(30)\n'
+                else:
+                    del self.harness_script
+                bundle = self.bundle()
+                if mode == 'timeout': self.command_timeout = 0.1
+                try:
+                    if mode == 'cancel':
+                        with mock.patch.object(peer, 'forward', side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+                            self.execute(bundle)
+                    elif mode == 'cleanup':
+                        with mock.patch.object(peer.shutil, 'rmtree', side_effect=OSError('controlled cleanup')), self.assertRaises(OSError):
+                            self.execute(bundle)
+                    else:
+                        with self.assertRaises((ValueError, subprocess.TimeoutExpired)):
+                            self.execute(bundle)
+                finally:
+                    if hasattr(self, 'command_timeout'): del self.command_timeout
+                self.assertTrue((bundle / 'execution.claim').exists())
+                self.assertTrue((bundle / 'runtime').is_dir())
+                self.assertFalse((bundle / 'payload-disposition.json').exists())
+                evidence = next(bundle.parent.glob('execution-*'))
+                self.assertFalse((evidence / 'passed.txt').exists())
+                self.assertEqual(json.loads((evidence / 'retained.json').read_text())['state'], 'retained-unresolved')
+
+    def test_artifact_change_after_first_case_prevents_second_case_and_disposal(self):
+        self.harness_script = ('#!'+sys.executable+'\nimport sys\n'
+            'print("test "+sys.argv[1]+" ... ok")\n'
+            'print("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s")\n'
+            'open('+repr(str(self.root / 'target/debug/qshd'))+',"wb").write(b"changed")\n')
+        bundle = self.bundle()
+        with self.assertRaises(ValueError): self.execute(bundle)
+        evidence = next(bundle.parent.glob('execution-*'))
+        self.assertTrue((evidence / (peer.CASES[-2][1]+'.log')).exists())
+        self.assertFalse((evidence / (peer.CASES[-1][1]+'.log')).exists())
+        self.assertFalse((evidence / 'passed.txt').exists())
+        self.assertTrue((bundle / 'runtime').is_dir())
+
+    def test_untrusted_preparation_missing_phase_receipts_cannot_be_claimed(self):
+        bundle = self.bundle()
+        marker = bundle / 'complete.json'
+        record = json.loads(marker.read_text())
+        record['phases'] = []
+        marker.write_text(json.dumps(record))
+        with self.assertRaises(ValueError): self.execute(bundle)
+        self.assertFalse((bundle / 'execution.claim').exists())
+
+    def test_untrusted_preparation_unsafe_recursive_cleanup_retains_actual_backing(self):
+        bundle = self.bundle()
+        with mock.patch.object(peer.shutil.rmtree, 'avoids_symlink_attacks', False), self.assertRaises(ValueError):
+            self.execute(bundle)
+        self.assertTrue((bundle / 'runtime').is_dir())
+        self.assertFalse((bundle / 'payload-disposition.json').exists())
+        self.assertFalse(next(bundle.parent.glob('execution-*')).joinpath('passed.txt').exists())
+
+
+    def test_concurrent_exact_bundle_claim_has_only_one_owner(self):
+        bundle = self.bundle()
+        record = json.loads((bundle / 'complete.json').read_text())
+        barrier = threading.Barrier(2)
+        outcomes = []
+        def claim():
+            barrier.wait(timeout=2)
+            try:
+                peer.claim_bundle(bundle, record)
+                outcomes.append('claimed')
+            except ValueError:
+                outcomes.append('refused')
+        threads = [threading.Thread(target=claim) for _ in range(2)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(timeout=3)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertCountEqual(outcomes, ['claimed', 'refused'])
+
+    def test_replaced_bundle_root_never_redirects_claim_or_cleanup(self):
+        bundle = self.bundle()
+        saved = bundle.with_name('saved-bundle')
+        bundle.rename(saved)
+        bundle.mkdir(mode=0o700)
+        (bundle / 'complete.json').write_bytes((saved / 'complete.json').read_bytes())
+        (bundle / 'complete.json').chmod(0o600)
+        with self.assertRaises(ValueError): self.execute(bundle)
+        self.assertFalse((bundle / 'execution.claim').exists())
+        self.assertTrue((saved / 'runtime').is_dir())
+
+
+    def test_cli_prepare_then_execute_uses_retained_fixture_without_cargo_at_runtime(self):
+        with tempfile.TemporaryDirectory(prefix='peer-cli-bundle-') as directory:
+            outer = Path(directory)
+            archive = AcceptanceTests.archive(self, outer, [(peer.PREFIX+'/'+name, tarfile.REGTYPE) for name in ('qsh', 'qshd')])
+            fixture = (peer.PREFIX, hashlib.sha256(archive.read_bytes()).hexdigest(), archive.stat().st_size)
+            bundle = outer / 'bundle'
+            preparation, execution = outer / 'preparation', outer / 'execution'
+            actual_stream = peer.stream_command
+            commands = []
+            def stream(command, env, log, **kwargs):
+                commands.append(command)
+                if command[0] in ('cargo', 'rustc'): return self.runner(command, env, log, **kwargs)
+                return actual_stream(command, env, log, **kwargs)
+            with (mock.patch.object(peer, 'WORKSPACE', self.root),
+                  mock.patch.object(peer, 'current_source', return_value='ab'*20),
+                  mock.patch.object(peer, 'current_input', return_value='cd'*32),
+                  mock.patch.object(peer, 'fixture_for_host', return_value=fixture),
+                  mock.patch.object(peer, 'stream_command', side_effect=stream),
+                  redirect_stdout(io.StringIO())):
+                with mock.patch.object(sys, 'argv', [str(SCRIPT), '--service-only', '--prepare-only',
+                        '--prepared-bundle', str(bundle), '--archive', str(archive), '--evidence', str(preparation)]):
+                    peer.main()
+                self.assertTrue((bundle / 'runtime/old/qshd').is_file())
+                self.assertFalse((preparation / 'passed.txt').exists())
+                before = len(commands)
+                with mock.patch.object(sys, 'argv', [str(SCRIPT), '--service-only', '--execute-prepared', str(bundle),
+                        '--evidence', str(execution)]):
+                    peer.main()
+            self.assertFalse(any(command[0] == 'cargo' for command in commands[before:]))
+            self.assertEqual((execution / 'passed.txt').read_text(), '2 selected tests; 2 passed; 0 skipped\n')
+            self.assertTrue(archive.is_file(), 'caller-owned archive must remain untouched')
+
+
+    def test_current_artifact_size_is_bounded_before_reading_cargo_candidate(self):
+        artifact = self.record('qsh', 'bin')
+        log = self.root / 'bounded-cargo.jsonl'
+        log.write_text(json.dumps(artifact)+'\n')
+        with (mock.patch.object(peer, 'WORKSPACE', self.root),
+              mock.patch.object(peer, 'MAX_ARTIFACT_BYTES', 2), self.assertRaises(ValueError)):
+            peer.select_artifact(log, 'qsh', 'bin', {})
+
+
+    def test_r1_cleanup_boundary_runtime_or_ancestor_swap_preserves_foreign_tree(self):
+        for boundary in ('runtime', 'ancestor'):
+            with self.subTest(boundary=boundary):
+                bundle = self.bundle()
+                runtime = bundle / 'runtime'
+                original = peer.shutil.rmtree
+                foreign = []
+                saved = bundle / 'original-runtime' if boundary == 'runtime' else bundle.with_name('original-bundle')
+                def substituted(path, *args, **kwargs):
+                    if boundary == 'runtime':
+                        runtime.rename(saved)
+                    else:
+                        bundle.rename(saved)
+                        bundle.mkdir(mode=0o700)
+                    runtime.mkdir(mode=0o700)
+                    sentinel = runtime / 'foreign-sentinel'
+                    sentinel.write_text('unrelated replacement')
+                    foreign.append(sentinel)
+                    return original(path, *args, **kwargs)
+                substituted.avoids_symlink_attacks = True
+                with mock.patch.object(peer.shutil, 'rmtree', substituted):
+                    with self.assertRaises(ValueError): self.execute(bundle)
+                self.assertTrue(foreign[0].is_file(), 'foreign replacement must never be deleted')
+                self.assertTrue(saved.is_dir())
+                self.assertFalse((bundle / 'payload-disposition.json').exists())
+                self.assertFalse(next(bundle.parent.glob('execution-*')).joinpath('passed.txt').exists())
+
+
+    def test_r1_positive_payload_cleanup_retains_captured_empty_metadata_and_closes_fds(self):
+        bundle = self.bundle()
+        record = json.loads((bundle / 'complete.json').read_text())
+        descriptors = []
+        original_open = peer.open_captured_directory
+        original_walk = peer.shutil.rmtree
+        def opening(*args, **kwargs):
+            descriptor = original_open(*args, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor
+        def walking(path, *args, **kwargs):
+            self.assertEqual(path, '.')
+            runtime = record['backing'][0]
+            info = os.fstat(kwargs['dir_fd'])
+            self.assertEqual((info.st_dev, info.st_ino), (runtime['device'], runtime['inode']))
+            return original_walk(path, *args, **kwargs)
+        walking.avoids_symlink_attacks = True
+        with (mock.patch.object(peer, 'open_captured_directory', side_effect=opening),
+              mock.patch.object(peer.shutil, 'rmtree', walking)):
+            evidence, _ = self.execute(bundle)
+        self.assertEqual(len(descriptors), 2)
+        for descriptor in descriptors:
+            with self.assertRaises(OSError): os.fstat(descriptor)
+        self.assertEqual(peer.directory_identity(bundle / 'runtime'), record['backing'][0])
+        self.assertEqual(list((bundle / 'runtime').iterdir()), [])
+        disposition = json.loads((bundle / 'payload-disposition.json').read_text())
+        self.assertTrue(disposition['payload_disposed'])
+        self.assertEqual(disposition['retained_owned_metadata'], record['backing'][0])
+        self.assertNotIn('runtime_disposed', disposition)
+        completed = json.loads((evidence / 'cleanup-completion.json').read_text())
+        self.assertTrue(completed['cleanup_directory_descriptors_closed'])
+        self.assertEqual(completed['commands_settled'], 2)
+
+    def test_r1_final_dot_alias_swap_preserves_foreign_sentinel_without_pass(self):
+        bundle = self.bundle()
+        runtime, saved = bundle / 'runtime', bundle / 'original-runtime'
+        original = peer.os.rmdir
+        observed = []
+        def final_alias(path, *args, **kwargs):
+            if path == '.':
+                self.assertEqual(list(runtime.iterdir()), [])
+                runtime.rename(saved)
+                runtime.mkdir(mode=0o700)
+                (runtime / 'foreign-sentinel').write_text('foreign final alias')
+                observed.append(True)
+            return original(path, *args, **kwargs)
+        with mock.patch.object(peer.os, 'rmdir', side_effect=final_alias), self.assertRaises(ValueError):
+            self.execute(bundle)
+        self.assertEqual(observed, [True])
+        self.assertTrue((runtime / 'foreign-sentinel').is_file())
+        self.assertTrue(saved.is_dir())
+        self.assertFalse((bundle / 'payload-disposition.json').exists())
+        self.assertFalse(next(bundle.parent.glob('execution-*')).joinpath('passed.txt').exists())
+
+    def test_r1_marker_writes_use_captured_bundle_after_ancestor_substitution(self):
+        bundle = self.bundle()
+        saved = bundle.with_name('original-bundle')
+        original = peer.atomic_record_at
+        changed = []
+        def marker(descriptor, name, record):
+            if name == 'settled.json':
+                bundle.rename(saved)
+                bundle.mkdir(mode=0o700)
+                (bundle / 'foreign-sentinel').write_text('foreign ancestor')
+                changed.append(True)
+            return original(descriptor, name, record)
+        with mock.patch.object(peer, 'atomic_record_at', side_effect=marker), self.assertRaises(ValueError):
+            self.execute(bundle)
+        self.assertEqual(changed, [True])
+        self.assertTrue((saved / 'settled.json').is_file())
+        self.assertFalse((bundle / 'settled.json').exists())
+        self.assertTrue((bundle / 'foreign-sentinel').is_file())
+        self.assertTrue((saved / 'runtime/old/qshd').is_file())
+        self.assertFalse((saved / 'payload-disposition.json').exists())
+        self.assertFalse(next(bundle.parent.glob('execution-*')).joinpath('passed.txt').exists())
+
+    def test_r1_unknown_walk_errors_and_cancellation_preserve_primary_and_close_fds(self):
+        import errno
+        for mode in ('descendant-einval', 'dot-eio', 'cancel'):
+            with self.subTest(mode=mode):
+                bundle = self.bundle()
+                descriptors = []
+                original_open = peer.open_captured_directory
+                def opening(*args, **kwargs):
+                    descriptor = original_open(*args, **kwargs)
+                    descriptors.append(descriptor)
+                    return descriptor
+                failure = KeyboardInterrupt('owned cancellation') if mode == 'cancel' else OSError(
+                    errno.EINVAL if mode == 'descendant-einval' else errno.EIO,
+                    'owned unknown cleanup error', 'no-build' if mode == 'descendant-einval' else '.')
+                original_unlink, original_rmdir = peer.os.unlink, peer.os.rmdir
+                def unlink(path, *args, **kwargs):
+                    if path == 'no-build': raise failure
+                    return original_unlink(path, *args, **kwargs)
+                def rmdir(path, *args, **kwargs):
+                    if path == '.': raise failure
+                    return original_rmdir(path, *args, **kwargs)
+                with mock.patch.object(peer, 'open_captured_directory', side_effect=opening):
+                    if mode == 'cancel':
+                        def cancelled(*args, **kwargs): raise failure
+                        cancelled.avoids_symlink_attacks = True
+                        manager = mock.patch.object(peer.shutil, 'rmtree', cancelled)
+                    elif mode == 'dot-eio': manager = mock.patch.object(peer.os, 'rmdir', side_effect=rmdir)
+                    else: manager = mock.patch.object(peer.os, 'unlink', side_effect=unlink)
+                    with manager, self.assertRaises(type(failure)) as raised:
+                        self.execute(bundle)
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(len(descriptors), 2)
+                for descriptor in descriptors:
+                    with self.assertRaises(OSError): os.fstat(descriptor)
+                self.assertTrue((bundle / 'runtime').is_dir())
+                self.assertFalse((bundle / 'payload-disposition.json').exists())
+                evidence = next(bundle.parent.glob('execution-*'))
+                self.assertFalse((evidence / 'passed.txt').exists())
+                self.assertEqual(json.loads((evidence / 'retained.json').read_text())['state'], 'retained-unresolved')
+
+
+    def test_r1_close_errors_do_not_publish_acceptance_or_replace_primary_failure(self):
+        import errno
+        for primary_walk_error in (False, True):
+            with self.subTest(primary_walk_error=primary_walk_error):
+                bundle = self.bundle()
+                captured = []
+                original_open, original_close, original_unlink = peer.open_captured_directory, peer.os.close, peer.os.unlink
+                close_failure = OSError(errno.EIO, 'owned close uncertainty')
+                walk_failure = OSError(errno.EINVAL, 'owned primary walk failure', 'no-build')
+                def opening(*args, **kwargs):
+                    descriptor = original_open(*args, **kwargs)
+                    captured.append(descriptor)
+                    return descriptor
+                def closing(descriptor):
+                    original_close(descriptor)
+                    if captured and descriptor == captured[0]: raise close_failure
+                def unlink(path, *args, **kwargs):
+                    if primary_walk_error and path == 'no-build': raise walk_failure
+                    return original_unlink(path, *args, **kwargs)
+                with (mock.patch.object(peer, 'open_captured_directory', side_effect=opening),
+                      mock.patch.object(peer.os, 'close', side_effect=closing),
+                      mock.patch.object(peer.os, 'unlink', side_effect=unlink), self.assertRaises(OSError) as raised):
+                    self.execute(bundle)
+                self.assertIs(raised.exception, walk_failure if primary_walk_error else close_failure)
+                for descriptor in captured:
+                    with self.assertRaises(OSError): os.fstat(descriptor)
+                evidence = next(bundle.parent.glob('execution-*'))
+                self.assertFalse((evidence / 'passed.txt').exists())
+                self.assertFalse((evidence / 'cleanup-completion.json').exists())
+                self.assertEqual(json.loads((evidence / 'retained.json').read_text())['state'], 'retained-unresolved')
+                if primary_walk_error:
+                    self.assertFalse((bundle / 'payload-disposition.json').exists())
+                    self.assertTrue(any('descriptor close failed' in note for note in raised.exception.__notes__))
+
+
+    def test_r1_ambiguous_close_never_retries_reused_unrelated_descriptor(self):
+        import errno
+        for mode in ('runtime', 'publication', 'primary-and-close'):
+            with self.subTest(mode=mode):
+                bundle = self.bundle()
+                sentinel = bundle.parent / 'unrelated-file'
+                sentinel.write_bytes(b'unrelated descriptor payload')
+                captured, reused, calls = [], [], []
+                original_open, original_close, original_unlink = peer.open_captured_directory, peer.os.close, peer.os.unlink
+                opening_file = os.open
+                close_failure = InterruptedError(errno.EINTR, 'ambiguous owned close')
+                walk_failure = OSError(errno.EINVAL, 'owned primary error', 'no-build')
+                def opening(*args, **kwargs):
+                    descriptor = original_open(*args, **kwargs)
+                    captured.append(descriptor)
+                    return descriptor
+                def closing(descriptor):
+                    target = captured[1] if len(captured) == 2 and mode == 'runtime' else captured[0] if captured else None
+                    if descriptor == target:
+                        calls.append(descriptor)
+                        if reused:
+                            raise AssertionError('retried numeric close authority after descriptor reuse')
+                        original_close(descriptor)
+                        replacement = opening_file(sentinel, os.O_RDONLY | os.O_CLOEXEC)
+                        self.assertEqual(replacement, descriptor)
+                        reused.append(replacement)
+                        raise close_failure
+                    original_close(descriptor)
+                def unlink(path, *args, **kwargs):
+                    if mode == 'primary-and-close' and path == 'no-build': raise walk_failure
+                    return original_unlink(path, *args, **kwargs)
+                try:
+                    with (mock.patch.object(peer, 'open_captured_directory', side_effect=opening),
+                          mock.patch.object(peer.os, 'close', side_effect=closing),
+                          mock.patch.object(peer.os, 'unlink', side_effect=unlink), self.assertRaises(OSError) as raised):
+                        self.execute(bundle)
+                    self.assertIs(raised.exception, walk_failure if mode == 'primary-and-close' else close_failure)
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(len(reused), 1)
+                    self.assertEqual(os.fstat(reused[0]).st_ino, sentinel.stat().st_ino)
+                    self.assertEqual(os.read(reused[0], 100), b'unrelated descriptor payload')
+                    evidence = next(bundle.parent.glob('execution-*'))
+                    self.assertFalse((evidence / 'cleanup-completion.json').exists())
+                    self.assertFalse((evidence / 'passed.txt').exists())
+                    self.assertEqual(json.loads((evidence / 'retained.json').read_text())['state'], 'retained-unresolved')
+                    self.assertFalse((bundle / 'disposed.json').exists(), 'no full-directory disposal claim exists')
+                finally:
+                    for descriptor in reused: original_close(descriptor)
+
+
+    def test_r1_late_ancestor_swap_after_payload_checkpoint_never_authorizes_pass(self):
+        bundle = self.bundle()
+        saved = bundle.with_name('late-original-bundle')
+        original = peer.atomic_record_at
+        def publication(descriptor, name, record):
+            if name == 'payload-disposition.json':
+                bundle.rename(saved)
+                bundle.mkdir(mode=0o700)
+                (bundle / 'foreign-sentinel').write_text('late unrelated ancestor')
+            return original(descriptor, name, record)
+        with mock.patch.object(peer, 'atomic_record_at', side_effect=publication), self.assertRaises(ValueError):
+            self.execute(bundle)
+        self.assertTrue((bundle / 'foreign-sentinel').is_file())
+        self.assertFalse((bundle / 'payload-disposition.json').exists())
+        self.assertTrue((saved / 'payload-disposition.json').is_file(), 'checkpoint belongs only to captured inode')
+        evidence = next(bundle.parent.glob('execution-*'))
+        self.assertFalse((evidence / 'cleanup-completion.json').exists())
+        self.assertFalse((evidence / 'passed.txt').exists())
+
+
+class WorkflowSplitTests(unittest.TestCase):
+    def test_both_native_service_lanes_prepare_before_bounded_direct_execution(self):
+        for path, platform in [('.github/workflows/native-crypto.yml', 'Intel Darwin'),
+                               ('.github/workflows/ci.yml', 'Darwin')]:
+            with self.subTest(path=path):
+                text = (SCRIPT.parents[1] / path).read_text()
+                prepare_name = 'Prepare native ' + platform + ' legacy account-service restart artifacts'
+                execute_name = 'Native ' + platform + ' legacy account-service restart acceptance'
+                start = text.index('      - name: ' + prepare_name)
+                middle = text.index('      - name: ' + execute_name, start)
+                end = text.index('      - name:', middle + 20)
+                preparation, execution = text[start:middle], text[middle:end]
+                self.assertIn('--prepare-only', preparation)
+                self.assertIn('--prepared-bundle', preparation)
+                self.assertIn('--execute-prepared', execution)
+                self.assertIn('timeout-minutes: 12', execution)
+                self.assertNotIn('timeout-minutes: 12', preparation)
+                self.assertIn('test_released_peer_acceptance.py', preparation)
+                self.assertNotIn('test_released_peer_acceptance.py', execution)
+                self.assertIn("2 selected tests; 2 passed; 0 skipped", execution)
+                exports = lambda block: [line.strip() for line in block.splitlines()
+                                         if line.strip().startswith(('export ', 'cargo_home='))]
+                self.assertEqual(exports(preparation), exports(execution))
+                self.assertIn('timeout-minutes: 45', text)
+                self.assertIn('if: always()', text[end:end + 300])

@@ -886,16 +886,55 @@ jobs:
             echo '::error::portable inline SSH bootstrap tests reported a runtime skip' >&2
             exit 1
           fi
+      - name: Prepare native Darwin legacy account-service restart artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export HISTFILE=/dev/null
+          started=$(date +%s)
+          python3 -m unittest discover -s scripts/tests -p test_released_peer_acceptance.py
+          python3 scripts/released-peer-acceptance.py --service-only --prepare-only \
+            --prepared-bundle "$RUNNER_TEMP/legacy-service-arm64-bundle" \
+            --evidence "$RUNNER_TEMP/legacy-service-arm64-preparation-evidence"
+          printf 'legacy-service preparation elapsed_seconds=%s\n' "$(( $(date +%s) - started ))"
       - name: Native Darwin legacy account-service restart acceptance
         shell: bash
         timeout-minutes: 12
         run: |
           set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           export HISTFILE=/dev/null
-          python3 -m unittest discover -s scripts/tests -p test_released_peer_acceptance.py
           python3 scripts/released-peer-acceptance.py --service-only \
+            --execute-prepared "$RUNNER_TEMP/legacy-service-arm64-bundle" \
             --evidence "$RUNNER_TEMP/legacy-service-arm64-evidence"
           grep -Fx '2 selected tests; 2 passed; 0 skipped' "$RUNNER_TEMP/legacy-service-arm64-evidence/passed.txt"
+      - name: Report native Darwin legacy-service bundle lifecycle
+        if: always()
+        shell: bash
+        run: |
+          python3 -I -B - "$RUNNER_TEMP/legacy-service-arm64-bundle" <<'PY_STATE'
+          import json, os, stat, sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          record = dict(state='not-created')
+          try:
+              info = root.lstat()
+              if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                  record = dict(state='unverified-backing-retained')
+              else:
+                  record = dict(state='owned-backing-retained')
+                  for name in ('complete.json', 'execution.claim', 'settled.json', 'payload-disposition.json'):
+                      path = root / name
+                      record[name] = path.is_file() and not path.is_symlink()
+          except FileNotFoundError:
+              pass
+          print('LEGACY_SERVICE_BUNDLE '+json.dumps(record, sort_keys=True))
+          PY_STATE
       - name: Portable pin-store and private-key file tests
         run: |
           set -euo pipefail
