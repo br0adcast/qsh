@@ -29,3 +29,9 @@ mod writer;
 pub(crate) mod authorization;
 #[allow(dead_code)] // No host process, endpoint, or writer is activated.
 pub(crate) mod host;
+
+pub mod host_auth_contract;
+pub mod local_admission_contract;
+#[cfg(test)]
+mod local_ipc_contract_tests;
+pub mod owner_resource_contract;
