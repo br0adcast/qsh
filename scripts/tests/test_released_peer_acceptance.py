@@ -1332,8 +1332,9 @@ class PreparedBundleTests(PreparationTests):
         outer = tempfile.TemporaryDirectory(prefix='peer-bundle-control-')
         self.addCleanup(outer.cleanup)
         bundle = peer.create_bundle(Path(outer.name) / 'bundle')
-        runtime = bundle / 'runtime'
-        runtime.mkdir(mode=0o700)
+        allocation = peer.allocate_runtime(bundle)
+        runtime = Path(allocation['root']['path'])
+        self.addCleanup(__import__('shutil').rmtree, runtime, True)
         for name in ('home', 'config', 'cache', 'tmp', 'old'):
             (runtime / name).mkdir(mode=0o700)
         old = [runtime / 'old' / name for name in ('qsh', 'qshd')]
@@ -1349,6 +1350,9 @@ class PreparedBundleTests(PreparationTests):
             peer.seal_bundle(context, bundle, runtime, old, {})
         self.assertFalse((self.evidence / 'passed.txt').exists())
         return bundle
+
+    def runtime(self, bundle):
+        return Path(json.loads((bundle / 'runtime-allocation.json').read_text())['root']['path'])
 
     def execute(self, bundle, cases=None, env=None, source=None, tracked=None):
         evidence = bundle.parent / ('execution-' + str(len(list(bundle.parent.glob('execution-*')))))
@@ -1376,8 +1380,8 @@ class PreparedBundleTests(PreparationTests):
         self.assertEqual((evidence / 'passed.txt').read_text(), '2 selected tests; 2 passed; 0 skipped\n')
         self.assertEqual(len([c for c in commands if c[0] != 'rustc']), 2)
         self.assertFalse(any(c[0] == 'cargo' for c in commands))
-        self.assertTrue((bundle / 'runtime').is_dir())
-        self.assertEqual(list((bundle / 'runtime').iterdir()), [])
+        self.assertTrue(self.runtime(bundle).is_dir())
+        self.assertEqual(list(self.runtime(bundle).iterdir()), [])
         self.assertTrue((bundle / 'payload-disposition.json').is_file())
         with self.assertRaises(ValueError):
             self.execute(bundle)
@@ -1396,7 +1400,7 @@ class PreparedBundleTests(PreparationTests):
                 with self.assertRaises(ValueError):
                     self.execute(bundle)
                 self.assertFalse((bundle / 'execution.claim').exists())
-                self.assertTrue((bundle / 'runtime').is_dir())
+                self.assertTrue(self.runtime(bundle).is_dir())
 
     def test_wrong_configuration_selection_partial_and_replaced_backing_refuse(self):
         bundle = self.bundle()
@@ -1405,7 +1409,7 @@ class PreparedBundleTests(PreparationTests):
         (bundle / 'complete.json').unlink()
         with self.assertRaises(ValueError): self.execute(bundle)
         bundle = self.bundle()
-        runtime = bundle / 'runtime'
+        runtime = self.runtime(bundle)
         runtime.rename(bundle / 'retained-runtime')
         runtime.symlink_to(bundle / 'retained-runtime', target_is_directory=True)
         with self.assertRaises(ValueError): self.execute(bundle)
@@ -1416,7 +1420,7 @@ class PreparedBundleTests(PreparationTests):
             with self.subTest(kind=kind):
                 bundle = self.bundle()
                 path = self.root / 'target/debug/qshd'
-                if kind == 'fixture': path = bundle / 'runtime/old/qshd'
+                if kind == 'fixture': path = self.runtime(bundle) / 'old/qshd'
                 if kind in ('hash', 'fixture'): path.write_bytes(b'changed')
                 elif kind == 'missing': path.unlink()
                 else:
@@ -1426,7 +1430,7 @@ class PreparedBundleTests(PreparationTests):
                     else: path.write_bytes(saved.read_bytes()); path.chmod(0o700)
                 with self.assertRaises(ValueError): self.execute(bundle)
                 self.assertFalse((bundle / 'execution.claim').exists())
-                self.assertTrue((bundle / 'runtime').is_dir())
+                self.assertTrue(self.runtime(bundle).is_dir())
 
     def test_default_selection_retains_all_eight_and_both_required_harnesses(self):
         bundle = self.bundle(peer.CASES)
@@ -1484,7 +1488,7 @@ class PreparedBundleTests(PreparationTests):
                 finally:
                     if hasattr(self, 'command_timeout'): del self.command_timeout
                 self.assertTrue((bundle / 'execution.claim').exists())
-                self.assertTrue((bundle / 'runtime').is_dir())
+                self.assertTrue(self.runtime(bundle).is_dir())
                 self.assertFalse((bundle / 'payload-disposition.json').exists())
                 evidence = next(bundle.parent.glob('execution-*'))
                 self.assertFalse((evidence / 'passed.txt').exists())
@@ -1501,7 +1505,7 @@ class PreparedBundleTests(PreparationTests):
         self.assertTrue((evidence / (peer.CASES[-2][1]+'.log')).exists())
         self.assertFalse((evidence / (peer.CASES[-1][1]+'.log')).exists())
         self.assertFalse((evidence / 'passed.txt').exists())
-        self.assertTrue((bundle / 'runtime').is_dir())
+        self.assertTrue(self.runtime(bundle).is_dir())
 
     def test_untrusted_preparation_missing_phase_receipts_cannot_be_claimed(self):
         bundle = self.bundle()
@@ -1516,7 +1520,7 @@ class PreparedBundleTests(PreparationTests):
         bundle = self.bundle()
         with mock.patch.object(peer.shutil.rmtree, 'avoids_symlink_attacks', False), self.assertRaises(ValueError):
             self.execute(bundle)
-        self.assertTrue((bundle / 'runtime').is_dir())
+        self.assertTrue(self.runtime(bundle).is_dir())
         self.assertFalse((bundle / 'payload-disposition.json').exists())
         self.assertFalse(next(bundle.parent.glob('execution-*')).joinpath('passed.txt').exists())
 
@@ -1548,7 +1552,7 @@ class PreparedBundleTests(PreparationTests):
         (bundle / 'complete.json').chmod(0o600)
         with self.assertRaises(ValueError): self.execute(bundle)
         self.assertFalse((bundle / 'execution.claim').exists())
-        self.assertTrue((saved / 'runtime').is_dir())
+        self.assertTrue(self.runtime(saved).is_dir())
 
 
     def test_cli_prepare_then_execute_uses_retained_fixture_without_cargo_at_runtime(self):
@@ -1573,7 +1577,7 @@ class PreparedBundleTests(PreparationTests):
                 with mock.patch.object(sys, 'argv', [str(SCRIPT), '--service-only', '--prepare-only',
                         '--prepared-bundle', str(bundle), '--archive', str(archive), '--evidence', str(preparation)]):
                     peer.main()
-                self.assertTrue((bundle / 'runtime/old/qshd').is_file())
+                self.assertTrue((self.runtime(bundle) / 'old/qshd').is_file())
                 self.assertFalse((preparation / 'passed.txt').exists())
                 before = len(commands)
                 with mock.patch.object(sys, 'argv', [str(SCRIPT), '--service-only', '--execute-prepared', str(bundle),
@@ -1583,6 +1587,144 @@ class PreparedBundleTests(PreparationTests):
             self.assertEqual((execution / 'passed.txt').read_text(), '2 selected tests; 2 passed; 0 skipped\n')
             self.assertTrue(archive.is_file(), 'caller-owned archive must remain untouched')
 
+
+    def test_long_ambient_and_explicit_bundle_keep_runtime_short_and_execute_without_cargo(self):
+        for mode in ['ambient', 'explicit'] + (['linux-long'] if sys.platform.startswith('linux') else []):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(prefix='peer-long-path-') as directory:
+                outer = Path(directory)
+                long = outer / ('long-metadata-' + 'x'*100)
+                long.mkdir(mode=0o700)
+                # Linux accepts this >2KiB path; Darwin's PATH_MAX is smaller.
+                if mode == 'linux-long':
+                    for index in range(10):
+                        long /= str(index)+'x'*199
+                        long.mkdir(mode=0o700)
+                archive = AcceptanceTests.archive(self, outer, [(peer.PREFIX+'/'+name, tarfile.REGTYPE) for name in ('qsh', 'qshd')])
+                fixture = (peer.PREFIX, hashlib.sha256(archive.read_bytes()).hexdigest(), archive.stat().st_size)
+                preparation, execution = outer / 'preparation', outer / 'execution'
+                bundle = long / 'explicit-bundle'
+                actual_stream, commands = peer.stream_command, []
+                def stream(command, env, log, **kwargs):
+                    commands.append(command)
+                    if command[0] in ('cargo', 'rustc'): return self.runner(command, env, log, **kwargs)
+                    return actual_stream(command, env, log, **kwargs)
+                previous_tempdir = tempfile.tempdir
+                try:
+                    tempfile.tempdir = None
+                    with (mock.patch.dict(os.environ, {'TMPDIR': str(long)}),
+                          mock.patch.object(peer, 'WORKSPACE', self.root),
+                          mock.patch.object(peer, 'current_source', return_value='ab'*20),
+                          mock.patch.object(peer, 'current_input', return_value='cd'*32),
+                          mock.patch.object(peer, 'fixture_for_host', return_value=fixture),
+                          mock.patch.object(peer, 'stream_command', side_effect=stream), redirect_stdout(io.StringIO())):
+                        args = [str(SCRIPT), '--service-only', '--archive', str(archive), '--evidence', str(preparation)]
+                        if mode != 'ambient': args += ['--prepare-only', '--prepared-bundle', str(bundle)]
+                        with mock.patch.object(sys, 'argv', args): peer.main()
+                        actual_bundle = Path((preparation / 'bundle-path.txt').read_text().strip())
+                        if mode != 'ambient': self.assertEqual(actual_bundle, bundle)
+                        else:
+                            self.assertEqual(actual_bundle.parent, long.resolve())
+                            self.assertRegex(actual_bundle.name, r'^qsh-prepared-[0-9a-f]{32}$')
+                        record = json.loads((actual_bundle / 'complete.json').read_text())
+                        if mode == 'linux-long':
+                            self.assertGreater(len(os.fsencode(actual_bundle)), 2000)
+                            self.assertGreater((actual_bundle / 'runtime-allocation.json').stat().st_size, 4096)
+                        runtime = Path(record['backing'][0]['path'])
+                        # The old nesting fails here before any runtime command.
+                        self.addCleanup(__import__('shutil').rmtree, runtime, True)
+                        self.assertLessEqual(len(os.fsencode(runtime / 'tmp')), 58)
+                        self.assertFalse(runtime.is_relative_to(actual_bundle))
+                        before = len(commands)
+                        if mode != 'ambient':
+                            with mock.patch.object(sys, 'argv', [str(SCRIPT), '--service-only', '--execute-prepared', str(actual_bundle), '--evidence', str(execution)]): peer.main()
+                        else:
+                            execution = preparation
+                            before = next(i for i, command in enumerate(commands) if command[0] not in ('cargo', 'rustc'))
+                    self.assertFalse(any(command[0] == 'cargo' for command in commands[before:]))
+                    self.assertEqual((execution / 'passed.txt').read_text(), '2 selected tests; 2 passed; 0 skipped\n')
+                finally:
+                    tempfile.tempdir = previous_tempdir
+
+
+    def test_schema1_and_allocation_transplant_refuse_without_claim(self):
+        for change in ('schema1', 'bundle', 'parent', 'root', 'marker'):
+            with self.subTest(change=change):
+                bundle = self.bundle()
+                complete = bundle / 'complete.json'
+                record = json.loads(complete.read_text())
+                if change == 'schema1': record['schema'] = 1
+                elif change == 'bundle':
+                    record['allocation']['bundle'] = {'path': '/foreign'}
+                    (bundle / 'runtime-allocation.json').write_text(json.dumps(record['allocation']))
+                elif change == 'parent': record['allocation']['parent']['inode'] += 1
+                elif change == 'root': record['allocation']['root']['path'] = '/tmp/not-a-runtime'
+                else: (bundle / 'runtime-allocation.json').write_text('{}')
+                complete.write_text(json.dumps(record))
+                with self.assertRaises((ValueError, KeyError)): self.execute(bundle)
+                self.assertFalse((bundle / 'execution.claim').exists())
+
+    def test_substituted_shared_parent_descriptor_never_deletes_foreign_backing(self):
+        bundle = self.bundle()
+        foreign = bundle.parent / 'foreign-parent'
+        foreign.mkdir(mode=0o700)
+        sentinel = foreign / 'sentinel'
+        sentinel.write_text('foreign parent')
+        original = peer.open_captured_directory
+        def substituted(path, captured, **kwargs):
+            return original(foreign if kwargs.get('shared') else path, captured, **kwargs)
+        with mock.patch.object(peer, 'open_captured_directory', side_effect=substituted), self.assertRaises(ValueError):
+            self.execute(bundle)
+        self.assertTrue(sentinel.is_file())
+        self.assertTrue((self.runtime(bundle) / 'old/qshd').exists())
+        self.assertFalse((bundle / 'payload-disposition.json').exists())
+        self.assertFalse(next(bundle.parent.glob('execution-*')).joinpath('passed.txt').exists())
+
+    def test_runtime_capture_substitution_refuses_and_closes_already_open_descriptors(self):
+        bundle = self.bundle()
+        runtime = self.runtime(bundle)
+        saved = bundle / 'saved-runtime'
+        original = peer.open_captured_directory
+        descriptors = []
+        def opening(path, captured, **kwargs):
+            if str(path) == runtime.name:
+                runtime.rename(saved)
+                runtime.mkdir(mode=0o700)
+                (runtime / 'foreign-sentinel').write_text('foreign captured runtime')
+            descriptor = original(path, captured, **kwargs)
+            descriptors.append(descriptor)
+            return descriptor
+        with mock.patch.object(peer, 'open_captured_directory', side_effect=opening), self.assertRaises(ValueError): self.execute(bundle)
+        self.assertTrue((runtime / 'foreign-sentinel').is_file())
+        self.assertTrue((saved / 'old/qshd').is_file())
+        for descriptor in descriptors:
+            with self.assertRaises(OSError): os.fstat(descriptor)
+        self.assertFalse((bundle / 'payload-disposition.json').exists())
+
+    def test_changed_parent_namespace_during_walk_or_publication_never_passes(self):
+        for boundary in ('walk', 'publication'):
+            with self.subTest(boundary=boundary):
+                bundle = self.bundle()
+                original_walk, original_marker = peer.shutil.rmtree, peer.atomic_record_at
+                wrong = bundle.parent / 'foreign-parent'
+                wrong.mkdir(mode=0o700)
+                (wrong / 'foreign-sentinel').write_text('foreign namespace')
+                changed = mock.patch.object(peer, 'runtime_parent', return_value=wrong)
+                def walking(*args, **kwargs):
+                    changed.start()
+                    return original_walk(*args, **kwargs)
+                walking.avoids_symlink_attacks = True
+                def publishing(fd, name, record):
+                    if name == 'payload-disposition.json': changed.start()
+                    return original_marker(fd, name, record)
+                try:
+                    with (mock.patch.object(peer.shutil, 'rmtree', walking if boundary == 'walk' else original_walk),
+                          mock.patch.object(peer, 'atomic_record_at', side_effect=publishing), self.assertRaises(ValueError)):
+                        self.execute(bundle)
+                finally: changed.stop()
+                self.assertTrue((wrong / 'foreign-sentinel').is_file())
+                evidence = next(bundle.parent.glob('execution-*'))
+                self.assertFalse((evidence / 'passed.txt').exists())
+                self.assertFalse((evidence / 'cleanup-completion.json').exists())
 
     def test_current_artifact_size_is_bounded_before_reading_cargo_candidate(self):
         artifact = self.record('qsh', 'bin')
@@ -1597,7 +1739,7 @@ class PreparedBundleTests(PreparationTests):
         for boundary in ('runtime', 'ancestor'):
             with self.subTest(boundary=boundary):
                 bundle = self.bundle()
-                runtime = bundle / 'runtime'
+                runtime = self.runtime(bundle)
                 original = peer.shutil.rmtree
                 foreign = []
                 saved = bundle / 'original-runtime' if boundary == 'runtime' else bundle.with_name('original-bundle')
@@ -1607,8 +1749,8 @@ class PreparedBundleTests(PreparationTests):
                     else:
                         bundle.rename(saved)
                         bundle.mkdir(mode=0o700)
-                    runtime.mkdir(mode=0o700)
-                    sentinel = runtime / 'foreign-sentinel'
+                    if boundary == 'runtime': runtime.mkdir(mode=0o700)
+                    sentinel = (runtime if boundary == 'runtime' else bundle) / 'foreign-sentinel'
                     sentinel.write_text('unrelated replacement')
                     foreign.append(sentinel)
                     return original(path, *args, **kwargs)
@@ -1641,11 +1783,11 @@ class PreparedBundleTests(PreparationTests):
         with (mock.patch.object(peer, 'open_captured_directory', side_effect=opening),
               mock.patch.object(peer.shutil, 'rmtree', walking)):
             evidence, _ = self.execute(bundle)
-        self.assertEqual(len(descriptors), 2)
+        self.assertEqual(len(descriptors), 3)
         for descriptor in descriptors:
             with self.assertRaises(OSError): os.fstat(descriptor)
-        self.assertEqual(peer.directory_identity(bundle / 'runtime'), record['backing'][0])
-        self.assertEqual(list((bundle / 'runtime').iterdir()), [])
+        self.assertEqual(peer.directory_identity(self.runtime(bundle)), record['backing'][0])
+        self.assertEqual(list(self.runtime(bundle).iterdir()), [])
         disposition = json.loads((bundle / 'payload-disposition.json').read_text())
         self.assertTrue(disposition['payload_disposed'])
         self.assertEqual(disposition['retained_owned_metadata'], record['backing'][0])
@@ -1656,7 +1798,7 @@ class PreparedBundleTests(PreparationTests):
 
     def test_r1_final_dot_alias_swap_preserves_foreign_sentinel_without_pass(self):
         bundle = self.bundle()
-        runtime, saved = bundle / 'runtime', bundle / 'original-runtime'
+        runtime, saved = self.runtime(bundle), bundle / 'original-runtime'
         original = peer.os.rmdir
         observed = []
         def final_alias(path, *args, **kwargs):
@@ -1693,7 +1835,7 @@ class PreparedBundleTests(PreparationTests):
         self.assertTrue((saved / 'settled.json').is_file())
         self.assertFalse((bundle / 'settled.json').exists())
         self.assertTrue((bundle / 'foreign-sentinel').is_file())
-        self.assertTrue((saved / 'runtime/old/qshd').is_file())
+        self.assertTrue((self.runtime(saved) / 'old/qshd').is_file())
         self.assertFalse((saved / 'payload-disposition.json').exists())
         self.assertFalse(next(bundle.parent.glob('execution-*')).joinpath('passed.txt').exists())
 
@@ -1728,10 +1870,10 @@ class PreparedBundleTests(PreparationTests):
                     with manager, self.assertRaises(type(failure)) as raised:
                         self.execute(bundle)
                 self.assertIs(raised.exception, failure)
-                self.assertEqual(len(descriptors), 2)
+                self.assertEqual(len(descriptors), 3)
                 for descriptor in descriptors:
                     with self.assertRaises(OSError): os.fstat(descriptor)
-                self.assertTrue((bundle / 'runtime').is_dir())
+                self.assertTrue(self.runtime(bundle).is_dir())
                 self.assertFalse((bundle / 'payload-disposition.json').exists())
                 evidence = next(bundle.parent.glob('execution-*'))
                 self.assertFalse((evidence / 'passed.txt').exists())
@@ -1790,7 +1932,7 @@ class PreparedBundleTests(PreparationTests):
                     captured.append(descriptor)
                     return descriptor
                 def closing(descriptor):
-                    target = captured[1] if len(captured) == 2 and mode == 'runtime' else captured[0] if captured else None
+                    target = captured[2] if len(captured) == 3 and mode == 'runtime' else captured[0] if captured else None
                     if descriptor == target:
                         calls.append(descriptor)
                         if reused:
@@ -1841,6 +1983,222 @@ class PreparedBundleTests(PreparationTests):
         evidence = next(bundle.parent.glob('execution-*'))
         self.assertFalse((evidence / 'cleanup-completion.json').exists())
         self.assertFalse((evidence / 'passed.txt').exists())
+
+
+class ShortRuntimeAllocationTests(unittest.TestCase):
+    def private_bundle(self):
+        outer = tempfile.TemporaryDirectory(prefix='short-runtime-control-', dir='/tmp')
+        self.addCleanup(outer.cleanup)
+        bundle = Path(outer.name) / 'bundle'
+        bundle.mkdir(mode=0o700)
+        return bundle
+
+    def allocate(self, bundle):
+        allocation = peer.allocate_runtime(bundle)
+        self.addCleanup(__import__('shutil').rmtree, allocation['root']['path'], True)
+        return allocation
+
+    def test_allocation_is_private_fixed_canonical_and_persisted_before_work(self):
+        bundle = self.private_bundle()
+        allocation = self.allocate(bundle)
+        runtime = Path(allocation['root']['path'])
+        self.assertEqual(runtime.parent, Path('/tmp').resolve())
+        self.assertRegex(runtime.name, r'^q5-[0-9a-f]{32}$')
+        self.assertEqual(runtime.stat().st_mode & 0o7777, 0o700)
+        self.assertLessEqual(len(os.fsencode(runtime / 'tmp')), 58)
+        self.assertEqual(json.loads((bundle / 'runtime-allocation.json').read_text()), allocation)
+        self.assertFalse((bundle / 'complete.json').exists())
+
+    def test_allocation_failure_and_unsupported_parent_never_publish_complete(self):
+        for mode in ('platform', 'parent', 'mkdir'):
+            bundle = self.private_bundle()
+            if mode == 'platform': manager = mock.patch.object(peer.platform, 'system', return_value='Unknown')
+            elif mode == 'parent': manager = mock.patch.object(peer, 'runtime_parent', return_value=bundle.parent)
+            else: manager = mock.patch.object(peer.os, 'mkdir', side_effect=OSError('owned allocation denial'))
+            with manager, self.assertRaises((ValueError, OSError)): peer.allocate_runtime(bundle)
+            self.assertFalse((bundle / 'complete.json').exists())
+            self.assertFalse((bundle / 'runtime-allocation.json').exists())
+
+    def test_preparation_failure_retains_known_allocation_without_build_or_complete(self):
+        for failure in (ValueError('fixture denied'), KeyboardInterrupt('cancel fixture')):
+            bundle = self.private_bundle()
+            evidence = bundle.parent / 'evidence'
+            evidence.mkdir(mode=0o700)
+            with (mock.patch.object(peer, 'current_source', return_value='ab'*20),
+                  mock.patch.object(peer, 'current_input', return_value='cd'*32),
+                  mock.patch.object(peer, 'download', side_effect=failure),
+                  mock.patch.object(peer, 'stream_command') as commands, redirect_stdout(io.StringIO()),
+                  self.assertRaises(type(failure))):
+                peer.prepare_bundle(bundle, peer.CASES[-2:], {}, evidence)
+            allocation = json.loads((bundle / 'runtime-allocation.json').read_text())
+            self.addCleanup(__import__('shutil').rmtree, allocation['root']['path'], True)
+            self.assertTrue(Path(allocation['root']['path']).is_dir())
+            retained = json.loads((evidence / 'preparation-retained.json').read_text())
+            self.assertEqual(retained['allocation'], allocation)
+            self.assertFalse((bundle / 'complete.json').exists())
+            commands.assert_not_called()
+
+    def test_interrupted_allocation_publication_retains_exact_known_backing(self):
+        bundle = self.private_bundle()
+        evidence = bundle.parent / 'evidence'
+        evidence.mkdir(mode=0o700)
+        token = peer.uuid.uuid4()
+        runtime = Path('/tmp').resolve() / ('q5-'+token.hex)
+        self.assertFalse(runtime.exists())
+        self.addCleanup(__import__('shutil').rmtree, runtime, True)
+        failure = KeyboardInterrupt('allocation publication interrupted')
+        with (mock.patch.object(peer.uuid, 'uuid4', return_value=token),
+              mock.patch.object(peer, 'current_source', return_value='ab'*20),
+              mock.patch.object(peer, 'current_input', return_value='cd'*32),
+              mock.patch.object(peer, 'atomic_record_at', side_effect=failure),
+              mock.patch.object(peer, 'download') as download, mock.patch.object(peer, 'stream_command') as commands,
+              redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt) as raised):
+            peer.prepare_bundle(bundle, peer.CASES[-2:], {}, evidence)
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(runtime.is_dir())
+        retained = json.loads((evidence / 'preparation-retained.json').read_text())
+        self.assertIsNotNone(retained['allocation'])
+        self.assertEqual(retained['allocation']['root'], peer.directory_identity(runtime))
+        self.assertFalse((bundle / 'complete.json').exists())
+        download.assert_not_called(); commands.assert_not_called()
+
+    def test_allocation_runtime_or_bundle_substitution_retains_without_redirected_marker(self):
+        for boundary in ('runtime', 'bundle'):
+            with self.subTest(boundary=boundary):
+                bundle = self.private_bundle()
+                token = peer.uuid.uuid4()
+                runtime = Path('/tmp').resolve() / ('q5-'+token.hex)
+                self.assertFalse(runtime.exists())
+                self.addCleanup(__import__('shutil').rmtree, runtime, True)
+                saved = bundle.parent / 'saved'
+                original_open, original_record = peer.open_captured_directory, peer.atomic_record_at
+                descriptors = []
+                def opening(path, captured, **kwargs):
+                    if boundary == 'runtime' and str(path) == runtime.name:
+                        runtime.rename(saved)
+                        runtime.mkdir(mode=0o700)
+                        (runtime / 'foreign-sentinel').write_text('foreign allocation')
+                    fd = original_open(path, captured, **kwargs)
+                    descriptors.append(fd)
+                    return fd
+                def writing(fd, name, record):
+                    if boundary == 'bundle':
+                        bundle.rename(saved)
+                        bundle.mkdir(mode=0o700)
+                        (bundle / 'foreign-sentinel').write_text('foreign bundle')
+                    return original_record(fd, name, record)
+                with (mock.patch.object(peer.uuid, 'uuid4', return_value=token),
+                      mock.patch.object(peer, 'open_captured_directory', side_effect=opening),
+                      mock.patch.object(peer, 'atomic_record_at', side_effect=writing), self.assertRaises(ValueError)):
+                    peer.allocate_runtime(bundle)
+                self.assertTrue(((runtime if boundary == 'runtime' else bundle) / 'foreign-sentinel').is_file())
+                self.assertFalse((bundle / 'runtime-allocation.json').exists())
+                self.assertFalse((bundle / 'complete.json').exists())
+                if boundary == 'bundle': self.assertTrue((saved / 'runtime-allocation.json').is_file())
+                for fd in descriptors:
+                    with self.assertRaises(OSError): os.fstat(fd)
+
+    def test_allocation_close_uncertainty_retains_record_and_closes_other_fds(self):
+        import errno
+        bundle = self.private_bundle()
+        original_open, original_close = peer.open_captured_directory, peer.os.close
+        opened, calls = [], []
+        failure = InterruptedError(errno.EINTR, 'owned allocation close uncertainty')
+        def opening(*args, **kwargs):
+            fd = original_open(*args, **kwargs); opened.append(fd); return fd
+        def closing(fd):
+            calls.append(fd); original_close(fd)
+            if fd == opened[-1]: raise failure
+        with (mock.patch.object(peer, 'open_captured_directory', side_effect=opening),
+              mock.patch.object(peer.os, 'close', side_effect=closing), self.assertRaises(InterruptedError) as raised):
+            peer.allocate_runtime(bundle)
+        self.assertIs(raised.exception, failure)
+        allocation = json.loads((bundle / 'runtime-allocation.json').read_text())
+        self.addCleanup(__import__('shutil').rmtree, allocation['root']['path'], True)
+        self.assertCountEqual(calls, opened)
+        for fd in opened:
+            with self.assertRaises(OSError): os.fstat(fd)
+        self.assertFalse((bundle / 'complete.json').exists())
+
+    def test_sized_budget_fixture_canonicalizes_a_deterministically_expanding_alias(self):
+        with tempfile.TemporaryDirectory(prefix='p1-', dir='/tmp') as directory:
+            outer = Path(directory).resolve()
+            target = outer / 'longer-canonical-base'
+            target.mkdir(mode=0o700)
+            alias = outer / 'a'
+            alias.symlink_to(target, target_is_directory=True)
+            bundle = alias / 'bundle'
+            bundle.mkdir(mode=0o700)
+            self.assertGreater(len(os.fsencode(target)), len(os.fsencode(alias)))
+            with mock.patch.object(self, 'private_bundle', return_value=bundle):
+                root = self.sized_root(54)
+            self.assertEqual(len(os.fsencode(root.resolve() / 'tmp')), 58)
+            peer.validate_runtime_budget(root)
+
+    def test_allocation_record_roundtrip_above_4k_including_json_escaping_and_64k_refusal(self):
+        for path in ('/'+('a'*2100), '/'+('é'*1100), '/'+('\x01'*2100)):
+            with self.subTest(escaped=repr(path[:8])):
+                bundle = self.private_bundle()
+                allocation = self.allocate(bundle)
+                identity = dict(allocation['bundle'], path=path, resolved=path)
+                allocation['bundle'] = identity
+                marker = bundle / 'runtime-allocation.json'
+                marker.write_text(json.dumps(allocation))
+                self.assertGreater(marker.stat().st_size, 4096)
+                self.assertLess(marker.stat().st_size, 65536)
+                original = peer.directory_identity
+                with mock.patch.object(peer, 'directory_identity', side_effect=lambda p: identity if Path(p) == bundle else original(p)):
+                    try: actual = peer.allocation_record(bundle)
+                    except ValueError as error: self.fail('bounded valid allocation record was refused: '+str(error))
+                    self.assertEqual(actual, allocation)
+                    payload = marker.read_bytes()
+                    marker.write_bytes(payload + b' ' * (65536-len(payload)))
+                    self.assertEqual(peer.allocation_record(bundle), allocation)
+                marker.write_bytes(b' ' * 65537)
+                with self.assertRaises(ValueError): peer.allocation_record(bundle)
+
+    def sized_root(self, size, unicode=False):
+        bundle = self.private_bundle()
+        base = bundle.parent.resolve(strict=True)
+        count = size - len(os.fsencode(base)) - 1
+        name = ('é'*(count//2) + 'x'*(count%2)) if unicode else 'x'*count
+        root = base / name
+        root.mkdir(mode=0o700)
+        return root
+
+    def test_byte_budget_58_passes_59_refuses_including_unicode_and_canonical_expansion(self):
+        for unicode in (False, True):
+            root = self.sized_root(54, unicode)
+            self.assertEqual(len(os.fsencode(root / 'tmp')), 58)
+            peer.validate_runtime_budget(root)
+            root = self.sized_root(55, unicode)
+            self.assertEqual(len(os.fsencode(root / 'tmp')), 59)
+            with self.assertRaises(ValueError): peer.validate_runtime_budget(root)
+        long = self.sized_root(70)
+        alias = long.parent / 's'
+        alias.symlink_to(long, target_is_directory=True)
+        self.assertLess(len(os.fsencode(alias / 'tmp')), 58)
+        with self.assertRaises(ValueError): peer.validate_runtime_budget(alias)
+
+    def test_native_socket_bind_connect_full_staging_and_final_suffix_at_shared_budget(self):
+        import socket
+        root = self.sized_root(54)
+        tmp = root / 'tmp'
+        tmp.mkdir(mode=0o700)
+        self.assertEqual(len(os.fsencode(tmp)), 58)
+        suffixes = [('.tmpABC123/qsh/.c2147483647/s', 88), ('.tmpABC123/qsh/control.sock', 86),
+                    ('.tmpABC123/Library/Caches/qsh/.c2147483647/s', 103),
+                    ('.tmpABC123/Library/Caches/qsh/control.sock', 101)]
+        for suffix, size in suffixes:
+            path = tmp / suffix
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.assertEqual(len(os.fsencode(path)), size)
+            with socket.socket(socket.AF_UNIX) as server, socket.socket(socket.AF_UNIX) as client:
+                server.bind(str(path)); server.listen(1); client.connect(str(path))
+                connection, _ = server.accept()
+                with connection:
+                    client.sendall(b'owned'); self.assertEqual(connection.recv(5), b'owned')
+            path.unlink()
 
 
 class WorkflowSplitTests(unittest.TestCase):
