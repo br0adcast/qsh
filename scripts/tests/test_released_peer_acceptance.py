@@ -1,5 +1,5 @@
 """Fail-closed controls for the focused released-peer gate; no product builds."""
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 import ast
 import fnmatch
 import hashlib
@@ -494,7 +494,7 @@ while True:
 
 
 GROUP_CLEANUP_CONTROL = r'''
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 import ctypes
 import importlib.util
 import io
@@ -658,7 +658,7 @@ class OwnedGroupCleanupTests(unittest.TestCase):
 
 
 COMPLETION_CONTROL = r'''
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 import importlib.util
 import io
 import json
@@ -903,7 +903,7 @@ class ZombieCensusTests(unittest.TestCase):
 
 
 DARWIN_CLEANUP_CONTROL = r'''
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 import ctypes
 import importlib.util
 import io
@@ -1555,6 +1555,67 @@ class PreparedBundleTests(PreparationTests):
         self.assertTrue(self.runtime(saved).is_dir())
 
 
+    @contextmanager
+    def synthetic_cli_environment(self):
+        # The inert records model the fixture's host-default target/debug layout.
+        # Native production selectors must remain outside this synthetic context.
+        keys = ('CARGO_BUILD_TARGET', 'CARGO_TARGET_DIR')
+        before = {key: os.environ.get(key) for key in keys}
+        for key in keys: os.environ.pop(key, None)
+        try:
+            yield
+        finally:
+            for key, value in before.items():
+                if value is None: os.environ.pop(key, None)
+                else: os.environ[key] = value
+
+    def test_synthetic_cli_environment_restores_values_absence_and_exception_without_other_changes(self):
+        for present in (False, True):
+            with self.subTest(present=present), mock.patch.dict(os.environ):
+                for key in ('CARGO_BUILD_TARGET', 'CARGO_TARGET_DIR'): os.environ.pop(key, None)
+                if present:
+                    os.environ.update(CARGO_BUILD_TARGET='native-model', CARGO_TARGET_DIR='foreign-model')
+                before = dict(os.environ)
+                with self.assertRaisesRegex(RuntimeError, 'owned context exception'):
+                    with self.synthetic_cli_environment():
+                        self.assertNotIn('CARGO_BUILD_TARGET', os.environ)
+                        self.assertNotIn('CARGO_TARGET_DIR', os.environ)
+                        self.assertEqual(dict(os.environ), {k:v for k,v in before.items() if k not in ('CARGO_BUILD_TARGET', 'CARGO_TARGET_DIR')})
+                        os.environ['QSH_FIXTURE_CONTEXT_SENTINEL'] = 'intentional override'
+                        raise RuntimeError('owned context exception')
+                self.assertEqual(dict(os.environ), dict(before, QSH_FIXTURE_CONTEXT_SENTINEL='intentional override'))
+
+    def test_synthetic_cli_restores_outer_layout_under_native_foreign_and_combined_environment(self):
+        variants = [{'CARGO_BUILD_TARGET': 'x86_64-apple-darwin'},
+                    {'CARGO_TARGET_DIR': str(self.root / 'foreign-target')},
+                    {'CARGO_BUILD_TARGET': 'x86_64-apple-darwin', 'CARGO_TARGET_DIR': str(self.root / 'foreign-target')}]
+        for selectors in variants:
+            with self.subTest(selectors=selectors), mock.patch.dict(os.environ, selectors):
+                before = {key: os.environ.get(key) for key in ('CARGO_BUILD_TARGET', 'CARGO_TARGET_DIR')}
+                self.test_cli_prepare_then_execute_uses_retained_fixture_without_cargo_at_runtime()
+                self.assertEqual({key: os.environ.get(key) for key in before}, before)
+                self.test_long_ambient_and_explicit_bundle_keep_runtime_short_and_execute_without_cargo()
+                self.assertEqual({key: os.environ.get(key) for key in before}, before)
+
+    def test_synthetic_cli_workspace_alias_keeps_resolved_artifact_identity(self):
+        with tempfile.TemporaryDirectory(prefix='alias-', dir='/tmp') as directory:
+            alias = Path(directory) / 'a'
+            original_root = self.root
+            alias.symlink_to(original_root, target_is_directory=True)
+            self.assertGreater(len(os.fsencode(alias.resolve())), len(os.fsencode(alias)))
+            try:
+                self.root = alias
+                self.test_cli_prepare_then_execute_uses_retained_fixture_without_cargo_at_runtime()
+                record = self.record('qsh', 'bin')
+                log = original_root / 'alias-cargo.jsonl'
+                log.write_text(json.dumps(record)+'\n')
+                with mock.patch.object(peer, 'WORKSPACE', alias):
+                    artifact = peer.select_artifact(log, 'qsh', 'bin', {})
+                self.assertEqual(Path(artifact['executable']).resolve(), original_root.resolve() / 'target/debug/qsh')
+                self.assertEqual(Path(record['manifest_path']).resolve(), original_root.resolve() / 'cli/Cargo.toml')
+                self.assertEqual(Path(record['target']['src_path']).resolve(), original_root.resolve() / 'cli/src/main.rs')
+            finally: self.root = original_root
+
     def test_cli_prepare_then_execute_uses_retained_fixture_without_cargo_at_runtime(self):
         with tempfile.TemporaryDirectory(prefix='peer-cli-bundle-') as directory:
             outer = Path(directory)
@@ -1575,13 +1636,13 @@ class PreparedBundleTests(PreparationTests):
                   mock.patch.object(peer, 'stream_command', side_effect=stream),
                   redirect_stdout(io.StringIO())):
                 with mock.patch.object(sys, 'argv', [str(SCRIPT), '--service-only', '--prepare-only',
-                        '--prepared-bundle', str(bundle), '--archive', str(archive), '--evidence', str(preparation)]):
+                        '--prepared-bundle', str(bundle), '--archive', str(archive), '--evidence', str(preparation)]), self.synthetic_cli_environment():
                     peer.main()
                 self.assertTrue((self.runtime(bundle) / 'old/qshd').is_file())
                 self.assertFalse((preparation / 'passed.txt').exists())
                 before = len(commands)
                 with mock.patch.object(sys, 'argv', [str(SCRIPT), '--service-only', '--execute-prepared', str(bundle),
-                        '--evidence', str(execution)]):
+                        '--evidence', str(execution)]), self.synthetic_cli_environment():
                     peer.main()
             self.assertFalse(any(command[0] == 'cargo' for command in commands[before:]))
             self.assertEqual((execution / 'passed.txt').read_text(), '2 selected tests; 2 passed; 0 skipped\n')
@@ -1619,7 +1680,7 @@ class PreparedBundleTests(PreparationTests):
                           mock.patch.object(peer, 'stream_command', side_effect=stream), redirect_stdout(io.StringIO())):
                         args = [str(SCRIPT), '--service-only', '--archive', str(archive), '--evidence', str(preparation)]
                         if mode != 'ambient': args += ['--prepare-only', '--prepared-bundle', str(bundle)]
-                        with mock.patch.object(sys, 'argv', args): peer.main()
+                        with mock.patch.object(sys, 'argv', args), self.synthetic_cli_environment(): peer.main()
                         actual_bundle = Path((preparation / 'bundle-path.txt').read_text().strip())
                         if mode != 'ambient': self.assertEqual(actual_bundle, bundle)
                         else:
@@ -1636,7 +1697,7 @@ class PreparedBundleTests(PreparationTests):
                         self.assertFalse(runtime.is_relative_to(actual_bundle))
                         before = len(commands)
                         if mode != 'ambient':
-                            with mock.patch.object(sys, 'argv', [str(SCRIPT), '--service-only', '--execute-prepared', str(actual_bundle), '--evidence', str(execution)]): peer.main()
+                            with mock.patch.object(sys, 'argv', [str(SCRIPT), '--service-only', '--execute-prepared', str(actual_bundle), '--evidence', str(execution)]), self.synthetic_cli_environment(): peer.main()
                         else:
                             execution = preparation
                             before = next(i for i, command in enumerate(commands) if command[0] not in ('cargo', 'rustc'))
