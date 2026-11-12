@@ -14,12 +14,15 @@ use std::collections::{hash_map::VacantEntry, HashMap};
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+/// The installed model and its native resize authority, without child custody.
+pub type RetainedModel = (Box<dyn SessionScreen>, Box<dyn ResizeHandle>);
+
 struct RetainedChannel {
     identity: OpenIdentity,
     reader: Option<Box<dyn Read + Send>>,
     writer: Option<Box<dyn Write + Send>>,
-    _resize: Box<dyn ResizeHandle>,
-    _screen: Box<dyn SessionScreen>,
+    resize: Option<Box<dyn ResizeHandle>>,
+    screen: Option<Box<dyn SessionScreen>>,
     started: bool,
     receipts: Option<[crate::session_manager::WorkerReceipt; 2]>,
 }
@@ -82,8 +85,8 @@ impl PreparedRetainedInstallation<'_> {
             identity: self.identity,
             reader: Some(reader),
             writer: Some(writer),
-            _resize: resize,
-            _screen: screen,
+            resize: Some(resize),
+            screen: Some(screen),
             started: false,
             receipts: None,
         });
@@ -164,6 +167,19 @@ impl RetainedChannelSet {
             identity,
             installation: prepared,
         })
+    }
+    /// One-time model/control transfer after exact guarded installation and
+    /// before scheduling. Never yields a wait handle, descriptor or installed slot.
+    pub fn take_model(&mut self, identity: OpenIdentity) -> Result<RetainedModel, OpenRefusal> {
+        let ch = self
+            .channels
+            .get_mut(&identity.stream)
+            .filter(|ch| ch.identity == identity && !ch.started)
+            .ok_or(OpenRefusal::InvalidIdentity)?;
+        if ch.screen.is_none() || ch.resize.is_none() {
+            return Err(OpenRefusal::InvalidIdentity);
+        }
+        Ok((ch.screen.take().unwrap(), ch.resize.take().unwrap()))
     }
     /// Workers own descriptors and their supervisors retain actual JoinHandles.
     /// No caller can replace the child wait or manufacture a joined receipt.
