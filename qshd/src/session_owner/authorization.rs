@@ -1,11 +1,14 @@
 //! Dormant host authority state. A policy intent is work to perform, never an
-//! approval. No production proof/peer constructor exists in this first shard.
+//! approval. System results accept only sealed isolated-verifier observations;
+//! local peer admission remains unavailable until its real adapter is integrated.
 //! The verifier adapter must retain physical child custody independently when
 //! an intent is cancelled, expires, or loses its consumer.
 use rand_core::{OsRng, RngCore};
 use transport::session_resume::{FrontendGeneration, HostInstance, SessionLocator};
 
 use super::authorization_contract::AttachGrant;
+#[cfg(feature = "system")]
+use crate::helper::server::policy_check::{SystemCredential, SystemPolicyApproval};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthorityError {
@@ -78,13 +81,15 @@ impl CanonicalAccount {
     }
 }
 
-/// A private observation from the matching real credential adapter. The actual
-/// key stays with that adapter; this state binds its opaque registration and
-/// independently resolved canonical account. No caller-provided identity maps
-/// an account into the catalog.
+/// A private observation from the matching real credential adapter. Actual
+/// system key material is retained through an opaque verified-key capability,
+/// alongside its independently resolved canonical account. No caller-provided
+/// identity maps an account into the catalog.
 #[derive(Debug)]
 struct VerifiedIdentity {
     account: CanonicalAccount,
+    #[cfg(feature = "system")]
+    system_credential: Option<SystemCredential>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +102,7 @@ pub(crate) enum PolicyKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PolicyBinding {
     host: HostInstance,
+    mode: HostMode,
     frontend: FrontendAdmission,
     attempt: AuthenticationAttempt,
     operation: u64,
@@ -113,10 +119,21 @@ struct PolicyBinding {
 #[derive(Debug)]
 pub(crate) struct PolicyIntent {
     binding: PolicyBinding,
+    #[cfg(feature = "system")]
+    system_credential: Option<SystemCredential>,
 }
 
-/// No production constructor until a real verifier/possession adapter is
-/// integrated. No bool, public Principal, UID, or wire frame can construct it.
+/// Opaque host/frontend/attempt binding carried by a verified system key.
+#[cfg(feature = "system")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SystemContext {
+    host: HostInstance,
+    frontend: FrontendAdmission,
+    attempt: AuthenticationAttempt,
+}
+
+/// Successful system construction requires the isolated verifier's sealed
+/// approval. No bool, public Principal, UID, or wire frame can construct it.
 #[derive(Debug)]
 pub(crate) struct PolicyResult {
     binding: PolicyBinding,
@@ -128,6 +145,8 @@ struct Attempt {
     handle: AuthenticationAttempt,
     frontend: FrontendAdmission,
     credential: Option<(CredentialRegistration, CanonicalAccount)>,
+    #[cfg(feature = "system")]
+    system_credential: Option<SystemCredential>,
 }
 
 #[derive(Debug)]
@@ -267,6 +286,7 @@ impl AuthorizationState {
         }
         let binding = PolicyBinding {
             host: self.host,
+            mode: self.mode,
             frontend,
             attempt: handle,
             operation,
@@ -281,10 +301,16 @@ impl AuthorizationState {
             handle,
             frontend,
             credential: None,
+            #[cfg(feature = "system")]
+            system_credential: None,
         });
         self.pending.push(binding);
         self.last_operation = operation;
-        Ok(PolicyIntent { binding })
+        Ok(PolicyIntent {
+            binding,
+            #[cfg(feature = "system")]
+            system_credential: None,
+        })
     }
     pub(super) fn identity(
         &self,
@@ -346,6 +372,7 @@ impl AuthorizationState {
             .ok_or(AuthorityError::Exhausted)?;
         let binding = PolicyBinding {
             host: self.host,
+            mode: self.mode,
             frontend: a.frontend,
             attempt,
             operation,
@@ -358,7 +385,11 @@ impl AuthorizationState {
         };
         self.pending.push(binding);
         self.last_operation = operation;
-        Ok(PolicyIntent { binding })
+        Ok(PolicyIntent {
+            binding,
+            #[cfg(feature = "system")]
+            system_credential: a.system_credential.clone(),
+        })
     }
     pub(super) fn resolve(
         &mut self,
@@ -403,6 +434,10 @@ impl AuthorizationState {
             {
                 return Err(AuthorityError::Refused);
             }
+            #[cfg(feature = "system")]
+            {
+                a.system_credential = observation.system_credential;
+            }
             a.credential = Some((
                 CredentialRegistration {
                     host: self.host,
@@ -413,7 +448,18 @@ impl AuthorizationState {
             return Ok(PolicyResolution::Authenticated(b.attempt));
         }
         let (credential, account) = a.credential.as_ref().ok_or(AuthorityError::Refused)?;
-        if Some(*credential) != b.credential || *account != observation.account {
+        #[cfg(feature = "system")]
+        let credential_matches = match (&a.system_credential, &observation.system_credential) {
+            (Some(old), Some(new)) => old.same_registration(new),
+            (None, None) => true,
+            _ => false,
+        };
+        #[cfg(not(feature = "system"))]
+        let credential_matches = true;
+        if Some(*credential) != b.credential
+            || *account != observation.account
+            || !credential_matches
+        {
             self.cancel_attempt(b.attempt)?;
             return Err(AuthorityError::Refused);
         }
@@ -489,17 +535,63 @@ impl AuthorizationState {
     }
 }
 
+#[cfg(feature = "system")]
+impl PolicyIntent {
+    pub(crate) fn system_context(&self) -> Option<SystemContext> {
+        (self.binding.mode == HostMode::System).then_some(SystemContext {
+            host: self.binding.host,
+            frontend: self.binding.frontend,
+            attempt: self.binding.attempt,
+        })
+    }
+    pub(crate) fn attempt(&self) -> AuthenticationAttempt {
+        self.binding.attempt
+    }
+    pub(crate) fn kind(&self) -> PolicyKind {
+        self.binding.kind
+    }
+    pub(crate) fn deadline(&self) -> u64 {
+        self.binding.deadline
+    }
+    pub(crate) fn system_credential(&self) -> Option<&SystemCredential> {
+        self.system_credential.as_ref()
+    }
+}
+#[cfg(feature = "system")]
+impl PolicyResult {
+    pub(crate) fn from_system(intent: PolicyIntent, approval: SystemPolicyApproval) -> Self {
+        let (uid, name, credential) = approval.into_parts();
+        let observation =
+            (intent.system_context() == Some(credential.context())).then_some(VerifiedIdentity {
+                account: CanonicalAccount { uid, name },
+                system_credential: Some(credential),
+            });
+        Self {
+            binding: intent.binding,
+            observation,
+        }
+    }
+    pub(crate) fn system_refusal(intent: PolicyIntent) -> Self {
+        Self {
+            binding: intent.binding,
+            observation: None,
+        }
+    }
+}
+
 #[cfg(test)]
 impl AuthenticatedPeer {
-    pub(super) fn for_test(host: HostInstance, mode: HostMode) -> Self {
+    pub(crate) fn for_test(host: HostInstance, mode: HostMode) -> Self {
         Self { host, mode }
     }
 }
 #[cfg(test)]
 impl PolicyIntent {
-    pub(super) fn copy_for_test(&self) -> Self {
+    pub(crate) fn copy_for_test(&self) -> Self {
         Self {
             binding: self.binding,
+            #[cfg(feature = "system")]
+            system_credential: self.system_credential.clone(),
         }
     }
 }
@@ -513,6 +605,8 @@ impl PolicyResult {
                     uid,
                     name: name.to_string(),
                 },
+                #[cfg(feature = "system")]
+                system_credential: None,
             }),
         }
     }
