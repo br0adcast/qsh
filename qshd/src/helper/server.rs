@@ -99,6 +99,35 @@ use super::protocol::{
     MonitorEvent, MonitorRequest, Nonce, Request, Response,
 };
 
+// Dormant internal adapter: fork entrypoints stay private to this existing
+// single-threaded server context. This exports sealed result types, not a new
+// runtime endpoint or a callable fork API for arbitrary worker threads.
+#[path = "policy_check.rs"]
+#[allow(dead_code)]
+pub(crate) mod policy_check;
+
+pub(super) enum VerificationDestination {
+    LegacyLogin {
+        id: super::protocol::AuthRequestId,
+        login_id: LoginId,
+        rhost: String,
+    },
+    #[cfg_attr(not(test), allow(dead_code))]
+    HostPolicy(Option<Box<policy_check::HostPolicyDestination>>),
+}
+
+enum VerificationWork<'a> {
+    Authenticate {
+        login: &'a str,
+        public_key: &'a [u8],
+        signature: &'a [u8],
+        handshake_hash: &'a [u8; 32],
+        nonce: &'a Nonce,
+    },
+    #[cfg_attr(not(test), allow(dead_code))]
+    CurrentPolicy(&'a policy_check::SystemCredential),
+}
+
 /// How long the loop waits on the socket before looking for dead children.
 /// Children are also reaped right after every message, so this only bounds
 /// how stale an `Exited` can be when nothing else is happening, AND how
@@ -602,6 +631,9 @@ struct LoopState {
     /// away never gets that far); or found already gone, because one of
     /// those three already claimed it.
     nonces: HashMap<Nonce, Instant>,
+    /// HostPolicy nonces are not spendable/releasable by the legacy worker seam.
+    /// Both destinations share MAX_OUTSTANDING_NONCES and the same expiry rule.
+    host_nonces: HashMap<Nonce, Instant>,
     /// Accounts a `Request::Verify` has admitted, keyed by uid -- the
     /// account exactly as the verifying child resolved and approved it
     /// ([`verify_proof_after_nonce`]), carried back whole on its report
@@ -1185,6 +1217,7 @@ fn serve_inner(
         orphans: Vec::new(),
         closing: HashMap::new(),
         nonces: HashMap::new(),
+        host_nonces: HashMap::new(),
         verified: admitted
             .values()
             .map(|account| (account.uid, account.clone()))
@@ -2222,7 +2255,7 @@ fn serve_auth_seam(
     match body {
         Request::Nonce => {
             let answer = match (!state.stopping && state.required_publication.is_none())
-                .then(|| issue_nonce(&mut state.nonces))
+                .then(|| issue_scoped_nonce(state, NonceDestination::LegacyLogin))
                 .flatten()
             {
                 Some(nonce) => Response::Nonce { nonce },
@@ -2342,7 +2375,11 @@ fn serve_auth_seam(
                             answered: false,
                             #[cfg(target_os = "linux")]
                             custody: Some(Box::new(custody)),
-                            id,
+                            destination: VerificationDestination::LegacyLogin {
+                                id,
+                                login_id,
+                                rhost: sanitized_rhost(&rhost),
+                            },
                             // Bounded HERE too, and for the same reason the
                             // address below is. The name the CHILD was
                             // forked with is the one the client sent, whole
@@ -2353,12 +2390,6 @@ fn serve_auth_seam(
                             // nothing, so it is kept in the form that line
                             // may safely carry.
                             login: sanitized_login_name(&login),
-                            login_id,
-                            // Bounded HERE, on the way in, rather than
-                            // wherever it is eventually read: what the
-                            // privileged process keeps must be within its
-                            // own bounds from the moment it keeps it.
-                            rhost: sanitized_rhost(&rhost),
                         },
                     });
                 }
@@ -3465,6 +3496,7 @@ fn reap(sock: &UnixStream, state: &mut LoopState) {
     // this ever needs to -- this is what bounds the table for a nonce
     // nobody follows up on.
     sweep_expired_nonces(&mut state.nonces, now);
+    sweep_expired_nonces(&mut state.host_nonces, now);
 
     // And, on the same pass and the same timescale, logins that verified
     // and never became real: a `Request::LoginEnded` (see
@@ -3530,6 +3562,41 @@ fn log_failed_kill(result: nix::Result<()>, pid: Pid, what: &str) {
             ),
         ),
     }
+}
+
+// Independent nonce destinations share one bounded issuance budget.
+#[derive(Clone, Copy)]
+enum NonceDestination {
+    LegacyLogin,
+    #[cfg_attr(not(test), allow(dead_code))]
+    HostPolicy,
+}
+fn issue_scoped_nonce(state: &mut LoopState, destination: NonceDestination) -> Option<Nonce> {
+    if state.nonces.len().checked_add(state.host_nonces.len())? >= MAX_OUTSTANDING_NONCES {
+        return None;
+    }
+    for _ in 0..8 {
+        let nonce = match destination {
+            NonceDestination::LegacyLogin => issue_nonce(&mut state.nonces)?,
+            NonceDestination::HostPolicy => issue_nonce(&mut state.host_nonces)?,
+        };
+        let collision = match destination {
+            NonceDestination::LegacyLogin => state.host_nonces.contains_key(&nonce),
+            NonceDestination::HostPolicy => state.nonces.contains_key(&nonce),
+        };
+        if !collision {
+            return Some(nonce);
+        }
+        match destination {
+            NonceDestination::LegacyLogin => {
+                state.nonces.remove(&nonce);
+            }
+            NonceDestination::HostPolicy => {
+                state.host_nonces.remove(&nonce);
+            }
+        }
+    }
+    None
 }
 
 /// Mint a fresh, single-use nonce and remember when it was issued, or
@@ -4126,7 +4193,7 @@ struct VerificationStart {
     custody: super::verification::VerificationChild,
 }
 
-// The Linux saved mask is a separate fork-boundary value, alongside the proof fields.
+// Preserve the legacy entrypoint and its original proof/lifetime semantics.
 #[allow(clippy::too_many_arguments)]
 fn fork_verification(
     login: &str,
@@ -4138,11 +4205,38 @@ fn fork_verification(
     switches: AccountSwitches,
     #[cfg(target_os = "linux")] child_mask: Option<super::stop_signal::ChildMask>,
 ) -> anyhow::Result<VerificationStart> {
+    fork_verification_work(
+        VerificationWork::Authenticate {
+            login,
+            public_key,
+            signature,
+            handshake_hash,
+            nonce,
+        },
+        config,
+        switches,
+        #[cfg(target_os = "linux")]
+        child_mask,
+        None,
+    )
+}
+
+// The Linux saved mask is a separate fork-boundary value, alongside the proof fields.
+#[allow(clippy::too_many_arguments)]
+fn fork_verification_work(
+    work: VerificationWork<'_>,
+    config: &HelperConfig,
+    switches: AccountSwitches,
+    #[cfg(target_os = "linux")] child_mask: Option<super::stop_signal::ChildMask>,
+    policy_deadline: Option<Instant>,
+) -> anyhow::Result<VerificationStart> {
     use nix::fcntl::OFlag;
     use nix::unistd::{fork, pipe2, ForkResult};
 
     #[cfg(target_os = "linux")]
-    let deadline = Instant::now() + config.verify_timeout;
+    let deadline = policy_deadline.map_or(Instant::now() + config.verify_timeout, |policy| {
+        policy.min(Instant::now() + config.verify_timeout)
+    });
     #[cfg(target_os = "linux")]
     let view = crate::process_scope::prepare()
         .map_err(anyhow::Error::msg)
@@ -4189,7 +4283,10 @@ fn fork_verification(
             );
             drop(report_write);
             #[cfg(not(target_os = "linux"))]
-            let deadline = Instant::now() + config.verify_timeout;
+            let deadline = policy_deadline
+                .map_or(Instant::now() + config.verify_timeout, |policy| {
+                    policy.min(Instant::now() + config.verify_timeout)
+                });
             Ok(VerificationStart {
                 report: report_read,
                 child,
@@ -4246,16 +4343,28 @@ fn fork_verification(
                 if child_mask.is_some_and(|mask| mask.restore().is_err()) {
                     unsafe { nix::libc::_exit(127) };
                 }
-                let verdict = match verify_proof_after_nonce(
-                    login,
-                    public_key,
-                    signature,
-                    handshake_hash,
-                    nonce,
-                    config,
-                    switches,
-                    verifier_parent,
-                ) {
+                let checked = match work {
+                    VerificationWork::Authenticate {
+                        login,
+                        public_key,
+                        signature,
+                        handshake_hash,
+                        nonce,
+                    } => verify_proof_after_nonce(
+                        login,
+                        public_key,
+                        signature,
+                        handshake_hash,
+                        nonce,
+                        config,
+                        switches,
+                        verifier_parent,
+                    ),
+                    VerificationWork::CurrentPolicy(credential) => {
+                        credential.check_current(config, switches, verifier_parent)
+                    }
+                };
+                let verdict = match checked {
                     Ok((account, identity, algorithm)) => Verdict::Admitted {
                         account,
                         identity,
@@ -4983,10 +5092,8 @@ fn finish_pending(
             answered,
             #[cfg(target_os = "linux")]
             mut custody,
-            id,
             login,
-            login_id,
-            rhost,
+            mut destination,
         } => {
             #[cfg(target_os = "linux")]
             {
@@ -5031,15 +5138,11 @@ fn finish_pending(
                             ));
                         }
                         let verdict = result.ok().and_then(|record| decode_verdict(&record));
-                        publish_verification(
+                        publish_verification_destination(
                             seams,
                             state,
-                            VerificationReply {
-                                id,
-                                login: &login,
-                                login_id,
-                                rhost: &rhost,
-                            },
+                            &mut destination,
+                            &login,
                             verdict,
                             why,
                         );
@@ -5054,10 +5157,8 @@ fn finish_pending(
                             child,
                             answered,
                             custody,
-                            id,
                             login,
-                            login_id,
-                            rhost,
+                            destination,
                         },
                     });
                 }
@@ -5102,15 +5203,11 @@ fn finish_pending(
                 };
 
                 let _ = answered;
-                publish_verification(
+                publish_verification_destination(
                     seams,
                     state,
-                    VerificationReply {
-                        id,
-                        login: &login,
-                        login_id,
-                        rhost: &rhost,
-                    },
+                    &mut destination,
+                    &login,
                     verdict,
                     why,
                 );
@@ -5124,6 +5221,44 @@ fn progress_verifications(seams: Seams<'_>, state: &mut LoopState, config: &Help
     for fd in state.pending.verification_fds() {
         if let Some(pending) = state.pending.take_ready(fd) {
             finish_pending(seams, state, config, pending, WhyFinished::Progress);
+        }
+    }
+}
+
+fn publish_verification_destination(
+    seams: Seams<'_>,
+    state: &mut LoopState,
+    destination: &mut VerificationDestination,
+    login: &str,
+    verdict: Option<Verdict>,
+    why: WhyFinished,
+) {
+    match destination {
+        VerificationDestination::LegacyLogin {
+            id,
+            login_id,
+            rhost,
+        } => publish_verification(
+            seams,
+            state,
+            VerificationReply {
+                id: *id,
+                login,
+                login_id: *login_id,
+                rhost,
+            },
+            verdict,
+            why,
+        ),
+        VerificationDestination::HostPolicy(destination) => {
+            if let Some(destination) = destination.take() {
+                let verdict = if state.stopping || state.required_publication.is_some() {
+                    None
+                } else {
+                    verdict
+                };
+                destination.publish(verdict);
+            }
         }
     }
 }
@@ -8158,6 +8293,7 @@ pub(crate) mod tests {
             orphans: Vec::new(),
             closing: HashMap::new(),
             nonces: HashMap::new(),
+            host_nonces: HashMap::new(),
             verified: HashMap::from([(account.uid, account.clone())]),
             logins,
             monitors: HashMap::new(),
@@ -8227,6 +8363,7 @@ pub(crate) mod tests {
             orphans: Vec::new(),
             closing: HashMap::new(),
             nonces: HashMap::new(),
+            host_nonces: HashMap::new(),
             verified: HashMap::new(),
             logins: HashMap::new(),
             monitors: HashMap::new(),
@@ -13316,10 +13453,12 @@ pub(crate) mod tests {
                 answered: false,
                 #[cfg(target_os = "linux")]
                 custody: None,
-                id: 1,
                 login: "filler".to_string(),
-                login_id: [0u8; 16],
-                rhost: String::new(),
+                destination: VerificationDestination::LegacyLogin {
+                    id: 1,
+                    login_id: [0u8; 16],
+                    rhost: String::new(),
+                },
             },
         }
     }
@@ -13587,10 +13726,12 @@ pub(crate) mod tests {
                 answered: false,
                 #[cfg(target_os = "linux")]
                 custody: None,
-                id: 77,
                 login: "partial".to_string(),
-                login_id: [13u8; 16],
-                rhost: String::new(),
+                destination: VerificationDestination::LegacyLogin {
+                    id: 77,
+                    login_id: [13u8; 16],
+                    rhost: String::new(),
+                },
             },
         });
 
@@ -17625,6 +17766,7 @@ pub(crate) mod tests {
             "a startup verdict must not release the slot before a cleanup receipt"
         );
     }
+    include!("server_policy_tests.rs");
     include!("server_open_tests.rs");
     include!("server_account_binding_tests.rs");
     include!("monitor_native_integration_tests.rs");

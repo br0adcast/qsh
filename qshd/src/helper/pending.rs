@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use nix::unistd::{Pid, Uid};
 use transport::LoginId;
 
-use super::protocol::{AuthRequestId, ChannelId};
+use super::protocol::ChannelId;
 
 /// A request the helper cannot finish on the spot: somebody else's process
 /// is working on it -- a child of the helper's own, or a login's monitor --
@@ -127,37 +127,11 @@ pub(super) enum PendingWhat {
         /// Missing custody is retained Unknown, never a numeric-PID fallback.
         #[cfg(target_os = "linux")]
         custody: Option<Box<super::verification::VerificationChild>>,
-        /// The number the answer must carry back on the AUTHENTICATION
-        /// seam. Every answer there is matched to its question by this
-        /// number (see `protocol::AuthRequest`), so a verdict that lost it
-        /// could admit one client under another client's proof.
-        id: AuthRequestId,
-        /// The account name the proof claimed -- for the helper's own log
-        /// line, and never for the wire.
-        ///
-        /// As the worker named it and this helper bounded it
-        /// (`server::sanitized_login_name`), for the same reason `rhost`
-        /// below is bounded: it is written into a ROOT process's log, on a
-        /// path reachable before anything has authenticated, and a newline
-        /// in it would forge a line of that log.
+        /// Sanitized account name for diagnostics only.
         login: String,
-        /// The login this proof is for. Carried across the wait because
-        /// the verdict is where that login's entry gets CREATED
-        /// (`ensure_login` -- the only place one is), and it cannot be
-        /// looked up again afterwards because it does not exist yet.
-        ///
-        /// Without this field the entry would once more wait for a first
-        /// `Open`, and task 2's availability fix would revert in silence:
-        /// a session that has proved itself but not yet opened anything
-        /// would lose its account's verification the moment some OTHER
-        /// login of that account ended. See `Request::Verify`'s own docs.
-        login_id: LoginId,
-        /// Where the client was, as the worker named it and this helper
-        /// bounded it (`server::sanitized_rhost`). Carried across the wait
-        /// for the same reason `login_id` is: the login entry it belongs to
-        /// is created ON the verdict, and there is nothing to look it up
-        /// from until then.
-        rhost: String,
+        /// Parent-selected result destination. The child report cannot choose
+        /// legacy login creation versus a sealed host policy observation.
+        destination: super::server::VerificationDestination,
     },
 }
 
@@ -497,10 +471,12 @@ mod tests {
                 answered: false,
                 #[cfg(target_os = "linux")]
                 custody: None,
-                id: 1,
                 login: "alice".to_string(),
-                login_id: login,
-                rhost: String::new(),
+                destination: super::super::server::VerificationDestination::LegacyLogin {
+                    id: 1,
+                    login_id: login,
+                    rhost: String::new(),
+                },
             },
         });
 

@@ -40,6 +40,9 @@ impl AdmittedReservation {
             _ => Err(OwnerProtocolError::Binding),
         }
     }
+    pub(super) fn cleanup(&self) -> RequestId {
+        self.cleanup
+    }
     pub fn reservation(&self) -> Reservation {
         self.reservation
     }
@@ -55,6 +58,12 @@ impl OwnerResourceClient {
     }
     pub(super) fn same_host(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.ledger, &other.ledger)
+    }
+    pub(super) fn canonical_uid(&self) -> Result<u32, OwnerProtocolError> {
+        self.ledger
+            .lock()
+            .map_err(|_| OwnerProtocolError::InvalidState)?
+            .canonical_uid(self.registration)
     }
     pub fn principal(&self) -> AuthenticatedPrincipalRef {
         self.registration.principal
@@ -79,6 +88,37 @@ impl OwnerResourceClient {
             },
         )
     }
+    pub(super) fn prepare_screen_commit(
+        &self,
+        base: &AdmittedReservation,
+        pending: super::resource_contract::ScreenCharge,
+        retained: super::resource_contract::ScreenCharge,
+    ) -> Result<PreparedScreenAccounting, OwnerProtocolError> {
+        if base.registration != self.registration
+            || !Weak::ptr_eq(&base.ledger, &Arc::downgrade(&self.ledger))
+        {
+            return Err(OwnerProtocolError::Binding);
+        }
+        let (provisional, _, replacement, cleanup) = self
+            .ledger
+            .lock()
+            .map_err(|_| OwnerProtocolError::InvalidState)?
+            .prepare_screen_commit(
+                self.registration,
+                base.reservation,
+                base.cleanup,
+                pending,
+                retained,
+            )?;
+        Ok(PreparedScreenAccounting {
+            client: self.clone(),
+            base: base.reservation,
+            provisional,
+            replacement,
+            cleanup,
+            finished: false,
+        })
+    }
     /// Caller supplies independent exact cleanup evidence; dropping the admitted
     /// token alone deliberately cannot release live debt.
     pub fn release(
@@ -97,6 +137,54 @@ impl OwnerResourceClient {
             .lock()
             .map_err(|_| OwnerProtocolError::InvalidState)?
             .release(admitted.reservation, receipt)
+    }
+}
+/// Never exposed to a peer. Prepared metadata pins the exact live entries.
+pub(super) struct PreparedScreenAccounting {
+    client: OwnerResourceClient,
+    base: Reservation,
+    provisional: Reservation,
+    replacement: Reservation,
+    cleanup: RequestId,
+    finished: bool,
+}
+impl PreparedScreenAccounting {
+    pub(super) fn commit(mut self) -> AdmittedReservation {
+        self.client
+            .ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish_screen_commit(
+                self.base,
+                self.provisional,
+                self.replacement,
+                self.cleanup,
+                true,
+            );
+        self.finished = true;
+        AdmittedReservation {
+            reservation: self.replacement,
+            cleanup: self.cleanup,
+            ledger: Arc::downgrade(&self.client.ledger),
+            registration: self.client.registration,
+        }
+    }
+}
+impl Drop for PreparedScreenAccounting {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.client
+                .ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .finish_screen_commit(
+                    self.base,
+                    self.provisional,
+                    self.replacement,
+                    self.cleanup,
+                    false,
+                );
+        }
     }
 }
 /// Internal allocation lifetime, separately authorized after its custody ends.

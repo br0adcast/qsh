@@ -601,3 +601,6 @@ async fn survival_body() {
     assert_eq!(ledger.lock().unwrap().reservations(), 0);
     note(&format!("owner529 exact_child_reaped=1 reader_joined=1 writer_joined=1 resource_reservations=0 frontend_waits=2 code={:?}",completed[0].code()));
 }
+
+#[path = "screen_native_tests.rs"]
+mod screen;

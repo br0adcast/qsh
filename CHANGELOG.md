@@ -7,12 +7,37 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- Run `qshd` on macOS 26 (Darwin 25, every xnu `12377` revision), after a
+  source review of macOS 26.0–26.5 and native qualification on macOS 26.
+
+### Changed
+
+- Refuse to start `qshd` on a macOS kernel without a qualified process
+  ownership contract, naming the observed kernel, instead of refusing every
+  channel later. Document the admitted macOS kernels.
+
 ### Fixed
 
+- Keep only the active and the replaced managed client generation after an
+  update, and document how to remove a managed installation.
+
+- Stop querying package databases, hashing the client and verifying its receipt
+  on the session thread for every server observation. qsh now checks update
+  eligibility only when an offer or incompatibility can be shown, and queries
+  package ownership once per process.
 - Read a pinned daemon's server info on the SSH bootstrap's own login, through
   the located and trust-checked `qshd`, instead of a separate SSH login and a
   `PATH` lookup. Agent and FIDO keys sign once per SSH attempt, including during
   recovery.
+
+### Security
+
+- Release publication waits for approval in the `release` environment and
+  refuses to sign without a tag ruleset protecting `v*` tags. Releases are
+  created as drafts and published after their last asset, and must be
+  immutable once published.
 
 ## [0.6.0-rc1]
 

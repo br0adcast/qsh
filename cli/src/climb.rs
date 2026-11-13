@@ -1033,10 +1033,11 @@ impl<'a> Climb<'a> {
                             report::printable(&proof.info().core_version), transport::wire::VERSION,
                             transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION));
                         let policy = crate::server_discovery::decision(Some(proof.info()));
-                        let eligibility = crate::client_install::update_eligibility()
-                            .unwrap_or(crate::client_install::UpdateEligibility::Unmanaged);
                         let view = crate::upgrade_offer::presentation(
-                            eligibility,
+                            || {
+                                crate::client_install::update_eligibility()
+                                    .unwrap_or(crate::client_install::UpdateEligibility::Unmanaged)
+                            },
                             true,
                             policy.offer.as_ref().map(|offer| offer.version.as_str()),
                         );

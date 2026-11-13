@@ -1,5 +1,6 @@
 //! Local owner lifecycle and administrative contracts, without runtime dispatch.
 use super::authorization_contract::*;
+use super::owner_resource_contract::OwnerResourceMessage;
 use super::protocol::{OwnerProtocolError as Error, OwnerRole};
 use super::status_contract::*;
 use super::wire::*;
@@ -19,6 +20,7 @@ pub enum OpenRefusal {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnerOperation {
+    Resource(OwnerResourceMessage),
     Open(OwnerOpen),
     Opened {
         attachment: Attachment,
@@ -70,6 +72,7 @@ pub enum OwnerOperation {
 impl OwnerOperation {
     pub const fn kind(&self) -> u8 {
         match self {
+            Self::Resource(r) => r.kind(),
             Self::Open(_) => 0x10,
             Self::Opened { .. } => 0x11,
             Self::OpenRefused { .. } => 0x12,
@@ -91,6 +94,7 @@ impl OwnerOperation {
     }
     pub(super) fn role(&self) -> OwnerRole {
         match self {
+            Self::Resource(r) => r.role(),
             Self::Open(_)
             | Self::Resize(_)
             | Self::CloseChannel(_)
@@ -118,6 +122,9 @@ impl OwnerOperation {
         }
     }
     pub(super) fn owner(&self) -> Option<OwnerInstance> {
+        if let Self::Resource(r) = self {
+            return Some(r.locator().owner);
+        }
         self.attachment().map(|a| a.locator.owner).or(match self {
             Self::AttachWithGrant { locator, .. } | Self::GrantRejected { locator, .. } => {
                 Some(locator.owner)
@@ -127,6 +134,9 @@ impl OwnerOperation {
         })
     }
     pub(super) fn request_kind(&self) -> Option<u8> {
+        if let Self::Resource(r) = self {
+            return r.request_kind();
+        }
         matches!(
             self,
             Self::Open(_)
@@ -142,6 +152,7 @@ impl OwnerOperation {
     }
     pub(super) fn reply_kind(&self) -> Option<u8> {
         match self {
+            Self::Resource(r) => r.reply_kind(),
             Self::Opened { .. } | Self::OpenRefused { .. } => Some(0x10),
             Self::ResizeResult { .. } => Some(0x13),
             Self::CloseAccepted(a) => Some(match a.target {
@@ -157,6 +168,7 @@ impl OwnerOperation {
     }
     pub(super) fn matches_reply(&self, reply: &Self) -> bool {
         match (self, reply) {
+            (Self::Resource(a), Self::Resource(b)) => a.matches_reply(b),
             (
                 Self::Open(o),
                 Self::Opened {
@@ -205,6 +217,7 @@ impl OwnerOperation {
     }
     pub(super) fn body_len(&self) -> Result<usize, Error> {
         Ok(match self {
+            Self::Resource(r) => r.len()?,
             Self::Open(o) => {
                 o.validate()?;
                 56 + 9 + o.request.command.len()
@@ -281,6 +294,10 @@ impl OwnerOperation {
     pub(super) fn encode(&self, id: u64) -> Result<Vec<u8>, Error> {
         let len = self.body_len()?;
         let mut out = Vec::with_capacity(len);
+        if let Self::Resource(r) = self {
+            r.put(&mut out);
+            return Ok(out);
+        }
         let request = || RequestId::new(id).ok_or(Error::Binding);
         let control = match self {
             Self::CloseChannel(c) => Some(ResumeControl::CloseChannel {
@@ -394,6 +411,12 @@ impl OwnerOperation {
         Ok(out)
     }
     pub(super) fn decode(kind: u8, id: u64, body: &[u8]) -> Result<Self, Error> {
+        if matches!(kind, 0x50..=0x54) {
+            let mut r = Reader::new(body);
+            let m = OwnerResourceMessage::read(kind, &mut r)?;
+            r.finish()?;
+            return Ok(Self::Resource(m));
+        }
         let public = match kind {
             0x15 => Some(0x3a),
             0x16 => Some(0x3b),

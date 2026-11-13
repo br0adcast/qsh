@@ -9,16 +9,31 @@ d135 40
 d287 11
 # file: src/ppk.rs
 a0 1
-// qsh modification: validate nonnegative Ed25519 magnitudes; see README.qsh.md.
-d496 1
+// qsh modification: decode PuTTY's Ed25519 seed string; see README.qsh.md.
+d488 2
+a489 4
+            // PuTTY documents an mpint, but writes the seed's little-endian
+            // integer as a plain string: exactly 32 bytes since 0.75, with
+            // high zero bytes trimmed before that. Copy it unchanged and
+            // restore trimmed bytes at the little-endian high end.
+a490 1
+            use crate::public::Ed25519PublicKey;
+d493 1
+d495 2
 a496 7
-            // Canonical zero has an empty encoding. Positive magnitudes may
-            // need an integer sign byte, which is not part of the seed.
-            let e_bytes = if e.as_bytes().is_empty() {
-                e.as_bytes()
-            } else {
-                e.as_positive_bytes().ok_or(Error::Crypto)?
-            };
+            reader.read_prefixed(|reader| {
+                let seed = buf
+                    .get_mut(..reader.remaining_len())
+                    .ok_or(Error::Crypto)?;
+                reader.read(seed)?;
+                Ok::<_, Error>(())
+            })?;
+d498 1
+a498 3
+            let private = Ed25519PrivateKey::from_bytes(&buf);
+            // As for OpenSSH keys, the seed must derive the stored public key.
+            if Ed25519PublicKey::from(&private) != *pk {
+d501 5
 # file: src/lib.rs
 a0 1
 // qsh modification: caller-provided private-key documentation; see README.qsh.md.

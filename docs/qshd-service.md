@@ -655,6 +655,30 @@ multi-account machine instead, see "System mode" above — a different
 unit entirely (`systemctl enable --now qshd`, no `--user`), shipped in
 the same `qshd` package.
 
+## macOS kernel support
+
+On macOS, `qshd` opens sessions only on kernels whose process-ownership
+behavior has been reviewed against Apple's published xnu source and qualified
+on native hardware. Apple's `distribution-macOS` source tags map the admitted
+families to these releases:
+
+| xnu source | Darwin | macOS | Admission |
+| --- | --- | --- | --- |
+| `10063.141.1` | 23 | 14.6 | Exact source base; not natively tested here |
+| `11417.140.69` | 24 | 15.6 | Exact source base |
+| `12377.*` | 25 | 26 (26.0–26.5 reviewed) | The whole source line |
+
+Other kernels, including macOS 14.0–14.5, 15.0–15.5 and any later Darwin
+major, are refused. A point update is admitted when its kernel reports an
+admitted base or line; `uname -v` shows the kernel's `xnu-` revision. For the
+`12377` line, revisions newer than the reviewed 26.5 source are admitted by
+design and are covered by native CI on GitHub's current macOS 26 runners
+rather than by a source review.
+
+On a refused kernel, `qshd serve` and `transport-ensure` exit before starting a
+daemon, naming the observed kernel and the admitted families. They do not
+start a daemon that would refuse every channel.
+
 ## macOS: launchd
 
 System mode, described above, is Linux only — macOS stays on this

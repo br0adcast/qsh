@@ -28,10 +28,10 @@ impl From<ResumeError> for RecoveryError {
 }
 /// A caller-supplied host charge, not an allocation limit chosen by this module.
 pub struct TransferAllowance {
-    client: OwnerResourceClient,
-    reservation: Reservation,
-    retained: usize,
-    charge: Arc<StorageCharge>,
+    pub(super) client: OwnerResourceClient,
+    pub(super) reservation: Reservation,
+    pub(super) retained: usize,
+    pub(super) charge: Arc<StorageCharge>,
 }
 impl TransferAllowance {
     pub fn admit(
@@ -64,6 +64,31 @@ impl TransferAllowance {
             charge,
         })
     }
+    pub(super) fn admit_peak(
+        client: OwnerResourceClient,
+        reservation: Reservation,
+        cleanup: RequestId,
+        retained: usize,
+        peak: usize,
+    ) -> Result<Self, RecoveryError> {
+        if reservation.kind != ReservationKind::SnapshotTransfer
+            || reservation.principal != client.principal()
+            || reservation.bytes < u64::try_from(peak).map_err(|_| RecoveryError::Unavailable)?
+        {
+            return Err(RecoveryError::Unavailable);
+        }
+        let token = client
+            .reserve(reservation, cleanup)
+            .map_err(RecoveryError::Resource)?;
+        let charge = StorageCharge::new(client.clone(), token, cleanup);
+        charge.allow_release();
+        Ok(Self {
+            client,
+            reservation,
+            retained,
+            charge,
+        })
+    }
     pub(super) fn matches(&self, attachment: Attachment, channel: ChannelInstance) -> bool {
         self.reservation.locator == attachment.locator && self.reservation.channel == channel
     }
@@ -73,7 +98,7 @@ impl TransferAllowance {
     pub(super) fn matches_locator(&self, attachment: Attachment) -> bool {
         self.reservation.locator == attachment.locator
     }
-    fn buffer(&self, capacity: usize) -> Result<Vec<u8>, RecoveryError> {
+    pub(super) fn buffer(&self, capacity: usize) -> Result<Vec<u8>, RecoveryError> {
         if capacity > self.retained {
             return Err(RecoveryError::Unavailable);
         }
@@ -93,6 +118,7 @@ pub struct RecoveryProducer {
     offset: usize,
     chunk_live: Arc<AtomicBool>,
     allowance: TransferAllowance,
+    _scratch: Option<Arc<StorageCharge>>,
 }
 pub struct ChargedRecoveryChunk {
     record: Option<RecoveryChunk>,
@@ -150,6 +176,31 @@ impl RecoveryProducer {
             offset: 0,
             chunk_live: Arc::new(AtomicBool::new(false)),
             allowance,
+            _scratch: None,
+        })
+    }
+    pub(super) fn from_owned(
+        start: RecoveryStart,
+        request_id: RequestId,
+        bytes: Vec<u8>,
+        allowance: TransferAllowance,
+        scratch: Option<Arc<StorageCharge>>,
+    ) -> Result<Self, RecoveryError> {
+        start.validate()?;
+        if bytes.len() as u64 != start.total_bytes
+            || bytes.capacity() > allowance.retained
+            || !allowance.matches(start.attachment, start.channel)
+        {
+            return Err(RecoveryError::Unavailable);
+        }
+        Ok(Self {
+            bytes,
+            start,
+            request_id,
+            offset: 0,
+            chunk_live: Arc::new(AtomicBool::new(false)),
+            allowance,
+            _scratch: scratch,
         })
     }
     pub fn start(&self) -> RecoveryStart {
@@ -217,12 +268,12 @@ pub struct NoScreenConsumer {
     allowance: TransferAllowance,
 }
 pub struct ConsumedRecovery {
-    host: OwnerResourceClient,
-    completion: RecoveryCompletion,
-    request_id: RequestId,
-    recovery_id: RecoveryId,
-    attachment: Attachment,
-    channel: ChannelInstance,
+    pub(super) host: OwnerResourceClient,
+    pub(super) completion: RecoveryCompletion,
+    pub(super) request_id: RequestId,
+    pub(super) recovery_id: RecoveryId,
+    pub(super) attachment: Attachment,
+    pub(super) channel: ChannelInstance,
 }
 impl ConsumedRecovery {
     pub(super) fn take(

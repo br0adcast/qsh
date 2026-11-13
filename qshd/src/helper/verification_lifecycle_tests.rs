@@ -94,10 +94,12 @@ impl Helper40VerificationFixture {
                         deadline,
                     ),
                 )),
-                id,
                 login: "controlled".into(),
-                login_id: [42; 16],
-                rhost: "203.0.113.7:1234".into(),
+                destination: VerificationDestination::LegacyLogin {
+                    id,
+                    login_id: [42; 16],
+                    rhost: "203.0.113.7:1234".into(),
+                },
             },
         }
     }
@@ -267,10 +269,12 @@ fn helper40_missing_verification_custody_retains_admission_without_deadline_spin
             child: Pid::this(),
             answered: false,
             custody: None,
-            id: 40,
             login: "controlled".into(),
-            login_id: [45; 16],
-            rhost: String::new(),
+            destination: VerificationDestination::LegacyLogin {
+                id: 40,
+                login_id: [45; 16],
+                rhost: String::new(),
+            },
         },
     });
     let pending = state.pending.take_ready(fd).unwrap();

@@ -347,13 +347,33 @@ without an available local control socket remain unknown. The executable's
 `--version` is not running-server evidence.
 
 Release authentication, destination validation or cancellation failures before
-publication leave the prior active generation in place. Updates retain the old
-generation and report the exact executable path to run next. They never replace
+publication leave the prior active generation in place. A successful update
+keeps the generation it replaced, removes older generations and any left by
+interrupted attempts, and reports the exact executable path to run next. A
+client still running from a removed generation keeps running. If removal fails,
+the update stays installed and the message says so. Updates never replace
 the running process, restart a session, or run automatically after a connection
 failure. Different client/server versions alone do not establish incompatibility;
 compatible peers remain usable. Unsupported protocol or capability combinations
 produce a diagnostic and require an explicit update through the client's normal
 installation channel.
+
+### Removing a managed installation
+
+There is no uninstall command. For the default prefix, check that `~/.local/bin/qsh`
+is the managed link, then remove the link before the store:
+
+```sh
+readlink ~/.local/bin/qsh   # ../lib/qsh/generations/generation-.../qsh
+rm ~/.local/bin/qsh
+rm -rf ~/.local/lib/qsh
+```
+
+With `--prefix PATH`, use `PATH/bin/qsh` and `PATH/lib/qsh`. A link left behind
+without its store blocks a later `--self-install`, which never overwrites an
+existing destination. Settings, host keys, session tokens, logs and the release
+cache under `~/.config/qsh` and `~/.cache/qsh` (or their XDG locations) are
+separate and stay in place.
 
 ## SSH startup and installation
 
