@@ -146,7 +146,9 @@ or switch console clients.
 On Linux, the portable binaries use static musl builds. The packaged system-mode
 `qshd` instead links glibc and PAM and has a minimum supported system version.
 macOS builds target Darwin and use macOS system libraries; they are not musl
-binaries. Windows packages are not currently produced.
+binaries. On macOS, `qshd` runs on macOS 14.6, 15.6 and 26; see
+[macOS kernel support](docs/qshd-service.md#macos-kernel-support) for the
+exact kernels. Windows packages are not currently produced.
 
 <details>
 <summary><strong>Package and archive installation examples</strong></summary>

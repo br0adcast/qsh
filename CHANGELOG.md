@@ -7,6 +7,17 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- Run `qshd` on macOS 26 (Darwin 25, every xnu `12377` revision), after a
+  source review of macOS 26.0–26.5 and native qualification on macOS 26.
+
+### Changed
+
+- Refuse to start `qshd` on a macOS kernel without a qualified process
+  ownership contract, naming the observed kernel, instead of refusing every
+  channel later. Document the admitted macOS kernels.
+
 ### Fixed
 
 - Keep only the active and the replaced managed client generation after an

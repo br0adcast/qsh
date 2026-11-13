@@ -956,6 +956,10 @@ fn absolute_cache_route(cache_dir: PathBuf) -> std::io::Result<PathBuf> {
 ///    parent, and daemonizes.
 fn run_transport_ensure(args: &[OsString]) -> Result<()> {
     let parsed = parse_transport_ensure_args(args)?;
+    // Every channel needs the reviewed Darwin runtime; refuse before reusing,
+    // replacing or starting a daemon that could not open one (#551).
+    #[cfg(target_os = "macos")]
+    qshd::darwin_runtime_admission()?;
 
     let cache_dir = absolute_cache_route(serve::cache_dir(false)?)
         .context("resolving the personal cache directory")?;
