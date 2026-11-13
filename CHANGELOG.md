@@ -9,6 +9,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Stop querying package databases, hashing the client and verifying its receipt
+  on the session thread for every server observation. qsh now checks update
+  eligibility only when an offer or incompatibility can be shown, and queries
+  package ownership once per process.
 - Name prerelease DEB and RPM files after the release version, such as
   `qsh_0.6.0-rc.2-1_amd64.deb`, so the signed `SHA256SUMS` matches the names
   GitHub publishes. Package metadata keeps `0.6.0~rc.2`.

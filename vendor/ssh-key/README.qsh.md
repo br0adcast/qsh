@@ -25,16 +25,21 @@ feature definitions have been removed.
 
 `qsh.patch` records the four changed upstream files: `Cargo.toml`,
 `src/ppk.rs`, `src/lib.rs` and `src/private.rs`. Each carries a qsh modification
-notice. The last two files have documentation changes only. PPK specifies Ed25519's
-private seed as an SSH mpint. The decoder previously counted the necessary
-positive sign byte as part of a 32-byte seed, refusing canonical 33-byte
-representations. It also accepted negative integers. After verifying the
-original container MAC, the Ed25519 conversion now explicitly permits canonical
-empty zero; otherwise it requires a positive magnitude, removes only its sign
-byte, checks the magnitude is at most 32 bytes, and left-pads the original
-seed in its existing zeroizing buffer. Global mpint canonicality, the PPK
-parser and MAC calculation, ECDSA conversion and encrypted-key policy remain
-unchanged.
+notice. The last two files have documentation changes only.
+
+PuTTY's format documentation calls the Ed25519 private field an mpint, but PuTTY
+writes the seed's little-endian integer as a plain SSH string: exactly 32 bytes
+since 0.75 (`put_mp_le_fixedlen`), and 0.74 or earlier with its high-order zero
+bytes trimmed (`put_mp_le_unsigned`). Its loader reads any such string as
+unsigned little-endian. On disk the bytes are the OpenSSH seed unchanged.
+Upstream decodes the field as an mpint. Its global canonicality check therefore
+refuses a seed starting with `00` followed by a byte below `0x80`, and it
+front-pads trimmed strings into a different seed. After verifying the original
+container MAC, the Ed25519 conversion now reads the field as a string of at most
+32 bytes into its existing zeroizing buffer, unchanged, with omitted trailing
+bytes left zero. It then requires the seed to derive the container's public key,
+as the OpenSSH keypair decoder already does. The PPK parser and MAC calculation,
+RSA and ECDSA conversion and encrypted-key policy remain unchanged.
 
 The maintenance file uses **GNU `diff -n` / RCS line edits**, not unified
 diff and not `git apply` input. Its header names the pristine archive checksum
@@ -54,17 +59,20 @@ byte-identical. Both licenses are unchanged. The source examples accept encoded
 key material and passwords from callers rather than embedding private fixtures.
 
 The deterministic regressions in `crates/sshauth/tests/key_file_formats.rs`
-generate synthetic seeds with boundary prefixes in memory, derive their
-matching public keys, and verify identity and signatures through both OpenSSH
-and PPK. They reject authenticated noncanonical, negative and overwidth
-integers and independently tampered original MAC fields. No private fixture
-is committed. The unrestricted random-key PPK test remains and now emits
-canonical integers.
+generate synthetic seeds with boundary prefixes and zero suffixes in memory,
+serialize them in each PuTTY layout (v3, v2 and trimmed legacy v2), and verify
+identity and signatures through both OpenSSH and PPK. A fixed set of seeds
+derived from a public label must serialize byte for byte to the files that
+official puttygen 0.85 and 0.74 releases write for them; only their SHA-256
+digests are committed. The tests reject overwidth, truncated and sign-prefixed
+fields, fields deriving a different public key, and independently tampered
+original MAC fields. No private fixture is committed. The unrestricted
+random-key PPK test remains and covers each layout.
 
 The crates.io index lists `0.7.0-rc.11` as the latest release. Upstream `master`
-at `8deeb752f2bfb26bd47ed57a128b9a34d98a190b` still uses the affected
-`e.as_bytes()` conversion. Remove this patch when a compatible upstream version
-contains an equivalent correction, after running these boundary regressions.
+at `8deeb752f2bfb26bd47ed57a128b9a34d98a190b` still decodes the field as an
+mpint. Remove this patch when a compatible upstream version contains an
+equivalent correction, after running these boundary regressions.
 
 The workspace root selects this exact source using `[patch.crates-io]` and
 excludes it from workspace membership. Existing exact `=0.7.0-rc.11`
