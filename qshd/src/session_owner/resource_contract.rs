@@ -184,6 +184,7 @@ struct Entry {
     reservation: Reservation,
     account: u32,
     cleanup: RequestId,
+    pinned: Option<ReservationId>,
 }
 #[derive(Debug)]
 pub struct ResourceLedger {
@@ -257,6 +258,21 @@ impl ResourceLedger {
         }
         self.principals.swap_remove(i);
         Ok(())
+    }
+    /// Read-only proposal; reserve still atomically checks this global high-water.
+    pub fn next_reservation_id(&self) -> Result<ReservationId, Error> {
+        ReservationId::new(self.last_id.checked_add(1).ok_or(Error::Exhausted)?)
+            .ok_or(Error::Exhausted)
+    }
+    pub(super) fn canonical_uid(&self, registration: PrincipalRegistration) -> Result<u32, Error> {
+        if registration.ledger != self.scope {
+            return Err(Error::Binding);
+        }
+        self.principals
+            .iter()
+            .find(|(p, _)| *p == registration)
+            .map(|(_, uid)| *uid)
+            .ok_or(Error::Binding)
     }
     pub fn principals(&self) -> usize {
         self.principals.len()
@@ -366,15 +382,104 @@ impl ResourceLedger {
             reservation: r,
             account,
             cleanup,
+            pinned: None,
         });
         self.last_id = r.id.get();
         Ok(())
+    }
+    /// Trusted local screen operation: all admission/metadata precede native effects.
+    pub(super) fn prepare_screen_commit(
+        &mut self,
+        principal: PrincipalRegistration,
+        base: Reservation,
+        base_cleanup: RequestId,
+        pending: ScreenCharge,
+        retained: ScreenCharge,
+    ) -> Result<(Reservation, RequestId, Reservation, RequestId), Error> {
+        let index = self
+            .entries
+            .iter()
+            .position(|e| e.reservation == base && e.cleanup == base_cleanup && e.pinned.is_none())
+            .ok_or(Error::Binding)?;
+        let old = base.screen_charge.ok_or(Error::Binding)?;
+        if base.kind != ReservationKind::ScreenModel
+            || old.models != 1
+            || pending.models != 0
+            || retained.models != 1
+            || retained.cells < old.cells
+            || retained.rows < old.rows
+            || retained.cells
+                > old
+                    .cells
+                    .checked_add(pending.cells)
+                    .ok_or(Error::TooLarge)?
+            || retained.rows > old.rows.checked_add(pending.rows).ok_or(Error::TooLarge)?
+        {
+            return Err(Error::Binding);
+        }
+        // Burn both identities before admission; cancellation never resets high-water.
+        let provisional_id = self.last_id.checked_add(1).ok_or(Error::Exhausted)?;
+        let fresh_id = provisional_id.checked_add(1).ok_or(Error::Exhausted)?;
+        let provisional = Reservation {
+            id: ReservationId::new(provisional_id).unwrap(),
+            screen_charge: Some(pending),
+            ..base
+        };
+        let replacement = Reservation {
+            id: ReservationId::new(fresh_id).unwrap(),
+            screen_charge: Some(retained),
+            ..base
+        };
+        replacement.validate()?;
+        let cleanup = RequestId::new(provisional_id).unwrap();
+        self.reserve(principal, provisional, cleanup)?;
+        self.last_id = fresh_id;
+        self.entries[index].pinned = Some(replacement.id);
+        self.entries.last_mut().unwrap().pinned = Some(replacement.id);
+        Ok((
+            provisional,
+            cleanup,
+            replacement,
+            RequestId::new(fresh_id).unwrap(),
+        ))
+    }
+    /// The private prepared token pins both exact entries against ordinary release.
+    /// No allocation, admission, callback or fallible operation follows the effect.
+    pub(super) fn finish_screen_commit(
+        &mut self,
+        base: Reservation,
+        provisional: Reservation,
+        replacement: Reservation,
+        cleanup: RequestId,
+        commit: bool,
+    ) {
+        let i = self
+            .entries
+            .iter()
+            .position(|e| e.reservation == provisional && e.pinned == Some(replacement.id))
+            .expect("private pinned provisional");
+        self.entries.swap_remove(i);
+        let e = self
+            .entries
+            .iter_mut()
+            .find(|e| e.reservation == base && e.pinned == Some(replacement.id))
+            .expect("private pinned base");
+        if commit {
+            e.reservation = replacement;
+            e.cleanup = cleanup;
+        }
+        e.pinned = None;
     }
     pub fn release(&mut self, r: Reservation, receipt: ReservationReceipt) -> Result<(), Error> {
         let i = self
             .entries
             .iter()
-            .position(|e| e.reservation == r && e.cleanup == receipt.id && receipt.matches(r))
+            .position(|e| {
+                e.reservation == r
+                    && e.cleanup == receipt.id
+                    && receipt.matches(r)
+                    && e.pinned.is_none()
+            })
             .ok_or(Error::Binding)?;
         self.entries.swap_remove(i);
         Ok(())

@@ -45,6 +45,7 @@ use terminal_size::TerminalSize;
 pub struct PtyChannelSpawner {
     opens: Arc<ChannelOpenRegistry>,
     budget: Arc<ScreenBudget>,
+    retained_screens: Option<Arc<crate::session_owner::screen_owner::RetainedScreenFactory>>,
     #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
     keeper_fixture: Option<crate::darwin_process_scope::KeeperFixture>,
 }
@@ -53,10 +54,19 @@ impl PtyChannelSpawner {
     pub fn new(budget: Arc<ScreenBudget>) -> Self {
         Self {
             budget,
+            retained_screens: None,
             #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
             keeper_fixture: None,
             opens: ChannelOpenRegistry::new(Default::default()),
         }
+    }
+    /// Explicit retained-owner configuration; ordinary constructors keep their pool.
+    pub fn with_retained_screens(
+        mut self,
+        factory: Arc<crate::session_owner::screen_owner::RetainedScreenFactory>,
+    ) -> Self {
+        self.retained_screens = Some(factory);
+        self
     }
     #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
     pub(crate) fn with_keeper_fixture(
@@ -82,7 +92,7 @@ impl ChannelSpawner for PtyChannelSpawner {
     fn spawn(
         &self,
         owner: &Principal,
-        _login: LoginId,
+        login: LoginId,
         req: &OpenRequest,
         term: Option<&str>,
         custody: &OpenCustody,
@@ -105,8 +115,11 @@ impl ChannelSpawner for PtyChannelSpawner {
         #[cfg(target_os = "macos")]
         let prepared = crate::darwin_process_scope::prepare_personal()
             .map_err(|error| custody.refuse_before_creation(error.to_string()))?;
-        let screen = make_screen(req, owner, Arc::clone(&self.budget))
-            .map_err(|e| custody.refuse_before_creation(e))?;
+        let screen = match &self.retained_screens {
+            Some(factory) if req.screen => factory.take(owner, login, req, custody),
+            _ => make_screen(req, owner, Arc::clone(&self.budget)),
+        }
+        .map_err(|e| custody.refuse_before_creation(e))?;
         let size = PtySize {
             rows: req.rows,
             cols: req.cols,
