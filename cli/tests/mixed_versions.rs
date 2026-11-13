@@ -1386,8 +1386,14 @@ fn legacy_service_fixture(force: bool, changed_during_dialog: bool) {
     leave(current_client);
     // Replacing the ordinary installed file does not change the serving image.
     // This is a fixture-owned valid executable; never alter Cargo artifacts.
-    let mut replacement_bytes = std::fs::read(&baseline).unwrap();
-    replacement_bytes.extend_from_slice(b"installed-after-service-start");
+    #[cfg(target_os = "linux")]
+    let replacement_bytes = {
+        let mut bytes = std::fs::read(&baseline).unwrap();
+        bytes.extend_from_slice(b"installed-after-service-start");
+        bytes
+    };
+    #[cfg(target_os = "macos")]
+    let replacement_bytes = std::fs::read(&baseline).unwrap();
     std::fs::write(&replacement, replacement_bytes).unwrap();
     #[cfg(target_os = "macos")]
     assert!(Command::new("/usr/bin/codesign")
@@ -1403,6 +1409,20 @@ fn legacy_service_fixture(force: bool, changed_during_dialog: bool) {
         .status()
         .unwrap()
         .success());
+    #[cfg(target_os = "macos")]
+    assert!(Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict"])
+        .arg(&replacement)
+        .status()
+        .unwrap()
+        .success());
+    assert_ne!(
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(std::fs::read(&replacement).unwrap())
+        ),
+        info.candidate.checksum
+    );
     std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o500)).unwrap();
     std::fs::rename(&replacement, &current).unwrap();
     assert_ne!(
