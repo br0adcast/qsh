@@ -1575,6 +1575,7 @@ fn serving_stage_path(pid: u32) -> PathBuf {
     {
         use std::os::unix::ffi::OsStringExt;
         let mut bytes = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let pid = libc::c_int::try_from(pid).expect("owned daemon PID must fit Darwin c_int");
         let count =
             unsafe { libc::proc_pidpath(pid, bytes.as_mut_ptr().cast(), bytes.len() as u32) };
         assert!(count > 0, "owned daemon path must be available");
