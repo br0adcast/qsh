@@ -623,3 +623,6 @@ mod tests;
 
 #[path = "personal_authorization.rs"]
 pub(crate) mod personal_authorization;
+
+#[path = "local_peer.rs"]
+pub(crate) mod local_peer;

@@ -35,3 +35,6 @@ pub mod local_admission_contract;
 #[cfg(test)]
 mod local_ipc_contract_tests;
 pub mod owner_resource_contract;
+
+#[allow(dead_code)] // Dormant inherited-channel component; no endpoint is activated.
+pub(crate) mod local_channel;
