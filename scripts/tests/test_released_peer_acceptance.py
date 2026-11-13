@@ -1616,6 +1616,43 @@ class PreparedBundleTests(PreparationTests):
                 self.assertEqual(Path(record['target']['src_path']).resolve(), original_root.resolve() / 'cli/src/main.rs')
             finally: self.root = original_root
 
+    def test_synthetic_cli_owned_tmp_alias_preserves_canonical_bundle_and_restores_cache(self):
+        with tempfile.TemporaryDirectory(prefix='cli-alias-', dir='/tmp') as directory:
+            owned = Path(directory).resolve()
+            canonical = owned / 'longer-canonical-private-temp'
+            canonical.mkdir(mode=0o700)
+            alias = owned / 'a'
+            alias.symlink_to(canonical, target_is_directory=True)
+            self.assertGreater(len(os.fsencode(canonical)), len(os.fsencode(alias)))
+            before_env, before_cache = dict(os.environ), tempfile.tempdir
+            @contextmanager
+            def alias_scope():
+                saved = tempfile.tempdir
+                try:
+                    with mock.patch.dict(os.environ, {'TMPDIR': str(alias),
+                            'CARGO_BUILD_TARGET': 'x86_64-apple-darwin',
+                            'CARGO_TARGET_DIR': str(owned / 'foreign-target')}):
+                        tempfile.tempdir = str(alias)
+                        yield
+                finally: tempfile.tempdir = saved
+            allocations = []
+            original_allocate = peer.allocate_runtime
+            def allocate(bundle):
+                allocation = original_allocate(bundle)
+                allocations.append(allocation)
+                return allocation
+            with alias_scope(), mock.patch.object(peer, 'allocate_runtime', side_effect=allocate):
+                self.test_cli_prepare_then_execute_uses_retained_fixture_without_cargo_at_runtime()
+                self.test_long_ambient_and_explicit_bundle_keep_runtime_short_and_execute_without_cargo()
+                self.test_synthetic_cli_restores_outer_layout_under_native_foreign_and_combined_environment()
+            self.assertTrue(allocations, 'the existing CLI models must actually prepare owned bundles')
+            self.assertEqual(dict(os.environ), before_env)
+            self.assertEqual(tempfile.tempdir, before_cache)
+            with self.assertRaisesRegex(RuntimeError, 'owned alias exception'):
+                with alias_scope(): raise RuntimeError('owned alias exception')
+            self.assertEqual(dict(os.environ), before_env)
+            self.assertEqual(tempfile.tempdir, before_cache)
+
     def test_cli_prepare_then_execute_uses_retained_fixture_without_cargo_at_runtime(self):
         with tempfile.TemporaryDirectory(prefix='peer-cli-bundle-') as directory:
             outer = Path(directory)
@@ -1664,6 +1701,7 @@ class PreparedBundleTests(PreparationTests):
                 fixture = (peer.PREFIX, hashlib.sha256(archive.read_bytes()).hexdigest(), archive.stat().st_size)
                 preparation, execution = outer / 'preparation', outer / 'execution'
                 bundle = long / 'explicit-bundle'
+                expected_bundle = bundle.parent.resolve(strict=True) / bundle.name
                 actual_stream, commands = peer.stream_command, []
                 def stream(command, env, log, **kwargs):
                     commands.append(command)
@@ -1682,7 +1720,7 @@ class PreparedBundleTests(PreparationTests):
                         if mode != 'ambient': args += ['--prepare-only', '--prepared-bundle', str(bundle)]
                         with mock.patch.object(sys, 'argv', args), self.synthetic_cli_environment(): peer.main()
                         actual_bundle = Path((preparation / 'bundle-path.txt').read_text().strip())
-                        if mode != 'ambient': self.assertEqual(actual_bundle, bundle)
+                        if mode != 'ambient': self.assertEqual(actual_bundle, expected_bundle)
                         else:
                             self.assertEqual(actual_bundle.parent, long.resolve())
                             self.assertRegex(actual_bundle.name, r'^qsh-prepared-[0-9a-f]{32}$')
