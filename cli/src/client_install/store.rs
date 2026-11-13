@@ -33,6 +33,8 @@ pub struct ManagedInstallation {
 #[derive(Debug)]
 pub struct InstalledClient {
     pub executable: PathBuf,
+    /// The installation committed, but superseded generations were not all removed.
+    pub retention_error: Option<String>,
 }
 
 struct Prepared<'a> {
@@ -383,9 +385,47 @@ fn publish_prepared_with_cancel(
     if sync_dir(&prefix.join("bin")).is_err() {
         return Err(refuse("installation committed, but directory sync failed; inspect the reported prefix before retrying"));
     }
+    // Activation is durable. Keep the new and the replaced generation for rollback;
+    // a failure here leaves extra generations, never a missing active client.
+    let mut keep = vec![generation];
+    keep.extend(expected.and_then(|previous| generation_name(&previous.active_target)));
     Ok(InstalledClient {
         executable: active(&prefix),
+        retention_error: prune(&generations, &keep).err().map(|e| e.to_string()),
     })
+}
+
+fn generation_name(active_target: &Path) -> Option<String> {
+    active_target
+        .parent()?
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
+}
+
+/// Runs only under the installation lock. Candidates are owned, non-symlink
+/// `generation-*` directories, including interrupted attempts; anything else stays.
+fn prune(generations: &Path, keep: &[String]) -> io::Result<()> {
+    let mut first_error = None;
+    for entry in fs::read_dir(generations)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("generation-") || keep.iter().any(|kept| kept == name) {
+            continue;
+        }
+        let meta = fs::symlink_metadata(entry.path())?;
+        if !meta.is_dir() || meta.uid() != uid() {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir_all(entry.path()) {
+            first_error.get_or_insert(error);
+        }
+    }
+    sync_dir(generations)?;
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Validate actual executable identity before any update network operation.
@@ -752,6 +792,161 @@ mod tests {
         );
         assert_eq!(snapshot(&prefix).version, "0.7.1");
         assert_eq!(fs::read(old_path).unwrap(), b"verified client fixture");
+    }
+    fn release(version: &'static str, bytes: &'static [u8]) -> Prepared<'static> {
+        let mut next = image();
+        next.version = version;
+        next.bytes = bytes;
+        next.binary_sha256 = hex(&Sha256::digest(bytes));
+        next
+    }
+    fn active_name(prefix: &Path) -> String {
+        generation_name(&active_link(prefix).unwrap()).unwrap()
+    }
+    fn generation_entries(prefix: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(prefix.join("lib/qsh/generations"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+    fn sorted(mut names: Vec<String>) -> Vec<String> {
+        names.sort();
+        names
+    }
+    #[test]
+    fn updates_keep_only_the_active_and_replaced_generations() {
+        let home = temp();
+        let prefix = home.path().join("prefix");
+        publish_prepared(home.path(), &prefix, &image(), None).unwrap();
+        for (version, bytes) in [
+            ("0.7.1", b"second".as_slice()),
+            ("0.7.2", b"third".as_slice()),
+            ("0.7.3", b"fourth".as_slice()),
+        ] {
+            let replaced = active_name(&prefix);
+            let installed = publish_prepared(
+                home.path(),
+                &prefix,
+                &release(version, bytes),
+                Some(&snapshot(&prefix)),
+            )
+            .unwrap();
+            assert_eq!(installed.retention_error, None);
+            assert_eq!(
+                generation_entries(&prefix),
+                sorted(vec![replaced, active_name(&prefix)])
+            );
+            assert_eq!(fs::read(prefix.join("bin/qsh")).unwrap(), bytes);
+            assert_eq!(snapshot(&prefix).version, version);
+        }
+    }
+    #[test]
+    fn pruning_removes_only_owned_generation_directories() {
+        let home = temp();
+        let outside = temp();
+        let prefix = home.path().join("prefix");
+        publish_prepared(home.path(), &prefix, &image(), None).unwrap();
+        let generations = prefix.join("lib/qsh/generations");
+        // An interrupted attempt keeps publication's read-only file modes.
+        let interrupted = generations.join("generation-interrupted");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&interrupted)
+            .unwrap();
+        write_new(&interrupted.join("qsh"), b"partial", 0o555).unwrap();
+        fs::write(outside.path().join("kept"), b"outside").unwrap();
+        symlink(outside.path(), generations.join("generation-link")).unwrap();
+        fs::write(generations.join("generation-file"), b"file").unwrap();
+        fs::create_dir(generations.join("manual")).unwrap();
+        let replaced = active_name(&prefix);
+        let installed = publish_prepared(
+            home.path(),
+            &prefix,
+            &release("0.7.1", b"second"),
+            Some(&snapshot(&prefix)),
+        )
+        .unwrap();
+        assert_eq!(installed.retention_error, None);
+        assert_eq!(
+            generation_entries(&prefix),
+            sorted(vec![
+                replaced,
+                active_name(&prefix),
+                "generation-file".into(),
+                "generation-link".into(),
+                "manual".into(),
+            ])
+        );
+        assert_eq!(fs::read(outside.path().join("kept")).unwrap(), b"outside");
+    }
+    #[test]
+    fn fresh_install_removes_interrupted_generations() {
+        let home = temp();
+        let prefix = home.path().join("prefix");
+        let generations = prefix.join("lib/qsh/generations");
+        inspect_directories(home.path(), &generations, true).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(generations.join("generation-interrupted"))
+            .unwrap();
+        let installed = publish_prepared(home.path(), &prefix, &image(), None).unwrap();
+        assert_eq!(installed.retention_error, None);
+        assert_eq!(generation_entries(&prefix), vec![active_name(&prefix)]);
+    }
+    #[test]
+    fn retention_failure_is_reported_without_undoing_activation() {
+        if uid() == 0 {
+            return; // Directory permissions do not stop root.
+        }
+        let home = temp();
+        let prefix = home.path().join("prefix");
+        publish_prepared(home.path(), &prefix, &image(), None).unwrap();
+        let locked = prefix.join("lib/qsh/generations/generation-locked");
+        fs::DirBuilder::new().mode(0o700).create(&locked).unwrap();
+        write_new(&locked.join("qsh"), b"partial", 0o555).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let replaced = active_name(&prefix);
+        let installed = publish_prepared(
+            home.path(),
+            &prefix,
+            &release("0.7.1", b"second"),
+            Some(&snapshot(&prefix)),
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        let installed = installed.unwrap();
+        assert!(installed.retention_error.is_some());
+        assert_eq!(fs::read(&installed.executable).unwrap(), b"second");
+        assert_eq!(snapshot(&prefix).version, "0.7.1");
+        assert_eq!(
+            generation_entries(&prefix),
+            sorted(vec![
+                replaced,
+                active_name(&prefix),
+                "generation-locked".into()
+            ])
+        );
+    }
+    #[test]
+    fn documented_removal_allows_a_fresh_installation() {
+        let home = temp();
+        let prefix = home.path().join("prefix");
+        publish_prepared(home.path(), &prefix, &image(), None).unwrap();
+        publish_prepared(
+            home.path(),
+            &prefix,
+            &release("0.7.1", b"second"),
+            Some(&snapshot(&prefix)),
+        )
+        .unwrap();
+        // The store alone leaves a dangling link that blocks reinstallation.
+        fs::remove_dir_all(prefix.join("lib/qsh")).unwrap();
+        assert!(publish_prepared(home.path(), &prefix, &image(), None).is_err());
+        fs::remove_file(prefix.join("bin/qsh")).unwrap();
+        let installed = publish_prepared(home.path(), &prefix, &image(), None).unwrap();
+        assert_eq!(fs::read(&installed.executable).unwrap(), image().bytes);
+        assert_eq!(generation_entries(&prefix), vec![active_name(&prefix)]);
     }
     #[test]
     fn stale_update_cannot_replace_a_newer_generation() {
