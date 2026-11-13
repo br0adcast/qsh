@@ -103,8 +103,9 @@ def publish(args):
             gh(*command)
             release = created_release(endpoint, args.tag)
         release_id = release['id']
+        assets = pages(f'{endpoint}/{release_id}/assets')
         remote = {}
-        for asset in pages(f'{endpoint}/{release_id}/assets'):
+        for asset in assets:
             name = asset['name']
             if name in remote:
                 raise UploadError('Duplicate remote asset name: ' + name)

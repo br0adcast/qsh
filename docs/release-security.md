@@ -112,7 +112,16 @@ installed daemon follows its existing explicit source policy; it is not selected
 to hide a metadata authentication error.
 
 Branch assembly remains twelve products plus `SHA256SUMS`. Tag publication adds
-only the bundle, for fourteen release assets total. The next separately authorized
+only the bundle, for fourteen release assets total.
+
+Product names carry the release version exactly as in the tag, for example
+`qsh_0.6.0-rc.2-1_amd64.deb`; only package metadata uses `0.6.0~rc.2`. A
+version whose names GitHub would rewrite, such as one with build metadata, can
+be neither assembled nor authenticated. The client's manifest contract and
+release assembly are tested against each other by running assembly. Manifests
+that name packages with the earlier `~` spelling are refused. The only signed
+one is the withdrawn `v0.6.0-rc1`, whose client predates managed installation;
+stable names are unchanged. The next separately authorized
 release must include the signing workflow before distributing an enforcing client.
 Its first real qsh attestation must pass the production verifier, including exact
 checkout-commit binding, before upload. Public upstream fixtures and synthetic

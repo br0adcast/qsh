@@ -15,7 +15,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   package ownership once per process.
 - Name prerelease DEB and RPM files after the release version, such as
   `qsh_0.6.0-rc.2-1_amd64.deb`, so the signed `SHA256SUMS` matches the names
-  GitHub publishes. Package metadata keeps `0.6.0~rc.2`.
+  GitHub publishes, and authenticate prerelease manifests under those names.
+  Package metadata keeps `0.6.0~rc.2`. Clients refuse the earlier `~` file
+  names, which only the withdrawn v0.6.0-rc1 used.
 
 ## [0.6.0-rc1]
 
