@@ -7,7 +7,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Changed
+### Fixed
+
+- Stop querying package databases, hashing the client and verifying its receipt
+  on the session thread for every server observation. qsh now checks update
+  eligibility only when an offer or incompatibility can be shown, and queries
+  package ownership once per process.
+
+### Security
 
 - Release publication waits for approval in the `release` environment and
   refuses to sign without a tag ruleset protecting `v*` tags. Releases are

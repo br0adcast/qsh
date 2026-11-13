@@ -142,6 +142,10 @@ pub struct OpenCustody {
 }
 
 impl OpenCustody {
+    /// Read-only identity comparison; grants no access to capsule resources.
+    pub fn same_capsule(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
     pub(crate) fn canceled_snapshot(&self, nonblocking: bool) -> Option<bool> {
         Some(metadata_lock(&self.inner.state, nonblocking)?.cancelled)
     }

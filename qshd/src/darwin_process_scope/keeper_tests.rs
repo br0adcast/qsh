@@ -1,4 +1,8 @@
 use super::keeper::*;
+#[path = "keeper_fixture_diagnostics.rs"]
+mod fixture_diagnostics;
+#[path = "keeper_fixture_gate.rs"]
+mod fixture_gate;
 #[test]
 fn keeper_control_partial_frame_and_sequence() {
     let instance = [17; 16];
@@ -709,11 +713,13 @@ mod native_fixture {
         keeper::{FixtureAuthority, FixtureSnapshot, KeeperOwner},
         keeper_pty::ImageSource,
     };
+    use super::fixture_diagnostics::{self as actor_diag, Evidence, Stage};
+    use super::fixture_gate::{exclusive, monotonic, read_gate, wait_release_observed};
     use super::late_diagnostics::{self as diag, Boundary, Gate, Phase, Poll};
     use nix::libc;
     use std::io::{self, Read, Write};
     use std::os::unix::{
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{MetadataExt, PermissionsExt},
         process::CommandExt,
     };
     use std::path::{Path, PathBuf};
@@ -737,14 +743,6 @@ mod native_fixture {
     const NONCE: &str = "QSH_KEEPER_APPLICATION_NONCE";
     const DEADLINE: &str = "QSH_KEEPER_APPLICATION_DEADLINE";
     static ENVIRONMENT: Mutex<()> = Mutex::new(());
-    fn monotonic() -> u128 {
-        let mut value: libc::timespec = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) },
-            0
-        );
-        value.tv_sec as u128 * 1_000_000_000 + value.tv_nsec as u128
-    }
     struct Deadline {
         raw: u128,
         end: Instant,
@@ -816,35 +814,6 @@ mod native_fixture {
             }
             unsafe { libc::umask(self.mask) };
         }
-    }
-    fn exclusive(path: &Path, bytes: &[u8]) -> io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        file.write_all(bytes)
-    }
-    fn read_gate(path: &Path) -> io::Result<Vec<u8>> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        let meta = file.metadata()?;
-        if !meta.is_file()
-            || meta.uid() != unsafe { libc::geteuid() }
-            || meta.mode() & 0o777 != 0o600
-            || meta.len() > 256
-        {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        let mut bytes = Vec::new();
-        file.take(257).read_to_end(&mut bytes)?;
-        if bytes.len() > 256 {
-            return Err(io::ErrorKind::InvalidData.into());
-        }
-        Ok(bytes)
     }
     fn actor_environment() -> Option<(String, PathBuf, String, u128)> {
         let mode = std::env::var(MODE).ok()?;
@@ -919,24 +888,6 @@ mod native_fixture {
         }
         panic!("fixture input exceeded original deadline");
     }
-    fn wait_release(path: &Path, nonce: &str, end: u128) {
-        loop {
-            assert!(
-                monotonic() < end,
-                "fixture release exceeded original deadline"
-            );
-            match read_gate(path) {
-                Ok(bytes) => {
-                    assert_eq!(bytes, nonce.as_bytes());
-                    return;
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    std::thread::sleep(Duration::from_millis(5))
-                }
-                Err(_) => panic!("fixture release gate refused"),
-            }
-        }
-    }
     fn ignore_hup() {
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
         action.sa_sigaction = libc::SIG_IGN;
@@ -957,6 +908,12 @@ mod native_fixture {
             }
             std::process::exit(125);
         }
+        let actor_evidence = (case == "late").then(|| {
+            let evidence = Evidence::open(&directory.join("actor-evidence")).unwrap();
+            evidence.install();
+            evidence.stage(Stage::Opened);
+            evidence
+        });
         assert_eq!(mode, case);
         let pid = unsafe { libc::getpid() };
         let sid = unsafe { libc::getsid(0) };
@@ -965,6 +922,9 @@ mod native_fixture {
         assert_eq!(unsafe { libc::isatty(0) }, 1);
         assert_eq!(group, pid);
         assert_eq!(foreground, group);
+        if let Some(evidence) = &actor_evidence {
+            evidence.stage(Stage::Ready);
+        }
         event(&nonce, "READY", &[pid, sid, group, foreground]);
         if case == "normal" {
             for fd in 0..3 {
@@ -991,6 +951,7 @@ mod native_fixture {
         }
         ignore_hup();
         if case == "late" {
+            let evidence = actor_evidence.as_ref().unwrap();
             let selector =
                 "darwin_process_scope::keeper_tests::keeper_native_session_death_late_fork";
             let mut intruder = Command::new(std::env::current_exe().unwrap());
@@ -1011,13 +972,19 @@ mod native_fixture {
             let mut intruder = intruder.spawn().unwrap();
             assert_eq!(unsafe { libc::getpgid(intruder.id() as i32) }, sid);
             event(&nonce, "S_INTRUSION", &[intruder.id() as i32]);
+            evidence.stage(Stage::KillSession);
             line("KILL_S", end);
             assert_eq!(unsafe { libc::kill(-sid, libc::SIGKILL) }, 0);
             assert!(!intruder.wait().unwrap().success());
             // Session-leader death can hang up the controlling PTY. From this
             // point synchronization is ordinary post-exec private file I/O.
+            evidence.stage(Stage::SessionKilled);
             exclusive(&directory.join("s-killed"), nonce.as_bytes()).unwrap();
-            wait_release(&directory.join("fork-late"), &nonce, end);
+            evidence.stage(Stage::ForkGate);
+            wait_release_observed(&directory.join("fork-late"), &nonce, end, |result| {
+                evidence.read(result)
+            });
+            evidence.stage(Stage::SpawnLate);
             let mut late = Command::new(std::env::current_exe().unwrap());
             late.args(["--exact", selector, "--nocapture"])
                 .env(MODE, "late-child")
@@ -1035,15 +1002,20 @@ mod native_fixture {
             let late = late.spawn().unwrap();
             let late_pid = late.id() as i32;
             assert_eq!(unsafe { libc::getpgid(late_pid) }, late_pid);
+            evidence.stage(Stage::LateCreated);
             exclusive(
                 &directory.join("late-created"),
                 format!("{nonce} {late_pid}").as_bytes(),
             )
             .unwrap();
-            wait_release(&directory.join("exit-a"), &nonce, end);
+            evidence.stage(Stage::ExitGate);
+            wait_release_observed(&directory.join("exit-a"), &nonce, end, |result| {
+                evidence.read(result)
+            });
             // The scoped watcher/keeper owner now holds the descendant's exit
             // obligation; after A exits it is intentionally a nondirect child.
             drop(late);
+            evidence.stage(Stage::Exit37);
             std::process::exit(37);
         }
         assert_eq!(case, "intrusion");
@@ -1247,6 +1219,7 @@ mod native_fixture {
         io: Option<IoWorkers>,
         complete: bool,
         late_diagnostic: Option<diag::State>,
+        actor_evidence: Option<std::fs::File>,
         deadline: Deadline,
         nonce: String,
         directory: tempfile::TempDir,
@@ -1274,6 +1247,8 @@ mod native_fixture {
             );
             let sha256 = std::env::var("QSH_DARWIN223_DAEMON_SHA256")
                 .expect("required Cargo artifact digest");
+            let actor_evidence = (case == "late")
+                .then(|| Evidence::create(&directory.path().join("actor-evidence")).unwrap());
             let authority = Arc::new(Mutex::new(None));
             let spawner = Spawner {
                 registry: ChannelOpenRegistry::new(OpenLimits::default()),
@@ -1288,6 +1263,7 @@ mod native_fixture {
                 io: None,
                 complete: false,
                 late_diagnostic: (case == "late").then(diag::State::new),
+                actor_evidence,
                 deadline,
                 nonce,
                 directory,
@@ -1476,6 +1452,12 @@ mod native_fixture {
         fn drop(&mut self) {
             if self.late_diagnostic.is_some() && (std::thread::panicking() || !self.complete) {
                 self.late_report(Boundary::Failure);
+                if let Some(evidence) = &self.actor_evidence {
+                    diag::emit(
+                        &mut io::stderr(),
+                        format_args!("{}", actor_diag::report(evidence)),
+                    );
+                }
             }
             if !self.complete {
                 if let Some(io) = &mut self.io {
@@ -1540,6 +1522,7 @@ mod native_fixture {
                 io: None,
                 complete: false,
                 late_diagnostic: None,
+                actor_evidence: None,
                 deadline,
                 nonce,
                 directory,

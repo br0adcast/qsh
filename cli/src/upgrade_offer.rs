@@ -58,11 +58,20 @@ pub fn with_authority(view: Presentation, version: &str, actionable: bool) -> Pr
 }
 
 /// `version` has already passed authenticated release policy.
+/// `eligibility` queries package databases, hashes the executable and verifies
+/// its receipt, so it runs only when an offer or incompatibility can be shown.
 pub fn presentation(
-    eligibility: UpdateEligibility,
+    eligibility: impl FnOnce() -> UpdateEligibility,
     incompatible: bool,
     version: Option<&str>,
 ) -> Presentation {
+    if version.is_none() && !incompatible {
+        return Presentation::Silent;
+    }
+    view(eligibility(), incompatible, version)
+}
+
+fn view(eligibility: UpdateEligibility, incompatible: bool, version: Option<&str>) -> Presentation {
     match eligibility {
         UpdateEligibility::SourceBuild => {
             if incompatible {
@@ -131,7 +140,7 @@ mod tests {
     use super::*;
     #[test]
     fn cached_metadata_is_labeled_context_and_never_an_update_choice() {
-        let view = presentation(UpdateEligibility::Managed, true, Some("1.2.3"));
+        let view = view(UpdateEligibility::Managed, true, Some("1.2.3"));
         assert!(
             matches!(with_authority(view,"1.2.3",false),Presentation::Guidance(line)
             if line.starts_with("Last authenticated observation:") && line.contains("Waiting for fresh discovery"))
@@ -172,18 +181,18 @@ mod tests {
     #[test]
     fn source_never_offers_a_download_and_only_diagnoses_incompatibility() {
         assert_eq!(
-            presentation(UpdateEligibility::SourceBuild, false, Some("1.2.3")),
+            view(UpdateEligibility::SourceBuild, false, Some("1.2.3")),
             Presentation::Silent
         );
         assert!(matches!(
-            presentation(UpdateEligibility::SourceBuild, true, Some("1.2.3")),
+            view(UpdateEligibility::SourceBuild, true, Some("1.2.3")),
             Presentation::Guidance(_)
         ));
     }
     #[test]
     fn only_managed_copies_offer_exact_server_release() {
         assert_eq!(
-            presentation(UpdateEligibility::Managed, false, Some("1.2.3+build.4")),
+            view(UpdateEligibility::Managed, false, Some("1.2.3+build.4")),
             Presentation::Offer("1.2.3".into())
         );
         for eligibility in [
@@ -191,13 +200,46 @@ mod tests {
             UpdateEligibility::Unmanaged,
         ] {
             assert!(matches!(
-                presentation(eligibility, false, Some("1.2.3")),
+                view(eligibility, false, Some("1.2.3")),
                 Presentation::Guidance(_)
             ));
         }
         assert_eq!(
-            presentation(UpdateEligibility::Managed, false, None),
+            view(UpdateEligibility::Managed, false, None),
             Presentation::Silent
         );
+    }
+    #[test]
+    fn eligibility_runs_only_when_its_answer_can_be_shown() {
+        let all = [
+            UpdateEligibility::SourceBuild,
+            UpdateEligibility::PackageOwned,
+            UpdateEligibility::Managed,
+            UpdateEligibility::Unmanaged,
+        ];
+        // Skipping the query never hides anything: every ownership is silent here.
+        for eligibility in all {
+            assert_eq!(view(eligibility, false, None), Presentation::Silent);
+        }
+        assert_eq!(
+            presentation(|| panic!("ownership queried without an offer"), false, None),
+            Presentation::Silent
+        );
+        for (incompatible, version) in [(true, None), (false, Some("1.2.3")), (true, Some("1.2.3"))]
+        {
+            for eligibility in all {
+                let calls = std::cell::Cell::new(0);
+                let shown = presentation(
+                    || {
+                        calls.set(calls.get() + 1);
+                        eligibility
+                    },
+                    incompatible,
+                    version,
+                );
+                assert_eq!(calls.get(), 1);
+                assert_eq!(shown, view(eligibility, incompatible, version));
+            }
+        }
     }
 }
