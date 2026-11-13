@@ -620,3 +620,6 @@ impl PolicyResult {
 #[cfg(test)]
 #[path = "authorization_tests.rs"]
 mod tests;
+
+#[path = "personal_authorization.rs"]
+pub(crate) mod personal_authorization;
