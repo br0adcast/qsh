@@ -55,10 +55,52 @@ verified-signing-time checks must all succeed.
 
 A downloader has no separately pinned expected source commit for a release. An
 authorized workflow signing different contents for that version remains within
-this trust boundary. Repository-ID pinning prevents repository-name reuse from
+this trust boundary; [release authority settings](#release-authority-settings)
+limit who can start one. Repository-ID pinning prevents repository-name reuse from
 silently acquiring the authority. HTTPS validation remains a separate requirement.
 There is no unsigned mode, public-key substitute, environment trust override,
 downloaded-root override or runtime dependency on GitHub CLI.
+
+## Release authority settings
+
+Anyone who can run `release.yml` from a `v*` tag obtains a manifest every
+client accepts for that version. The workflow file comes from the tagged commit,
+so these repository settings are part of the trust boundary:
+
+| Setting | Required state | Checked by |
+| --- | --- | --- |
+| Tag ruleset | Active; targets tags; includes `refs/tags/v*` or all tags, with no exclusions; restricts creations, updates and deletions; bypass list only the repository admin role | `scripts/check-release-settings.py` before signing, except the bypass list |
+| `release` environment | The owner is a required reviewer; deployment limited to `v*` tags | the same script, reviewer only |
+| Immutable releases | Enabled | the uploader, on the published release |
+
+The script does not inspect the ruleset bypass list, so keeping it to the
+owner is a manual duty. The immutability setting needs administration access,
+which the workflow token never has; the published release's `immutable` field
+is read instead.
+
+These checks detect a settings regression in an honest release run. They do
+not constrain a run someone else started: a tagged commit can delete both the
+check and the job's `environment:` line. Only the tag ruleset prevents that, for
+everyone outside its bypass list. Repository administrators can change all of
+these settings and remain inside the boundary.
+
+Publication creates a draft release, uploads the fourteen assets and only then
+publishes it, because GitHub refuses new assets on a published immutable
+release. An interrupted run leaves the draft, and a rerun completes it. A
+published release that lacks assets, or that does not report itself immutable,
+stops the run.
+
+To configure the settings in the GitHub web interface:
+
+1. **Settings → Rules → Rulesets → New ruleset → New tag ruleset.** Name it
+   `release tags` and set enforcement to Active. Add Repository admin to the
+   bypass list. Under target tags, include by pattern `v*`. Enable Restrict
+   creations, Restrict updates and Restrict deletions.
+2. **Settings → Environments → New environment** named `release`. Add the owner
+   as a required reviewer and leave self-review allowed. Under deployment
+   branches and tags, choose selected branches and tags and add the tag pattern
+   `v*`.
+3. **Settings → General → Releases:** enable release immutability.
 
 ## Network failures and cache
 
