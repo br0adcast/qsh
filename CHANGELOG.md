@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop querying package databases, hashing the client and verifying its receipt
+  on the session thread for every server observation. qsh now checks update
+  eligibility only when an offer or incompatibility can be shown, and queries
+  package ownership once per process.
+
 ## [0.6.0-rc1]
 
 ### Changed
