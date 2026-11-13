@@ -698,10 +698,16 @@ jobs:
     if: github.ref_type == 'tag' && github.repository == 'br0adcast/qsh'
     needs: [release, ordinary-ci, released-peer-acceptance, release-verifier]
     runs-on: ubuntu-latest
+    # Its required reviewer approves each publication before any step runs.
+    # The tagged commit supplies this file, so the tag ruleset, not this
+    # line, limits who can publish; see docs/release-security.md.
+    environment: release
     permissions:
       contents: write
       id-token: write
       attestations: write
+      # Reads the release environment's protection rules.
+      actions: read
     # One publication per tag at a time: another run waits for this one
     # rather than racing it, and a running publication is never cancelled.
     # GitHub keeps one waiting run per group; a newer one replaces it.
@@ -729,6 +735,13 @@ jobs:
           test "$GITHUB_REF_TYPE" = tag
           test -n "$RELEASE_VERSION"
           test "$GITHUB_REF" = "refs/tags/v$RELEASE_VERSION"
+      # Read-only, before a signature can be requested: a release run stops
+      # if the tag ruleset or the environment reviewer has been removed.
+      # Immutability is checked on the published release by the uploader.
+      - name: Require the release authority settings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check-release-settings.py --repo "$GITHUB_REPOSITORY"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist

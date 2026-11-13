@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Publish missing release assets, accepting retries only for identical bytes."""
+"""Publish missing release assets, accepting retries only for identical bytes.
+
+A new release starts as a draft and is published after its last asset:
+GitHub refuses new assets on a published immutable release. The published
+release must report itself immutable.
+"""
 import argparse
 import hashlib
 import json
@@ -43,7 +48,9 @@ def release_for_tag(endpoint, tag):
     for release in releases:
         if (not isinstance(release, dict)
                 or not isinstance(release.get('tag_name'), str)
-                or type(release.get('id')) is not int or release['id'] <= 0):
+                or type(release.get('id')) is not int or release['id'] <= 0
+                or type(release.get('draft')) is not bool
+                or type(release.get('immutable')) is not bool):
             raise UploadError('Unexpected GitHub release record')
     matches = [release for release in releases if release['tag_name'] == tag]
     if len(matches) > 1:
@@ -64,6 +71,26 @@ def created_release(endpoint, tag, sleeper=None):
         raise UploadError('Created release visibility timed out; retry publication '
                           'to check the existing release before uploading')
     return release
+
+
+def published_release(endpoint, tag, sleeper=None):
+    """Waits until the release reads back as published and immutable."""
+    if sleeper is None:
+        sleeper = time.sleep
+    release = release_for_tag(endpoint, tag)
+    for delay in (*RELEASE_VISIBILITY_DELAYS, None):
+        if release is None:
+            raise UploadError('Release disappeared during publication')
+        if not release['draft'] and release['immutable']:
+            return release
+        if delay is None:
+            break
+        sleeper(delay)
+        release = release_for_tag(endpoint, tag)
+    if release['draft']:
+        raise UploadError('Release is still a draft after publication')
+    raise UploadError('Published release is not immutable; enable immutable releases '
+                      'in the repository settings')
 
 
 def digest(path):
@@ -96,13 +123,16 @@ def publish(args):
         release = release_for_tag(endpoint, args.tag)
         if release is None:
             command = ['release', 'create', args.tag, '--repo', args.repo,
-                       '--verify-tag', '--title', 'qsh ' + args.tag.removeprefix('v'),
+                       '--verify-tag', '--draft', '--title', 'qsh ' + args.tag.removeprefix('v'),
                        '--notes-file', args.notes_file]
             if '-' in args.tag:
                 command.append('--prerelease')
             gh(*command)
             release = created_release(endpoint, args.tag)
         release_id = release['id']
+        if not release['draft'] and not release['immutable']:
+            raise UploadError('Published release is not immutable; enable immutable releases '
+                              'in the repository settings')
         assets = pages(f'{endpoint}/{release_id}/assets')
         remote = {}
         for asset in assets:
@@ -110,6 +140,8 @@ def publish(args):
             if name in remote:
                 raise UploadError('Duplicate remote asset name: ' + name)
             remote[name] = int(asset['id'])
+        if not release['draft'] and any(s.name not in remote for s in snapshots):
+            raise UploadError('Published immutable release lacks assets; it cannot gain them')
         # Complete preflight before the first upload, including later conflicts.
         for snapshot in snapshots:
             if snapshot.name in remote:
@@ -127,11 +159,16 @@ def publish(args):
                 # GitHub rejects collisions; never pass --clobber or delete assets.
                 gh('release', 'upload', args.tag, '--repo', args.repo, str(snapshot))
                 print('Uploaded missing asset: ' + snapshot.name)
+        # Check names before publishing: an immutable release cannot be fixed.
         published = {asset['name'] for asset in pages(f'{endpoint}/{release_id}/assets')}
         renamed = [snapshot.name for snapshot in snapshots if snapshot.name not in published]
         if renamed:
             raise UploadError('Release assets are not published under their names: '
                               + ', '.join(renamed))
+        if release['draft']:
+            gh('api', '--method', 'PATCH', f'{endpoint}/{release_id}', '-F', 'draft=false')
+            print('Published release: ' + args.tag)
+        published_release(endpoint, args.tag)
 
 
 def main():

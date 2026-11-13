@@ -206,44 +206,166 @@ fn assert_worker_masks_and_fds(worker: u32, pin: &Pin) {
         "exact worker must stay live through mask inventory"
     );
 }
-#[test]
-fn a_vanished_secondary_task_preserves_the_required_live_main_task() {
-    let worker = std::process::id();
-    let pin = Pin::new(worker);
-    let (started, receiver) = std::sync::mpsc::channel();
-    let (release, released) = std::sync::mpsc::channel();
-    let thread = std::thread::spawn(move || {
-        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
-        started.send(tid).unwrap();
-        released.recv().unwrap();
-    });
-    let tid = receiver.recv().unwrap();
-    assert_ne!(tid, worker);
-    assert!(worker_task_status(worker, tid).is_some());
-    release.send(()).unwrap();
-    thread.join().unwrap();
-    // Join can wake before the kernel removes its proc task entry. Establish
-    // the control's absent-task premise; the production inventory never retries.
-    let status_path = format!("/proc/{worker}/task/{tid}/status");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match std::fs::metadata(&status_path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Ok(_) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "joined fixture task did not leave proc"
-                );
-                std::thread::yield_now();
+fn assert_private_body_tasks(worker: u32, test_tid: u32) {
+    let actual: std::collections::BTreeSet<u32> = std::fs::read_dir(format!("/proc/{worker}/task"))
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        std::collections::BTreeSet::from([worker, test_tid]),
+        "only the quiescent harness main and executing test may remain"
+    );
+}
+// This outer-only sibling models a legitimate stop-mask critical section.
+// Keeping it blocked makes loss of exact-process isolation deterministic.
+struct BlockedSibling {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl BlockedSibling {
+    fn start() -> Self {
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            assert_eq!(unsafe { libc::sigemptyset(&mut set) }, 0);
+            assert_eq!(unsafe { libc::sigaddset(&mut set, libc::SIGTERM) }, 0);
+            assert_eq!(unsafe { libc::sigaddset(&mut set, libc::SIGINT) }, 0);
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous) },
+                0
+            );
+            let result = std::panic::catch_unwind(|| {
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+                started.send(tid).unwrap();
+                released.recv_timeout(Duration::from_secs(30)).unwrap();
+            });
+            // Restore even when the owned channel or body fails.
+            assert_eq!(
+                unsafe {
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut())
+                },
+                0
+            );
+            if let Err(cause) = result {
+                std::panic::resume_unwind(cause);
             }
-            Err(error) => panic!("cannot establish vanished fixture task: {error}"),
+        });
+        let sibling = Self {
+            release: Some(release),
+            thread: Some(thread),
+        };
+        let tid = ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let status = worker_task_status(std::process::id(), tid).unwrap();
+        let blocked = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigBlk:"))
+            .unwrap();
+        let stop_bits = (1u64 << (libc::SIGTERM - 1)) | (1u64 << (libc::SIGINT - 1));
+        assert_eq!(
+            u64::from_str_radix(blocked.trim(), 16).unwrap() & stop_bits,
+            stop_bits
+        );
+        sibling
+    }
+    fn finish(mut self) {
+        self.release.take().unwrap().send(()).unwrap();
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+impl Drop for BlockedSibling {
+    fn drop(&mut self) {
+        // Taking the sender releases the owned thread on success or unwind.
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
-    assert!(
-        worker_task_status(worker, tid).is_none(),
-        "actual joined thread must disappear"
-    );
-    assert_worker_masks_and_fds(worker, &pin);
+}
+#[test]
+fn a_vanished_secondary_task_preserves_the_required_live_main_task() {
+    let interference = std::env::var_os("QSH_TEST_BORROWED_SCOPE_MODE")
+        .is_none()
+        .then(BlockedSibling::start);
+    test_borrowed_scope::run_exact(
+        "a_vanished_secondary_task_preserves_the_required_live_main_task",
+        0,
+        || {
+            let worker = std::process::id();
+            let pin = Pin::new(worker);
+            let test_tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+            assert_ne!(worker, test_tid, "the exact body runs in its test thread");
+            // Rust 1.98.1 libtest's single-test serial path spawns this test, then
+            // waits for its completion without spawning again (test/src/lib.rs:429).
+            // The child can run before pthread_create restores the main task's mask.
+            // Observe that initial restoration explicitly, before the strict inventory.
+            // run_exact exits this process before the body returns to libtest; its
+            // null stdio also creates no collector threads. This is setup readiness
+            // for the fixture's harness main, never a retry of a daemon worker mask.
+            until(|| {
+                let status =
+                    worker_task_status(worker, worker).expect("mandatory harness main task");
+                let blocked = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SigBlk:"))
+                    .unwrap();
+                let stop_bits = (1u64 << (libc::SIGTERM - 1)) | (1u64 << (libc::SIGINT - 1));
+                u64::from_str_radix(blocked.trim(), 16).unwrap() & stop_bits == 0
+            });
+            let (started, receiver) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+                started.send(tid).unwrap();
+                released.recv().unwrap();
+            });
+            let tid = receiver.recv().unwrap();
+            assert_ne!(tid, worker);
+            assert!(worker_task_status(worker, tid).is_some());
+            release.send(()).unwrap();
+            thread.join().unwrap();
+            // Join can wake before the kernel removes its proc task entry. Establish
+            // the control's absent-task premise; the production inventory never retries.
+            let status_path = format!("/proc/{worker}/task/{tid}/status");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match std::fs::metadata(&status_path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Ok(_) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "joined fixture task did not leave proc"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("cannot establish vanished fixture task: {error}"),
+                }
+            }
+            assert!(
+                worker_task_status(worker, tid).is_none(),
+                "actual joined thread must disappear"
+            );
+            assert_private_body_tasks(worker, test_tid);
+            assert_worker_masks_and_fds(worker, &pin);
+            assert_private_body_tasks(worker, test_tid);
+        },
+    )
+    .assert_clean(0);
+    if let Some(interference) = interference {
+        interference.finish();
+    }
 }
 fn release_fifo(path: &Path) {
     let mut writer = None;

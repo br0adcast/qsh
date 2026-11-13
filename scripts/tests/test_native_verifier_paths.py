@@ -518,13 +518,34 @@ elif name == 'python3':
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
         self.assertIn('  darwin-owner-intel:\n', native, 'Intel ownership needs its independent budget')
         job = native.split('  darwin-owner-intel:\n', 1)[1].split('\n  system-floors:', 1)[0]
-        for required in ('name: Native Intel Darwin process owner', 'runs-on: macos-15-intel',
+        for required in ('runs-on: ${{ matrix.runner }}',
+                         'QSH_RUNNER_LABEL: ${{ matrix.runner }}',
+                         "environ.get('QSH_RUNNER_LABEL'), r'macos-(?:15|26)-intel'",
                          'timeout-minutes: 45', 'NATIVE_TARGET: x86_64-apple-darwin',
                          'ref: ${{ github.sha }}', 'checkout_sha=$(git rev-parse HEAD)',
                          'test "$checkout_sha" = "$GITHUB_SHA"',
+                         'shim_sha=$(/usr/bin/git rev-parse HEAD)',
+                         'test "$shim_sha" = "$checkout_sha"',
                          '"$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
-                         'key: native-owner-x86_64-apple-darwin'):
+                         'key: native-owner-x86_64-apple-darwin${{ matrix.cache_suffix }}'):
             self.assertIn(required, job)
+        # macOS 15 keeps its check name and cache keys; macOS 26 qualifies the
+        # xnu-12377 line admission with separate caches (#551).
+        import re
+        self.assertEqual(re.findall(
+            r"          - runner: (\S+)\n            name: (.+)\n            cache_suffix: (\S+)", job), [
+            ('macos-15-intel', 'Native Intel Darwin process owner', "''"),
+            ('macos-26-intel', 'Native Intel Darwin process owner on macOS 26', '-macos-26')])
+        ci = (ROOT / '.github/workflows/ci.yml').read_text()
+        arm = ci.split('  macos:\n', 1)[1].split('\n  check:\n', 1)[0]
+        self.assertEqual(re.findall(
+            r"          - runner: (\S+)\n            name: (.+)\n            cache_suffix: (\S+)", arm), [
+            ('macos-15', 'macOS portable tests', "''"),
+            ('macos-26', 'macOS 26 portable tests', '-macos-26')])
+        for required in ('    name: ${{ matrix.name }}\n', '    runs-on: ${{ matrix.runner }}\n',
+                         '          key: ${{ matrix.cache_suffix }}\n',
+                         'key: native-${{ runner.os }}-${{ runner.arch }}${{ matrix.cache_suffix }}-'):
+            self.assertIn(required, arm)
         for forbidden in ('needs:', 'continue-on-error:', 'if: success()', 'download-artifact',
                           'Qualify offline release authentication', self.NATIVE,
                           'cargo test --locked -p sshauth'):

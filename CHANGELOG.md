@@ -7,7 +7,25 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- Run `qshd` on macOS 26 (Darwin 25, every xnu `12377` revision), after a
+  source review of macOS 26.0–26.5 and native qualification on macOS 26.
+
+### Changed
+
+- Refuse to start `qshd` on a macOS kernel without a qualified process
+  ownership contract, naming the observed kernel, instead of refusing every
+  channel later. Document the admitted macOS kernels.
+- Deliberately stop authenticating the withdrawn v0.6.0-rc1 release. Its signed
+  `SHA256SUMS` names packages with `~`, and clients now accept one manifest
+  layout per version, so rc1's archives are refused too, whether downloaded or
+  from cached evidence. rc1's published assets, signature and tag are unchanged.
+
 ### Fixed
+
+- Keep only the active and the replaced managed client generation after an
+  update, and document how to remove a managed installation.
 
 - Stop querying package databases, hashing the client and verifying its receipt
   on the session thread for every server observation. qsh now checks update
@@ -16,8 +34,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Name prerelease DEB and RPM files after the release version, such as
   `qsh_0.6.0-rc.2-1_amd64.deb`, so the signed `SHA256SUMS` matches the names
   GitHub publishes, and authenticate prerelease manifests under those names.
-  Package metadata keeps `0.6.0~rc.2`. Clients refuse the earlier `~` file
-  names, which only the withdrawn v0.6.0-rc1 used.
+  Package metadata keeps `0.6.0~rc.2`.
+
+### Security
+
+- Release publication waits for approval in the `release` environment and
+  refuses to sign without a tag ruleset protecting `v*` tags. Releases are
+  created as drafts and published after their last asset, and must be
+  immutable once published.
 
 ## [0.6.0-rc1]
 
