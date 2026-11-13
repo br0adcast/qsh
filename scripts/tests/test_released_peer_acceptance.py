@@ -1229,35 +1229,189 @@ class FinalKillDenialTests(unittest.TestCase):
 
 
 class ObserverExitReserveTests(unittest.TestCase):
+    def modeled_observer(self, outer_delta, cleanup_offset, initial_budget=True):
+        """Deterministic clock/child model; no OS child or command is executed."""
+        start = 10.0
+        outer = start+outer_delta
+        deadline = min(outer-.1, start+1)
+        read_deadline = deadline-.1
+        now = [start]
+        waits, events, spawned = [], [], []
+        case = self
+
+        class Pipe:
+            def __init__(self, number, chunks):
+                self.number, self.chunks, self.closed = number, chunks, False
+
+            def fileno(self):
+                return self.number
+
+            def close(self):
+                self.closed = True
+
+        class Observer:
+            def __init__(self):
+                self.stdout = Pipe(101, [b'41 41 Z\n', b''])
+                self.stderr = Pipe(102, [b''])
+                self.returncode = None
+
+            def wait(self, timeout):
+                phase = 'cleanup' if 'kill' in events else 'normal'
+                events.append(phase+'-wait')
+                waits.append(dict(phase=phase, timeout=timeout, cutoff=now[0]+timeout))
+                if phase == 'normal':
+                    now[0] = deadline+cleanup_offset
+                    raise subprocess.TimeoutExpired('modeled normal wait', timeout)
+                if timeout <= 0:
+                    raise subprocess.TimeoutExpired('modeled unreaped zero-time wait', timeout)
+                self.returncode = -peer.signal.SIGKILL
+                return self.returncode
+
+            def kill(self):
+                case.assertIsNone(self.returncode)
+                events.append('kill')
+
+        observer = Observer()
+
+        class Selector:
+            def __init__(self):
+                self.keys = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.keys.clear()
+
+            def register(self, pipe, event, data):
+                self.keys[pipe] = mock.Mock(fileobj=pipe, data=data)
+
+            def unregister(self, pipe):
+                del self.keys[pipe]
+
+            def get_map(self):
+                return self.keys
+
+            def select(self, timeout):
+                case.assertGreater(timeout, 0)
+                return [(key, 1) for key in list(self.keys.values())]
+
+        def spawn(command, **kwargs):
+            self.assertEqual(command, ['/bin/ps', '-x', '-g', '41', '-o', 'pid=,pgid=,stat='])
+            spawned.append(command)
+            return observer
+
+        def read(number, size):
+            pipe = {101: observer.stdout, 102: observer.stderr}[number]
+            data = pipe.chunks.pop(0)
+            self.assertLessEqual(len(data), size)
+            return data
+
+        with mock.patch.object(peer.time, 'monotonic', side_effect=lambda: now[0]), mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn), mock.patch.object(peer.selectors, 'DefaultSelector', Selector), mock.patch.object(peer.os, 'read', side_effect=read):
+            result = peer.observe_zombie_group(41, outer)
+        self.assertEqual(result['classification'], 'unknown', 'neither model authorizes acceptance')
+        self.assertGreaterEqual(outer-deadline+.000001, .1)
+        if not initial_budget:
+            self.assertEqual(spawned, [])
+            self.assertEqual(waits, [])
+            self.assertEqual(events, [])
+            self.assertFalse(result['observer_reaped'])
+            self.assertIsNone(result['status'])
+        else:
+            self.assertEqual(len(spawned), 1)
+            self.assertEqual(events, ['normal-wait', 'kill', 'cleanup-wait'])
+            self.assertEqual(len(waits), 2)
+            self.assertAlmostEqual(waits[0]['cutoff'], read_deadline, places=6)
+            self.assertAlmostEqual(deadline-waits[0]['cutoff'], .1, places=6)
+            self.assertAlmostEqual(waits[1]['timeout'], max(0, -cleanup_offset), places=6)
+            self.assertTrue(observer.stdout.closed)
+            self.assertTrue(observer.stderr.closed)
+            self.assertEqual(result['stdout_bytes'], len(b'41 41 Z\n'))
+            self.assertEqual(result['stderr_bytes'], 0)
+            if cleanup_offset < 0:
+                self.assertGreater(waits[1]['timeout'], 0)
+                self.assertEqual(waits[1]['phase'], 'cleanup')
+                self.assertEqual(result['status'], -peer.signal.SIGKILL)
+                self.assertTrue(result['observer_reaped'])
+                self.assertFalse(any(e['operation'] == 'observer-reap' for e in result['errors']))
+            else:
+                self.assertEqual(waits[1]['timeout'], 0)
+                self.assertIsNone(result['status'])
+                self.assertFalse(result['observer_reaped'])
+                self.assertTrue(any(e['operation'] == 'observer-reap' for e in result['errors']))
+        print('MODELED_OBSERVER_RESERVE '+json.dumps(dict(
+            kind='deterministic-clock-and-child-model', actual_child=False,
+            outer=outer, deadline=deadline, read_deadline=read_deadline,
+            cleanup_offset=cleanup_offset, waits=waits, result=result,
+            spawn_count=len(spawned), events=events), sort_keys=True), flush=True)
+
+    def test_one_second_cap_keeps_positive_cleanup_reserve_and_reap(self):
+        self.modeled_observer(2, -.05)
+
+    def test_shorter_outer_budget_keeps_positive_cleanup_reserve_and_reap(self):
+        self.modeled_observer(.6, -.05)
+
+    def test_cleanup_at_deadline_is_zero_unknown_and_unreaped(self):
+        for outer in (2, .6):
+            with self.subTest(outer=outer):
+                self.modeled_observer(outer, 0)
+
+    def test_cleanup_past_deadline_is_zero_unknown_and_unreaped(self):
+        for outer in (2, .6):
+            with self.subTest(outer=outer):
+                self.modeled_observer(outer, .2)
+
+    def test_no_initial_read_budget_never_spawns_an_observer(self):
+        for outer in (.1, .19):
+            with self.subTest(outer=outer):
+                self.modeled_observer(outer, 0, initial_budget=False)
+
     def test_closed_pipes_stalled_observer_retains_kill_and_reap_capacity(self):
+        self.real_observer_case(force_expired=False)
+
+    def test_closed_pipes_stalled_observer_forced_expiry_is_truthful(self):
+        self.real_observer_case(force_expired=True)
+
+    def real_observer_case(self, force_expired):
         original_spawn, original_clock = subprocess.Popen, peer.time.monotonic
         children, waits, kills, clocks = [], [], [], []
-        returned = None
+        returned = snapshot = None
         fallback_completed = False
+        fallback_kill_attempted = False
         started = original_clock()
         outer_deadline = started+2
 
         def clock():
             value = original_clock()
+            if force_expired and kills:
+                value = max(value, min(outer_deadline-.1, clocks[0]+1))
             clocks.append(value)
             return value
 
         def spawn(command, **kwargs):
             self.assertEqual(command, ['/bin/ps', '-x', '-g', '41', '-o', 'pid=,pgid=,stat='])
-            # EOF on BOTH pipes must not be confused with process completion.
+            # Real owned child: EOF on both pipes does not establish its exit.
             code = "import os,time;os.write(1,b'41 41 Z\\n');os.close(1);os.close(2);time.sleep(30)"
             child = original_spawn([sys.executable, '-u', '-c', code], **kwargs)
             real_wait, real_kill = child.wait, child.kill
             children.append((child, real_wait, real_kill))
 
             def wait(timeout):
-                # The source calls its monotonic clock immediately before
-                # passing this timeout. Record the requested absolute cutoff
-                # so the reserve assertion cannot pass through scheduling luck.
-                call = {'timeout': timeout, 'cutoff': clocks[-1]+timeout, 'status': None}
+                phase = 'cleanup' if kills else 'normal'
+                call = dict(phase=phase, timeout=timeout, cutoff=clocks[-1]+timeout,
+                            status=None, injected_timeout=False, outcome='pending')
                 waits.append(call)
-                call['status'] = real_wait(timeout=timeout)
-                return call['status']
+                if force_expired and phase == 'cleanup':
+                    self.assertEqual(timeout, 0)
+                    call.update(injected_timeout=True, outcome='injected-timeout-without-consumption')
+                    raise subprocess.TimeoutExpired('injected zero-time consuming wait', timeout)
+                try:
+                    call['status'] = real_wait(timeout=timeout)
+                    call['outcome'] = 'actual-consumed-status'
+                    return call['status']
+                except subprocess.TimeoutExpired:
+                    call['outcome'] = 'actual-timeout'
+                    raise
 
             def kill():
                 self.assertIsNone(child.returncode, 'observer identity consumed before kill')
@@ -1270,40 +1424,59 @@ class ObserverExitReserveTests(unittest.TestCase):
         try:
             with mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn), mock.patch.object(peer.time, 'monotonic', side_effect=clock):
                 returned = peer.observe_zombie_group(41, outer_deadline)
+                # Snapshot before fallback changes the actual Popen returncode.
+                snapshot = json.loads(json.dumps(returned))
         finally:
-            # Independent test custody also cleans the expected RED path.
             for child, real_wait, real_kill in children:
                 if child.returncode is None:
+                    # Independent custody retains the exact unreaped Popen object.
+                    # Its saved method guards status before signaling; never use
+                    # the numeric PID again after consuming its wait status.
+                    fallback_kill_attempted = True
                     try:
                         real_kill()
                     except OSError:
                         pass
                     real_wait(timeout=2)
             fallback_completed = True
-            print('OWNED_OBSERVER_RESERVE '+json.dumps({
-                'fallback_completed': fallback_completed,
-                'observer_reaped_on_return': None if returned is None else returned['observer_reaped'],
-                'requested_normal_reserve': None if not waits else min(outer_deadline-.1, clocks[0]+1)-waits[0]['cutoff'],
-                'cleanup_wait_positive': len(waits)>1 and waits[1]['timeout']>0,
-                'kill_before_consumption': bool(kills),
-                'actual_cleanup_status': None if len(waits)<2 else waits[1]['status'],
-            },sort_keys=True),flush=True)
+            print('OWNED_OBSERVER_RESERVE '+json.dumps(dict(
+                kind='real-child-with-forced-expiry' if force_expired else 'real-child-real-clock',
+                forced_clock_expiry=force_expired,
+                elapsed=original_clock()-started, waits=waits,
+                return_snapshot=snapshot, fallback_completed=fallback_completed,
+                fallback_kill_attempted=fallback_kill_attempted,
+                final_actual_status=[child.returncode for child, _, _ in children],
+                pipes_closed=[child.stdout.closed and child.stderr.closed for child, _, _ in children],
+                production_kill_count=len(kills)), sort_keys=True), flush=True)
         self.assertTrue(fallback_completed)
+        self.assertEqual(returned, snapshot, 'fallback must never rewrite production evidence')
         self.assertEqual(returned['classification'], 'unknown')
         self.assertEqual(len(children), 1)
         self.assertEqual(len(kills), 1)
-        self.assertEqual(len(waits), 2)
-        # Source cutoff equality proves the normal wait leaves the explicit
-        # .1-second reserve, independently of whether a zero-time reap wins.
+        normal = [w for w in waits if w['phase'] == 'normal']
+        cleanup = [w for w in waits if w['phase'] == 'cleanup']
+        self.assertLessEqual(len(normal), 1)
+        self.assertEqual(len(cleanup), 1)
         observer_deadline = min(outer_deadline-.1, clocks[0]+1)
-        self.assertAlmostEqual(waits[0]['cutoff'], observer_deadline-.1, places=6)
-        self.assertGreater(waits[1]['timeout'], 0)
-        self.assertEqual(waits[1]['status'], -peer.signal.SIGKILL)
-        self.assertEqual(returned['status'], -peer.signal.SIGKILL)
-        self.assertTrue(returned['observer_reaped'])
-        self.assertLess(original_clock(), outer_deadline)
+        if normal:
+            self.assertAlmostEqual(normal[0]['cutoff'], observer_deadline-.1, places=6)
+        if force_expired:
+            self.assertEqual(cleanup[0]['timeout'], 0)
+            self.assertTrue(cleanup[0]['injected_timeout'])
+        if cleanup[0]['status'] is not None:
+            self.assertEqual(cleanup[0]['status'], -peer.signal.SIGKILL)
+            self.assertEqual(returned['status'], -peer.signal.SIGKILL)
+            self.assertTrue(returned['observer_reaped'])
+        else:
+            self.assertFalse(returned['observer_reaped'])
+            self.assertIsNone(returned['status'])
+            self.assertTrue(any(e['operation'] == 'observer-reap' for e in returned['errors']))
+        child = children[0][0]
+        self.assertEqual(child.returncode, -peer.signal.SIGKILL)
+        self.assertTrue(child.stdout.closed)
+        self.assertTrue(child.stderr.closed)
         with self.assertRaises(ChildProcessError):
-            os.waitpid(children[0][0].pid, os.WNOHANG)
+            os.waitpid(child.pid, os.WNOHANG)
 
 
 class PreparedBundleTests(PreparationTests):
