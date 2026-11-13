@@ -369,3 +369,82 @@ fn bootstrap() {
     assert!(!shown.contains("Key fingerprint"), "{shown}");
     assert!(!home.path().join("qsh/ssh_bindings.json").exists());
 }
+/// Teardown owns what `start_shell` started: a command that ignores stdin
+/// EOF and keeps its output open, here through a background child too, is
+/// killed with its process group, reaped, and its readers joined before
+/// `Server::drop` returns, even after the client has gone.
+#[test]
+fn shell_fixture_teardown_kills_and_reaps_a_blocking_command() {
+    use client::channel::{ChannelSubstrate, SubstrateEvent};
+    use std::sync::atomic::Ordering;
+    use transport::channel::{ChannelKind, OpenRequest};
+    struct Forward(std::sync::mpsc::Sender<SubstrateEvent>);
+    impl ssh::SshEvents for Forward {
+        fn on_channel(&self, event: SubstrateEvent) {
+            let _ = self.0.send(event);
+        }
+        fn on_closed(&self, _: String) {}
+    }
+    let (remote, shell, _) = remote_home();
+    let ssh = fake::Server::start_shell(shell);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (conn, mut sub) = ssh::connect(
+        ssh::SshParams {
+            host: "127.0.0.1".into(),
+            port: ssh.port,
+            username: "fixture".into(),
+            known_host_keys: vec![ssh.wire()],
+            connect_timeout: std::time::Duration::from_secs(5),
+            keepalive_interval: std::time::Duration::from_secs(15),
+            compression: true,
+            tcp_nodelay: true,
+            knock: Vec::new(),
+        },
+        ssh::SshAuthPlan::single(ssh::AuthMethod::Signer(Arc::new(
+            support_home::ssh_support::SoftSigner::random(),
+        ))),
+        Arc::new(knock::NoBind),
+        Arc::new(Forward(tx)),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    sub.open(&OpenRequest {
+        stream: 1,
+        kind: ChannelKind::Command,
+        cols: 0,
+        rows: 0,
+        screen: false,
+        command: b"sleep 600 & echo $! > \"$HOME/background\"; echo $$ > \"$HOME/command\"; echo started; exec sleep 600".to_vec(),
+    })
+    .unwrap();
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+            SubstrateEvent::Data { bytes, .. } if bytes.starts_with(b"started") => break,
+            SubstrateEvent::Exit { .. } | SubstrateEvent::Refused { .. } => {
+                panic!("the blocking command ended early")
+            }
+            _ => {}
+        }
+    }
+    let pid = |name: &str| {
+        let raw: i32 = std::fs::read_to_string(remote.path().join(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        rustix::process::Pid::from_raw(raw).unwrap()
+    };
+    let (command, background) = (pid("command"), pid("background"));
+    assert_eq!(ssh.activity.running.load(Ordering::SeqCst), 1);
+    conn.close();
+    let activity = ssh.activity.clone();
+    drop(ssh);
+    assert_eq!(activity.running.load(Ordering::SeqCst), 0);
+    // The command's own child was reaped by its worker before drop returned;
+    // the background child, reparented when its parent died, goes as well.
+    assert!(rustix::process::test_kill_process(command).is_err());
+    assert!(wait_until(|| rustix::process::test_kill_process(
+        background
+    )
+    .is_err()));
+}

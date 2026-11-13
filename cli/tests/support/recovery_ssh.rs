@@ -24,6 +24,9 @@ pub struct Activity {
     pub commands: Mutex<Vec<String>>,
     /// Each command `Server::start_shell` ran, in completion order.
     pub finished: Mutex<Vec<Finished>>,
+    /// Commands whose worker has not yet reaped the child and joined its
+    /// pipe readers.
+    pub running: AtomicUsize,
 }
 pub struct Finished {
     pub command: String,
@@ -42,7 +45,19 @@ pub struct Server {
     pub activity: Arc<Activity>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    running: Arc<Mutex<Vec<Running>>>,
 }
+/// One command `start_shell` started. Its worker owns the child, joins the
+/// child's pipe readers, then reaps it; `settled` disconnects when the
+/// worker ends. Until then the child is unreaped, so its pid, which is also
+/// its process group, cannot be reused.
+struct Running {
+    group: rustix::process::Pid,
+    settled: std::sync::mpsc::Receiver<()>,
+    worker: std::thread::JoinHandle<()>,
+}
+/// How long teardown waits for killed commands to settle.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
 impl Server {
     pub fn start() -> Self {
         Self::launch(None)
@@ -66,6 +81,8 @@ impl Server {
         let port = listener.local_addr().unwrap().port();
         let activity = Arc::new(Activity::default());
         let observed = activity.clone();
+        let running = Arc::new(Mutex::new(Vec::new()));
+        let owned = running.clone();
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -81,7 +98,7 @@ impl Server {
                         let (stream, _) = accepted.unwrap();
                         observed.connections.fetch_add(1, Ordering::SeqCst);
                         let config = config.clone();
-                        let handler = Handler { activity: observed.clone(), channels: Vec::new(), shell: shell.clone(), stdin: HashMap::new() };
+                        let handler = Handler { activity: observed.clone(), channels: Vec::new(), shell: shell.clone(), stdin: HashMap::new(), running: owned.clone() };
                         tokio::spawn(async move { if let Ok(session) = russh::server::run_stream(config, stream, handler).await { let _ = session.await; } });
                     }
                 }}
@@ -93,6 +110,7 @@ impl Server {
             activity,
             stop: Some(stop),
             thread: Some(thread),
+            running,
         }
     }
     pub fn wire(&self) -> Vec<u8> {
@@ -109,8 +127,45 @@ impl Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
+        // No exec request can start a command once the runtime is gone.
         let _ = self.stop.take().unwrap().send(());
         let _ = self.thread.take().unwrap().join();
+        let running = std::mem::take(&mut *self.running.lock().unwrap());
+        // Only this server's own unsettled commands, by their whole process
+        // group: a child the command left behind may hold the pipes too.
+        for command in &running {
+            if matches!(
+                command.settled.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ) {
+                let _ = rustix::process::kill_process_group(
+                    command.group,
+                    rustix::process::Signal::KILL,
+                );
+            }
+        }
+        let deadline = std::time::Instant::now() + SETTLE;
+        let mut unsettled = Vec::new();
+        for command in running {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match command.settled.recv_timeout(left) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    unsettled.push(command.group.as_raw_pid())
+                }
+                _ => {
+                    let _ = command.worker.join();
+                }
+            }
+        }
+        // Timing out is not cleanup: say so, unless a test already failed.
+        if !unsettled.is_empty() {
+            let message = format!("fake SSH commands did not settle after SIGKILL: {unsettled:?}");
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
     }
 }
 struct Handler {
@@ -118,6 +173,7 @@ struct Handler {
     channels: Vec<Channel<russh::server::Msg>>,
     shell: Option<Arc<Shell>>,
     stdin: HashMap<ChannelId, ChildStdin>,
+    running: Arc<Mutex<Vec<Running>>>,
 }
 enum Output {
     Data(Vec<u8>),
@@ -129,13 +185,13 @@ fn forward(
     to: tokio::sync::mpsc::UnboundedSender<Output>,
     wrap: fn(Vec<u8>) -> Output,
 ) -> Vec<u8> {
+    // Reads to EOF even after the channel is gone, so the command never
+    // blocks on a full pipe and its output is recorded whole.
     let mut buffer = [0; 16 * 1024];
     let mut read = Vec::new();
     while let Ok(n @ 1..) = from.read(&mut buffer) {
         read.extend_from_slice(&buffer[..n]);
-        if to.send(wrap(buffer[..n].to_vec())).is_err() {
-            break;
-        }
+        let _ = to.send(wrap(buffer[..n].to_vec()));
     }
     read
 }
@@ -201,6 +257,7 @@ impl russh::server::Handler for Handler {
         self.activity.commands.lock().unwrap().push(command.clone());
         session.channel_success(channel)?;
         if let Some(shell) = &self.shell {
+            use std::os::unix::process::CommandExt;
             let mut child = std::process::Command::new("/bin/sh")
                 .arg("-c")
                 .arg(&command)
@@ -210,13 +267,18 @@ impl russh::server::Handler for Handler {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
+                .process_group(0)
                 .spawn()
                 .expect("run the command in the private home");
+            let group = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
             self.stdin.insert(channel, child.stdin.take().unwrap());
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
             let activity = self.activity.clone();
-            std::thread::spawn(move || {
+            let (settle, settled) = std::sync::mpsc::channel::<()>();
+            activity.running.fetch_add(1, Ordering::SeqCst);
+            let worker = std::thread::spawn(move || {
+                let _settle = settle;
                 let out = {
                     let tx = tx.clone();
                     std::thread::spawn(move || forward(stdout, tx, Output::Data))
@@ -233,7 +295,13 @@ impl russh::server::Handler for Handler {
                     code,
                     stdout,
                 });
+                activity.running.fetch_sub(1, Ordering::SeqCst);
                 let _ = tx.send(Output::Exit(code as u32));
+            });
+            self.running.lock().unwrap().push(Running {
+                group,
+                settled,
+                worker,
             });
             let handle = session.handle();
             tokio::spawn(async move {
