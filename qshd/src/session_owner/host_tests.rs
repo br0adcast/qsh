@@ -111,6 +111,8 @@ fn host529_live_detached_and_unknown_resource_debt_never_age_out() {
         screen_charge: None,
     };
     h.resources
+        .lock()
+        .unwrap()
         .reserve(
             e.resources.unwrap(),
             reservation,
@@ -119,7 +121,7 @@ fn host529_live_detached_and_unknown_resource_debt_never_age_out() {
         .unwrap();
     h.sweep(1_000_000).unwrap();
     assert_eq!(h.catalog_len(), 2);
-    assert_eq!(h.resources.reservations(), 1);
+    assert_eq!(h.resources.lock().unwrap().reservations(), 1);
     assert_eq!(
         h.create_session(a, 1_000_001).unwrap_err(),
         HostError::Capacity
@@ -155,7 +157,7 @@ fn host529_fresh_policy_each_phase_and_epoch_are_single_use() {
     };
     assert_eq!(second.attachment().epoch.get(), 2);
     assert_eq!(
-        h.resources.principals(),
+        h.resources.lock().unwrap().principals(),
         1,
         "grant retirement never retires durable resource registration"
     );
@@ -174,7 +176,7 @@ fn host529_revocation_between_issue_and_consume_leaves_catalog_and_resources_int
         .apply_policy_result(PolicyResult::allow_for_test(i, 1000, "alice"), 7)
         .is_err());
     assert_eq!(h.catalog_len(), 1);
-    assert_eq!(h.resources.principals(), 1);
+    assert_eq!(h.resources.lock().unwrap().principals(), 1);
     assert_eq!(h.grants.grants(), 0);
     assert!(
         h.begin_authentication(f, 8, 100).is_ok(),
@@ -241,7 +243,7 @@ fn host529_expired_offer_can_be_replaced_without_resetting_session_or_epoch() {
         "expired grant must not retain a registration slot or block legitimate retry"
     );
     assert_eq!(h.catalog[0].last_epoch, 0);
-    assert_eq!(h.resources.principals(), 1);
+    assert_eq!(h.resources.lock().unwrap().principals(), 1);
 }
 
 #[test]
@@ -275,6 +277,8 @@ fn host529_owner_completion_cannot_refund_unknown_backing_debt() {
         .unwrap();
     let e = &h.catalog[0];
     h.resources
+        .lock()
+        .unwrap()
         .reserve(
             e.resources.unwrap(),
             Reservation {
@@ -297,8 +301,8 @@ fn host529_owner_completion_cannot_refund_unknown_backing_debt() {
     assert!(h.acknowledge_completion(a, s).is_err());
     h.sweep(1_000_000).unwrap();
     assert_eq!(h.catalog_len(), 1);
-    assert_eq!(h.resources.reservations(), 1);
-    assert_eq!(h.resources.principals(), 1);
+    assert_eq!(h.resources.lock().unwrap().reservations(), 1);
+    assert_eq!(h.resources.lock().unwrap().principals(), 1);
 }
 
 #[test]
@@ -314,7 +318,7 @@ fn host529_attach_epoch_exhaustion_refuses_without_wrapping_or_resource_reset() 
         Err(HostError::Exhausted)
     ));
     assert_eq!(h.catalog[0].last_epoch, u64::MAX);
-    assert_eq!(h.resources.principals(), 1);
+    assert_eq!(h.resources.lock().unwrap().principals(), 1);
 }
 
 #[test]
@@ -352,5 +356,5 @@ fn host529_completion_preserves_exit_and_final_input_output_cursors() {
         .unwrap();
     h.sweep(300_003).unwrap();
     assert_eq!(h.completed_facts(a, s).unwrap(), &[fact]);
-    assert_eq!(h.resources.principals(), 0);
+    assert_eq!(h.resources.lock().unwrap().principals(), 0);
 }
