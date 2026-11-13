@@ -1,9 +1,12 @@
 //! Dormant admission of locally provisioned socketpairs, not endpoint publication.
 //! Kernel credentials describe socket creation/connection identity, not a later
 //! credential change, executable identity, PID authority, or target-account login.
+use super::authorization::FrontendAdmission;
 use super::authorization::{fresh_bytes, AuthorityError, HostMode};
+use super::host::{HostError, HostState};
+use super::host_auth_contract::AuthMethod;
 use super::host_protocol::{self, HostFrame, HostHeader, HostMessage};
-use super::local_admission_contract::LocalAdmission;
+use super::local_admission_contract::{AdmissionSpec, LocalAdmission};
 use super::protocol::{self, OwnerFrame, OwnerHeader, OwnerMessage, OwnerRole};
 use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
@@ -134,8 +137,94 @@ pub(crate) struct AdmittedChannel {
     local: OwnerRole,
     peer: OwnerRole,
     evidence: bool,
+    host_state: Option<host_protocol::HostPeerState>,
+}
+/// One nonclone handoff keeps the exact channel, its completed correlation,
+/// and the actual host registration together. Correlation is not proof of
+/// target-account authentication. No runtime constructs this dormant component.
+/// Drop closes only channel custody; callers must explicitly retire the host
+/// registration. EOF/cancel retirement belongs to the future dispatcher.
+#[derive(Debug)]
+pub(crate) struct HostDispatchChannel {
+    channel: AdmittedChannel,
+    state: host_protocol::HostPeerState,
+    frontend: FrontendAdmission,
+}
+impl HostDispatchChannel {
+    pub(crate) fn frontend(&self) -> FrontendAdmission {
+        self.frontend
+    }
+    pub(crate) fn receive_at(
+        &mut self,
+        frame: &HostFrame,
+        now: u64,
+    ) -> Result<(), protocol::OwnerProtocolError> {
+        self.state.receive_at(frame, now)
+    }
+    pub(crate) fn send_at(
+        &mut self,
+        frame: &HostFrame,
+        now: u64,
+    ) -> Result<(), protocol::OwnerProtocolError> {
+        self.state.send_at(frame, now)
+    }
+    /// One nonblocking operation; the future dispatcher owns deadlines/queues.
+    pub(crate) fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let socket = stream(
+            self.channel
+                .custody
+                .fd
+                .as_ref()
+                .ok_or_else(|| io::Error::other("closed channel"))?,
+        );
+        (&*socket).read(bytes)
+    }
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let socket = stream(
+            self.channel
+                .custody
+                .fd
+                .as_ref()
+                .ok_or_else(|| io::Error::other("closed channel"))?,
+        );
+        (&*socket).write(bytes)
+    }
+    pub(crate) fn retire(self, host: &mut HostState) -> Result<(), HostError> {
+        host.retire_frontend(self.frontend)
+    }
 }
 impl AdmittedChannel {
+    /// Consume exact admitted custody, rather than pairing a freely supplied
+    /// generation or detached correlation state with another descriptor.
+    pub(crate) fn into_host_dispatch(
+        mut self,
+        host: &mut HostState,
+        mode: HostMode,
+        limit: usize,
+    ) -> Result<HostDispatchChannel, HostError> {
+        if !(1..=protocol::MAX_OWNER_REQUESTS).contains(&limit) {
+            return Err(AuthorityError::InvalidLimits.into());
+        }
+        let mut state = self.host_state.take().ok_or(AuthorityError::Refused)?;
+        let peer = super::authorization::local_peer::authenticate_frontend(&mut self, mode)?;
+        let frontend = host.admit_frontend(peer)?;
+        let method = match mode {
+            HostMode::Personal { .. } => AuthMethod::Personal,
+            HostMode::System => AuthMethod::System,
+        };
+        if state
+            .bind_local_authentication(frontend.generation(), method, limit)
+            .is_err()
+        {
+            host.retire_frontend(frontend)?;
+            return Err(AuthorityError::Refused.into());
+        }
+        Ok(HostDispatchChannel {
+            channel: self,
+            state,
+            frontend,
+        })
+    }
     pub(super) fn take_frontend_evidence(
         &mut self,
         mode: HostMode,
@@ -402,12 +491,56 @@ pub(crate) fn admit_channel(
     let requester = expected.local == expected.config.requester;
     let mut outgoing = frame(&expected, expected.local, requester)?;
     let incoming = frame(&expected, expected.peer, !requester)?;
+    let mut host_state = if expected.config.owner.is_none() {
+        Some(
+            host_protocol::HostPeerState::for_local_admission(
+                expected.local,
+                expected.peer,
+                expected.config.host,
+                AdmissionSpec {
+                    host: expected.config.host,
+                    owner: None,
+                    requester: expected.config.requester,
+                    channel: expected.channel,
+                    challenge: expected.challenge,
+                    min_version: expected.config.min_version,
+                    max_version: expected.config.max_version,
+                },
+            )
+            .map_err(|_| AdmissionError::Refused)?,
+        )
+    } else {
+        None
+    };
+    // The retained state observes only an exact successfully transferred frame.
+    // receive_exact checks the private expectation before any state transition.
+    let mut record = |bytes: &[u8], sending: bool| -> Result<(), AdmissionError> {
+        if let Some(state) = host_state.as_mut() {
+            let frames = host_protocol::HostDecoder::new()
+                .push(bytes)
+                .map_err(|_| AdmissionError::Refused)?;
+            let [frame] = frames.as_slice() else {
+                return Err(AdmissionError::Refused);
+            };
+            if sending {
+                state.send(frame)
+            } else {
+                state.receive(frame)
+            }
+            .map_err(|_| AdmissionError::Refused)?;
+        }
+        Ok(())
+    };
     if requester {
         transfer(fd, &mut outgoing, true, deadline)?;
+        record(&outgoing, true)?;
         receive_exact(fd, &incoming, expected.config.owner.is_some(), deadline)?;
+        record(&incoming, false)?;
     } else {
         receive_exact(fd, &incoming, expected.config.owner.is_some(), deadline)?;
+        record(&incoming, false)?;
         transfer(fd, &mut outgoing, true, deadline)?;
+        record(&outgoing, true)?;
     }
     before(deadline)?;
     Ok(AdmittedChannel {
@@ -416,6 +549,7 @@ pub(crate) fn admit_channel(
         local: expected.local,
         peer: expected.peer,
         evidence: true,
+        host_state,
     })
 }
 
