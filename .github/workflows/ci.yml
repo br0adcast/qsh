@@ -1631,10 +1631,14 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 75` is the exact compiled system-library body count:
-          # the prior 74 plus native_observer_process, an isolated exit-only
-          # observer role. Its required native_observer_retains_unrelated_process
-          # parent below drives marker/liveness, drop-without-kill and exact exit.
+          # `--ignored 85` is the exact compiled system-library body count:
+          # the prior 75 plus ten isolated host-policy verifier bodies. Each
+          # required host529_policy parent below reexecs exactly one body and
+          # requires that body's successful one-test result. These component
+          # checks do not substitute for privileged PAM/service qualification.
+          # native_observer_process remains an isolated exit-only observer role.
+          # Its required native_observer_retains_unrelated_process parent below
+          # drives marker/liveness, drop-without-kill and exact exit.
           # The owned worker stage-barrier body's four parents remain required.
           # The deleted-cwd body is in qshd's binary test target, not this
           # library binary. Keep the strict count and require both library
@@ -1677,7 +1681,17 @@ jobs:
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 75 \
+          run_suite lib qshd --ignored 85 \
+            --require helper::server::tests::host_policy::host529_policy_bad_bounds_wrong_nonce_and_shared_child_cap_refuse_before_fork \
+            --require helper::server::tests::host_policy::host529_policy_cancelled_consumer_and_deadline_retain_real_child_until_wait \
+            --require helper::server::tests::host_policy::host529_policy_current_account_and_root_restrictions_are_rechecked \
+            --require helper::server::tests::host_policy::host529_policy_forged_signature_and_wrong_key_refuse \
+            --require helper::server::tests::host_policy::host529_policy_key_revocation_between_issue_and_consume_is_current \
+            --require helper::server::tests::host_policy::host529_policy_late_real_verdict_after_cancel_or_revocation_cannot_grant \
+            --require helper::server::tests::host_policy::host529_policy_nonce_cannot_be_redirected_to_legacy_login \
+            --require helper::server::tests::host_policy::host529_policy_nonce_replay_expiry_shared_capacity_and_recovery \
+            --require helper::server::tests::host_policy::host529_policy_real_auth_and_two_policy_checks_do_not_create_logins \
+            --require helper::server::tests::host_policy::host529_policy_verdict_before_reap_lost_consumer_stays_charged \
             --require process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session \
             --require control::peer_tests::control_peer_root_client_rejects_foreign_server \
             --require control::peer_tests::control_peer_foreign_client_rejects_root_server \

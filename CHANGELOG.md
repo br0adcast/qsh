@@ -18,6 +18,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   ownership contract, naming the observed kernel, instead of refusing every
   channel later. Document the admitted macOS kernels.
 
+### Fixed
+
+- Stop querying package databases, hashing the client and verifying its receipt
+  on the session thread for every server observation. qsh now checks update
+  eligibility only when an offer or incompatibility can be shown, and queries
+  package ownership once per process.
+
 ## [0.6.0-rc1]
 
 ### Changed
