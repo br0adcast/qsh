@@ -141,7 +141,7 @@ impl PreparedScreenResize for EmptyResize {
 ///
 /// The bytes `repaint` returns are consumed by the CLIENT's emulator, not by
 /// a real terminal: they may use everything our own emulator understands.
-pub trait SessionScreen: Send {
+pub trait SessionScreen: Send + std::any::Any {
     /// Feed fresh shell output once and return ordered application-input replies.
     /// Display replicas and replay must not call this authoritative response path.
     /// A failed batch returns no prefix; the owner must end this channel.

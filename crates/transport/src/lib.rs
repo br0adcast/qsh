@@ -119,3 +119,6 @@ pub mod session_resume;
 
 #[cfg(feature = "tokio-driver")]
 pub mod channel_owner;
+
+#[cfg(feature = "tokio-driver")]
+pub mod personal_admission;

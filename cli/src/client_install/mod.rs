@@ -19,7 +19,7 @@ pub fn update_eligibility() -> Result<UpdateEligibility, String> {
     let executable = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .map_err(|_| "could not resolve the actual running qsh executable")?;
-    if package_copy(&executable) {
+    if PACKAGE_OWNERSHIP.get(&executable, package_copy) {
         return Ok(UpdateEligibility::PackageOwned);
     }
     let home = dirs::home_dir().ok_or("could not determine your home directory")?;
@@ -107,6 +107,30 @@ fn native_platform() -> Result<bringup::Platform, String> {
         _ => return Err("managed installation supports Linux and macOS only".into()),
     };
     bringup::Platform::from_uname(os, std::env::consts::ARCH).map_err(|e| e.to_string())
+}
+
+/// Offers ask again for every new server observation; package databases are
+/// queried once per executable path. Install and update query them afresh.
+static PACKAGE_OWNERSHIP: OwnershipCache = OwnershipCache(std::sync::Mutex::new(None));
+
+struct OwnershipCache(std::sync::Mutex<Option<(PathBuf, bool)>>);
+
+impl OwnershipCache {
+    fn get(
+        &self,
+        executable: &std::path::Path,
+        query: impl FnOnce(&std::path::Path) -> bool,
+    ) -> bool {
+        let mut cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match &*cached {
+            Some((path, owned)) if path == executable => *owned,
+            _ => {
+                let owned = query(executable);
+                *cached = Some((executable.to_path_buf(), owned));
+                owned
+            }
+        }
+    }
 }
 
 fn package_copy(executable: &std::path::Path) -> bool {
@@ -364,6 +388,26 @@ fn run_with_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn package_ownership_is_queried_once_per_executable_path() {
+        let cache = OwnershipCache(std::sync::Mutex::new(None));
+        let queries = std::cell::RefCell::new(Vec::new());
+        let query = |path: &std::path::Path| {
+            queries.borrow_mut().push(path.to_path_buf());
+            path.ends_with("packaged/qsh")
+        };
+        let packaged = std::path::Path::new("/home/u/packaged/qsh");
+        let managed = std::path::Path::new("/home/u/.local/bin/qsh");
+        assert!(cache.get(packaged, query));
+        assert!(cache.get(packaged, query));
+        assert!(!cache.get(managed, query));
+        assert!(!cache.get(managed, query));
+        assert!(cache.get(packaged, query));
+        assert_eq!(
+            *queries.borrow(),
+            [packaged, managed, packaged].map(std::path::Path::to_path_buf)
+        );
+    }
     #[test]
     fn signal_during_client_fetch_cancels_before_publication() {
         // Signal flags are process-wide; isolate the real SIGINT from other

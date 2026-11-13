@@ -61,6 +61,21 @@ pub struct InputSubmission {
     ticket: u64,
 }
 impl InputSubmission {
+    pub(super) fn try_accepted(&self) -> Option<Result<InputPosition, WriterError>> {
+        let state = self.writer.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((ticket, result)) = state.response {
+            if ticket == self.ticket {
+                return Some(result);
+            }
+            if ticket > self.ticket {
+                return Some(Err(WriterError::ResponseExpired));
+            }
+        }
+        if state.closed && state.payload.is_none() {
+            return Some(Err(WriterError::Closed));
+        }
+        None
+    }
     /// Only ledger acceptance is an ACK. A lost receiver never cancels bytes.
     pub async fn accepted(self) -> Result<InputPosition, WriterError> {
         loop {
