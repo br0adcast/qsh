@@ -194,6 +194,46 @@ impl HostDispatchChannel {
     }
 }
 impl AdmittedChannel {
+    /// Borrow exact frontend custody for one nonblocking operation.
+    fn frontend_socket(
+        &self,
+        host: HostInstance,
+        mode: HostMode,
+    ) -> io::Result<ManuallyDrop<UnixStream>> {
+        if self.local != OwnerRole::Frontend
+            || self.peer != OwnerRole::Host
+            || self.config.owner.is_some()
+            || self.config.host != host
+            || self.config.mode != mode
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "frontend channel identity mismatch",
+            ));
+        }
+        Ok(stream(
+            self.custody
+                .fd
+                .as_ref()
+                .ok_or_else(|| io::Error::other("closed channel"))?,
+        ))
+    }
+    pub(crate) fn frontend_read(
+        &mut self,
+        host: HostInstance,
+        mode: HostMode,
+        bytes: &mut [u8],
+    ) -> io::Result<usize> {
+        (&*self.frontend_socket(host, mode)?).read(bytes)
+    }
+    pub(crate) fn frontend_write(
+        &mut self,
+        host: HostInstance,
+        mode: HostMode,
+        bytes: &[u8],
+    ) -> io::Result<usize> {
+        (&*self.frontend_socket(host, mode)?).write(bytes)
+    }
     /// Consume exact admitted custody, rather than pairing a freely supplied
     /// generation or detached correlation state with another descriptor.
     pub(crate) fn into_host_dispatch(

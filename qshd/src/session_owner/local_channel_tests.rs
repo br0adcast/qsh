@@ -713,3 +713,214 @@ fn authdispatch529_invalid_correlation_limit_precedes_host_registration() {
     assert_eq!(budget.in_use(), 0);
     assert_eq!(host.catalog_len(), 0);
 }
+
+static FRONTEND_CLOSE_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+fn observe_frontend_close(fd: RawFd) -> bool {
+    FRONTEND_CLOSE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    close_once(fd)
+}
+
+// These calls exercise the production frontend facade over real admitted pairs.
+#[test]
+fn frontendio529_personal_and_system_roundtrip_preserves_evidence_and_custody() {
+    let _serial = SERIAL.lock().unwrap();
+    for mode in [config(None, OwnerRole::Frontend).mode, HostMode::System] {
+        let budget = AdmissionBudget::new(1).unwrap();
+        let mut host = host_sentinel(mode);
+        let mut cfg = config(None, OwnerRole::Frontend);
+        cfg.mode = mode;
+        cfg.host = host.instance();
+        let (mut frontend, mut channel) = admitted(cfg, &budget);
+        FRONTEND_CLOSE_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        frontend.custody.closer = observe_frontend_close;
+        channel.custody.closer = observe_frontend_close;
+        let mut bytes = [0; 5];
+        assert_eq!(
+            frontend
+                .frontend_read(cfg.host, mode, &mut bytes)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            frontend.frontend_write(cfg.host, mode, b"hello").unwrap(),
+            5
+        );
+        // Frontend I/O must preserve the host's one-shot evidence and correlation.
+        let mut dispatch = channel.into_host_dispatch(&mut host, mode, 2).unwrap();
+        assert_eq!(dispatch.read(&mut bytes).unwrap(), 5);
+        assert_eq!(&bytes, b"hello");
+        assert_eq!(dispatch.write(b"reply").unwrap(), 5);
+        assert_eq!(
+            frontend.frontend_read(cfg.host, mode, &mut bytes).unwrap(),
+            5
+        );
+        assert_eq!(&bytes, b"reply");
+        assert_eq!(
+            frontend
+                .frontend_read(cfg.host, mode, &mut bytes)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(frontend);
+        assert_eq!(
+            FRONTEND_CLOSE_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(budget.in_use(), 1);
+        assert_eq!(dispatch.read(&mut bytes).unwrap(), 0);
+        dispatch.retire(&mut host).unwrap();
+        assert_eq!(
+            FRONTEND_CLOSE_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(budget.in_use(), 0);
+    }
+}
+
+#[test]
+fn frontendio529_wrong_host_mode_and_personal_uid_transfer_no_bytes() {
+    let _serial = SERIAL.lock().unwrap();
+    for mode in [config(None, OwnerRole::Frontend).mode, HostMode::System] {
+        let budget = AdmissionBudget::new(1).unwrap();
+        let mut cfg = config(None, OwnerRole::Frontend);
+        cfg.mode = mode;
+        let (mut frontend, host) = admitted(cfg, &budget);
+        let socket = stream(host.custody.fd.as_ref().unwrap());
+        let mut other = &*socket;
+        other.write_all(b"reply").unwrap();
+        let personal = config(None, OwnerRole::Frontend).mode;
+        let wrong_mode = if mode == HostMode::System {
+            personal
+        } else {
+            HostMode::System
+        };
+        let mut denied = vec![
+            (HostInstance::new([9; 16]).unwrap(), mode),
+            (cfg.host, wrong_mode),
+        ];
+        if let HostMode::Personal { canonical_uid } = mode {
+            denied.push((
+                cfg.host,
+                HostMode::Personal {
+                    canonical_uid: canonical_uid.wrapping_add(1),
+                },
+            ));
+        }
+        for (expected_host, expected_mode) in denied {
+            let mut bytes = [0; 5];
+            assert_eq!(
+                frontend
+                    .frontend_read(expected_host, expected_mode, &mut bytes)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(bytes, [0; 5]);
+            assert_eq!(
+                frontend
+                    .frontend_write(expected_host, expected_mode, b"wrong")
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                other.read(&mut bytes).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        let mut bytes = [0; 5];
+        assert_eq!(
+            frontend.frontend_read(cfg.host, mode, &mut bytes).unwrap(),
+            5
+        );
+        assert_eq!(&bytes, b"reply");
+        assert_eq!(
+            frontend.frontend_write(cfg.host, mode, b"valid").unwrap(),
+            5
+        );
+        other.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"valid");
+        drop(frontend);
+        assert_eq!(budget.in_use(), 1);
+        drop(host);
+        assert_eq!(budget.in_use(), 0);
+    }
+}
+
+#[test]
+fn frontendio529_host_and_owner_endpoints_transfer_no_bytes() {
+    let _serial = SERIAL.lock().unwrap();
+    for mode in [config(None, OwnerRole::Frontend).mode, HostMode::System] {
+        for (owner, requester) in [
+            (None, OwnerRole::Frontend),
+            (
+                Some(OwnerInstance::new([2; 16]).unwrap()),
+                OwnerRole::Frontend,
+            ),
+            (Some(OwnerInstance::new([2; 16]).unwrap()), OwnerRole::Owner),
+        ] {
+            let budget = AdmissionBudget::new(1).unwrap();
+            let mut cfg = config(owner, requester);
+            cfg.mode = mode;
+            let (mut a, mut b) = admitted(cfg, &budget);
+            // Owner-bearing pairs deny both ends; the direct pair denies Host.
+            {
+                let (endpoint, peer) = if owner.is_some() {
+                    (&mut a, &mut b)
+                } else {
+                    (&mut b, &mut a)
+                };
+                let socket = stream(peer.custody.fd.as_ref().unwrap());
+                let mut other = &*socket;
+                other.write_all(b"saved").unwrap();
+                let mut bytes = [0; 5];
+                assert_eq!(
+                    endpoint
+                        .frontend_read(cfg.host, mode, &mut bytes)
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+                assert_eq!(
+                    endpoint
+                        .frontend_write(cfg.host, mode, b"wrong")
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+                assert_eq!(
+                    other.read(&mut bytes).unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                let endpoint_socket = stream(endpoint.custody.fd.as_ref().unwrap());
+                (&*endpoint_socket).read_exact(&mut bytes).unwrap();
+                assert_eq!(&bytes, b"saved");
+                if owner.is_some() {
+                    assert_eq!(
+                        peer.frontend_read(cfg.host, mode, &mut bytes)
+                            .unwrap_err()
+                            .kind(),
+                        io::ErrorKind::PermissionDenied
+                    );
+                    assert_eq!(
+                        peer.frontend_write(cfg.host, mode, b"wrong")
+                            .unwrap_err()
+                            .kind(),
+                        io::ErrorKind::PermissionDenied
+                    );
+                    assert_eq!(
+                        (&*endpoint_socket).read(&mut bytes).unwrap_err().kind(),
+                        io::ErrorKind::WouldBlock
+                    );
+                }
+            }
+            drop(a);
+            assert_eq!(budget.in_use(), 1);
+            drop(b);
+            assert_eq!(budget.in_use(), 0);
+        }
+    }
+}
