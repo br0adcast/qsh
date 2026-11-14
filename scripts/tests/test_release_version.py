@@ -165,14 +165,67 @@ class ReleaseVersionTests(unittest.TestCase):
                 result = self.select(self.with_version(version), 'branch', 'main')
                 self.assertEqual((result.returncode, result.stdout), (0, version + '\n'))
 
-    def order(self, ref_name, tags, ref_type='tag'):
+    def order(self, ref_name, tags, ref_type='tag', releases=()):
+        """`releases` holds (tag, draft, immutable) rows as the job lists them."""
         with tempfile.TemporaryDirectory(prefix='qsh-release-tags-') as directory:
             path = Path(directory) / 'tags'
             path.write_text(''.join(tag + '\n' for tag in tags))
+            listing = Path(directory) / 'releases'
+            listing.write_text(''.join('\t'.join(row) + '\n' for row in releases))
             return subprocess.run(
                 [sys.executable, str(SCRIPT), '--ref-type', ref_type, '--ref-name', ref_name,
-                 '--existing-tags', str(path)],
+                 '--existing-tags', str(path), '--releases', str(listing)],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+
+    def test_retry_of_a_published_immutable_release_follows_newer_tags(self):
+        # An older published tag stays retryable after a newer one exists.
+        published = [('v0.6.0-rc.2', 'false', 'true'), ('v0.6.0-rc.3', 'false', 'true')]
+        for ref_name, tags in [
+                ('v0.6.0-rc.2', ['v0.6.0-rc.2', 'v0.6.0-rc.3']),
+                ('v0.6.0-rc.2', ['v0.6.0-rc.2', 'v0.6.0-rc.3', 'v0.6.0']),
+                ('v0.6.0-rc.3', ['v0.6.0-rc.2', 'v0.6.0-rc.3'])]:
+            with self.subTest(ref_name=ref_name, tags=tags):
+                result = self.order(ref_name, tags, releases=published)
+                self.assertEqual((result.returncode, result.stdout), (0, ref_name[1:] + '\n'))
+                self.assertEqual(result.stderr, 'release version: retrying published '
+                                 'immutable release ' + ref_name + '\n')
+
+    def test_new_publication_below_a_newer_tag_is_refused(self):
+        # Without its own published immutable release, rc.2 would be a new
+        # lower-precedence publication, whatever other releases exist.
+        tags = ['v0.6.0-rc.2', 'v0.6.0-rc.3']
+        for releases in [
+                [],
+                [('v0.6.0-rc.3', 'false', 'true')],
+                # A draft left by an interrupted run is still unpublished.
+                [('v0.6.0-rc.2', 'true', 'false'), ('v0.6.0-rc.3', 'false', 'true')],
+                [('v0.6.0-rc.2', 'true', 'true')],
+                # Published before immutable releases: its assets could change.
+                [('v0.6.0-rc.2', 'false', 'false')],
+                # The tag must match exactly.
+                [('v0.6.0-rc.2+1', 'false', 'true'), ('0.6.0-rc.2', 'false', 'true')]]:
+            with self.subTest(releases=releases):
+                result = self.order('v0.6.0-rc.2', tags, releases=releases)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr, 'release version: release tag does not '
+                                 'follow existing tag v0.6.0-rc.3\n')
+
+    def test_release_listing_must_be_well_formed(self):
+        tags = ['v0.6.0-rc.2']
+        for releases, error in [
+                ([('v0.6.0-rc.2', 'false')], 'invalid release listing'),
+                ([('v0.6.0-rc.2', 'false', 'true', 'x')], 'invalid release listing'),
+                ([('v0.6.0-rc.2', 'False', 'true')], 'invalid release listing'),
+                ([('v0.6.0-rc.2', 'false', 'null')], 'invalid release listing'),
+                ([('v0.6.0-rc.2', 'false', '')], 'invalid release listing'),
+                ([('v0.6.0-rc.2', 'false', 'true'), ('v0.6.0-rc.2', 'true', 'false')],
+                 'several releases use the release tag')]:
+            with self.subTest(releases=releases):
+                result = self.order('v0.6.0-rc.2', tags, releases=releases)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr, 'release version: ' + error + '\n')
 
     def test_release_tag_follows_existing_tags_of_its_version(self):
         for ref_name, tags in [
@@ -220,18 +273,34 @@ class ReleaseVersionTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, '')
                 self.assertEqual(result.stderr, 'release version: ' + error + '\n')
-        result = subprocess.run(
-            [sys.executable, str(SCRIPT), '--ref-type', 'tag', '--ref-name', 'v0.6.0-rc.2',
-             '--existing-tags', str(Path(self.fixture.name) / 'missing')],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
-        self.assertEqual((result.returncode, result.stdout, result.stderr),
-                         (1, '', 'release version: unreadable existing tags\n'))
+        missing = str(Path(self.fixture.name) / 'missing')
+        with tempfile.TemporaryDirectory(prefix='qsh-release-tags-') as directory:
+            present = Path(directory) / 'present'
+            present.write_text('v0.6.0-rc.2\n')
+            for files, error in [((missing, str(present)), 'unreadable existing tags'),
+                                 ((str(present), missing), 'unreadable release listing')]:
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), '--ref-type', 'tag', '--ref-name',
+                     'v0.6.0-rc.2', '--existing-tags', files[0], '--releases', files[1]],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (1, '', 'release version: ' + error + '\n'))
+            # The release listing is required: without it a retry and a new
+            # publication look alike.
+            for option in ('--existing-tags', '--releases'):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), '--ref-type', 'tag', '--ref-name',
+                     'v0.6.0-rc.2', option, str(present)],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                self.assertEqual((result.returncode, result.stdout), (2, ''))
+                self.assertIn('--existing-tags and --releases go together', result.stderr)
 
 
 class TagOrderWorkflowTests(unittest.TestCase):
-    def run_step(self, ref_name, listing, git_status=0):
+    def run_step(self, ref_name, listing, git_status=0, releases=(), gh_status=0):
         # Execute the publish job's actual step body with a fake git that
-        # prints a fixed ls-remote listing.
+        # prints a fixed ls-remote listing and a fake gh that prints the
+        # release rows its --jq filter would.
         workflow = (ROOT / '.github/workflows/release.yml').read_text()
         block = workflow.split("      - name: Require the tag to follow its version's existing tags\n", 1)[1]
         block = block.split('        run: |\n', 1)[1]
@@ -252,9 +321,19 @@ class TagOrderWorkflowTests(unittest.TestCase):
                 'refs/tags/v*" || exit 2\n'
                 'cat "$LISTING"\nexit "$GIT_STATUS"\n')
             fake.chmod(0o755)
+            (base / 'releases').write_text(''.join('\t'.join(row) + '\n' for row in releases))
+            fake = base / 'bin/gh'
+            fake.write_text(
+                '#!/bin/sh\n'
+                'test "$*" = "api --paginate repos/example/project/releases --jq '
+                '.[] | [.tag_name, (.draft | tostring), (.immutable | tostring)] | @tsv" '
+                '|| exit 2\n'
+                'cat "$RELEASES"\nexit "$GH_STATUS"\n')
+            fake.chmod(0o755)
             env = dict(PATH=str(base / 'bin') + os.pathsep + os.environ['PATH'],
                        HOME=directory, HISTFILE='/dev/null', RUNNER_TEMP=directory,
                        LISTING=str(base / 'listing'), GIT_STATUS=str(git_status),
+                       RELEASES=str(base / 'releases'), GH_STATUS=str(gh_status),
                        GITHUB_REPOSITORY='example/project', GITHUB_REF_TYPE='tag',
                        GITHUB_REF_NAME=ref_name)
             return subprocess.run(['bash', '-c', '\n'.join(lines)], cwd=ROOT, env=env,
@@ -274,6 +353,27 @@ class TagOrderWorkflowTests(unittest.TestCase):
 
     def test_actual_step_fails_when_the_tag_listing_fails(self):
         result = self.run_step('v0.6.0-rc.2', ['v0.6.0-rc.2'], git_status=128)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+
+    def test_actual_step_retries_a_published_immutable_release_below_a_newer_tag(self):
+        tags = ['v0.5.0', 'v0.6.0-rc.2', 'v0.6.0-rc.3']
+        published = [('v0.6.0-rc.2', 'false', 'true'), ('v0.6.0-rc.3', 'false', 'true')]
+        result = self.run_step('v0.6.0-rc.2', tags, releases=published)
+        self.assertEqual((result.returncode, result.stdout), (0, '0.6.0-rc.2\n'))
+        self.assertEqual(result.stderr, 'release version: retrying published immutable '
+                         'release v0.6.0-rc.2\n')
+        # The same tag as a draft is a new publication below rc.3.
+        draft = [('v0.6.0-rc.2', 'true', 'false'), ('v0.6.0-rc.3', 'false', 'true')]
+        result = self.run_step('v0.6.0-rc.2', tags, releases=draft)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, 'release version: release tag does not follow '
+                         'existing tag v0.6.0-rc.3\n')
+
+    def test_actual_step_fails_when_the_release_listing_fails(self):
+        published = [('v0.6.0-rc.2', 'false', 'true')]
+        result = self.run_step('v0.6.0-rc.2', ['v0.6.0-rc.2', 'v0.6.0-rc.3'],
+                               releases=published, gh_status=1)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, '')
 

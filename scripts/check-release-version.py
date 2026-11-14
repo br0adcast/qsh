@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Select the shipped pair's version from Cargo metadata on standard input.
 
-With --existing-tags, instead check a release tag against the repository's
-existing version tags: no Cargo metadata is read.
+With --existing-tags and --releases, instead check a release tag against the
+repository's existing version tags and releases: no Cargo metadata is read.
 """
 import argparse
 import json
@@ -114,7 +114,30 @@ def selected_version(metadata, ref_type, ref_name):
     return version
 
 
-def checked_order(ref_type, ref_name, tags_text):
+def published_immutable(ref_name, releases_text):
+    """Whether `ref_name` already has a published, immutable release.
+
+    Each line is `TAG<TAB>DRAFT<TAB>IMMUTABLE`, as the publish job lists the
+    repository's releases. Such a run retries a publication instead of
+    starting one: it reuses the release's verified signature and manifest,
+    and the uploader compares every published asset's digest and cannot add
+    assets to an immutable release. A missing or draft release is a new
+    publication, and so is a published release that is not immutable.
+    """
+    rows = []
+    for line in releases_text.splitlines():
+        fields = line.split('\t')
+        if (len(fields) != 3 or fields[1] not in ('true', 'false')
+                or fields[2] not in ('true', 'false')):
+            raise ValueError('invalid release listing')
+        if fields[0] == ref_name:
+            rows.append(fields[1:])
+    if len(rows) > 1:
+        raise ValueError('several releases use the release tag')
+    return rows == [['false', 'true']]
+
+
+def checked_order(ref_type, ref_name, tags_text, releases_text):
     if ref_type != 'tag':
         raise ValueError('tag order applies only to a release tag')
     version = ref_name[1:] if ref_name.startswith('v') else ''
@@ -125,6 +148,12 @@ def checked_order(ref_type, ref_name, tags_text):
     tags = tags_text.splitlines()
     if ref_name not in tags:
         raise ValueError('release tag is missing from the existing tags')
+    if published_immutable(ref_name, releases_text):
+        # Retrying a published release is idempotent; newer tags of its
+        # version do not make it a lower-precedence publication.
+        print('release version: retrying published immutable release ' + ref_name,
+              file=sys.stderr)
+        return version
     error = order_error(version, tags)
     if error is not None:
         raise ValueError(error)
@@ -137,15 +166,23 @@ def main():
     parser.add_argument('--ref-name', required=True)
     parser.add_argument('--existing-tags', metavar='FILE',
                         help='existing tag names, one per line, instead of Cargo metadata')
+    parser.add_argument('--releases', metavar='FILE',
+                        help='existing releases as TAG, DRAFT, IMMUTABLE tab-separated lines; '
+                             'required with --existing-tags')
     args = parser.parse_args()
+    if (args.existing_tags is None) != (args.releases is None):
+        parser.error('--existing-tags and --releases go together')
     try:
         if args.existing_tags is not None:
-            try:
-                with open(args.existing_tags, encoding='utf-8') as tags:
-                    text = tags.read()
-            except (OSError, UnicodeError):
-                raise ValueError('unreadable existing tags')
-            version = checked_order(args.ref_type, args.ref_name, text)
+            texts = []
+            for path, what in ((args.existing_tags, 'existing tags'),
+                               (args.releases, 'release listing')):
+                try:
+                    with open(path, encoding='utf-8') as source:
+                        texts.append(source.read())
+                except (OSError, UnicodeError):
+                    raise ValueError('unreadable ' + what)
+            version = checked_order(args.ref_type, args.ref_name, *texts)
         else:
             try:
                 metadata = json.load(sys.stdin)

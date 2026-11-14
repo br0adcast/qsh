@@ -157,13 +157,24 @@ and the remote daemon cache selection all use SemVer precedence.
 
 On a tag run, every job that validates the shipped pair version refuses another
 prerelease spelling. Before signing, the publish job also lists the repository's
-version tags. It refuses the tag unless it has greater precedence than every
-other tag of the same `major.minor.patch`, including that version's final
-release. Tags of other versions do not constrain it, so a patch release of an
-older line remains possible, and a re-run on the same tag is accepted.
+version tags and releases. It refuses the tag unless it has greater precedence
+than every other tag of the same `major.minor.patch`, including that version's
+final release. Tags of other versions do not constrain it, so a patch release of an
+older line remains possible.
 
-`v0.6.0-rc1` was published before this rule and withdrawn by the owner, because
-it orders above every `0.6.0-rc.N`. A host that still caches
+A re-run of a tag whose release is already published and immutable is a retry,
+not a new publication, so it is accepted even after a newer tag of its version
+exists. It cannot change the release: it reuses the published signature only
+after native verification and only if the assembled `SHA256SUMS` equals the
+published one, the uploader compares the digest of every published asset, and
+a published immutable release cannot gain assets. A tag without a release, or
+whose release is still a draft or is not immutable, is a new publication and
+must outrank every other tag of its version. A draft left by an interrupted run
+can therefore be completed only while no newer tag of its version exists.
+
+`v0.6.0-rc1` was published before this rule. The owner withdrew it and deleted
+its release and tag, because it orders above every `0.6.0-rc.N` and its tag
+would refuse each of them. A host that still caches
 `~/.cache/qsh/qshd-0.6.0-rc1-<arch>` (with a `-darwin` suffix on macOS) keeps
 selecting it over a later `0.6.0-rc.N` until that file is removed. Distribution
 packages are unaffected: `dpkg` and `rpm` order `0.6.0~rc.2` above `0.6.0~rc1`.
@@ -191,9 +202,8 @@ the only signed manifest with that spelling, the withdrawn `v0.6.0-rc1`: a
 client with this rule cannot authenticate any rc1 product, including its four
 archives, whether downloaded or from cached evidence. rc1's client predates
 managed installation, so no managed generation holds rc1 evidence. Stable names
-are unchanged. The published rc1 assets, signature, tag and release notes are
-not rewritten; withdrawing them follows the owner's release sequence for
-`v0.6.0-rc.2`. The next separately authorized
+are unchanged. rc1's assets, signature and release notes were never rewritten;
+the owner withdrew rc1 by deleting its release and tag before `v0.6.0-rc.2`. The next separately authorized
 release must include the signing workflow before distributing an enforcing client.
 Its first real qsh attestation must pass the production verifier, including exact
 checkout-commit binding, before upload. Public upstream fixtures and synthetic
