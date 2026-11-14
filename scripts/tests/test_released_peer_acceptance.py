@@ -1883,14 +1883,18 @@ class ObserverExitReserveTests(unittest.TestCase):
         original_spawn, original_clock = subprocess.Popen, peer.time.monotonic
         original_wait, original_kill = peer.ObserverCustody.wait, os.kill
         children, waits, kills, clocks = [], [], [], []
+        wait_capsules = []
+        original_wait_calls = []
         custodian = peer.ObserverCustodian()
         returned = snapshot = None
         fallback_completed = False
         started = original_clock()
         outer_deadline = started+2
+        budget_now = [started]
+        read_deadline = min(outer_deadline-.1, started+1)-.1
 
         def clock():
-            value = original_clock()
+            value = budget_now[0] if positive_timeout else original_clock()
             if force_expired and kills:
                 value = max(value, min(outer_deadline-.1, clocks[0]+1))
             clocks.append(value)
@@ -1909,14 +1913,28 @@ class ObserverExitReserveTests(unittest.TestCase):
             call = dict(phase=phase, timeout=timeout, cutoff=clocks[-1]+timeout,
                         status=None, injected_timeout=False, outcome='pending')
             waits.append(call)
-            if phase == 'cleanup' and (force_expired or positive_timeout):
-                if positive_timeout:
-                    self.assertGreater(timeout, 0)
+            wait_capsules.append(capsule)
+            if positive_timeout:
+                self.assertIs(capsule, custodian.active)
+                self.assertIs(capsule.observer, children[0][0])
+                self.assertIsNone(capsule.status)
+                self.assertIsNone(children[0][0].returncode)
+                self.assertGreater(timeout, 0)
+                if phase == 'normal':
+                    self.assertAlmostEqual(call['cutoff'], read_deadline, places=6)
+                    budget_now[0] = read_deadline
                 else:
-                    self.assertEqual(timeout, 0)
+                    self.assertAlmostEqual(timeout, .1, places=6)
+                # A controlled clock must never enter the real timed wait.
+                # Both phases inject expiry without consuming physical status.
+                call.update(injected_timeout=True, outcome='injected-timeout-without-consumption')
+                raise subprocess.TimeoutExpired('injected owned consuming wait', timeout)
+            if phase == 'cleanup' and force_expired:
+                self.assertEqual(timeout, 0)
                 call.update(injected_timeout=True, outcome='injected-timeout-without-consumption')
                 raise subprocess.TimeoutExpired('injected owned consuming wait', timeout)
             try:
+                original_wait_calls.append(phase)
                 call['status'] = original_wait(capsule, timeout)
                 call['outcome'] = 'actual-consumed-status'
                 return call['status']
@@ -1938,15 +1956,29 @@ class ObserverExitReserveTests(unittest.TestCase):
                 if not returned['observer_reaped']:
                     self.assertIs(custodian.active, observation.custody)
                     self.assertIs(observation.custody.observer, children[0][0])
+                if positive_timeout:
+                    self.assertEqual(len(children), 1)
+                    self.assertEqual(len(kills), 1)
+                    self.assertEqual(returned['classification'], 'unknown')
+                    self.assertIsNone(returned['status'])
+                    self.assertFalse(returned['observer_reaped'])
+                    self.assertEqual(observation.custody.wait_authority, 'owned')
+                    self.assertIsNone(observation.custody.status)
+                    self.assertIsNone(children[0][0].returncode)
+                    self.assertTrue(children[0][0].stdout.closed)
+                    self.assertTrue(children[0][0].stderr.closed)
+                    self.assertTrue(any(e['operation'] == 'observer-reap' and e['failure'] == 'TimeoutExpired' for e in returned['errors']))
+                    self.assertFalse(any(e['failure'] == 'AssertionError' for e in returned['errors']))
         finally:
             # Transfer exclusive fixture custody only after the synchronous
             # producer has ended. Never call its capsule again after transfer.
             settle_observer_fixtures(children, custodian)
             fallback_completed = True
             print('OWNED_OBSERVER_RESERVE '+json.dumps(dict(
-                kind='real-child-positive-timeout' if positive_timeout else
+                kind='real-child-controlled-clock-positive-timeout' if positive_timeout else
                      'real-child-with-forced-expiry' if force_expired else 'real-child-real-clock',
                 forced_clock_expiry=force_expired, positive_timeout_injected=positive_timeout,
+                controlled_budget_clock=positive_timeout, real_wait_delegations=original_wait_calls,
                 elapsed=original_clock()-started, waits=waits,
                 return_snapshot=snapshot, fallback_completed=fallback_completed,
                 final_actual_status=[child.returncode for child, _, _ in children],
@@ -1967,6 +1999,15 @@ class ObserverExitReserveTests(unittest.TestCase):
         if force_expired:
             self.assertEqual(cleanup[0]['timeout'], 0)
         if positive_timeout:
+            self.assertEqual(len(normal), 1)
+            self.assertEqual(len(cleanup), 1)
+            self.assertTrue(normal[0]['injected_timeout'], 'positive mode delegated its normal wait to a real timer')
+            self.assertEqual(original_wait_calls, [], 'controlled clock must never run the real wait loop')
+            self.assertIs(wait_capsules[0], wait_capsules[1])
+            self.assertIs(wait_capsules[0].observer, children[0][0])
+            for call in normal+cleanup:
+                self.assertTrue(call['injected_timeout'])
+                self.assertEqual(call['outcome'], 'injected-timeout-without-consumption')
             self.assertGreater(cleanup[0]['timeout'], 0)
         if force_expired or positive_timeout:
             self.assertTrue(cleanup[0]['injected_timeout'])
