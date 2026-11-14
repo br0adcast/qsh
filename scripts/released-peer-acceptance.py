@@ -77,13 +77,49 @@ def extract_pair(archive, destination, digest=SHA256):
 
 
 def check_result(name, output, returncode):
+    def refuse():
+        raise ValueError(f'{name}: expected exactly one actual pass, no skips, and exit zero')
+
     summaries = re.findall(r'^test result: (.*)$', output, re.MULTILINE)
     expected_summary = r'ok\. 1 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in [0-9.]+s'
-    tests = re.findall(r'^test (\S+) \.\.\. (.*)$', output, re.MULTILINE)
-    if (returncode != 0 or tests != [(name, 'ok')] or len(summaries) != 1
+    if (returncode != 0 or len(summaries) != 1
             or not re.fullmatch(expected_summary, summaries[0])
             or re.search(r'\bskip(?:ped|ping)?\b', output, re.IGNORECASE)):
-        raise ValueError(f'{name}: expected exactly one actual pass, no skips, and exit zero')
+        refuse()
+
+    # Serial --nocapture output may put a synchronous child's diagnostic on
+    # the announcement line, with libtest's outcome on a later line. Retain
+    # one record, not a search for any convenient "ok" in the transcript.
+    state = 'waiting'
+    header_seen = False
+    for line in output.splitlines():
+        if line.startswith('test result:'):
+            if state != 'complete':
+                refuse()
+            state = 'summary'
+        elif line.startswith('test '):
+            record = re.fullmatch(r'test (\S+) \.\.\.(?: (.*))?', line)
+            if state != 'waiting' or record is None or record[1] != name:
+                refuse()
+            tail = record[2] or ''
+            if tail == 'ok':
+                state = 'complete'
+            elif re.match(r'(?:ok|FAILED|ignored|test|running \d+ tests?)\b', tail.lstrip()):
+                refuse()
+            else:
+                state = 'pending'
+        elif re.match(r'(?:ok|FAILED|ignored)\b', line.strip()):
+            if line != 'ok' or state != 'pending':
+                refuse()
+            state = 'complete'
+        elif re.match(r'running \d+ tests?\b', line.strip()):
+            # Preserve header-less records, but never accept another run or
+            # a contradictory count when a libtest header is present.
+            if line != 'running 1 test' or header_seen or state != 'waiting':
+                refuse()
+            header_seen = True
+    if state != 'summary':
+        refuse()
 
 
 def run_case(package, name, ignored, env, evidence):
