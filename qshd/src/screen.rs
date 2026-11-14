@@ -17,6 +17,7 @@
 //! the model grows. Repaints describe the retained visible state at its size.
 
 use crate::screen_budget::{ResizeReservation, ScreenBudget, ScreenLease};
+use crate::session_owner::screen_owner::{HostResizeReservation, HostScreenLease};
 use std::sync::Arc;
 use terminal::{Frame, TerminalCore, TerminalOptions};
 use terminal_size::TerminalSize;
@@ -27,7 +28,7 @@ use transport::shell_server::{
 /// A shell session's screen: the emulator that follows the output.
 pub struct PtyScreen {
     term: TerminalCore,
-    lease: ScreenLease,
+    lease: ModelLease,
 }
 
 impl PtyScreen {
@@ -46,10 +47,24 @@ impl PtyScreen {
                     replay: true,
                 },
             ),
-            lease,
+            lease: ModelLease::Ordinary(lease),
         })
     }
 
+    /// The actual host lease was admitted before any TerminalCore allocation.
+    pub(crate) fn with_host_lease(lease: HostScreenLease) -> Self {
+        let size = lease.size();
+        Self {
+            term: TerminalCore::with_options(
+                size,
+                TerminalOptions {
+                    history_lines: 0,
+                    replay: true,
+                },
+            ),
+            lease: ModelLease::Host(lease),
+        }
+    }
     /// The screen as the model sees it. For tests and for callers that want
     /// to compare the two sides.
     pub fn frame(&self) -> Frame {
@@ -63,14 +78,47 @@ impl PtyScreen {
     }
 }
 
+enum ModelLease {
+    Ordinary(ScreenLease),
+    Host(HostScreenLease),
+}
+// Keep preadmitted resize guards inline instead of adding heap backing.
+#[allow(clippy::large_enum_variant)]
+enum ModelResize<'a> {
+    Ordinary(ResizeReservation<'a>),
+    Host(HostResizeReservation<'a>),
+}
+impl ModelLease {
+    fn prepare(&mut self, size: TerminalSize) -> Result<ModelResize<'_>, String> {
+        match self {
+            Self::Ordinary(lease) => lease.prepare(size).map(ModelResize::Ordinary),
+            Self::Host(lease) => lease.prepare(size).map(ModelResize::Host),
+        }
+    }
+}
+impl ModelResize<'_> {
+    fn begin_effect(&mut self) {
+        if let Self::Host(reservation) = self {
+            reservation.begin_effect();
+        }
+    }
+    fn commit(self) {
+        match self {
+            Self::Ordinary(r) => r.commit(),
+            Self::Host(r) => r.commit(),
+        }
+    }
+}
+
 struct ScreenResize<'a> {
     term: &'a mut TerminalCore,
-    reservation: ResizeReservation<'a>,
+    reservation: ModelResize<'a>,
     size: TerminalSize,
 }
 
 impl PreparedScreenResize for ScreenResize<'_> {
-    fn commit(self: Box<Self>) {
+    fn commit(mut self: Box<Self>) {
+        self.reservation.begin_effect();
         self.term.resize_to(self.size);
         self.reservation.commit();
     }

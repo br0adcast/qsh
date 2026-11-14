@@ -62,7 +62,8 @@ def injected(endpoint):
     for prefix, code in s.get('errors', {}).items():
         if endpoint.startswith(prefix): return code
 def release_list():
-    return [{'id': 1, 'tag_name': s['tag_name']}] if s['release'] else []
+    return [{'id': 1, 'tag_name': s['tag_name'], 'draft': s.get('draft', False),
+             'immutable': s.get('immutable', True)}] if s['release'] else []
 def asset_list():
     out = []
     for i, asset in enumerate(s['assets']):
@@ -103,9 +104,13 @@ elif a[:3] == ['api', '-H', 'Accept: application/octet-stream']:
     mode = s.get('download')
     sys.stdout.buffer.write(data + b'x' if mode == 'long' else data[:-1] if mode == 'short' else data)
 elif a[:2] == ['release', 'create']:
-    assert not s['release']
-    s['release'] = True; s['mutations'].append('create'); save()
+    assert not s['release'] and '--draft' in a, a
+    s.update(release=True, draft=True, immutable=False); s['mutations'].append('create'); save()
+elif a[:3] == ['api', '--method', 'PATCH']:
+    assert a[3:] == [repo + 'releases/1', '-F', 'draft=false'] and s['draft'], a
+    s.update(draft=False, immutable=True); s['mutations'].append('publish'); save()
 elif a[:2] == ['release', 'upload']:
+    assert s['draft'], 'upload to a published release'
     name = pathlib.Path(a[5]).name
     race = s.get('race', {})
     if name in race:
@@ -545,19 +550,20 @@ class PublicationTests(Harness):
         r = self.publish()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.remote()['mutations'], ['create'] + ['upload:' + n for n in PRODUCTS]
-                         + ['upload:SHA256SUMS.sigstore.json', 'upload:SHA256SUMS'])
+                         + ['upload:SHA256SUMS.sigstore.json', 'upload:SHA256SUMS', 'publish'])
 
     def test_an_interrupted_upload_is_completed_by_reusing_the_published_bundle(self):
         bundle = stub_bundle(self.manifest)
         published = [{'name': n, 'content': (self.dist / n).read_bytes().decode('latin1')} for n in PRODUCTS]
-        self.set_remote(release=True, assets=published + [
+        # An interrupted publication leaves its draft behind.
+        self.set_remote(release=True, draft=True, immutable=False, assets=published + [
             {'name': 'SHA256SUMS.sigstore.json', 'content': bundle.decode()}])
         r = self.run_helper('preflight')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.outputs(), {'sign': 'false'})
         r = self.publish()
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(self.remote()['mutations'], ['upload:SHA256SUMS'])
+        self.assertEqual(self.remote()['mutations'], ['upload:SHA256SUMS', 'publish'])
 
     def test_a_concurrent_publication_cannot_replace_the_bundle(self):
         # Another run signed and uploaded its own bundle after this run's
@@ -603,7 +609,8 @@ class PublicationTests(Harness):
 
     def test_a_conflicting_published_product_stops_before_any_upload(self):
         (self.dist / 'SHA256SUMS.sigstore.json').write_bytes(stub_bundle(self.manifest))
-        self.set_remote(release=True, assets=[{'name': PRODUCTS[-1], 'content': 'different'}])
+        self.set_remote(release=True, draft=True, immutable=False,
+                        assets=[{'name': PRODUCTS[-1], 'content': 'different'}])
         r = self.publish()
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('Conflicting release asset: ' + PRODUCTS[-1], r.stderr)
@@ -649,6 +656,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("    if: github.ref_type == 'tag' && github.repository == 'br0adcast/qsh'\n",
                       self.jobs['release-verifier'])
 
+    def test_publish_waits_for_the_release_environment_and_checks_settings(self):
+        body = self.jobs['publish']
+        self.assertIn('\n    environment: release\n', body)
+        self.assertIn('      actions: read\n', body)
+        for job, other in self.jobs.items():
+            if job != 'publish':
+                with self.subTest(job=job):
+                    self.assertNotIn('environment:', other)
+                    self.assertNotIn('actions: read', other)
+        check = self.step('publish', 'Require the release authority settings')
+        self.assertIn('python3 scripts/check-release-settings.py --repo "$GITHUB_REPOSITORY"', check)
+        self.assertIn('GH_TOKEN: ${{ github.token }}', check)
+
     def test_privileged_checkouts_are_exact_and_keep_no_credentials(self):
         for job in ['publish', 'release-verifier']:
             with self.subTest(job=job):
@@ -671,7 +691,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_steps_run_in_order_and_publish_passes_explicit_files(self):
         body = self.jobs['publish']
-        order = ['Require the release repository and tag', 'name: dist', 'name: release-verifier',
+        order = ['Require the release repository and tag', 'Require the release authority settings',
+                 'name: dist', 'name: release-verifier',
                  'Check the published release metadata', 'Sign the release manifest',
                  'Verify the new signature', 'Check release metadata for secrets', 'Publish the release']
         positions = [body.index(marker) for marker in order]

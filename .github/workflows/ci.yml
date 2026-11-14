@@ -31,8 +31,21 @@ concurrency:
 
 jobs:
   macos:
-    name: macOS portable tests
-    runs-on: macos-15
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            name: macOS portable tests
+            cache_suffix: ''
+          # Native qualification of the xnu-12377 (macOS 26) admission (#551).
+          # Separate caches: objects built against the macOS 26 SDK must not
+          # reach the macOS 15 job.
+          - runner: macos-26
+            name: macOS 26 portable tests
+            cache_suffix: -macos-26
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
       RUSTUP_TOOLCHAIN: "1.98.1"
@@ -65,12 +78,14 @@ jobs:
           printf '%s\n' "$compiler"
           grep -qx 'release: 1.98.1' <<< "$compiler"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: ${{ matrix.cache_suffix }}
       - name: Install native build prerequisites
         run: brew install gnupg
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/native-crypto
-          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*openssl*', 'scripts/openssl/*') }}
+          key: native-${{ runner.os }}-${{ runner.arch }}${{ matrix.cache_suffix }}-${{ hashFiles('scripts/*openssl*', 'scripts/openssl/*') }}
       - name: Prepare the pinned native backend
         shell: bash
         run: |
@@ -358,6 +373,44 @@ jobs:
           grep -F 'ledger_before_setsid=true pending_interval=true refund=false replacement_refused=true foreign_signal=false voluntary_exit=true rescue=false' "$runtime/keeper-integrated-results.log"
           grep -F 'wire_STOP=ack_then_actual_exit_watch_and_consumed_wait' "$runtime/keeper-integrated-results.log"
           grep -F 'keeper223 replacement_routes old_image=' "$runtime/keeper-integrated-results.log"
+      # #548: a failed keeper fixture's last manager wait is bounded. A blocked
+      # wait must end the harness with native stacks from `sample`. Reuses the
+      # ordinary harness features built above.
+      - name: Keeper failure settlement bound
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-keeper548.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          export HOME="$runtime/home"
+          export XDG_CONFIG_HOME="$runtime/config"
+          export XDG_CACHE_HOME="$runtime/cache"
+          export HISTFILE=/dev/null
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
+          cargo test -p qshd --lib --features test-build-labels --locked -- \
+            darwin_process_scope::keeper_integration_tests::keeper548_ --nocapture --test-threads=1 \
+            2>&1 | tee "$runtime/results.log"
+          # Filtered on purpose, so each test is required by name instead of
+          # scripts/no-silent-skips.sh, which rejects any filter.
+          for name in \
+            darwin_process_scope::keeper_integration_tests::keeper548_blocked_wait_returns_a_settled_task_without_diagnostics \
+            darwin_process_scope::keeper_integration_tests::keeper548_blocked_wait_reports_and_ends_the_harness \
+            darwin_process_scope::keeper_integration_tests::keeper548_descendants_follow_parents_and_reduce_names
+          do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/results.log"
+          done
+          if grep -F 'SKIPPED' "$runtime/results.log"; then exit 1; fi
+          grep -F 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$runtime/results.log"
       - name: Compile safe libraries and inline tests
         run: >-
           cargo test --lib --no-run --locked
@@ -1072,6 +1125,7 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_darwin_artifact_smoke.py'
           python3 -m unittest discover -s scripts/tests -p 'test_release_assembly.py'
           python3 -m unittest discover -s scripts/tests -p 'test_release_upload.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_release_settings.py'
           python3 -m unittest discover -s scripts/tests -p 'test_rpm_tool.py'
           python3 -m unittest discover -s scripts/tests -p 'test_bootstrap_tools.py'
           python3 -m unittest discover -s scripts/tests -p 'test_package_dependencies.py'
@@ -1578,10 +1632,14 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 75` is the exact compiled system-library body count:
-          # the prior 74 plus native_observer_process, an isolated exit-only
-          # observer role. Its required native_observer_retains_unrelated_process
-          # parent below drives marker/liveness, drop-without-kill and exact exit.
+          # `--ignored 85` is the exact compiled system-library body count:
+          # the prior 75 plus ten isolated host-policy verifier bodies. Each
+          # required host529_policy parent below reexecs exactly one body and
+          # requires that body's successful one-test result. These component
+          # checks do not substitute for privileged PAM/service qualification.
+          # native_observer_process remains an isolated exit-only observer role.
+          # Its required native_observer_retains_unrelated_process parent below
+          # drives marker/liveness, drop-without-kill and exact exit.
           # The owned worker stage-barrier body's four parents remain required.
           # The deleted-cwd body is in qshd's binary test target, not this
           # library binary. Keep the strict count and require both library
@@ -1624,7 +1682,17 @@ jobs:
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 75 \
+          run_suite lib qshd --ignored 85 \
+            --require helper::server::tests::host_policy::host529_policy_bad_bounds_wrong_nonce_and_shared_child_cap_refuse_before_fork \
+            --require helper::server::tests::host_policy::host529_policy_cancelled_consumer_and_deadline_retain_real_child_until_wait \
+            --require helper::server::tests::host_policy::host529_policy_current_account_and_root_restrictions_are_rechecked \
+            --require helper::server::tests::host_policy::host529_policy_forged_signature_and_wrong_key_refuse \
+            --require helper::server::tests::host_policy::host529_policy_key_revocation_between_issue_and_consume_is_current \
+            --require helper::server::tests::host_policy::host529_policy_late_real_verdict_after_cancel_or_revocation_cannot_grant \
+            --require helper::server::tests::host_policy::host529_policy_nonce_cannot_be_redirected_to_legacy_login \
+            --require helper::server::tests::host_policy::host529_policy_nonce_replay_expiry_shared_capacity_and_recovery \
+            --require helper::server::tests::host_policy::host529_policy_real_auth_and_two_policy_checks_do_not_create_logins \
+            --require helper::server::tests::host_policy::host529_policy_verdict_before_reap_lost_consumer_stays_charged \
             --require process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session \
             --require control::peer_tests::control_peer_root_client_rejects_foreign_server \
             --require control::peer_tests::control_peer_foreign_client_rejects_root_server \

@@ -29,3 +29,16 @@ mod writer;
 pub(crate) mod authorization;
 #[allow(dead_code)] // No host process, endpoint, or writer is activated.
 pub(crate) mod host;
+mod output;
+pub mod screen_control;
+pub mod screen_owner;
+pub mod screen_recovery;
+
+pub mod host_auth_contract;
+pub mod local_admission_contract;
+#[cfg(test)]
+mod local_ipc_contract_tests;
+pub mod owner_resource_contract;
+
+#[allow(dead_code)] // Dormant inherited-channel component; no endpoint is activated.
+pub(crate) mod local_channel;

@@ -18,6 +18,11 @@ s = json.loads(p.read_text())
 a = sys.argv[1:]
 def save(): p.write_text(json.dumps(s))
 def fail(): sys.exit(1)
+def record(r):
+    # Listed records follow the release's current draft and immutable state.
+    if isinstance(r, dict):
+        r.setdefault('draft', s.get('draft', False)); r.setdefault('immutable', s.get('immutable', True))
+    return r
 if a[:2] == ['api', '--paginate']:
     if s.get('error') == 'query': fail()
     if s.get('error') == 'malformed':
@@ -30,9 +35,11 @@ if a[:2] == ['api', '--paginate']:
             listing = s['listings'][min(index, len(s['listings']) - 1)]
             save()
             if listing == 'error': fail()
+            if isinstance(listing, list):
+                listing = [[record(r) for r in page] if isinstance(page, list) else page for page in listing]
             print(json.dumps(listing))
         else:
-            print(json.dumps([[{'id': 1, 'tag_name': 'v1.2.3-rc1'}] if s['exists'] else []]))
+            print(json.dumps([[record({'id': 1, 'tag_name': 'v1.2.3-rc1'})] if s['exists'] else []]))
     elif endpoint == 'repos/example/project/releases/1/assets':
         if s.get('error') == 'assets': fail()
         print(json.dumps([[{'id': i+1, 'name': n}] for i,n in enumerate(s['assets'])]))
@@ -41,11 +48,20 @@ elif a[:3] == ['api', '-H', 'Accept: application/octet-stream']:
     if s.get('error') == 'download': fail()
     idx = int(a[-1].rsplit('/',1)[1])-1
     sys.stdout.buffer.write(list(s['assets'].values())[idx].encode('latin1'))
+elif a[:3] == ['api', '--method', 'PATCH']:
+    assert a == ['api','--method','PATCH','repos/example/project/releases/1','-F','draft=false'], a
+    assert s['exists'] and s['draft'], s
+    if s.get('error') == 'publish': fail()
+    s['draft'] = False
+    s['immutable'] = s.get('immutable_on_publish', True)
+    s['mutations'].append('publish'); save()
 elif a[:2] == ['release', 'create']:
-    assert a == ['release','create','v1.2.3-rc1','--repo','example/project','--verify-tag','--title','qsh 1.2.3-rc1','--notes-file',os.environ['FAKE_NOTES'],'--prerelease'], a
+    assert a == ['release','create','v1.2.3-rc1','--repo','example/project','--verify-tag','--draft','--title','qsh 1.2.3-rc1','--notes-file',os.environ['FAKE_NOTES'],'--prerelease'], a
     if s.get('error') == 'create': fail()
     assert not s['exists']
     s['exists'] = True
+    s['draft'] = True
+    s['immutable'] = False
     s['metadata'] = {'title':'qsh 1.2.3-rc1', 'notes':'release notes', 'prerelease':True}
     s['mutations'].append('create'); save()
 elif a[:2] == ['release', 'upload']:
@@ -54,8 +70,10 @@ elif a[:2] == ['release', 'upload']:
     f = pathlib.Path(a[5])
     if s.get('race'):
         s['assets'][f.name] = s['race']; save(); fail()
+    assert s['draft'], 'uploaded to a published release'
     if s.get('error') == 'upload' or f.name in s['assets']: fail()
-    s['assets'][f.name] = f.read_bytes().decode('latin1')
+    # GitHub may store an upload under another name and still succeed.
+    s['assets'][s.get('rename', {}).get(f.name, f.name)] = f.read_bytes().decode('latin1')
     s['mutations'].append('upload:'+f.name); save()
 else: raise AssertionError(a)
 '''
@@ -76,8 +94,8 @@ class ReleaseUploadTests(unittest.TestCase):
                         XDG_CONFIG_HOME=str(self.base/'config'), HISTFILE='/dev/null',
                         FAKE_STATE=str(self.state), FAKE_NOTES=str(self.notes))
 
-    def run_upload(self, assets=None, exists=True, files=None, **extra):
-        initial = dict(exists=exists, assets=assets or {}, mutations=[],
+    def run_upload(self, assets=None, exists=True, files=None, draft=False, immutable=True, **extra):
+        initial = dict(exists=exists, assets=assets or {}, mutations=[], draft=draft, immutable=immutable,
                        metadata={'title':'keep', 'notes':'keep', 'prerelease':False}, **extra)
         self.state.write_text(json.dumps(initial))
         paths = []
@@ -98,8 +116,8 @@ class ReleaseUploadTests(unittest.TestCase):
         visible = [[{'id': 1, 'tag_name': 'v1.2.3-rc1'}]]
         result, state, _ = self.run_upload(exists=False, listings=[[], [], [], visible])
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(state['queries'], 4)
-        self.assertEqual(state['mutations'], ['create', 'upload:a.tar.gz', 'upload:b.deb'])
+        self.assertEqual(state['queries'], 5)  # Plus one readback after publication.
+        self.assertEqual(state['mutations'], ['create', 'upload:a.tar.gz', 'upload:b.deb', 'publish'])
 
     def test_created_release_visibility_exhaustion_never_recreates_or_uploads(self):
         result, state, _ = self.run_upload(exists=False, listings=[[]])
@@ -169,16 +187,27 @@ class ReleaseUploadTests(unittest.TestCase):
         r, s, _ = self.run_upload(exists=False)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(s['assets'], {'a.tar.gz':'aaa','b.deb':'bbb'})
-        self.assertEqual(s['mutations'], ['create','upload:a.tar.gz','upload:b.deb'])
+        self.assertEqual(s['mutations'], ['create','upload:a.tar.gz','upload:b.deb','publish'])
+        self.assertEqual((s['draft'], s['immutable']), (False, True))
 
     def test_prerelease_rpm_asset_name_uploads_and_retries(self):
-        name='qsh-1.2.3~rc1-1.x86_64.rpm'
-        result,state,_=self.run_upload(files={name:'rpm fixture'})
+        name='qsh-1.2.3-rc1-1.x86_64.rpm'
+        result,state,_=self.run_upload(files={name:'rpm fixture'},draft=True)
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(state['mutations'],['upload:'+name])
+        self.assertEqual(state['mutations'],['upload:'+name,'publish'])
         result,state,initial=self.run_upload({name:'rpm fixture'},files={name:'rpm fixture'})
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(state,initial)
+
+    def test_renamed_upload_fails_instead_of_reporting_publication(self):
+        renamed = {'b.deb': 'b.renamed.deb'}
+        result, state, _ = self.run_upload(rename=renamed, draft=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not published under their names: b.deb', result.stderr)
+        self.assertEqual(state['assets'], {'a.tar.gz': 'aaa', 'b.renamed.deb': 'bbb'})
+        # The draft stays unpublished, so the release can still be corrected.
+        self.assertEqual(state['mutations'], ['upload:a.tar.gz', 'upload:b.deb'])
+        self.assertTrue(state['draft'])
 
     def test_binary_identical_retry_and_same_size_conflict(self):
         for remote, success in [('\x00\xffa', True), ('\x00\xffb', False)]:
@@ -192,14 +221,48 @@ class ReleaseUploadTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(s, initial)
 
-    def test_partial_retry_adds_only_missing(self):
-        r, s, initial = self.run_upload({'a.tar.gz':'aaa'})
+    def test_partial_retry_adds_only_missing_then_publishes(self):
+        r, s, initial = self.run_upload({'a.tar.gz':'aaa'}, draft=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(s['mutations'], ['upload:b.deb'])
+        self.assertEqual(s['mutations'], ['upload:b.deb', 'publish'])
         self.assertEqual(s['metadata'], initial['metadata'])
 
+    def test_published_release_cannot_gain_assets(self):
+        r, s, initial = self.run_upload({'a.tar.gz':'aaa'})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('cannot gain', r.stderr)
+        self.assertEqual(s, initial)
+
+    def test_published_release_without_immutability_is_refused_before_mutation(self):
+        for assets in [{'a.tar.gz':'aaa','b.deb':'bbb'}, {'a.tar.gz':'aaa'}]:
+            with self.subTest(assets=assets):
+                r, s, initial = self.run_upload(assets, immutable=False)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn('not immutable', r.stderr)
+                self.assertEqual(s, initial)
+
+    def test_publication_without_immutability_fails_after_readback(self):
+        r, s, _ = self.run_upload(exists=False, immutable_on_publish=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('not immutable', r.stderr)
+        self.assertEqual(s['mutations'], ['create', 'upload:a.tar.gz', 'upload:b.deb', 'publish'])
+
+    def test_failed_publication_leaves_a_retryable_draft(self):
+        r, s, _ = self.run_upload(exists=False, error='publish')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(s['draft'])
+        self.assertEqual(s['mutations'], ['create', 'upload:a.tar.gz', 'upload:b.deb'])
+        del s['error']
+        self.state.write_text(json.dumps(s))
+        retry = subprocess.run([sys.executable, str(HELPER), '--repo', 'example/project',
+                                '--tag', 'v1.2.3-rc1', '--notes-file', str(self.notes),
+                                str(self.base/'a.tar.gz'), str(self.base/'b.deb')],
+                               env=self.env, capture_output=True, text=True)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(self.state.read_text())['mutations'][-1], 'publish')
+
     def test_later_conflict_prevents_earlier_missing_upload(self):
-        r, s, initial = self.run_upload({'b.deb':'different'})
+        r, s, initial = self.run_upload({'b.deb':'different'}, draft=True)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn('b.deb', r.stderr)
         self.assertEqual(s, initial)
@@ -207,14 +270,15 @@ class ReleaseUploadTests(unittest.TestCase):
     def test_errors_are_fatal(self):
         for error in ['query','assets','malformed','download','upload','create']:
             with self.subTest(error=error):
-                r, s, initial = self.run_upload({'a.tar.gz':'aaa'}, exists=error!='create', error=error)
+                r, s, initial = self.run_upload({'a.tar.gz':'aaa'}, exists=error!='create',
+                                                draft=error!='create', error=error)
                 self.assertNotEqual(r.returncode, 0)
                 self.assertEqual(s, initial)
 
     def test_competing_upload_cannot_replace_bytes(self):
         for content in ['aaa','competitor']:
             with self.subTest(content=content):
-                r, s, _ = self.run_upload(race=content)
+                r, s, _ = self.run_upload(race=content, draft=True)
                 self.assertNotEqual(r.returncode, 0)
                 self.assertEqual(s['assets'], {'a.tar.gz':content})
                 self.assertEqual(s['mutations'], [])
@@ -262,7 +326,9 @@ class ReleaseUploadTests(unittest.TestCase):
                 self.assertEqual(json.loads(self.state.read_text()), initial)
 
     def test_invalid_names_and_duplicates_fail_before_mutation(self):
-        for files in [{'bad#label':'x'}, {'bad~name;cmd.rpm':'x'}, {'~leading.rpm':'x'}, {'one/a':'x','two/a':'y'}]:
+        for files in [{'bad#label':'x'}, {'bad~name;cmd.rpm':'x'}, {'~leading.rpm':'x'}, {'one/a':'x','two/a':'y'},
+                      {'qsh-1.2.3~rc1-1.x86_64.rpm':'x'}, {'qsh-1.2.3+build-1.x86_64.rpm':'x'},
+                      {'.leading':'x'}, {'trailing.':'x'}]:
             with self.subTest(files=files):
                 r, s, initial = self.run_upload(files=files)
                 self.assertNotEqual(r.returncode, 0)

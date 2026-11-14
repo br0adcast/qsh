@@ -2,6 +2,7 @@
 //!
 //! A matching role/instance is a routing check, not proof of authentication.
 //! Runtime callers must validate their inherited/credential-checked endpoints.
+use super::local_admission_contract::{AdmissionSpec, AdmissionState, LocalAdmission};
 use super::operations::OwnerOperation;
 use std::collections::BTreeMap;
 use transport::session_resume::{
@@ -46,6 +47,7 @@ pub struct OwnerHeader {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnerMessage {
+    Admission(LocalAdmission),
     Operation(OwnerOperation),
     Hello { min_version: u16, max_version: u16 },
     HelloAck { selected_version: u16 },
@@ -55,6 +57,7 @@ pub enum OwnerMessage {
 impl OwnerMessage {
     pub const fn kind(&self) -> u8 {
         match self {
+            Self::Admission(a) => a.kind(),
             Self::Operation(op) => op.kind(),
             Self::Hello { .. } => 1,
             Self::HelloAck { .. } => 2,
@@ -100,6 +103,12 @@ fn validate_frame(frame: &OwnerFrame) -> Result<(), OwnerProtocolError> {
         return Err(OwnerProtocolError::Binding);
     }
     match &frame.message {
+        OwnerMessage::Admission(a) => {
+            a.validate()?;
+            if h.request_id == 0 || !a.role_allowed(h.role, true) {
+                return Err(OwnerProtocolError::Binding);
+            }
+        }
         OwnerMessage::Operation(op) => {
             if h.role != op.role()
                 || op.owner().is_some_and(|owner| owner != h.owner)
@@ -151,6 +160,11 @@ fn validate_frame(frame: &OwnerFrame) -> Result<(), OwnerProtocolError> {
 pub fn encode(frame: &OwnerFrame) -> Result<Vec<u8>, OwnerProtocolError> {
     validate_frame(frame)?;
     let body = match &frame.message {
+        OwnerMessage::Admission(a) => {
+            let mut bytes = Vec::with_capacity(a.len());
+            a.put(&mut bytes);
+            bytes
+        }
         OwnerMessage::Operation(op) => op.encode(frame.header.request_id)?,
         OwnerMessage::Hello {
             min_version,
@@ -194,6 +208,12 @@ fn parse_header(bytes: &[u8]) -> Result<(OwnerHeader, u8, usize), OwnerProtocolE
         return Err(OwnerProtocolError::TooLarge);
     }
     let (min, max) = match kind {
+        3 => (52, 52),
+        4 => (50, 50),
+        0x50 => (50, 74),
+        0x51 => (66, 90),
+        0x52 => (51, 75),
+        0x53 | 0x54 => (56, 56),
         1 => (4, 4),
         2 => (2, 2),
         0x10 => (65, 65 + transport::channel::MAX_COMMAND_LEN),
@@ -236,6 +256,15 @@ fn parse_header(bytes: &[u8]) -> Result<(OwnerHeader, u8, usize), OwnerProtocolE
     if body_len > max {
         return Err(OwnerProtocolError::TooLarge);
     }
+    if (kind == 0x50 && !matches!(body_len, 50 | 74))
+        || (kind == 0x51 && !matches!(body_len, 66 | 90))
+        || (kind == 0x52 && !matches!(body_len, 51 | 75))
+    {
+        return Err(OwnerProtocolError::Malformed);
+    }
+    if (kind == 3 && role == OwnerRole::Host) || (kind == 4 && role == OwnerRole::Frontend) {
+        return Err(OwnerProtocolError::Binding);
+    }
     // Continuity tags0/1/2 have exactly these body sizes, before allocation.
     if kind == 0x38 && !matches!(body_len, 73 | 89 | 105) {
         return Err(OwnerProtocolError::Malformed);
@@ -270,6 +299,12 @@ fn decode(bytes: &[u8]) -> Result<OwnerFrame, OwnerProtocolError> {
     }
     let body = &bytes[OWNER_HEADER_LEN..];
     let message = match kind {
+        3 | 4 => {
+            let mut r = super::wire::Reader::new(body);
+            let a = LocalAdmission::read(kind, &mut r)?;
+            r.finish()?;
+            OwnerMessage::Admission(a)
+        }
         1 => OwnerMessage::Hello {
             min_version: u16::from_be_bytes(body[..2].try_into().unwrap()),
             max_version: u16::from_be_bytes(body[2..].try_into().unwrap()),
@@ -277,7 +312,7 @@ fn decode(bytes: &[u8]) -> Result<OwnerFrame, OwnerProtocolError> {
         2 => OwnerMessage::HelloAck {
             selected_version: u16::from_be_bytes(body.try_into().unwrap()),
         },
-        0x10..=0x25 => {
+        0x10..=0x25 | 0x50..=0x54 => {
             OwnerMessage::Operation(OwnerOperation::decode(kind, header.request_id, body)?)
         }
         0x30..=0x3d => OwnerMessage::Control(session_resume::decode_control_payload(
@@ -369,6 +404,7 @@ impl OwnerDecoder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestKind {
+    Admission,
     Hello,
     Attach,
     Fence,
@@ -376,6 +412,7 @@ enum RequestKind {
 }
 fn request_kind(message: &OwnerMessage) -> Option<RequestKind> {
     match message {
+        OwnerMessage::Admission(a) => (a.kind() == 3).then_some(RequestKind::Admission),
         OwnerMessage::Operation(op) => op.request_kind().map(|k| {
             if k == 0x20 {
                 RequestKind::Attach
@@ -403,6 +440,7 @@ fn request_kind(message: &OwnerMessage) -> Option<RequestKind> {
 }
 fn reply_kind(message: &OwnerMessage) -> Option<RequestKind> {
     match message {
+        OwnerMessage::Admission(a) => (a.kind() == 4).then_some(RequestKind::Admission),
         OwnerMessage::Operation(op) => op.reply_kind().map(|k| {
             if k == 0x20 {
                 RequestKind::Attach
@@ -433,6 +471,7 @@ fn reply_kind(message: &OwnerMessage) -> Option<RequestKind> {
 /// queues; data events never occupy the separately bounded control tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerState {
+    admission: Option<AdmissionState>,
     local_role: OwnerRole,
     peer_role: OwnerRole,
     host: HostInstance,
@@ -453,6 +492,7 @@ impl PeerState {
         owner: OwnerInstance,
     ) -> Self {
         Self {
+            admission: None,
             local_role,
             peer_role,
             host,
@@ -465,6 +505,18 @@ impl PeerState {
             hello_received: false,
             ready: false,
         }
+    }
+    pub fn with_admission(
+        local: OwnerRole,
+        peer: OwnerRole,
+        host: HostInstance,
+        owner: OwnerInstance,
+        spec: AdmissionSpec,
+    ) -> Result<Self, OwnerProtocolError> {
+        let admission = AdmissionState::new(spec, local, peer, host, Some(owner))?;
+        let mut value = Self::new(local, peer, host, owner);
+        value.admission = Some(admission);
+        Ok(value)
     }
     pub fn outstanding(&self) -> usize {
         self.outgoing.len()
@@ -485,6 +537,34 @@ impl PeerState {
         self.apply(frame, false)
     }
     fn apply(&mut self, frame: &OwnerFrame, sending: bool) -> Result<(), OwnerProtocolError> {
+        let mut admission = self.admission.clone();
+        match &frame.message {
+            OwnerMessage::Admission(m) => admission
+                .as_mut()
+                .ok_or(OwnerProtocolError::InvalidState)?
+                .apply(frame.header.request_id, frame.header.role, m)?,
+            _ => {
+                if admission.as_ref().is_some_and(|a| !a.ready()) {
+                    return Err(OwnerProtocolError::InvalidState);
+                }
+                if matches!(
+                    &frame.message,
+                    OwnerMessage::Operation(OwnerOperation::Resource(_))
+                ) && admission.is_none()
+                {
+                    return Err(OwnerProtocolError::InvalidState);
+                }
+            }
+        }
+        self.apply_correlated(frame, sending)?;
+        self.admission = admission;
+        Ok(())
+    }
+    fn apply_correlated(
+        &mut self,
+        frame: &OwnerFrame,
+        sending: bool,
+    ) -> Result<(), OwnerProtocolError> {
         validate_frame(frame)?;
         // Validate nested lengths/offsets on typed frames as well as decoded ones.
         match &frame.message {
@@ -512,7 +592,9 @@ impl PeerState {
         }
         let id = frame.header.request_id;
         if let Some(kind) = request_kind(&frame.message) {
-            if kind == RequestKind::Hello {
+            if kind == RequestKind::Admission {
+                // The separate opt-in admission gate precedes Hello.
+            } else if kind == RequestKind::Hello {
                 if self.ready
                     || if sending {
                         self.hello_sent
@@ -546,7 +628,7 @@ impl PeerState {
                 }
             }
         } else if let Some(kind) = reply_kind(&frame.message) {
-            if kind != RequestKind::Hello && !self.ready {
+            if kind != RequestKind::Hello && kind != RequestKind::Admission && !self.ready {
                 return Err(OwnerProtocolError::InvalidState);
             }
             let table = if sending {
@@ -573,6 +655,7 @@ impl PeerState {
 fn reply_matches(request: &OwnerMessage, reply: &OwnerMessage) -> bool {
     use session_resume::ResumeControl as C;
     match (request, reply) {
+        (OwnerMessage::Admission(a), OwnerMessage::Admission(b)) => a.matches_reply(b),
         (OwnerMessage::Hello { .. }, OwnerMessage::HelloAck { .. }) => true,
         (OwnerMessage::Operation(a), OwnerMessage::Operation(b)) => a.matches_reply(b),
         (
@@ -640,7 +723,8 @@ fn required_role(kind: u8) -> Option<OwnerRole> {
         0x10 | 0x13 | 0x15 | 0x16 | 0x19 | 0x20 | 0x36 | 0x38 | 0x3a | 0x3b => {
             Some(OwnerRole::Frontend)
         }
-        0x22 | 0x24 => Some(OwnerRole::Host),
+        0x22 | 0x24 | 0x51 | 0x52 | 0x54 => Some(OwnerRole::Host),
+        0x50 | 0x53 => Some(OwnerRole::Owner),
         0x11
         | 0x12
         | 0x14

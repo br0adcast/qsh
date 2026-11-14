@@ -173,6 +173,31 @@ pub(super) fn prepare_observation(
         contract: contract.family.id,
     })
 }
+/// Daemon startup admission (#551): the reviewed runtime row every channel
+/// admission requires, checked before the daemon binds anything so that an
+/// unadmitted kernel is named at startup rather than at the first channel open.
+pub(crate) fn require_admitted_runtime() -> Result<(), String> {
+    let mut error = Error::default();
+    let mut runtime = Runtime {
+        release: [0; 64],
+        version: [0; 512],
+        build: [0; 64],
+        machine: [0; 32],
+    };
+    result(
+        unsafe { qsh_scope_observation_prepare(&mut runtime, &mut error) },
+        error,
+    )
+    .map_err(|error| AdmissionError::Native(error).to_string())?;
+    let release = runtime_text(&runtime.release).map_err(|error| error.to_string())?;
+    let version = runtime_text(&runtime.version).map_err(|error| error.to_string())?;
+    let build = runtime_text(&runtime.build).map_err(|error| error.to_string())?;
+    let machine = runtime_text(&runtime.machine).map_err(|error| error.to_string())?;
+    match runtime_contract(release, version, build, machine, std::env::consts::ARCH) {
+        Some(_) => Ok(()),
+        None => Err(unsupported_runtime_message(release, version)),
+    }
+}
 pub(super) struct Watch {
     fd: OwnedFd,
     identity: Identity,

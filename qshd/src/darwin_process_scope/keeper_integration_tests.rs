@@ -125,6 +125,368 @@ fn keeper_settlement_diagnostics_continue_after_broken_pipe() {
     );
 }
 
+// #548: a failure rescue returning is not a settlement receipt, so the
+// manager can stay blocked after it. Bound that wait; on expiry record where
+// the process stands and end the harness. A blocked dependency can also block
+// runtime teardown, so this exits instead of unwinding. Never a pass.
+#[cfg(unix)]
+async fn wait_or_end_blocked<T>(
+    task: &mut tokio::task::JoinHandle<T>,
+    bound: std::time::Duration,
+    boundary: &'static str,
+) -> Result<T, tokio::task::JoinError> {
+    if let Ok(joined) = tokio::time::timeout(bound, task).await {
+        return joined;
+    }
+    let stderr = &mut std::io::stderr();
+    emit_settlement(
+        stderr,
+        format_args!(
+            "keeper548 blocked boundary={boundary} bound_ms={}",
+            bound.as_millis()
+        ),
+    );
+    emit_blocked_diagnostics(stderr);
+    emit_settlement(
+        stderr,
+        format_args!("keeper548 blocked boundary={boundary} result=exit status=101"),
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::process::exit(101)
+}
+
+/// Closed categories only: counts, process names without arguments (those
+/// carry nonces and paths) and native stacks, never terminal contents.
+#[cfg(unix)]
+fn emit_blocked_diagnostics(out: &mut impl std::io::Write) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let metrics = handle.metrics();
+        emit_settlement(
+            out,
+            format_args!(
+                "keeper548 runtime workers={} alive_tasks={} global_queue={}",
+                metrics.num_workers(),
+                metrics.num_alive_tasks(),
+                metrics.global_queue_depth()
+            ),
+        );
+    }
+    let pid = std::process::id();
+    match bounded_output(std::process::Command::new("/bin/ps").args([
+        "-A",
+        "-o",
+        "pid=,ppid=,pgid=,stat=,comm=",
+    ])) {
+        Some(listing) => {
+            for row in descendants(&String::from_utf8_lossy(&listing), pid) {
+                emit_settlement(out, format_args!("keeper548 descendant {row}"));
+            }
+        }
+        None => emit_settlement(out, format_args!("keeper548 descendants=unavailable")),
+    }
+    emit_thread_stacks(out, pid);
+}
+
+/// Rows below `root`, breadth first, at most 64, with the name reduced to a
+/// short printable basename.
+#[cfg(unix)]
+fn descendants(listing: &str, root: u32) -> Vec<String> {
+    let rows: Vec<(u32, u32, &str, &str, &str)> = listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            let pgid = fields.next()?;
+            let stat = fields.next()?;
+            let comm = fields.next()?;
+            Some((pid, ppid, pgid, stat, comm))
+        })
+        .collect();
+    let mut parents = std::collections::VecDeque::from([root]);
+    let mut found = Vec::new();
+    while let Some(parent) = parents.pop_front() {
+        for &(pid, ppid, pgid, stat, comm) in &rows {
+            if ppid == parent && pid != root && found.len() < 64 {
+                let name: String = comm
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .filter(|c| c.is_ascii_graphic())
+                    .take(32)
+                    .collect();
+                found.push(format!(
+                    "pid={pid} ppid={ppid} pgid={pgid} stat={stat} name={name}"
+                ));
+                parents.push_back(pid);
+            }
+        }
+    }
+    found
+}
+
+/// Runs a fixed diagnostic tool for at most 30 seconds and keeps at most
+/// 512 KiB of its output.
+#[cfg(unix)]
+fn bounded_output(command: &mut std::process::Command) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut stdout).take(512 * 1024).read_to_end(&mut bytes);
+        bytes
+    });
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < end => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let bytes = reader.join().ok()?;
+    status.filter(|s| s.success()).map(|_| bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn emit_thread_stacks(out: &mut impl std::io::Write, pid: u32) {
+    // `sample` records every thread's native stack while the wait is still
+    // blocked; its report goes to a private file, then to the log.
+    let Ok(directory) = tempfile::Builder::new().prefix("qsh-keeper548-").tempdir() else {
+        emit_settlement(
+            out,
+            format_args!("keeper548 stacks=unavailable reason=tempdir"),
+        );
+        return;
+    };
+    let report = directory.path().join("sample.txt");
+    let ran = bounded_output(
+        std::process::Command::new("/usr/bin/sample")
+            .arg(pid.to_string())
+            .args(["2", "-mayDie", "-file"])
+            .arg(&report),
+    );
+    match (ran, std::fs::read(&report)) {
+        (Some(_), Ok(bytes)) => {
+            let shown = &bytes[..bytes.len().min(512 * 1024)];
+            emit_settlement(
+                out,
+                format_args!("keeper548 stacks begin tool=sample bytes={}", bytes.len()),
+            );
+            let _ = out.write_all(shown);
+            emit_settlement(
+                out,
+                format_args!(
+                    "\nkeeper548 stacks end truncated={}",
+                    shown.len() < bytes.len()
+                ),
+            );
+        }
+        _ => emit_settlement(
+            out,
+            format_args!("keeper548 stacks=unavailable reason=sample"),
+        ),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn emit_thread_stacks(out: &mut impl std::io::Write, _pid: u32) {
+    // Kernel stacks need privileges; name, state and wait channel do not.
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        emit_settlement(
+            out,
+            format_args!("keeper548 stacks=unavailable reason=proc"),
+        );
+        return;
+    };
+    let printable = |text: &str| -> String {
+        text.chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ')
+            .take(64)
+            .collect()
+    };
+    for task in tasks.flatten().take(256) {
+        let read = |name: &str| std::fs::read_to_string(task.path().join(name)).unwrap_or_default();
+        let status = read("status");
+        let state = status
+            .lines()
+            .find_map(|l| l.strip_prefix("State:"))
+            .unwrap_or_default();
+        emit_settlement(
+            out,
+            format_args!(
+                "keeper548 thread tid={} name={} state={} wchan={}",
+                task.file_name().to_string_lossy(),
+                printable(read("comm").trim()),
+                printable(state.trim()),
+                printable(read("wchan").trim())
+            ),
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn keeper548_blocked_wait_returns_a_settled_task_without_diagnostics() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut task = tokio::spawn(async { 7 });
+        let joined = wait_or_end_blocked(
+            &mut task,
+            std::time::Duration::from_secs(5),
+            "fixture_settled",
+        )
+        .await;
+        assert_eq!(joined.unwrap(), 7);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn keeper548_blocked_wait_reports_and_ends_the_harness() {
+    const CHILD: &str = "QSH548_BLOCKED_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        // A descendant that outlives the bound, and a task that never ends.
+        // It inherits no output, so the parent's read ends with this process.
+        // It is never waited for: this process exits under it, and the parent
+        // ends it by pid.
+        #[allow(clippy::zombie_processes)]
+        let sleeper = std::process::Command::new("/bin/sleep")
+            .arg("20")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        eprintln!("keeper548 fixture sleeper={}", sleeper.id());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut task = tokio::spawn(std::future::pending::<()>());
+            let _ = wait_or_end_blocked(
+                &mut task,
+                std::time::Duration::from_millis(200),
+                "fixture_blocked",
+            )
+            .await;
+        });
+        unreachable!("the bounded wait ends the process");
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "darwin_process_scope::keeper_integration_tests::keeper548_blocked_wait_reports_and_ends_the_harness",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let collect = |mut stream: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stream.read_to_end(&mut bytes);
+            bytes
+        })
+    };
+    let stdout = collect(Box::new(child.stdout.take().unwrap()));
+    let stderr = collect(Box::new(child.stderr.take().unwrap()));
+    // An unbounded wait would hang this test too; end it within a fixed time.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the blocked wait did not end its harness within 30 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = String::from_utf8(stdout.join().unwrap()).unwrap();
+    let stderr = String::from_utf8_lossy(&stderr.join().unwrap()).into_owned();
+    let sleeper: u32 = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("keeper548 fixture sleeper="))
+        .and_then(|pid| pid.parse().ok())
+        .expect(&stderr);
+    // The orphaned descendant is this test's own; end it by its exact pid.
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(sleeper as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    assert_eq!(status.code(), Some(101), "{stderr}");
+    // An exit, not a panic: the harness never reports the test or a summary.
+    assert!(
+        !stdout.contains("FAILED") && !stdout.contains("test result:"),
+        "{stdout}"
+    );
+    let lines: Vec<&str> = stderr.lines().collect();
+    let position = |prefix: &str| {
+        lines
+            .iter()
+            .position(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix}: {stderr}"))
+    };
+    let start = position("keeper548 blocked boundary=fixture_blocked bound_ms=200");
+    let runtime = position("keeper548 runtime workers=2 alive_tasks=");
+    let descendant = lines
+        .iter()
+        .position(|l| {
+            l.starts_with(&format!("keeper548 descendant pid={sleeper} "))
+                && l.ends_with(" name=sleep")
+        })
+        .unwrap_or_else(|| panic!("missing sleeper descendant: {stderr}"));
+    let stacks = position(if cfg!(target_os = "macos") {
+        "keeper548 stacks begin tool=sample"
+    } else {
+        "keeper548 thread tid="
+    });
+    let end = position("keeper548 blocked boundary=fixture_blocked result=exit status=101");
+    assert!(
+        start < runtime && runtime < descendant && descendant < stacks && stacks < end,
+        "{stderr}"
+    );
+    assert!(!stderr.contains(" ... ok"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn keeper548_descendants_follow_parents_and_reduce_names() {
+    let listing = "  10     1    10 Ss   /usr/bin/harness\n  11    10    10 S    /bin/sleep\n  12    11    12 R+   /private/var/x/qshd-keeper\n  13     1    13 S    other\n  bad row\n";
+    assert_eq!(
+        descendants(listing, 10),
+        [
+            "pid=11 ppid=10 pgid=10 stat=S name=sleep",
+            "pid=12 ppid=11 pgid=12 stat=R+ name=qshd-keeper",
+        ]
+    );
+    assert!(descendants(listing, 13).is_empty());
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EofComponent {
     Eof,
@@ -1387,6 +1749,8 @@ pub(super) mod native {
         end: Instant,
         diagnostic_kind: std::sync::Mutex<Option<(ChannelKind, bool)>>,
     }
+    /// After both rescues: the manager has had the original budget already.
+    const FAILURE_MANAGER_BOUND: Duration = Duration::from_secs(60);
     fn settlement(boundary: &'static str, body_ok: bool) {
         super::emit_settlement(
             &mut std::io::stderr(),
@@ -1562,7 +1926,12 @@ pub(super) mod native {
                         super::emit_settlement(&mut std::io::stderr(), format_args!("keeper223 settlement boundary=failure_rescue_return body_ok={body_ok} index={i}"));
                     }
                     settlement("failure_final_manager_wait_entry", body_ok);
-                    let result = self.manager.await;
+                    let result = super::wait_or_end_blocked(
+                        &mut self.manager,
+                        FAILURE_MANAGER_BOUND,
+                        "failure_final_manager_wait",
+                    )
+                    .await;
                     settlement("failure_final_manager_wait_return", body_ok);
                     result
                 }
@@ -1975,6 +2344,10 @@ pub(super) mod native {
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert_eq!(input, b"keeper-input-proof\n");
+            // #548: fds 0-2 share one description. XNU discards unread PTY
+            // output when the last slave close is non-blocking, so restore
+            // blocking mode before writing the marker and closing stdio.
+            assert_eq!(unsafe { nix::libc::fcntl(0, nix::libc::F_SETFL, flags) }, 0);
             assert_eq!(
                 unsafe { nix::libc::ioctl(0, nix::libc::TIOCGWINSZ, &mut size) },
                 0

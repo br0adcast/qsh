@@ -54,11 +54,12 @@ completed validation in the PR so the next update has a traceable starting point
 
 ## Release source qualification
 
-Tag publication requires the complete ordinary CI workflow at the release
-run's exact commit: macOS portable tests; formatting, Clippy, workspace unit
-and integration tests, and separate doctests; and the privileged disposable
-container tier with its required-test and silent-skip checks. Native crypto,
-package builds and installed-package acceptance remain required independently.
+Tag publication requires the complete ordinary CI workflow at the release run's
+exact commit: macOS 15 and macOS 26 portable tests; formatting, Clippy,
+workspace unit and integration tests, and separate doctests; and the privileged
+disposable container tier with its required-test and silent-skip checks. Native
+crypto, package builds and installed-package acceptance remain required
+independently.
 
 The release workflow calls the local reusable CI definition from its own
 commit. Source checkouts use `github.sha` and log and verify the actual checked

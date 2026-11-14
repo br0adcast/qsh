@@ -56,10 +56,52 @@ verified-signing-time checks must all succeed.
 
 A downloader has no separately pinned expected source commit for a release. An
 authorized workflow signing different contents for that version remains within
-this trust boundary. Repository-ID pinning prevents repository-name reuse from
+this trust boundary; [release authority settings](#release-authority-settings)
+limit who can start one. Repository-ID pinning prevents repository-name reuse from
 silently acquiring the authority. HTTPS validation remains a separate requirement.
 There is no unsigned mode, public-key substitute, environment trust override,
 downloaded-root override or runtime dependency on GitHub CLI.
+
+## Release authority settings
+
+Anyone who can run `release.yml` from a `v*` tag obtains a manifest every
+client accepts for that version. The workflow file comes from the tagged commit,
+so these repository settings are part of the trust boundary:
+
+| Setting | Required state | Checked by |
+| --- | --- | --- |
+| Tag ruleset | Active; targets tags; includes `refs/tags/v*` or all tags, with no exclusions; restricts creations, updates and deletions; bypass list only the repository admin role | `scripts/check-release-settings.py` before signing, except the bypass list |
+| `release` environment | The owner is a required reviewer; deployment limited to `v*` tags | the same script, reviewer only |
+| Immutable releases | Enabled | the uploader, on the published release |
+
+The script does not inspect the ruleset bypass list, so keeping it to the
+owner is a manual duty. The immutability setting needs administration access,
+which the workflow token never has; the published release's `immutable` field
+is read instead.
+
+These checks detect a settings regression in an honest release run. They do
+not constrain a run someone else started: a tagged commit can delete both the
+check and the job's `environment:` line. Only the tag ruleset prevents that, for
+everyone outside its bypass list. Repository administrators can change all of
+these settings and remain inside the boundary.
+
+Publication creates a draft release, uploads the fourteen assets and only then
+publishes it, because GitHub refuses new assets on a published immutable
+release. An interrupted run leaves the draft, and a rerun completes it. A
+published release that lacks assets, or that does not report itself immutable,
+stops the run.
+
+To configure the settings in the GitHub web interface:
+
+1. **Settings → Rules → Rulesets → New ruleset → New tag ruleset.** Name it
+   `release tags` and set enforcement to Active. Add Repository admin to the
+   bypass list. Under target tags, include by pattern `v*`. Enable Restrict
+   creations, Restrict updates and Restrict deletions.
+2. **Settings → Environments → New environment** named `release`. Add the owner
+   as a required reviewer and leave self-review allowed. Under deployment
+   branches and tags, choose selected branches and tags and add the tag pattern
+   `v*`.
+3. **Settings → General → Releases:** enable release immutability.
 
 ## Network failures and cache
 
@@ -135,7 +177,23 @@ installed daemon follows its existing explicit source policy; it is not selected
 to hide a metadata authentication error.
 
 Branch assembly remains twelve products plus `SHA256SUMS`. Tag publication adds
-only the bundle, for fourteen release assets total. The next separately authorized
+only the bundle, for fourteen release assets total.
+
+Product names carry the release version exactly as in the tag, for example
+`qsh_0.6.0-rc.2-1_amd64.deb`; only package metadata uses `0.6.0~rc.2`. A
+version whose names GitHub would rewrite, such as one with build metadata, can
+be neither assembled nor authenticated. The client's manifest contract and
+release assembly are tested against each other by running assembly.
+
+Manifests that name packages with the earlier `~` spelling are refused, so each
+version has one manifest layout. This is a deliberate compatibility break for
+the only signed manifest with that spelling, the withdrawn `v0.6.0-rc1`: a
+client with this rule cannot authenticate any rc1 product, including its four
+archives, whether downloaded or from cached evidence. rc1's client predates
+managed installation, so no managed generation holds rc1 evidence. Stable names
+are unchanged. The published rc1 assets, signature, tag and release notes are
+not rewritten; withdrawing them follows the owner's release sequence for
+`v0.6.0-rc.2`. The next separately authorized
 release must include the signing workflow before distributing an enforcing client.
 Its first real qsh attestation must pass the production verifier, including exact
 checkout-commit binding, before upload. Public upstream fixtures and synthetic

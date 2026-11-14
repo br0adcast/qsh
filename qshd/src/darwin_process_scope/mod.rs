@@ -123,6 +123,8 @@ pub(crate) fn prepare_personal() -> Result<PreparedPersonalOwner, native::Admiss
 
 #[cfg(target_os = "macos")]
 pub(crate) use keeper_pty::spawn_prepared;
+#[cfg(target_os = "macos")]
+pub(crate) use native::require_admitted_runtime;
 #[cfg(all(test, target_os = "macos"))]
 mod native_tests;
 
@@ -132,21 +134,47 @@ mod native_tests;
 struct SourceFamily {
     id: &'static str,
     public_source: &'static str,
-    base: &'static str,
+    base: SourceBase,
     major: &'static str,
 }
-const SOURCE_FAMILIES: [SourceFamily; 2] = [
+/// Which observed xnu revisions a reviewed family covers.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceBase {
+    /// The first three revision components equal this reviewed base.
+    Exact(&'static str),
+    /// Every revision of this source line (the first component). The line's
+    /// published revisions were reviewed against an exact family and natively
+    /// qualified; later revisions rely on native CI on the current runner (#551).
+    Line(&'static str),
+}
+impl SourceBase {
+    fn covers(&self, parts: &[&str]) -> bool {
+        match self {
+            Self::Exact(base) => *base == parts[..3].join("."),
+            Self::Line(line) => *line == parts[0],
+        }
+    }
+}
+const SOURCE_FAMILIES: [SourceFamily; 3] = [
     SourceFamily {
         id: "xnu-10063.141.1-conditional-v1",
         public_source: "xnu-10063.141.1",
-        base: "10063.141.1",
+        base: SourceBase::Exact("10063.141.1"),
         major: "23",
     },
     SourceFamily {
         id: "xnu-11417.140.69-conditional-v1",
         public_source: "xnu-11417.140.69",
-        base: "11417.140.69",
+        base: SourceBase::Exact("11417.140.69"),
         major: "24",
+    },
+    // macOS 26.0-26.5: xnu-12377.1.9 through xnu-12377.121.6 were reviewed
+    // against xnu-11417.140.69 for every premise the native operations use.
+    SourceFamily {
+        id: "xnu-12377-line-conditional-v1",
+        public_source: "xnu-12377.1.9..xnu-12377.121.6",
+        base: SourceBase::Line("12377"),
+        major: "25",
     },
 ];
 #[derive(Debug, PartialEq, Eq)]
@@ -171,6 +199,35 @@ impl ObservedRuntime {
             self.native_arch,
         )
     }
+}
+/// Why a daemon refuses to start on an unadmitted Darwin runtime (#551). The
+/// observed values are reduced to printable ASCII and bounded; the admitted
+/// families come from the same table the channel admission uses.
+fn unsupported_runtime_message(release: &str, version: &str) -> String {
+    let printable = |value: &str| -> String {
+        value
+            .chars()
+            .take(64)
+            .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+            .collect()
+    };
+    let kernel = version
+        .rfind("root:xnu-")
+        .map_or("unknown", |at| &version[at + "root:xnu-".len()..]);
+    let admitted: Vec<String> = SOURCE_FAMILIES
+        .iter()
+        .map(|family| match family.base {
+            SourceBase::Exact(base) => format!("xnu-{base} (Darwin {})", family.major),
+            SourceBase::Line(line) => format!("xnu-{line}.* (Darwin {})", family.major),
+        })
+        .collect();
+    format!(
+        "this macOS kernel has no qualified process ownership contract: Darwin {} (xnu-{}); \
+         qshd admits {}",
+        printable(release),
+        printable(kernel),
+        admitted.join(", ")
+    )
 }
 fn bounded_text(value: &str, limit: usize) -> bool {
     !value.is_empty()
@@ -219,7 +276,7 @@ fn runtime_contract(
     }
     let family = SOURCE_FAMILIES
         .iter()
-        .find(|family| family.base == parts[..3].join(".") && family.major == release_parts[0])?;
+        .find(|family| family.base.covers(&parts) && family.major == release_parts[0])?;
     let build_suffix = build.strip_prefix(family.major)?;
     if build_suffix.len() < 2
         || !build_suffix.as_bytes()[0].is_ascii_uppercase()
