@@ -78,6 +78,7 @@ struct Fixture {
     found: Option<PathBuf>,
     cached: Option<PathBuf>,
     commands: Vec<(String, String)>,
+    selected_helpers: Vec<String>,
     bootstrap_capabilities: Option<String>,
     busy_candidate: Option<crate::CandidateImageIdentity>,
     ensure_fault: Option<EnsureFault>,
@@ -87,6 +88,8 @@ struct Fixture {
     verification_fault: Option<VerificationFault>,
     publication_fault: bool,
     temporary: Option<(String, Arc<AtomicBool>)>,
+    /// Whether `server-info` answers; otherwise it fails like an older helper.
+    server_info: bool,
 }
 impl Fixture {
     fn new() -> Self {
@@ -97,6 +100,7 @@ impl Fixture {
             found: None,
             cached: None,
             commands: vec![],
+            selected_helpers: vec![],
             bootstrap_capabilities: None,
             busy_candidate: None,
             ensure_fault: None,
@@ -106,6 +110,7 @@ impl Fixture {
             verification_fault: None,
             publication_fault: false,
             temporary: None,
+            server_info: false,
         }
     }
     fn daemon(&mut self, permissions: u32) -> PathBuf {
@@ -128,6 +133,15 @@ impl Fixture {
         hooks: BringUpHooks,
         cancel: &knock::Cancel,
     ) -> Result<crate::Ready, BringUpError> {
+        self.run_probed(policy, hooks, None, cancel)
+    }
+    fn run_probed(
+        &mut self,
+        policy: InstallPolicy,
+        hooks: BringUpHooks,
+        server_info: Option<crate::ServerInfoProbe<'_>>,
+        cancel: &knock::Cancel,
+    ) -> Result<crate::Ready, BringUpError> {
         on_session(
             self,
             "fixture".into(),
@@ -143,8 +157,15 @@ impl Fixture {
             22,
             policy,
             hooks,
+            server_info,
             cancel,
         )
+    }
+    fn steps(&self) -> Vec<&str> {
+        self.commands
+            .iter()
+            .map(|(what, _)| what.as_str())
+            .collect()
     }
     fn starts(&self) -> usize {
         self.commands
@@ -154,6 +175,10 @@ impl Fixture {
     }
 }
 impl Remote for Fixture {
+    fn selected_helper(&mut self, path: &str) {
+        self.selected_helpers.push(path.into());
+    }
+
     fn command(
         &mut self,
         what: &str,
@@ -187,6 +212,15 @@ impl Remote for Fixture {
                     self.root.path().display()
                 ),
             ));
+        }
+        if what == "qshd server-info" {
+            if !self.server_info {
+                return Ok(exec::test_support::output(1, ""));
+            }
+            let challenge = script.split("--challenge ").nth(1).unwrap().trim();
+            let reply = serde_json::json!({"challenge":challenge,"server_pubkey":"02".repeat(32),
+                "generation":"03".repeat(16),"core_version":"1.2.3","session_protocols":[[2,2,2]]});
+            return Ok(exec::test_support::output(0, &format!("{reply}\n")));
         }
         if what == "qshd bootstrap-capabilities" {
             return Ok(match &self.bootstrap_capabilities {
@@ -696,6 +730,7 @@ fn busy_opt_in_requires_explicit_tool_capability_without_mutating_legacy_daemon(
         22,
         InstallPolicy::ExistingOnly,
         hooks,
+        None,
         &knock::Cancel::new(),
     );
     assert!(
@@ -748,6 +783,7 @@ fn advertised_tool_capability_allows_scoped_busy_flags_without_version_inference
         22,
         InstallPolicy::ExistingOnly,
         hooks,
+        None,
         &knock::Cancel::new(),
     )
     .unwrap();
@@ -791,6 +827,7 @@ fn reported_candidate_must_match_verified_provider_bytes_before_prompting() {
                 version: "0.5.0".into(),
             },
             hooks,
+            None,
             &knock::Cancel::new(),
         );
         if matches {
@@ -856,6 +893,7 @@ fn confirmed_destructive_command_loss_is_uncertain_without_retry_or_ready() {
             22,
             InstallPolicy::ExistingOnly,
             hooks,
+            None,
             &knock::Cancel::new(),
         );
         if matches!(fault, EnsureFault::Refused) {
@@ -894,4 +932,505 @@ fn confirmed_destructive_command_loss_is_uncertain_without_retry_or_ready() {
         Err(BringUpError::Transfer(_))
     ));
     assert_eq!(fixture.starts(), 1);
+}
+/// Records every call of a probe's gate and answers with `permit`.
+struct Gate {
+    permit: bool,
+    seen: std::cell::RefCell<Vec<Option<[u8; 16]>>>,
+}
+impl Gate {
+    fn new(permit: bool) -> Self {
+        Self {
+            permit,
+            seen: Default::default(),
+        }
+    }
+    fn call(&self, info: Option<&ssh::VerifiedSshServerInfo>) -> bool {
+        self.seen
+            .borrow_mut()
+            .push(info.map(|info| info.info().generation));
+        self.permit
+    }
+}
+fn probe<'a>(
+    before: &'a dyn Fn(Option<&ssh::VerifiedSshServerInfo>) -> bool,
+) -> crate::ServerInfoProbe<'a> {
+    crate::ServerInfoProbe {
+        expected_key: [2; 32],
+        before: Some(before),
+        after_ready: None,
+    }
+}
+#[test]
+fn server_info_uses_the_trusted_lookup_in_the_same_session_before_startup() {
+    let mut f = Fixture::new();
+    let path = f.daemon(0o700);
+    f.server_info = true;
+    let gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| gate.call(info);
+    let (_, hooks) = hooks();
+    f.run_probed(
+        InstallPolicy::RestartOnly,
+        hooks,
+        Some(probe(&before)),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(*gate.seen.borrow(), [Some([3; 16])]);
+    // One trust check serves both the query and the startup.
+    assert_eq!(
+        f.steps(),
+        [
+            "the qshd lookup",
+            "qshd path trust",
+            "qshd server-info",
+            "qshd transport-ensure"
+        ]
+    );
+    let query = &f.commands[2].1;
+    assert!(query.starts_with(&format!(
+        "{} server-info --challenge ",
+        shell::quote(path.to_str().unwrap())
+    )));
+}
+#[test]
+fn a_refusing_gate_stops_before_approval_installation_or_startup() {
+    for policy in [
+        InstallPolicy::ExistingOnly,
+        InstallPolicy::RestartOnly,
+        InstallPolicy::AskIfMissing {
+            version: "0.5.0".into(),
+        },
+        bundled(),
+    ] {
+        let mut f = Fixture::new();
+        f.daemon(0o700);
+        f.server_info = true;
+        let gate = Gate::new(false);
+        let before = |info: Option<&ssh::VerifiedSshServerInfo>| gate.call(info);
+        let (h, hooks) = hooks();
+        let result = f.run_probed(policy, hooks, Some(probe(&before)), &knock::Cancel::new());
+        assert!(
+            matches!(result, Err(BringUpError::ServerInfoRefused)),
+            "{result:?}"
+        );
+        assert_eq!(gate.seen.borrow().len(), 1);
+        assert_eq!(f.starts(), 0);
+        assert_eq!(f.uploads, 0);
+        assert_eq!(h.loads.load(Ordering::SeqCst), 0);
+        assert_eq!(h.approvals.load(Ordering::SeqCst), 0);
+    }
+}
+#[test]
+fn unknown_server_info_still_reaches_the_gate_once_and_bring_up_continues() {
+    // An older helper without `server-info`.
+    let mut f = Fixture::new();
+    f.daemon(0o700);
+    let gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| gate.call(info);
+    let (_, legacy) = hooks();
+    f.run_probed(
+        InstallPolicy::ExistingOnly,
+        legacy,
+        Some(probe(&before)),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(*gate.seen.borrow(), [None]);
+    assert_eq!(f.starts(), 1);
+    // No qshd to ask: the gate decides before the installation offer.
+    let mut f = Fixture::new();
+    let gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| gate.call(info);
+    let (h, hooks) = hooks();
+    f.run_probed(
+        InstallPolicy::AskIfMissing {
+            version: "0.5.0".into(),
+        },
+        hooks,
+        Some(probe(&before)),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(*gate.seen.borrow(), [None]);
+    assert!(!f.steps().contains(&"qshd server-info"));
+    assert_eq!(h.approvals.load(Ordering::SeqCst), 1);
+    assert_eq!(f.starts(), 1);
+}
+#[test]
+fn an_unsafe_lookup_is_never_executed_for_server_info() {
+    let mut f = Fixture::new();
+    f.daemon(0o777);
+    f.server_info = true;
+    let gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| gate.call(info);
+    let (_, hooks) = hooks();
+    let result = f.run_probed(
+        InstallPolicy::ExistingOnly,
+        hooks,
+        Some(probe(&before)),
+        &knock::Cancel::new(),
+    );
+    assert!(matches!(result, Err(BringUpError::Verify(_))), "{result:?}");
+    assert_eq!(*gate.seen.borrow(), [None]);
+    assert!(!f.steps().contains(&"qshd server-info"));
+    assert_eq!(f.starts(), 0);
+}
+#[test]
+fn a_reply_for_another_key_is_unknown() {
+    let mut f = Fixture::new();
+    f.daemon(0o700);
+    f.server_info = true;
+    let gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| gate.call(info);
+    let (_, hooks) = hooks();
+    f.run_probed(
+        InstallPolicy::ExistingOnly,
+        hooks,
+        Some(crate::ServerInfoProbe {
+            expected_key: [9; 32],
+            ..probe(&before)
+        }),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(*gate.seen.borrow(), [None]);
+}
+#[test]
+fn after_ready_reads_server_info_on_the_same_session() {
+    let mut f = Fixture::new();
+    f.daemon(0o700);
+    f.server_info = true;
+    let seen = std::cell::RefCell::new(Vec::new());
+    let after = |info: Option<&ssh::VerifiedSshServerInfo>| {
+        seen.borrow_mut()
+            .push(info.map(|info| info.info().generation))
+    };
+    let (_, hooks) = hooks();
+    f.run_probed(
+        InstallPolicy::RestartOnly,
+        hooks,
+        Some(crate::ServerInfoProbe {
+            expected_key: [2; 32],
+            before: None,
+            after_ready: Some(&after),
+        }),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(*seen.borrow(), [Some([3; 16])]);
+    assert_eq!(
+        f.steps(),
+        [
+            "the qshd lookup",
+            "qshd path trust",
+            "qshd transport-ensure",
+            "qshd server-info"
+        ]
+    );
+}
+#[test]
+fn cancellation_after_trust_stops_before_the_query_gate_and_startup() {
+    let mut f = Fixture::new();
+    f.daemon(0o700);
+    f.server_info = true;
+    let cancel = knock::Cancel::new();
+    let gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| gate.call(info);
+    f.cancel_after_trust = true;
+    let (_, hooks) = hooks();
+    let result = f.run_probed(
+        InstallPolicy::RestartOnly,
+        hooks,
+        Some(probe(&before)),
+        &cancel,
+    );
+    assert!(
+        matches!(result, Err(BringUpError::Ssh(ssh::SshError::Cancelled))),
+        "{result:?}"
+    );
+    assert!(gate.seen.borrow().is_empty());
+    assert_eq!(f.starts(), 0);
+}
+
+// This observation is synthetic; the real on_session policy chooses which
+// commands may reach the owned Remote fixture and when its helper is retained.
+fn service_observation(
+    fixture: &Fixture,
+) -> (
+    crate::BusyDecision,
+    crate::ServiceRestartConsent,
+    crate::BusySshTarget,
+) {
+    use daemon_bootstrap_protocol::*;
+    let info = BusyDaemonInfo {
+        schema: 2,
+        attempt: BusyAttemptId::from_bytes([1; 16]),
+        identity: BusyDaemonIdentity {
+            version: "0.5.0".into(),
+            build: 1,
+            checksum: "ab".repeat(32),
+            pid: 42,
+            generation: None,
+        },
+        candidate: CandidateImageIdentity {
+            build: 2,
+            checksum: "ef".repeat(32),
+        },
+        active_connections: 2,
+        serving_profiles: None,
+        preservation: PreservationCapability::Unknown,
+        service_restart: Some(PersonalServiceSelector {
+            profile: PersonalServiceProfile::PersonalTransportV1,
+            uid: 1000,
+            endpoint: fixture
+                .root
+                .path()
+                .join("control.sock")
+                .to_str()
+                .unwrap()
+                .into(),
+            port: 60022,
+        }),
+    };
+    let consent = info.confirm_service_restart().unwrap();
+    let decision = PendingBusy::new(info)
+        .unwrap()
+        .decide(BusyChoice::ForceUpdate);
+    let target = crate::BusySshTarget {
+        host: "fixture.invalid".into(),
+        port: 22,
+        username: "fixture".into(),
+        host_key: ssh::HostKeyInfo {
+            key_type: "ssh-ed25519".into(),
+            key: vec![1; 32],
+            fingerprint: "SHA256:fixture".into(),
+        },
+        helper_path: fixture
+            .found
+            .as_ref()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .into(),
+    };
+    (decision, consent, target)
+}
+
+fn run_selected_service(
+    fixture: &mut Fixture,
+    decision: crate::BusyDecision,
+    consent: crate::ServiceRestartConsent,
+    target: &crate::BusySshTarget,
+    probe: crate::ServerInfoProbe<'_>,
+    cancel: &knock::Cancel,
+) -> Result<crate::Ready, BringUpError> {
+    let (_, hooks) = hooks();
+    on_session(
+        fixture,
+        "fixture".into(),
+        60022,
+        [7; 32],
+        true,
+        Some(decision),
+        None,
+        Some(consent),
+        Some(target),
+        "fixture.invalid".into(),
+        "fixture".into(),
+        22,
+        InstallPolicy::ExistingOnly,
+        hooks,
+        Some(probe),
+        cancel,
+    )
+}
+
+#[test]
+fn probed_service_restart_retains_selected_helper_and_consent() {
+    let mut fixture = Fixture::new();
+    fixture.daemon(0o700);
+    fixture.server_info = true;
+    fixture.bootstrap_capabilities =
+        Some(r#"{"schema":1,"busy_decisions":true,"account_service_restart_v1":true}"#.into());
+    let (decision, consent, target) = service_observation(&fixture);
+    let decision_json = serde_json::to_string(&decision).unwrap();
+    let consent_json = serde_json::to_string(&consent).unwrap();
+    let before_gate = Gate::new(true);
+    let after_gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| before_gate.call(info);
+    let after = |info: Option<&ssh::VerifiedSshServerInfo>| {
+        after_gate.call(info);
+    };
+    let result = run_selected_service(
+        &mut fixture,
+        decision,
+        consent,
+        &target,
+        crate::ServerInfoProbe {
+            expected_key: [2; 32],
+            before: Some(&before),
+            after_ready: Some(&after),
+        },
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(result.version, "custom-actual");
+    assert_eq!(*before_gate.seen.borrow(), [Some([3; 16])]);
+    assert_eq!(*after_gate.seen.borrow(), [Some([3; 16])]);
+    assert_eq!(
+        fixture.selected_helpers.as_slice(),
+        std::slice::from_ref(&target.helper_path)
+    );
+    assert_eq!(
+        fixture.steps(),
+        [
+            "the qshd lookup",
+            "qshd path trust",
+            "qshd server-info",
+            "qshd bootstrap-capabilities",
+            "qshd transport-ensure",
+            "qshd server-info",
+        ]
+    );
+    let ensure = &fixture.commands[4].1;
+    assert!(ensure.starts_with(&format!(
+        "{} transport-ensure ",
+        shell::quote(&target.helper_path)
+    )));
+    assert!(ensure.contains(&format!(
+        " --busy-decision {}",
+        shell::quote(&decision_json)
+    )));
+    assert!(ensure.contains(&format!(
+        " --service-restart-consent {}",
+        shell::quote(&consent_json)
+    )));
+    assert!(ensure.contains(&format!(
+        " --service-candidate-helper {}",
+        shell::quote(&target.helper_path)
+    )));
+    assert_eq!(fixture.uploads, 0);
+}
+
+#[test]
+fn probed_service_restart_refuses_changed_selected_helper_before_capabilities() {
+    let mut fixture = Fixture::new();
+    fixture.daemon(0o700);
+    fixture.server_info = true;
+    fixture.bootstrap_capabilities =
+        Some(r#"{"schema":1,"busy_decisions":true,"account_service_restart_v1":true}"#.into());
+    let (decision, consent, mut target) = service_observation(&fixture);
+    target.helper_path = fixture
+        .root
+        .path()
+        .join("another-helper")
+        .to_str()
+        .unwrap()
+        .into();
+    let before_gate = Gate::new(true);
+    let after_gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| before_gate.call(info);
+    let after = |info: Option<&ssh::VerifiedSshServerInfo>| {
+        after_gate.call(info);
+    };
+    let result = run_selected_service(
+        &mut fixture,
+        decision,
+        consent,
+        &target,
+        crate::ServerInfoProbe {
+            expected_key: [2; 32],
+            before: Some(&before),
+            after_ready: Some(&after),
+        },
+        &knock::Cancel::new(),
+    );
+    assert!(
+        matches!(result, Err(BringUpError::Verify(message)) if message == "selected helper path changed")
+    );
+    assert_eq!(*before_gate.seen.borrow(), [Some([3; 16])]);
+    assert!(after_gate.seen.borrow().is_empty());
+    assert!(fixture.selected_helpers.is_empty());
+    assert_eq!(
+        fixture.steps(),
+        ["the qshd lookup", "qshd path trust", "qshd server-info"]
+    );
+    assert_eq!(fixture.starts(), 0);
+    assert_eq!(fixture.uploads, 0);
+}
+
+#[test]
+fn probed_service_restart_refusing_gate_never_spends_consent() {
+    let mut fixture = Fixture::new();
+    fixture.daemon(0o700);
+    fixture.server_info = true;
+    let (decision, consent, target) = service_observation(&fixture);
+    let before_gate = Gate::new(false);
+    let after_gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| before_gate.call(info);
+    let after = |info: Option<&ssh::VerifiedSshServerInfo>| {
+        after_gate.call(info);
+    };
+    let result = run_selected_service(
+        &mut fixture,
+        decision,
+        consent,
+        &target,
+        crate::ServerInfoProbe {
+            expected_key: [2; 32],
+            before: Some(&before),
+            after_ready: Some(&after),
+        },
+        &knock::Cancel::new(),
+    );
+    assert!(matches!(result, Err(BringUpError::ServerInfoRefused)));
+    assert_eq!(*before_gate.seen.borrow(), [Some([3; 16])]);
+    assert!(after_gate.seen.borrow().is_empty());
+    assert!(fixture.selected_helpers.is_empty());
+    assert_eq!(
+        fixture.steps(),
+        ["the qshd lookup", "qshd path trust", "qshd server-info"]
+    );
+    assert_eq!(fixture.starts(), 0);
+    assert_eq!(fixture.uploads, 0);
+}
+
+#[test]
+fn probed_service_restart_cancellation_after_trust_never_spends_consent() {
+    let mut fixture = Fixture::new();
+    fixture.daemon(0o700);
+    fixture.server_info = true;
+    fixture.cancel_after_trust = true;
+    let (decision, consent, target) = service_observation(&fixture);
+    let before_gate = Gate::new(true);
+    let after_gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| before_gate.call(info);
+    let after = |info: Option<&ssh::VerifiedSshServerInfo>| {
+        after_gate.call(info);
+    };
+    let result = run_selected_service(
+        &mut fixture,
+        decision,
+        consent,
+        &target,
+        crate::ServerInfoProbe {
+            expected_key: [2; 32],
+            before: Some(&before),
+            after_ready: Some(&after),
+        },
+        &knock::Cancel::new(),
+    );
+    assert!(matches!(
+        result,
+        Err(BringUpError::Ssh(ssh::SshError::Cancelled))
+    ));
+    assert!(before_gate.seen.borrow().is_empty());
+    assert!(after_gate.seen.borrow().is_empty());
+    assert!(fixture.selected_helpers.is_empty());
+    assert_eq!(fixture.steps(), ["the qshd lookup", "qshd path trust"]);
+    assert_eq!(fixture.starts(), 0);
+    assert_eq!(fixture.uploads, 0);
 }

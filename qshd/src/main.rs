@@ -1071,6 +1071,11 @@ fn write_service_failure(
 ///    parent, and daemonizes.
 fn run_transport_ensure(args: &[OsString], stage_context: Option<OsString>) -> Result<()> {
     let parsed = parse_transport_ensure_args(args)?;
+    // Every channel needs the reviewed Darwin runtime; refuse before reusing,
+    // replacing or starting a daemon that could not open one (#551).
+    #[cfg(target_os = "macos")]
+    qshd::darwin_runtime_admission()?;
+
     anyhow::ensure!(
         stage_context.is_none() || parsed.service_restart_consent.is_some(),
         "service stage requires explicit service consent"

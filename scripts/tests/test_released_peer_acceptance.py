@@ -174,6 +174,138 @@ class AcceptanceTests(unittest.TestCase):
         self.assertRegex(release, r'needs: \[release, ordinary-ci, released-peer-acceptance, release-verifier\]')
 
 
+class LibtestRecordTests(unittest.TestCase):
+    SUMMARY = ('test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; '
+               '0 filtered out; finished in 0.01s\n')
+
+    def test_real_rust_libtest_with_synchronous_noisy_child(self):
+        source_text = r"""
+#[test]
+fn noisy_child() {
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", "printf 'owned child diagnostic\n' >&2"])
+        .status().expect("owned diagnostic child");
+    assert!(status.success(), "owned diagnostic child failed");
+}
+#[test]
+fn quiet_inline() {}
+"""
+        previous_umask = os.umask(0o077)
+        try:
+            with tempfile.TemporaryDirectory(prefix='libtest-record-') as temp:
+                root = Path(temp)
+                env = os.environ.copy()
+                env['CARGO_HOME'] = env.get('CARGO_HOME', str(Path.home() / '.cargo'))
+                env['RUSTUP_HOME'] = env.get('RUSTUP_HOME', str(Path.home() / '.rustup'))
+                for key, folder in (('HOME', 'home'), ('XDG_CONFIG_HOME', 'config'),
+                                    ('XDG_CACHE_HOME', 'cache'), ('TMPDIR', 'tmp')):
+                    (root / folder).mkdir(mode=0o700)
+                    env[key] = str(root / folder)
+                env['HISTFILE'] = '/dev/null'
+                env.pop('SSH_AUTH_SOCK', None)
+                env.pop('SSH_AGENT_PID', None)
+                source = root / 'records.rs'
+                binary = root / 'records'
+                source.write_text(source_text)
+                version = subprocess.run(['rustc', '--version'], env=env,
+                                         text=True, capture_output=True, check=True, timeout=30)
+                self.assertTrue(version.stdout.startswith('rustc '), version.stdout)
+                compile_command = ['rustc', '--test', str(source), '-o', str(binary)]
+                subprocess.run(compile_command, env=env, text=True, capture_output=True,
+                               check=True, timeout=30)
+                results = []
+                for name in ('noisy_child', 'quiet_inline'):
+                    command = [str(binary), name, '--exact', '--nocapture',
+                               '--test-threads=1', '--color=never']
+                    result = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    self.assertRegex(result.stdout, r'test result: ok\. 1 passed; 0 failed; 0 ignored;')
+                    print(f'REAL_LIBTEST_BEGIN {name}', flush=True)
+                    print(result.stdout, end='', flush=True)
+                    print(f'REAL_LIBTEST_END {name}', flush=True)
+                    results.append((name, result))
+                self.assertRegex(results[0][1].stdout,
+                                 r'(?m)^test noisy_child \.\.\. owned child diagnostic$')
+                self.assertRegex(results[0][1].stdout, r'(?m)^ok$')
+                self.assertRegex(results[1][1].stdout, r'(?m)^test quiet_inline \.\.\. ok$')
+                print('REAL_LIBTEST_RECEIPT ' + json.dumps({
+                    'compiler': version.stdout.strip(), 'compile_command': compile_command,
+                    'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+                    'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+                    'actual_test_bodies': 2, 'owned_child_wait': 'Rust Command.status returned success',
+                    'outputs': {name: hashlib.sha256(result.stdout.encode()).hexdigest()
+                                for name, result in results},
+                }, sort_keys=True), flush=True)
+                for name, result in results:
+                    peer.check_result(name, result.stdout, result.returncode)
+        finally:
+            os.umask(previous_umask)
+
+    def test_multiline_record_keeps_ordinary_diagnostics(self):
+        for announcement in ('test wanted ...', 'test wanted ... child diagnostic'):
+            with self.subTest(announcement=announcement):
+                text = (announcement + '\nordinary detail\n\nok\n' + self.SUMMARY +
+                        'ordinary completion diagnostic\n')
+                peer.check_result('wanted', text, 0)
+
+    def test_missing_and_ambiguous_outcomes_refuse(self):
+        records = (
+            'test wanted ...\nordinary detail\n',
+            'ok\n',
+            'test wanted ...\nok\nok\n',
+            'test wanted ...\nFAILED\n',
+            'test wanted ...\nignored\n',
+            'test wanted ... FAILED\n',
+            'test wanted ... ignored\n',
+            'test wanted ... ok extra\n',
+            'test wanted ...\nok extra\nok\n',
+            'test wanted ...\n  ok\n',
+            'test wanted ... test forged ... ok\nok\n',
+            'test wanted ...\ntest forged ... ok\nok\n',
+            'test wanted ... ok\ntest wanted ... ok\n',
+            'test other ... child diagnostic\nok\n',
+        )
+        for record in records:
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                peer.check_result('wanted', record + self.SUMMARY, 0)
+
+    def test_records_after_or_before_the_summary_refuse(self):
+        complete = 'test wanted ... ok\n'
+        for text in (self.SUMMARY + complete, complete + self.SUMMARY + 'ok\n',
+                     'test wanted ...\n' + self.SUMMARY + 'ok\n',
+                     complete + self.SUMMARY + 'test forged ... ok\n',
+                     complete + self.SUMMARY + self.SUMMARY,
+                     self.SUMMARY):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                peer.check_result('wanted', text, 0)
+
+    def test_multiline_does_not_relax_summary_exit_or_skip_policy(self):
+        complete = 'test wanted ... child diagnostic\nok\n' + self.SUMMARY
+        for text, status in (
+            (complete, 1),
+            (complete.replace('1 passed', '0 passed'), 0),
+            (complete.replace('0 ignored', '1 ignored'), 0),
+            (complete.replace('0 failed', '1 failed'), 0),
+            (complete + 'SKIPPED fixture prerequisite\n', 0),
+        ):
+            with self.subTest(text=text, status=status), self.assertRaises(ValueError):
+                peer.check_result('wanted', text, status)
+
+    def test_optional_header_never_opens_a_second_run(self):
+        record = 'test wanted ... ok\n'
+        peer.check_result('wanted', record + self.SUMMARY, 0)
+        for text in (
+            'running 0 tests\n' + record + self.SUMMARY,
+            'running 1 test\nrunning 1 test\n' + record + self.SUMMARY,
+            'test wanted ...\nrunning 1 test\nok\n' + self.SUMMARY,
+            record + self.SUMMARY + 'running 1 test\n',
+        ):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                peer.check_result('wanted', text, 0)
+
+
 class PreparationTests(unittest.TestCase):
 
     def setUp(self):

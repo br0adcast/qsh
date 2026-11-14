@@ -30,18 +30,23 @@ class AssemblyError(ValueError):
 def expected_products(version):
     if not _version.valid_version(version):
         raise AssemblyError('invalid release version')
-    deb=_output.debian_version(version)
-    rpm=_output.rpm_version(version)
+    # The signed manifest names exactly what is uploaded, so no name may be
+    # one GitHub rewrites; archive names carry the same version.
+    def package(fmt,program,version,arch):
+        try:
+            return _output.package_file_name(fmt,program,version,arch)
+        except ValueError:
+            raise AssemblyError('product name would be renamed on upload') from None
     products={}
     for target,deb_arch,rpm_arch in (
             ('x86_64-unknown-linux-musl','amd64','x86_64'),
             ('aarch64-unknown-linux-musl','arm64','aarch64')):
         products['linux-'+target]=(f'qsh-{version}-{target}.tar.gz',
-            f'qsh_{deb}_{deb_arch}.deb',f'qsh-{rpm}-1.{rpm_arch}.rpm')
+            package('deb','qsh',version,deb_arch),package('rpm','qsh',version,rpm_arch))
     products['macos']=tuple(f'qsh-{version}-{target}.tar.gz'
         for target in ('aarch64-apple-darwin','x86_64-apple-darwin'))
-    products['server-packages']=tuple(f'qshd_{deb}_{arch}.deb' for arch in ('amd64','arm64'))+tuple(
-        f'qshd-{rpm}-1.{arch}.rpm' for arch in ('x86_64','aarch64'))
+    products['server-packages']=tuple(package('deb','qshd',version,arch) for arch in ('amd64','arm64'))+tuple(
+        package('rpm','qshd',version,arch) for arch in ('x86_64','aarch64'))
     names=[name for values in products.values() for name in values]
     if len(names)!=12 or len(set(names))!=12:
         raise AssemblyError('ambiguous product names')

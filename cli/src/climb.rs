@@ -187,20 +187,6 @@ struct SshRecoveryEvidence {
 }
 
 impl Setup {
-    pub(crate) fn discover_server_info(
-        &self,
-        address: &::connect::Address,
-        cancel: &knock::Cancel,
-    ) -> Result<Option<ssh::VerifiedSshServerInfo>, SshStepError> {
-        let Some(identity) = self.server_identity() else {
-            return Ok(None);
-        };
-        let Some(route) = &address.ssh else {
-            return Ok(None);
-        };
-        self.ssh_step(true, bringup::InstallPolicy::RestartOnly)
-            .discover_server_info(address, route, &identity, cancel)
-    }
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         args: Args,
@@ -345,13 +331,17 @@ impl Setup {
         address: &::connect::Address,
         cancel: &knock::Cancel,
     ) -> Result<bringup::Ready, SshStepError> {
-        self.bring_up_observed(address, cancel, || {})
+        self.bring_up_observed(address, cancel, None, None, || {})
     }
 
+    /// Recovery's one SSH login. `before` and `after_ready` receive the
+    /// running daemon's server info from that login (`bringup::ServerInfoProbe`).
     pub(crate) fn bring_up_observed(
         &self,
         address: &::connect::Address,
         cancel: &knock::Cancel,
+        before: Option<bringup::ServerInfoGate<'_>>,
+        after_ready: Option<bringup::ServerInfoSink<'_>>,
         started: impl FnOnce(),
     ) -> Result<bringup::Ready, SshStepError> {
         let Some(server) = self.server_identity() else {
@@ -367,18 +357,26 @@ impl Setup {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .filter(|evidence| evidence.server == server);
-        let ready = self
-            .ssh_step(true, bringup::InstallPolicy::RestartOnly)
-            .run_recovery_observed(
-                address,
-                route,
-                self.keypair.public,
-                evidence
-                    .as_ref()
-                    .map(|evidence| (&evidence.origin, evidence.host_key.as_slice())),
-                cancel,
-                started,
-            )?;
+        let server_info =
+            (before.is_some() || after_ready.is_some()).then_some(bringup::ServerInfoProbe {
+                expected_key: server.qsh_key,
+                before,
+                after_ready,
+            });
+        let ready = SshStep {
+            server_info,
+            ..self.ssh_step(true, bringup::InstallPolicy::RestartOnly)
+        }
+        .run_recovery_observed(
+            address,
+            route,
+            self.keypair.public,
+            evidence
+                .as_ref()
+                .map(|evidence| (&evidence.origin, evidence.host_key.as_slice())),
+            cancel,
+            started,
+        )?;
         let port = ready.port_for(address.qsh_port);
         trust::check_bootstrap_key(&address.host, port, server.qsh_key, ready.server_pubkey)
             .and_then(|()| {
@@ -429,6 +427,7 @@ impl Setup {
             background,
             install_policy,
             images: daemon_images(),
+            server_info: None,
         }
     }
 
@@ -747,48 +746,56 @@ impl<'a> Climb<'a> {
                         .expect("discovery keys")
                         .get(&addr)
                         .copied();
-                    if let Some(qsh_key) = expected_key {
-                        let expected = ::connect::server_identity::ServerIdentity {
-                            qsh_key,
-                            username: self.setup.args.login.clone(),
-                        };
-                        if let Ok(Some(proof)) = self
-                            .setup
-                            .ssh_step(true, bringup::InstallPolicy::RestartOnly)
-                            .discover_server_info(&addrs[addr], route, &expected, cancel)
+                    // The pinned daemon's server info comes from the bootstrap's
+                    // own login, before anything is installed or started.
+                    let refused = std::cell::RefCell::new(None);
+                    let gate = |info: Option<&ssh::VerifiedSshServerInfo>| match info {
+                        Some(proof)
+                            if crate::server_discovery::decision(Some(proof.info()))
+                                .compatibility
+                                == ::connect::upgrade::Compatibility::Incompatible =>
                         {
-                            if crate::server_discovery::decision(Some(proof.info())).compatibility
-                                == ::connect::upgrade::Compatibility::Incompatible
-                            {
-                                let why = crate::server_discovery::incompatibility(proof.info());
-                                let line = report::no_answer(host, addrs[addr].qsh_port, &why);
-                                self.provisional_evidence
-                                    .lock()
-                                    .expect("discovery evidence")
-                                    .insert(
-                                        format!("ssh:{}:{}", addrs[addr].host, route.port),
-                                        crate::server_discovery::AuthenticatedServerInfo::Ssh(
-                                            proof,
-                                        ),
-                                    );
-                                let outcome = Outcome::Ssh(SshOutcome::Failed(
-                                    ::connect::SshFailure::plain(line.clone()),
-                                ));
-                                action = self.advance(&mut ladder, outcome, Some(line));
-                                continue;
-                            }
+                            *refused.borrow_mut() = Some(proof.clone());
+                            false
                         }
-                    }
-                    let result = self
-                        .setup
-                        .ssh_step(
+                        _ => true,
+                    };
+                    let result = SshStep {
+                        server_info: expected_key.map(|expected_key| bringup::ServerInfoProbe {
+                            expected_key,
+                            before: Some(&gate),
+                            after_ready: None,
+                        }),
+                        ..self.setup.ssh_step(
                             self.background(),
                             self.setup
                                 .install_policy(self.recovery.is_some(), self.background()),
                         )
-                        .run_foreground(&addrs[addr], route, self.setup.keypair.public, cancel);
+                    }
+                    .run_foreground(
+                        &addrs[addr],
+                        route,
+                        self.setup.keypair.public,
+                        cancel,
+                    );
                     if !self.background() && crate::signals::termination_requested() {
                         return Climbed::Exit(130);
+                    }
+                    if let Some(proof) = refused.take() {
+                        let why = crate::server_discovery::incompatibility(proof.info());
+                        let line = report::no_answer(host, addrs[addr].qsh_port, &why);
+                        self.provisional_evidence
+                            .lock()
+                            .expect("discovery evidence")
+                            .insert(
+                                format!("ssh:{}:{}", addrs[addr].host, route.port),
+                                crate::server_discovery::AuthenticatedServerInfo::Ssh(proof),
+                            );
+                        let outcome = Outcome::Ssh(SshOutcome::Failed(
+                            ::connect::SshFailure::plain(line.clone()),
+                        ));
+                        action = self.advance(&mut ladder, outcome, Some(line));
+                        continue;
                     }
                     match result {
                         Ok(result) => {
@@ -1026,10 +1033,11 @@ impl<'a> Climb<'a> {
                             report::printable(&proof.info().core_version), transport::wire::VERSION,
                             transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION));
                         let policy = crate::server_discovery::decision(Some(proof.info()));
-                        let eligibility = crate::client_install::update_eligibility()
-                            .unwrap_or(crate::client_install::UpdateEligibility::Unmanaged);
                         let view = crate::upgrade_offer::presentation(
-                            eligibility,
+                            || {
+                                crate::client_install::update_eligibility()
+                                    .unwrap_or(crate::client_install::UpdateEligibility::Unmanaged)
+                            },
                             true,
                             policy.offer.as_ref().map(|offer| offer.version.as_str()),
                         );

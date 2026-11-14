@@ -145,3 +145,97 @@ fn resources_rebuilt_host_rejects_old_token_with_reused_public_receipt() {
     fresh.release(&live, receipt).unwrap();
     old.release(&stale, receipt).unwrap();
 }
+
+#[test]
+fn screen_host_prepared_consolidation_pins_exact_tokens_and_churn_stays_bounded() {
+    use crate::screen_budget::ScreenEnvelope;
+    let p = AuthenticatedPrincipalRef::new([81; 16]).unwrap();
+    let mut caps = limits();
+    caps.max_reservations = 2;
+    caps.screen = ScreenLimits {
+        global_cells: 100_000_000,
+        account_cells: 100_000_000,
+        global_rows: 100_000_000,
+        account_rows: 100_000_000,
+        global_models: 1,
+        account_models: 1,
+    };
+    let mut host = ResourceLedger::new(LedgerInstance::new([81; 16]).unwrap(), caps).unwrap();
+    let reg = host.register_fresh_principal(p, 1000).unwrap();
+    let host = Arc::new(Mutex::new(host));
+    let client = OwnerResourceClient::new(host.clone(), reg);
+    let size = terminal_size::TerminalSize::new(4, 2).unwrap();
+    let slots = ScreenEnvelope::new(size).charge().unwrap();
+    let r = Reservation {
+        id: ReservationId::new(1).unwrap(),
+        principal: p,
+        locator: SessionLocator {
+            session: RetainedSessionId::new([81; 16]).unwrap(),
+            owner: OwnerInstance::new([81; 16]).unwrap(),
+        },
+        channel: ChannelInstance::new(1).unwrap(),
+        kind: ReservationKind::ScreenModel,
+        bytes: 0,
+        screen_charge: Some(ScreenCharge {
+            cells: slots.cells as u64,
+            rows: slots.rows as u64,
+            models: 1,
+        }),
+    };
+    let mut lease = super::screen_owner::HostScreenLease::admit(
+        client.clone(),
+        r,
+        RequestId::new(1).unwrap(),
+        size,
+    )
+    .unwrap();
+    let stale = client
+        .reserve(
+            Reservation {
+                id: ReservationId::new(2).unwrap(),
+                screen_charge: Some(ScreenCharge {
+                    cells: 1,
+                    rows: 1,
+                    models: 0,
+                }),
+                ..r
+            },
+            RequestId::new(2).unwrap(),
+        )
+        .unwrap();
+    client
+        .release(
+            &stale,
+            ReservationReceipt {
+                id: RequestId::new(2).unwrap(),
+                reservation: stale.reservation().id,
+                locator: r.locator,
+                channel: r.channel,
+            },
+        )
+        .unwrap();
+    for i in 0..12 {
+        let next = terminal_size::TerminalSize::new(
+            if i % 2 == 0 { 2 } else { 4 },
+            if i % 2 == 0 { 1 } else { 2 },
+        )
+        .unwrap();
+        let pending = lease.prepare(next).unwrap();
+        assert_eq!(host.lock().unwrap().reservations(), 2);
+        pending.commit();
+        assert_eq!(host.lock().unwrap().reservations(), 1);
+        assert!(client
+            .release(
+                &stale,
+                ReservationReceipt {
+                    id: RequestId::new(2).unwrap(),
+                    reservation: stale.reservation().id,
+                    locator: r.locator,
+                    channel: r.channel
+                }
+            )
+            .is_err());
+    }
+    drop(lease);
+    assert_eq!(host.lock().unwrap().reservations(), 0);
+}

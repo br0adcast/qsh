@@ -105,8 +105,8 @@ manager. Download packages or archives and `SHA256SUMS` from the
 [releases page](https://github.com/br0adcast/qsh/releases).
 
 The managed home installer described on `main` requires a later release containing
-`--self-install`; published `0.6.0-rc.1` does not contain it. It fails closed with
-older binaries. No existing release is changed by this work.
+`--self-install`; no published release contains it, and neither did the
+withdrawn `0.6.0-rc1`. It fails closed with older binaries.
 
 Once an installer-capable release is published, download and inspect the script:
 
@@ -146,13 +146,18 @@ or switch console clients.
 On Linux, the portable binaries use static musl builds. The packaged system-mode
 `qshd` instead links glibc and PAM and has a minimum supported system version.
 macOS builds target Darwin and use macOS system libraries; they are not musl
-binaries. Windows packages are not currently produced.
+binaries. On macOS, `qshd` runs on macOS 14.6, 15.6 and 26; see
+[macOS kernel support](docs/qshd-service.md#macos-kernel-support) for the
+exact kernels. Windows packages are not currently produced.
 
 <details>
 <summary><strong>Package and archive installation examples</strong></summary>
 
 Replace `0.5.0` with the version you downloaded. On Linux ARM64, use `_arm64.deb`,
-`.aarch64.rpm`, or the `aarch64-unknown-linux-musl` archive.
+`.aarch64.rpm`, or the `aarch64-unknown-linux-musl` archive. Prerelease package
+files carry the release version, for example `qsh_0.6.0-rc.2-1_amd64.deb`; the
+version inside the package is `0.6.0~rc.2-1`, so package managers order it
+before `0.6.0`.
 
 ```sh
 # Debian / Ubuntu: the client; install qshd separately if this is a server
@@ -187,15 +192,35 @@ See the [service guide](docs/qshd-service.md) for platform requirements.
 
 </details>
 
-Verify downloads against the checksums from the same release:
+Verify downloads in two steps. First authenticate `SHA256SUMS` with the
+`SHA256SUMS.sigstore.json` bundle from the same release, using
+[GitHub CLI](https://cli.github.com/). Verifying a local bundle needs no GitHub
+login. Set `VERSION` to the release you downloaded, without the leading `v`:
 
 ```sh
-# Linux
-sha256sum --ignore-missing -c SHA256SUMS
-
-# macOS
-shasum -a 256 --ignore-missing -c SHA256SUMS
+VERSION=0.6.0
+gh attestation verify SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+  --repo br0adcast/qsh \
+  --cert-identity "https://github.com/br0adcast/qsh/.github/workflows/release.yml@refs/tags/v$VERSION" \
+  --predicate-type https://github.com/br0adcast/qsh/release-manifest/v1 \
+  --deny-self-hosted-runners
 ```
+
+Then check each downloaded file by its exact name. The lookup fails unless the
+verified manifest lists that name exactly once, so a file missing from the
+manifest fails instead of being skipped. Set `FILE` to each file in turn; on
+macOS, use `shasum -a 256 -c` for `sha256sum -c`:
+
+```sh
+FILE=qsh_0.6.0-1_amd64.deb
+awk -v f="$FILE" '$2 == f { print; n++ } END { exit (n != 1) }' SHA256SUMS > "$FILE.sha256" &&
+  sha256sum -c "$FILE.sha256"
+```
+
+Releases without `SHA256SUMS.sigstore.json`, such as v0.5.0, are unsigned;
+their checksums only detect damaged downloads. See
+[release authentication](docs/release-security.md#independent-verification)
+for what this checks and for authenticating the first-install executable.
 
 ### Installing a missing daemon over SSH
 

@@ -271,8 +271,9 @@ and wire format are in [the protocol specification](protocol.md).
 ## Client installation and updates
 
 These commands describe `main` and require a later installer-capable release.
-Published `0.6.0-rc.1` lacks `--self-install` and `--self-update`; the bootstrap
-refuses an older executable rather than falling back to another release.
+No published release has `--self-install` or `--self-update`, and neither did
+the withdrawn `0.6.0-rc1`; the bootstrap refuses an older executable rather than
+falling back to another release.
 
 The [README installer instructions](../README.md#installing) download
 `scripts/install.sh` directly from official GitHub HTTPS. The script selects the
@@ -333,21 +334,47 @@ again before atomic activation. Cancellation observed before activation leaves
 the previous active client in place. A signal after activation commits does not
 undo the installation; relaunch is still explicit.
 
-If UDP discovery is unavailable, an already configured and trusted SSH route
-may execute read-only `qshd server-info --challenge HEX64`. Its response must
-echo the fresh challenge and match the pinned qsh key. Discovery never accepts
-a new SSH host key, installs a daemon, or authorizes a client. Unsupported
-legacy commands and daemon modes without an available local control socket
-remain unknown; the executable's `--version` is not running-server evidence.
+If UDP discovery is unavailable for a pinned daemon, the SSH bootstrap reads
+its server info on the same SSH login, so an agent or FIDO key signs once per
+attempt. After the lookup and the `trust.sh` checks accept the located `qshd`,
+and before anything is installed or started, that login runs read-only
+`<qshd> server-info --challenge HEX64`. Background recovery reads it again on
+the same login after readiness. The response must echo the fresh challenge and
+match the pinned qsh key; it is authenticated only by the SSH account that
+returned it. The query never prompts, installs a daemon, or authorizes a
+client. Its host key is the one that login verified. A lookup that `trust.sh`
+refuses is never executed. Unsupported legacy commands and daemon modes
+without an available local control socket remain unknown. The executable's
+`--version` is not running-server evidence.
 
 Release authentication, destination validation or cancellation failures before
-publication leave the prior active generation in place. Updates retain the old
-generation and report the exact executable path to run next. They never replace
+publication leave the prior active generation in place. A successful update
+keeps the generation it replaced, removes older generations and any left by
+interrupted attempts, and reports the exact executable path to run next. A
+client still running from a removed generation keeps running. If removal fails,
+the update stays installed and the message says so. Updates never replace
 the running process, restart a session, or run automatically after a connection
 failure. Different client/server versions alone do not establish incompatibility;
 compatible peers remain usable. Unsupported protocol or capability combinations
 produce a diagnostic and require an explicit update through the client's normal
 installation channel.
+
+### Removing a managed installation
+
+There is no uninstall command. For the default prefix, check that `~/.local/bin/qsh`
+is the managed link, then remove the link before the store:
+
+```sh
+readlink ~/.local/bin/qsh   # ../lib/qsh/generations/generation-.../qsh
+rm ~/.local/bin/qsh
+rm -rf ~/.local/lib/qsh
+```
+
+With `--prefix PATH`, use `PATH/bin/qsh` and `PATH/lib/qsh`. A link left behind
+without its store blocks a later `--self-install`, which never overwrites an
+existing destination. Settings, host keys, session tokens, logs and the release
+cache under `~/.config/qsh` and `~/.cache/qsh` (or their XDG locations) are
+separate and stay in place.
 
 ## SSH startup and installation
 

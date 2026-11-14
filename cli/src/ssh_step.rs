@@ -260,6 +260,8 @@ pub struct SshStep<'a> {
     /// Lifecycle policy is independent of whether authentication may prompt.
     pub install_policy: bringup::InstallPolicy,
     pub images: Arc<dyn bringup::ImageSource>,
+    /// The running daemon's server info, read on this step's own login.
+    pub server_info: Option<bringup::ServerInfoProbe<'a>>,
 }
 
 /// Who answers the login's questions, and -- in the background -- the one
@@ -277,36 +279,6 @@ impl Prompter {
 }
 
 impl SshStep<'_> {
-    /// Read-only fallback using the configured account and remembered host keys.
-    /// Discovery never broadens credentials or asks a background question.
-    pub fn discover_server_info(
-        &self,
-        addr: &::connect::Address,
-        route: &::connect::SshRoute,
-        expected: &::connect::server_identity::ServerIdentity,
-        cancel: &knock::Cancel,
-    ) -> Result<Option<ssh::VerifiedSshServerInfo>, SshStepError> {
-        if self.login != expected.username {
-            return Ok(None);
-        }
-        let keys = self
-            .known_hosts
-            .lookup(&addr.host, route.port)
-            .map_err(|e| plain(e.to_string()))?;
-        if keys.known.is_empty() {
-            return Ok(None);
-        }
-        let request = self.request(addr, route, [0; 32], &keys, Arc::new(ssh::NoPrompts));
-        ssh::discover_server_info(
-            request.ssh,
-            request.auth,
-            Arc::new(knock::NoBind),
-            expected.qsh_key,
-            cancel,
-        )
-        .map_err(|e| plain(e.to_string()))
-    }
-
     fn prompter(&self) -> Prompter {
         if self.no_password {
             // `--no-password` asks nothing anywhere: a login that needed an
@@ -400,7 +372,7 @@ impl SshStep<'_> {
             request.destructive_consent = consent.take();
             request.service_restart_consent = service_consent.take();
             request.pending_busy_target = pending_target.clone();
-            let result = bringup::bring_up_identified(
+            let result = bringup::bring_up_probed(
                 request,
                 self.install_policy.clone(),
                 bringup::BringUpHooks {
@@ -409,6 +381,7 @@ impl SshStep<'_> {
                     observer: Arc::new(InstallProgress::new(self.background)),
                     timing: bringup::InstallTiming::default(),
                 },
+                self.server_info,
                 Arc::new(knock::NoBind),
                 cancel,
             );
@@ -807,6 +780,7 @@ mod tests {
                     images: Arc::new(crate::releases::GitHubImages::new(Some(
                         home.path().join("cache"),
                     ))),
+                    server_info: None,
                 };
                 let route = ::connect::SshRoute {
                     port: 22,
@@ -882,6 +856,7 @@ mod tests {
             background: true,
             install_policy: bringup::InstallPolicy::RestartOnly,
             images: source.clone(),
+            server_info: None,
         };
         let route = ::connect::SshRoute {
             port: sb.sshd.port,

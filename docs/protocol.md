@@ -3015,6 +3015,139 @@ host authentication/policy integration can register principals, mint grants
 and establish actual authority. Grants belong only on inherited local IPC;
 external records, bootstrap, public catalogs and status have no grant fields.
 
+**Local admission, authentication and owner-resource supplement.** These are
+additive local contracts, not enabled endpoints or external network kinds.
+Existing kinds, bytes, sender roles and semantic meanings above are unchanged.
+In particular QSHO `0x30` already means retained Attach; owner resource requests
+use `0x50`–`0x54`. QSHH and QSHO remain independent registries and strict
+magic/version domains. All integers below are unsigned big-endian, all fixed
+byte arrays have exactly their stated width, and each header request ID is
+nonzero. Locator is the existing session16/owner16 pair; channel is nonzero u64.
+Complete frames remain at most 65,536 bytes, data payloads at most 16,384 bytes,
+and outstanding control requests at most 64 in each direction.
+
+Admission uses `0x03` Admission and `0x04` AdmissionAck in both registries.
+Admission body is `channel_id:16 | challenge:32 | ipc_min:u16 | ipc_max:u16`
+(52 bytes); Ack is `channel_id:16 | challenge:32 | selected:u16` (50 bytes).
+Channel and challenge are nonzero. The exact channel/challenge, expected role
+pair, host, optional real owner, and offered IPC range come from trusted local
+provisioning, never from the first peer frame. The range must include v1 and
+selected is 1. QSHH Admission is Frontend→Host and Ack reverses that path.
+QSHO Admission is Frontend→Owner or Owner→Host, and Ack reverses its specific
+provisioned path. No Host→Frontend or Owner→Frontend request is inferred from
+claimed role bytes. Both ends must additionally validate actual credentials,
+owned descriptor provenance and one-use provisioning in the later channel
+adapter; decoded admission and pure correlation readiness are not that evidence.
+
+Strict opt-in peer states require this admission before QSHH application
+records, or before QSHO's unchanged Hello1/HelloAck2 exchange. QSHO still
+requires Hello completion before operations/data. Legacy peer constructors
+keep their existing behavior and cannot accept the new authentication/resource
+families without the explicit admission gate. A wrong challenge, role, owner,
+request ID, range or repeated admission is inert and cannot consume the valid
+pending exchange. Header/body errors terminate only the attempted decoder;
+no contract function closes an owner or releases any resource.
+
+Authentication kinds are QSHH-only. Method is Personal=1 or System=2. Refusal
+is InvalidRequest=1, Unavailable=2, Unauthorized=3, Expired=4 or Cancelled=5;
+these generic codes contain no account identity. Ticket and context are opaque
+nonzero 16-byte wire references, not private authority or caller-selected UIDs.
+The host must mint fresh references and bind them to its actual admitted seam,
+frontend generation and existing internal attempt/lease. No decoder can create
+AuthenticatedPeer, PolicyResult, a grant authority or a cleanup capability.
+
+| Kind | Record | Sender→receiver | Exact body, in order | Body bytes |
+|---|---|---|---|---|
+| `0x30` | AuthBegin | Frontend→Host | method:u8 | 1 |
+| `0x31` | AuthChallenge | Host→Frontend | outcome:u8, method:u8; refusal(0): reason:u8; challenge(1): ticket16, deadline:u64, system-only nonce16 | 3 / 26 personal / 42 system |
+| `0x32` | SystemProof | Frontend→Host | ticket16, handshake_hash32, record_length:u16, canonical v2 AuthRecord bytes | 73–8192 |
+| `0x33` | PersonalReport | Frontend→Host | ticket16, actual client static key32, transport session_id:u64, transport token16 | 72 |
+| `0x34` | AuthResult | Host→Frontend | ticket16, outcome:u8; refusal(0): reason:u8; success(1): context16 | 18 / 33 |
+| `0x35` | AuthCancel | Frontend→Host | ticket16 | 16 |
+| `0x36` | AuthCancelled | Host→Frontend | ticket16 | 16 |
+| `0x37` | AuthorizeAuthenticatedAttach | Frontend→Host | context16, locator32 | 48 |
+| `0x38` | AuthenticatedAttachResult | Host→Frontend | context16, locator32, outcome:u8; refusal(0): attach_refusal:u8; success(1): grant32, existing grant binding88 | 50 / 169 |
+
+AuthBegin is correlated only with AuthChallenge under its original envelope
+ID; proof/report with AuthResult; cancel with AuthCancelled; authenticated
+attach with AuthenticatedAttachResult. Challenge/refusal echoes the selected
+method. Proof, result, cancellation and attach stages must match the exact live
+ticket/context and pending request, not a different operation or a matching
+public key. A system proof's nonce must equal its challenge nonce. Personal
+reports are refused by a System trusted-mode correlation context, regardless
+of claimed method/key/UID. Their session ID/token retain their actual transport
+u64/16-byte shapes (including zero values permitted by transport); these fields
+are neither public session locators nor evidence of independently verified
+Noise. Only the later trusted personal delegation adapter may report the exact
+3A3 completion already paired to that pre-proof ticket.
+
+A successful context must differ from its ticket and other live contexts.
+The attach result echoes both context and locator; successful binding must
+match the locator and admitted frontend generation. Retained correlation slots
+are explicitly bounded by an injected existing host registration/pending bound,
+never an additional per-owner quota. The pure table grants no registrations;
+future dispatch must precharge actual HostState intent/lease capacity before
+challenge. Each control table still enforces 64 pending IDs per direction.
+Cancellation marks its exact ticket/context unusable before acknowledgement;
+acknowledgement retires only its associated pending proof/attach requests.
+Late, twin, cancelled, expired or cross-request replies are inert. Failed
+transitions preserve the original table and monotonically increasing request
+high-water marks; no whole-table reset or unbounded replay-history set is used.
+Actual verifier-child debt remains with 3A2 until exact wait/cleanup, regardless
+of cancellation or protocol correlation retirement.
+
+The proof is the actual binary `transport::auth::{encode_auth_record,
+parse_auth_record}` v2 format, not helper JSON:
+
+```text
+02 | nonce:16 | login_length:u8 | login:UTF-8
+   | public_key_length:u16 | SSH public key bytes
+   | signature_length:u16 | SSH signature blob bytes
+```
+
+Login is 1–255 bytes with no NUL or slash; v1, truncation, noncanonical length,
+trailing bytes and invalid UTF-8 refuse. The existing binary codec permits
+empty key/signature fields syntactically; such untrusted records supply no
+crypto authority and the real verifier must still reject invalid keys or
+signatures. `record_length` must exactly equal those canonical bytes and is at
+most 8,142, because the SystemProof body including its 50-byte fixed prefix is
+at most 8,192. The signed transcript remains the existing qsh-auth-v2 transcript,
+including handshake hash, nonce and login; it is not redesigned by local IPC.
+
+The helper envelope bound is a second, independent constraint: 3A2 bounds the
+actual serialized Request::Verify with this login/key/signature/hash/nonce,
+zero16 login_id and empty rhost to 8,192 bytes. Binary length alone does not
+imply that JSON representation fits. Contract preflight counts the identical
+borrowed Serialize-only shape without allocating or transmitting JSON; system
+fixture tests compare it byte-for-byte with the real helper Request::Verify.
+No helper command, JSON envelope, fabricated verdict or login/PAM operation is
+sent by this component. Later dispatch must still invoke the actual 3A2 bounds
+and verification path, never treat successful parsing as authentication.
+
+Owner resource kinds are QSHO-only; requests are Owner→Host, replies Host→Owner.
+The request shape R is `locator32 | channel:u64 | kind:u8 | bytes:u64 |
+screen_present:u8 | optional(cells:u64, rows:u64, models:u64)`, exactly 50/74
+bytes. Kind retains ScreenModel=1, OutputHistory=2, SnapshotTransfer=3,
+ControlQueue=4 and existing shape validation: ScreenModel has bytes=0, a present
+charge with positive cells/rows and models≤1; other kinds have positive bytes
+and no ScreenCharge. There is no requested principal, account or reservation ID.
+
+| Kind | Record | Exact body | Body bytes |
+|---|---|---|---|
+| `0x50` | OwnerReserve | R | 50 / 74 |
+| `0x51` | OwnerReserved | exact R, host reservation:u64, cleanup correlation:u64 | 66 / 90 |
+| `0x52` | OwnerReserveRefused | exact R, existing reservation refusal:u8 | 51 / 75 |
+| `0x53` | OwnerReleaseReport | locator32, channel:u64, reservation:u64, cleanup correlation:u64 | 56 |
+| `0x54` | OwnerReleaseReported | exact release report | 56 |
+
+Reply ID, R or release report must exactly match its pending request; locator
+owner must equal the real QSHO header owner. Reservation/cleanup IDs are nonzero
+public correlation descriptions assigned by Host. Neither request nor decode
+constructs ledger registrations, ReservationReceipt authority, cleanup proof or
+resource release; OwnerReleaseReported acknowledges report receipt only. Host
+alone binds principal/account and actual accounting/custody in later 3C. Existing
+QSHH frontend Reserve/Release keep their roles and numeric meanings unchanged.
+
 **Status and replacement facts.** A build identity is version length (`u8`,
 1–128), ASCII non-control version bytes, build (`u64`), and checksum (32).
 Frontend identity adds its generation. A status page carries host instance,
@@ -3566,6 +3699,11 @@ transport or changing its paths; obsolete replies cannot satisfy the new round.
 
 For a configured, verified SSH path, `qshd server-info --challenge <64 hex digits>`
 queries the running personal daemon's dedicated `SERVER-INFO` control request.
+The client runs it only inside the bring-up's own SSH session, never on a login
+of its own. It uses the path the lookup found, once `trust.sh` accepts it for
+execution, and runs before installation, `bootstrap-capabilities` and
+`transport-ensure`. A positively incompatible reply ends the bring-up there.
+Recovery repeats the query on the same session after `TRANSPORT-READY`.
 An optional `--socket` chooses an existing local control endpoint. It never
 loads or creates server keys, installs a daemon, or uses the invoked binary's
 version as evidence. The bounded JSON response contains `challenge`,
