@@ -526,6 +526,12 @@ impl AuthCorrelation {
             tickets: BTreeMap::new(),
         })
     }
+    pub(super) fn retire_local(&mut self, ticket: AuthReference) -> Option<Retired> {
+        self.tickets.remove(&ticket).map(|t| Retired {
+            ticket,
+            context: t.context,
+        })
+    }
     pub(super) fn apply(
         &mut self,
         id: u64,

@@ -521,3 +521,76 @@ fn personal529_expired_queued_ticket_is_pruned_before_new_reservation() {
     drop(old);
     assert_eq!(adapter.registrations(), 0);
 }
+
+// A trusted Personal frontend reports its actual Noise completion. The host
+// receiver later validates live-ticket delegation/current policy; it does not
+// independently reverify Noise from the serialized report fields.
+#[tokio::test]
+async fn authdispatch529_personal_sender_reports_real_noise_for_its_exact_reserved_ticket() {
+    use crate::session_owner::host_auth_contract::{AuthReference, HostAuthMessage};
+    use crate::session_owner::local_channel::{
+        admit_channel, provision_pair, AdmissionBudget, TrustedChannelConfig,
+    };
+    use crate::session_owner::protocol::OwnerRole;
+    let mode = HostMode::Personal {
+        canonical_uid: nix::unistd::geteuid().as_raw(),
+    };
+    let mut h = host(mode);
+    let budget = AdmissionBudget::new(1).unwrap();
+    let (a, b) = provision_pair(
+        TrustedChannelConfig {
+            host: h.instance(),
+            owner: None,
+            requester: OwnerRole::Frontend,
+            mode,
+            system_uid: nix::unistd::geteuid().as_raw(),
+            min_version: 1,
+            max_version: 1,
+        },
+        &budget,
+    )
+    .unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let worker = std::thread::spawn(move || admit_channel(a, until));
+    let channel = admit_channel(b, until).unwrap();
+    let peer = worker.join().unwrap().unwrap();
+    let dispatch = channel.into_host_dispatch(&mut h, mode, 2).unwrap();
+    let f = dispatch.frontend();
+    let allowlist = Arc::new(Mutex::new(vec![]));
+    let adapter =
+        PersonalAuthorization::new(h.instance(), f, mode, allowlist.clone(), 2, Arc::new(|| 0))
+            .unwrap();
+    let ticket_a = AuthReference::new([61; 16]).unwrap();
+    let ticket_b = AuthReference::new([62; 16]).unwrap();
+    let (observer_a, lease_a, reports_a) = adapter
+        .reserve_report(h.begin_authentication(f, 0, 100).unwrap(), ticket_a, 0)
+        .unwrap();
+    let (observer_b, lease_b, reports_b) = adapter
+        .reserve_report(h.begin_authentication(f, 0, 100).unwrap(), ticket_b, 0)
+        .unwrap();
+    assert_eq!(adapter.registrations(), 2);
+    let (stop_a, task_a, key_a) =
+        real_packets(observer_a, lease_a.slot.clone(), allowlist.clone()).await;
+    let report_a = reports_a.try_take_report().unwrap().unwrap();
+    assert!(
+        matches!(report_a, HostAuthMessage::PersonalReport { ticket, key, session_id, token } if ticket==ticket_a && key==key_a && session_id!=0 && token==[53;16])
+    );
+    assert!(reports_a.try_take_report().unwrap().is_none());
+    assert!(reports_b.try_take_report().unwrap().is_none());
+    let (stop_b, task_b, key_b) = real_packets(observer_b, lease_b.slot.clone(), allowlist).await;
+    let report_b = reports_b.try_take_report().unwrap().unwrap();
+    assert!(
+        matches!(report_b, HostAuthMessage::PersonalReport { ticket, key, session_id, token } if ticket==ticket_b && key==key_b && session_id!=0 && token==[53;16])
+    );
+    stop_a.request();
+    stop_b.request();
+    task_a.await.unwrap().unwrap();
+    task_b.await.unwrap().unwrap();
+    lease_a.cancel(&mut h).unwrap();
+    lease_b.cancel(&mut h).unwrap();
+    assert_eq!(adapter.registrations(), 0);
+    dispatch.retire(&mut h).unwrap();
+    drop(peer);
+    assert_eq!(budget.in_use(), 0);
+    assert_eq!(h.catalog_len(), 0);
+}

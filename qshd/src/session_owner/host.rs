@@ -213,6 +213,19 @@ impl HostState {
     pub(crate) fn instance(&self) -> HostInstance {
         self.instance
     }
+    /// Protocol registrations share these actual global authority bounds.
+    pub(super) fn local_auth_registration_limit(&self) -> usize {
+        self.limits.attempts.min(self.limits.pending).min(63)
+    }
+    pub(super) fn authentication_is_current(
+        &self,
+        attempt: AuthenticationAttempt,
+        frontend: FrontendAdmission,
+    ) -> bool {
+        self.authorization
+            .identity(attempt)
+            .is_ok_and(|(_, f)| f == frontend)
+    }
     pub(crate) fn catalog_len(&self) -> usize {
         self.catalog.len()
     }

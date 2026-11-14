@@ -63,6 +63,12 @@ impl PersonalPossessionCompletion {
     pub fn client_key(&self) -> [u8; 32] {
         self.binding.client_key()
     }
+    pub fn session_id(&self) -> u64 {
+        self.binding.0.session_id
+    }
+    pub fn token(&self) -> [u8; 16] {
+        self.binding.0.token
+    }
 }
 /// Implementations reserve a bounded one-use host ticket, never wait for a
 /// consumer, and cancel logical authority when their attempt is dropped.

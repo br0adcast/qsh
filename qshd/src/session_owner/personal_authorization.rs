@@ -4,6 +4,7 @@
 //! This module creates no shell, PAM login, retained owner, or resource receipt.
 use super::*;
 use crate::session_owner::host::{HostDecision, HostError, HostState};
+use crate::session_owner::host_auth_contract::{AuthReference, HostAuthMessage};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -66,6 +67,9 @@ struct Slot {
     active: AtomicBool,
     key: Mutex<Option<[u8; 32]>>,
     delivery: AtomicUsize,
+    report_ticket: Option<AuthReference>,
+    report: Mutex<Option<HostAuthMessage>>,
+    report_consumer_alive: AtomicBool,
 }
 impl Slot {
     fn deactivate(&self) {
@@ -183,6 +187,20 @@ impl PersonalAuthorization {
         intent: PolicyIntent,
         now: u64,
     ) -> Result<(Arc<Observer>, PersonalAdmission), Box<ReservationRefused>> {
+        let (ticket, lease) = self.reserve_ticket(intent, now, None)?;
+        self.observer
+            .tickets
+            .try_lock()
+            .map_err(|_| ReservationRefused::new(AuthorityError::Unavailable, ticket.slot.binding))?
+            .push_back(ticket);
+        Ok((self.observer.clone(), lease))
+    }
+    fn reserve_ticket(
+        &self,
+        intent: PolicyIntent,
+        now: u64,
+        report_ticket: Option<AuthReference>,
+    ) -> Result<(Ticket, PersonalAdmission), Box<ReservationRefused>> {
         let b = intent.binding;
         let now = now.max((self.inner.clock)());
         self.observer
@@ -220,19 +238,17 @@ impl PersonalAuthorization {
             active: AtomicBool::new(true),
             key: Mutex::new(None),
             delivery: AtomicUsize::new(0),
+            report_ticket,
+            report: Mutex::new(None),
+            report_consumer_alive: AtomicBool::new(report_ticket.is_some()),
         });
         let (tx, rx) = sync_channel(1);
-        self.observer
-            .tickets
-            .try_lock()
-            .map_err(|_| ReservationRefused::new(AuthorityError::Unavailable, b))?
-            .push_back(Ticket {
+        Ok((
+            Ticket {
                 slot: slot.clone(),
                 reply: tx,
                 answered: false,
-            });
-        Ok((
-            self.observer.clone(),
+            },
             PersonalAdmission {
                 slot,
                 intent: Mutex::new(Some(intent)),
@@ -432,3 +448,9 @@ impl Drop for PersonalAdmission {
 #[cfg(test)]
 #[path = "personal_authorization_tests.rs"]
 mod tests;
+
+#[path = "local_personal_dispatch.rs"]
+pub(crate) mod local_personal_dispatch;
+
+#[path = "local_auth_dispatch.rs"]
+pub(crate) mod local_auth_dispatch;
