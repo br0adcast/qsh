@@ -18,6 +18,8 @@ on:
       - 'qshd/src/transport_daemon.rs'
       - 'qshd/src/destructive_restart.rs'
       - 'qshd/src/modern_restart.rs'
+      - 'qshd/src/service_restart.rs'
+      - 'qshd/src/control_service_tests.rs'
       - 'cli/src/ssh_step.rs'
       - 'cli/src/busy_daemon.rs'
       - 'cli/src/climb.rs'
@@ -68,7 +70,7 @@ jobs:
           echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Qualify the acceptance controls
         run: python3 -m unittest discover -s scripts/tests -p 'test_released_peer_acceptance.py'
-      - name: Run seven exact released-peer and current-peer scenarios
+      - name: Run eight exact released-peer and current-peer scenarios
         run: python3 scripts/released-peer-acceptance.py --evidence "$RUNNER_TEMP/released-peer-evidence"
       - name: Retain source, fixture and exact test evidence
         if: always()

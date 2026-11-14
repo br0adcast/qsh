@@ -1,5 +1,9 @@
-//! Identity-scoped startup decisions before registration or session handshake.
+//! Explicit startup decisions before registration or session handshake.
 use serde::{Deserialize, Serialize};
+mod service;
+pub use service::{
+    PersonalServiceProfile, PersonalServiceSelector, ServiceRestartAction, ServiceRestartConsent,
+};
 
 fn hex_field(text: &str, bytes: usize) -> bool {
     text.len() == bytes * 2 && text.bytes().all(|b| b.is_ascii_hexdigit())
@@ -11,6 +15,8 @@ fn hex_field(text: &str, bytes: usize) -> bool {
 pub struct BootstrapToolCapabilities {
     pub schema: u8,
     pub busy_decisions: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub account_service_restart_v1: bool,
 }
 
 /// Exact selected executable bytes and actual build, never inferred from a release label.
@@ -160,6 +166,8 @@ pub struct BusyDaemonInfo {
     /// Complete [wire, handshake, channel] profiles; None means unknown.
     pub serving_profiles: Option<Vec<[u8; 3]>>,
     pub preservation: PreservationCapability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_restart: Option<PersonalServiceSelector>,
 }
 impl<'de> Deserialize<'de> for BusyDaemonInfo {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -173,6 +181,7 @@ impl<'de> Deserialize<'de> for BusyDaemonInfo {
             active_connections: u64,
             serving_profiles: Option<Vec<[u8; 3]>>,
             preservation: PreservationCapability,
+            service_restart: Option<PersonalServiceSelector>,
         }
         let fields = Fields::deserialize(deserializer)?;
         let value = Self {
@@ -183,6 +192,7 @@ impl<'de> Deserialize<'de> for BusyDaemonInfo {
             active_connections: fields.active_connections,
             serving_profiles: fields.serving_profiles,
             preservation: fields.preservation,
+            service_restart: fields.service_restart,
         };
         if value.valid() {
             Ok(value)
@@ -194,11 +204,24 @@ impl<'de> Deserialize<'de> for BusyDaemonInfo {
 
 impl BusyDaemonInfo {
     pub fn valid(&self) -> bool {
-        self.schema == 1
+        self.schema == 2
+            && self
+                .service_restart
+                .as_ref()
+                .is_none_or(PersonalServiceSelector::valid)
             && self.identity.valid()
             && self.candidate.valid()
             && self.active_connections > 0
             && self.serving_profiles.as_ref().is_none_or(|p| p.len() <= 16)
+    }
+    pub fn confirm_service_restart(&self) -> Option<ServiceRestartConsent> {
+        self.valid().then_some(())?;
+        Some(ServiceRestartConsent {
+            attempt: self.attempt.clone(),
+            service: self.service_restart.clone()?,
+            candidate: self.candidate.clone(),
+            action: ServiceRestartAction::RestartAccountService,
+        })
     }
     /// Caller confirmation only, never a server-issued stop authority.
     pub fn confirm_destructive_restart(&self) -> DestructiveRestartConsent {
@@ -228,6 +251,7 @@ impl PendingBusy {
             identity: self.0.identity,
             candidate: self.0.candidate,
             choice,
+            service_restart: self.0.service_restart,
         }
     }
 }
@@ -239,6 +263,8 @@ pub struct BusyDecision {
     pub identity: BusyDaemonIdentity,
     pub candidate: CandidateImageIdentity,
     pub choice: BusyChoice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_restart: Option<PersonalServiceSelector>,
 }
 impl<'de> Deserialize<'de> for BusyDecision {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -249,6 +275,7 @@ impl<'de> Deserialize<'de> for BusyDecision {
             identity: BusyDaemonIdentity,
             candidate: CandidateImageIdentity,
             choice: BusyChoice,
+            service_restart: Option<PersonalServiceSelector>,
         }
         let fields = Fields::deserialize(deserializer)?;
         let value = Self {
@@ -256,6 +283,7 @@ impl<'de> Deserialize<'de> for BusyDecision {
             identity: fields.identity,
             candidate: fields.candidate,
             choice: fields.choice,
+            service_restart: fields.service_restart,
         };
         if value.valid() {
             Ok(value)
@@ -267,7 +295,12 @@ impl<'de> Deserialize<'de> for BusyDecision {
 
 impl BusyDecision {
     pub fn valid(&self) -> bool {
-        self.identity.valid() && self.candidate.valid()
+        self.identity.valid()
+            && self.candidate.valid()
+            && self
+                .service_restart
+                .as_ref()
+                .is_none_or(PersonalServiceSelector::valid)
     }
     pub fn matches(&self, info: &BusyDaemonInfo) -> bool {
         self.valid()
@@ -275,6 +308,7 @@ impl BusyDecision {
             && self.attempt == info.attempt
             && self.identity == info.identity
             && self.candidate == info.candidate
+            && self.service_restart == info.service_restart
     }
 }
 
@@ -346,7 +380,7 @@ mod tests {
     use super::*;
     fn info() -> BusyDaemonInfo {
         BusyDaemonInfo {
-            schema: 1,
+            schema: 2,
             attempt: BusyAttemptId::from_bytes([18; 16]),
             identity: BusyDaemonIdentity {
                 version: "0.5.9".into(),
@@ -362,8 +396,86 @@ mod tests {
             active_connections: 2,
             serving_profiles: Some(vec![[2, 1, 1]]),
             preservation: PreservationCapability::Unknown,
+            service_restart: None,
         }
     }
+    #[test]
+    fn service_offer_requires_schema2_and_explicit_personal_selector() {
+        let modern = serde_json::to_value(info()).unwrap();
+        assert!(modern.get("service_restart").is_none());
+        let mut offered = modern.clone();
+        offered["schema"] = 2.into();
+        offered["identity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generation");
+        offered["service_restart"] = serde_json::json!({
+            "profile":"personal_transport_v1", "uid":1000,
+            "endpoint":"/fixture/cache/qsh/control.sock", "port":60022
+        });
+        let live: BusyDaemonInfo = serde_json::from_value(offered.clone())
+            .expect("explicit schema2 personal-service offer");
+        assert_eq!(serde_json::to_value(live).unwrap(), offered);
+        let mut invalid = offered.clone();
+        invalid["schema"] = 1.into();
+        assert!(serde_json::from_value::<BusyDaemonInfo>(invalid).is_err());
+        for (field, value) in [
+            ("uid", serde_json::json!(0)),
+            ("port", serde_json::json!(0)),
+            ("endpoint", serde_json::json!("relative/control.sock")),
+            ("profile", serde_json::json!("system")),
+        ] {
+            let mut invalid = offered.clone();
+            invalid["service_restart"][field] = value;
+            assert!(serde_json::from_value::<BusyDaemonInfo>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn service_consent_is_checked_and_never_reinterpreted_as_exact_consent() {
+        let mut live = info();
+        assert!(live.confirm_service_restart().is_none());
+        live.service_restart = Some(PersonalServiceSelector {
+            profile: PersonalServiceProfile::PersonalTransportV1,
+            uid: 1000,
+            endpoint: "/fixture/qsh/control.sock".into(),
+            port: 60022,
+        });
+        let consent = live.confirm_service_restart().unwrap();
+        let encoded = serde_json::to_value(&consent).unwrap();
+        assert_eq!(encoded["action"], "restart_account_service");
+        assert!(serde_json::from_value::<DestructiveRestartConsent>(encoded.clone()).is_err());
+        assert_eq!(
+            serde_json::from_value::<ServiceRestartConsent>(encoded.clone()).unwrap(),
+            consent
+        );
+        for field in ["action", "unknown", "candidate", "service"] {
+            let mut invalid = encoded.clone();
+            match field {
+                "action" => invalid[field] = "stop_and_restart".into(),
+                "unknown" => invalid[field] = true.into(),
+                "candidate" => invalid[field]["checksum"] = "bad".into(),
+                _ => invalid[field]["uid"] = 0.into(),
+            }
+            assert!(
+                serde_json::from_value::<ServiceRestartConsent>(invalid).is_err(),
+                "{field}"
+            );
+        }
+        for changed in ["attempt", "candidate", "service"] {
+            let mut other = live.clone();
+            match changed {
+                "attempt" => other.attempt = BusyAttemptId::from_bytes([8; 16]),
+                "candidate" => other.candidate.build += 1,
+                _ => other.service_restart.as_mut().unwrap().port += 1,
+            }
+            assert!(!consent.matches(&other), "{changed}");
+        }
+        live.identity.pid += 1;
+        live.identity.generation = Some("aa".repeat(16));
+        assert!(consent.matches(&live));
+    }
+
     #[test]
     fn destructive_consent_binds_candidate_and_explicit_action() {
         let mut value = serde_json::to_value(info()).unwrap();
@@ -397,7 +509,7 @@ mod tests {
             live
         );
         for (field, invalid) in [
-            ("schema", serde_json::json!(2)),
+            ("schema", serde_json::json!(1)),
             ("active_connections", serde_json::json!(0)),
             ("serving_profiles", serde_json::json!(vec![[2, 1, 1]; 17])),
             ("unexpected", serde_json::json!(true)),

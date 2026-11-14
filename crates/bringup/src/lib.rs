@@ -21,7 +21,8 @@ mod trust;
 pub use daemon_bootstrap_protocol::{
     BusyAttemptId, BusyChoice, BusyDaemonIdentity, BusyDaemonInfo, BusyDecision,
     CandidateImageIdentity, DestructiveRestartAction, DestructiveRestartConsent, PendingBusy,
-    PreservationCapability,
+    PersonalServiceProfile, PersonalServiceSelector, PreservationCapability, ServiceRestartAction,
+    ServiceRestartConsent,
 };
 
 pub use image::{
@@ -35,11 +36,14 @@ pub use timing::InstallTiming;
 pub struct BringUpRequest {
     /// Opt in to a non-ready busy decision; ordinary/background callers use false.
     pub report_busy: bool,
-    /// Consent for precisely the daemon identity reported in this attempt.
+    /// The observed choice. Continue and exact Force bind the instance;
+    /// explicit service Force carries its separately approved service scope.
     pub busy_decision: Option<BusyDecision>,
-    /// Separate interrupting-restart confirmation; currently always refused without
-    /// qualified exact-instance authority. ForceUpdate alone cannot imply it.
+    /// Separate exact-instance interruption confirmation; qualified receipt
+    /// and exit authority are still required. ForceUpdate alone cannot imply it.
     pub destructive_consent: Option<DestructiveRestartConsent>,
+    pub service_restart_consent: Option<ServiceRestartConsent>,
+    pub pending_busy_target: Option<BusySshTarget>,
     pub name: String,
     pub ssh: ssh::SshParams,
     pub auth: ssh::SshAuthPlan,
@@ -64,6 +68,21 @@ pub struct ServerInfoProbe<'a> {
     pub before: Option<ServerInfoGate<'a>>,
     /// Called once after readiness with a fresh query in the same session.
     pub after_ready: Option<ServerInfoSink<'a>>,
+}
+
+/// Local authenticated observation binding. Never supplied by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusySshTarget {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub host_key: ssh::HostKeyInfo,
+    pub helper_path: String,
+}
+#[derive(Debug)]
+pub struct ObservedBusy {
+    pub info: BusyDaemonInfo,
+    pub target: BusySshTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +123,8 @@ impl Ready {
 pub enum BringUpError {
     /// A preflight choice requiring caller consent before registration/readiness.
     BusyDaemon(Box<BusyDaemonInfo>),
-    /// No qualified preservation transaction or exact-instance destructive authority.
+    ObservedBusy(Box<ObservedBusy>),
+    /// The requested destructive operation was refused before dispatch.
     DestructiveRestartUnavailable,
     /// A confirmed command may have committed but did not yield verified readiness.
     DestructiveRestartUncertain {
@@ -137,15 +157,16 @@ pub enum BringUpError {
 impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            BringUpError::ObservedBusy(observation) => write!(f, "{}", BringUpError::BusyDaemon(Box::new(observation.info.clone()))),
             BringUpError::BusyDaemon(info) => write!(f,
                 "running qshd {} has {} active connections; the new daemon cannot start. choose Cancel, Continue with old daemon, or Force update.",
                 info.identity.version, info.active_connections),
-            BringUpError::BusyReportingUnavailable => write!(f, "the installed qshd helper did not advertise support for busy-daemon choices; update that executable before retrying. The running daemon was left unchanged"),
+            BringUpError::BusyReportingUnavailable => write!(f, "the installed qshd helper did not advertise support for busy-daemon choices; update that executable before retrying. No daemon restart was requested"),
             BringUpError::DestructiveRestartUncertain {cause}=> {
                 write!(f,"forced update may have committed, but replacement readiness was not proved; rediscover before trying again")?;
                 if let Some(cause)=cause {write!(f,": {cause}")?;}Ok(())
             },
-            BringUpError::DestructiveRestartUnavailable => write!(f, "forced update is unavailable: this daemon cannot prove an exact-instance restart; no sessions were interrupted"),
+            BringUpError::DestructiveRestartUnavailable => write!(f, "forced update was refused before destructive dispatch; rediscover before trying again"),
             BringUpError::InvalidRequest(reason) => write!(f, "invalid bring-up request: {reason}"),
             BringUpError::UnsupportedPlatform(platform) => {
                 write!(f, "unsupported server platform: {platform}")
