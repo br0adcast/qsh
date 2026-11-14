@@ -154,7 +154,10 @@ exact kernels. Windows packages are not currently produced.
 <summary><strong>Package and archive installation examples</strong></summary>
 
 Replace `0.5.0` with the version you downloaded. On Linux ARM64, use `_arm64.deb`,
-`.aarch64.rpm`, or the `aarch64-unknown-linux-musl` archive.
+`.aarch64.rpm`, or the `aarch64-unknown-linux-musl` archive. Prerelease package
+files carry the release version, for example `qsh_0.6.0-rc.2-1_amd64.deb`; the
+version inside the package is `0.6.0~rc.2-1`, so package managers order it
+before `0.6.0`.
 
 ```sh
 # Debian / Ubuntu: the client; install qshd separately if this is a server
