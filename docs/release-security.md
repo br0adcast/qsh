@@ -63,19 +63,41 @@ A file is authenticated only through its line in the verified `SHA256SUMS`.
 
 This replaces the bootstrap script. The first executable is then trusted through
 the verified manifest rather than GitHub HTTPS alone. It requires an
-installer-capable release (see [Client bootstrap trust](#client-bootstrap-trust)).
+installer-capable release (see [Client bootstrap trust](#client-bootstrap-trust))
+and GitHub CLI.
+
+Set `VERSION`, and set `TARGET` to `x86_64-unknown-linux-musl`,
+`aarch64-unknown-linux-musl`, `aarch64-apple-darwin` or `x86_64-apple-darwin`.
+On macOS, use `shasum -a 256 -c` for `sha256sum -c`. The block is one command
+chain, so it can be pasted into an interactive shell: it works in a new
+temporary directory, and each step runs only if every earlier one succeeded.
+The archive is extracted, and `qsh` runs, only after `gh attestation verify`
+has authenticated `SHA256SUMS` and the archive matches its single line there.
 
 ```sh
 VERSION=0.6.0
-TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
+TARGET=x86_64-unknown-linux-musl
 STEM=qsh-$VERSION-$TARGET
 base=https://github.com/br0adcast/qsh/releases/download/v$VERSION
-curl --fail --location --proto '=https' --proto-redir '=https' \
-  -O "$base/SHA256SUMS" -O "$base/SHA256SUMS.sigstore.json" -O "$base/$STEM.tar.gz"
-# Authenticate SHA256SUMS and check $STEM.tar.gz as in the README.
-tar xzf "$STEM.tar.gz"
-"$STEM/qsh" --self-install --version "$VERSION"
+cd "$(mktemp -d)" &&
+  curl --fail --location --proto '=https' --proto-redir '=https' \
+    -O "$base/SHA256SUMS" -O "$base/SHA256SUMS.sigstore.json" -O "$base/$STEM.tar.gz" &&
+  gh attestation verify SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+    --repo br0adcast/qsh \
+    --cert-identity "https://github.com/br0adcast/qsh/.github/workflows/release.yml@refs/tags/v$VERSION" \
+    --predicate-type https://github.com/br0adcast/qsh/release-manifest/v1 \
+    --deny-self-hosted-runners &&
+  awk -v f="$STEM.tar.gz" '$2 == f { print; n++ } END { exit (n != 1) }' SHA256SUMS > "$STEM.sha256" &&
+  sha256sum -c "$STEM.sha256" &&
+  tar xzf "$STEM.tar.gz" &&
+  "$STEM/qsh" --self-install --version "$VERSION"
 ```
+
+If a download or verification step fails, the chain stops with a non-zero
+status before extraction.
+`scripts/tests/test_release_verification_docs.py` runs this block, pasted into
+interactive `bash`, `dash` and `zsh`, and checks that a failed download,
+attestation or checksum never extracts or runs anything.
 
 The installation engine then downloads and authenticates the release again under
 the compiled policy, as it does for the script. `--prefix PATH` works as with the

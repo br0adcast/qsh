@@ -195,10 +195,10 @@ See the [service guide](docs/qshd-service.md) for platform requirements.
 Verify downloads in two steps. First authenticate `SHA256SUMS` with the
 `SHA256SUMS.sigstore.json` bundle from the same release, using
 [GitHub CLI](https://cli.github.com/). Verifying a local bundle needs no GitHub
-login:
+login. Set `VERSION` to the release you downloaded, without the leading `v`:
 
 ```sh
-VERSION=0.6.0   # the release you downloaded, without the leading v
+VERSION=0.6.0
 gh attestation verify SHA256SUMS --bundle SHA256SUMS.sigstore.json \
   --repo br0adcast/qsh \
   --cert-identity "https://github.com/br0adcast/qsh/.github/workflows/release.yml@refs/tags/v$VERSION" \
@@ -206,14 +206,15 @@ gh attestation verify SHA256SUMS --bundle SHA256SUMS.sigstore.json \
   --deny-self-hosted-runners
 ```
 
-Then check each downloaded file by name, so a file missing from the manifest
-fails instead of being skipped. The lookup also accepts GitHub's `.` for the `~`
-in prerelease package names ([#526](https://github.com/br0adcast/qsh/issues/526)):
+Then check each downloaded file by its exact name. The lookup fails unless the
+verified manifest lists that name exactly once, so a file missing from the
+manifest fails instead of being skipped. Set `FILE` to each file in turn; on
+macOS, use `shasum -a 256 -c` for `sha256sum -c`:
 
 ```sh
-FILE=qsh_0.6.0-1_amd64.deb   # repeat for each file
-awk -v f="$FILE" '{ n = $2; gsub("~", ".", n) } n == f { print $1 "  " f }' SHA256SUMS |
-  sha256sum -c                # macOS: shasum -a 256 -c
+FILE=qsh_0.6.0-1_amd64.deb
+awk -v f="$FILE" '$2 == f { print; n++ } END { exit (n != 1) }' SHA256SUMS > "$FILE.sha256" &&
+  sha256sum -c "$FILE.sha256"
 ```
 
 Releases without `SHA256SUMS.sigstore.json`, such as v0.5.0, are unsigned;
