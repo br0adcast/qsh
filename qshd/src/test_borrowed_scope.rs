@@ -43,6 +43,13 @@ diagnostic_codes!(DiagnosticPhase {
     Unspecified => "unspecified", Setup => "setup", Identity => "identity",
     MemberExec => "member-exec", Membership => "membership", PtyAck => "pty-ack",
     Receipt => "receipt", Cleanup => "cleanup", Assertions => "assertions", Complete => "complete",
+    ScreenSetup => "screen-setup", ScreenOpen => "screen-open",
+    ScreenInitialIdentity => "screen-initial-identity", ScreenInitialRecovery => "screen-initial-recovery",
+    ScreenInput => "screen-input", ScreenFrontendLoss => "screen-frontend-loss",
+    ScreenDetachedBurst => "screen-detached-burst", ScreenReattach => "screen-reattach",
+    ScreenGapRecovery => "screen-gap-recovery", ScreenQuery => "screen-query",
+    ScreenResize => "screen-resize", ScreenPostResizeRecovery => "screen-post-resize-recovery",
+    ScreenFinalChecks => "screen-final-checks", ScreenCleanup => "screen-cleanup",
 });
 diagnostic_codes!(DiagnosticAssertion {
     Unspecified => "unspecified", Opened => "opened", Barrier => "identity-barrier",
@@ -53,7 +60,63 @@ diagnostic_codes!(DiagnosticAssertion {
     MemberExit => "member-exit", EarlyPam => "no-early-pam-close", PamClosed => "pam-closed",
     Elapsed => "receipt-deadline", LeaderStatus => "leader-status", Deliberate => "deliberate-assertion",
     FixtureIntervention => "fixture-intervention", ResidualChildren => "residual-children",
+    ScreenRuntime => "screen-runtime", ScreenSetup => "screen-setup", ScreenOpen => "screen-open",
+    ScreenCatalogWait => "screen-catalog-wait", ScreenCatalog => "screen-catalog",
+    ScreenRequirements => "screen-requirements", ScreenAllowance => "screen-allowance",
+    ScreenRecoveryStart => "screen-recovery-start", ScreenRecoveryMode => "screen-recovery-mode",
+    ScreenRecoveryGap => "screen-recovery-gap", ScreenRecoveryBegin => "screen-recovery-begin",
+    ScreenRecoveryChunk => "screen-recovery-chunk", ScreenRecoveryEnd => "screen-recovery-end",
+    ScreenRecoveryAccept => "screen-recovery-accept", ScreenRecoveryFinish => "screen-recovery-finish",
+    ScreenClient => "screen-client", ScreenCanonicalCopy => "screen-canonical-copy",
+    ScreenCanonicalConsume => "screen-canonical-consume", ScreenCanonicalEqual => "screen-canonical-equal",
+    ScreenProgress => "screen-progress", ScreenIdentity => "screen-identity", ScreenInput => "screen-input",
+    ScreenCommitted => "screen-committed", ScreenBarrier => "screen-barrier", ScreenGate => "screen-gate",
+    ScreenDetachedBytes => "screen-detached-bytes", ScreenAttach => "screen-attach",
+    ScreenQueryReply => "screen-query-reply", ScreenGeometry => "screen-geometry",
+    ScreenCursor => "screen-cursor", ScreenHistory => "screen-history", ScreenInputStatus => "screen-input-status",
+    ScreenReceipts => "screen-receipts", ScreenWorkerJoin => "screen-worker-join",
+    ScreenControlJoin => "screen-control-join", ScreenScopeDrain => "screen-scope-drain",
+    ScreenReservations => "screen-reservations", ScreenNoChildren => "screen-no-children",
+    ScreenReceiptStatus => "screen-receipt-status",
 });
+diagnostic_codes!(DiagnosticSource {
+    Unknown => "unknown", Screen => "screen_native_tests.rs",
+    Engine => "engine_native_tests.rs", BorrowedScope => "test_borrowed_scope.rs",
+});
+diagnostic_codes!(DiagnosticRecordStatus {
+    Unavailable => "unavailable", Available => "available", Invalid => "invalid",
+});
+
+#[derive(Clone, Copy, Default)]
+struct DiagnosticLocation {
+    source: usize,
+    line: usize,
+    column: usize,
+}
+impl DiagnosticLocation {
+    fn from_source(file: &str, line: u32, column: u32) -> Self {
+        let source = match file.rsplit(['/', '\\']).next() {
+            Some("screen_native_tests.rs") => DiagnosticSource::Screen,
+            Some("engine_native_tests.rs") => DiagnosticSource::Engine,
+            Some("test_borrowed_scope.rs") => DiagnosticSource::BorrowedScope,
+            _ => DiagnosticSource::Unknown,
+        };
+        Self {
+            source: source as usize,
+            line: line as usize,
+            column: column as usize,
+        }
+    }
+}
+impl std::fmt::Debug for DiagnosticLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Location")
+            .field("source", &DiagnosticSource::label(self.source))
+            .field("line", &self.line)
+            .field("column", &self.column)
+            .finish()
+    }
+}
 
 #[derive(Clone, Copy, Default)]
 struct Diagnostic {
@@ -64,6 +127,11 @@ struct Diagnostic {
     observations: usize,
     cleanup_stops: usize,
     exit_code: usize,
+    failure: bool,
+    body_status: usize,
+    body: DiagnosticLocation,
+    child_status: usize,
+    child: DiagnosticLocation,
 }
 impl std::fmt::Debug for Diagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -71,6 +139,16 @@ impl std::fmt::Debug for Diagnostic {
             .field("mode", &DiagnosticMode::label(self.mode))
             .field("phase", &DiagnosticPhase::label(self.phase))
             .field("assertion", &DiagnosticAssertion::label(self.assertion))
+            .field(
+                "body_record",
+                &DiagnosticRecordStatus::label(self.body_status),
+            )
+            .field("body_location", &self.body)
+            .field(
+                "child_record",
+                &DiagnosticRecordStatus::label(self.child_status),
+            )
+            .field("child_location", &self.child)
             .field("elapsed_ms", &self.elapsed_ms)
             .field("receipt", &(self.observations & 1 != 0))
             .field("exit_seen", &(self.observations & 2 != 0))
@@ -97,8 +175,10 @@ impl std::fmt::Debug for Diagnostic {
 }
 impl Diagnostic {
     fn report_fields(self) -> String {
-        format!("mode={} phase={} assertion={} elapsed_ms={} observations={} cleanup_stops={} exit_code={}",
-            self.mode, self.phase, self.assertion, self.elapsed_ms, self.observations, self.cleanup_stops, self.exit_code)
+        format!("mode={} phase={} assertion={} elapsed_ms={} observations={} cleanup_stops={} exit_code={} failure={} body_status={} body_source={} body_line={} body_column={} child_status={} child_source={} child_line={} child_column={}",
+            self.mode, self.phase, self.assertion, self.elapsed_ms, self.observations, self.cleanup_stops, self.exit_code,
+            usize::from(self.failure), self.body_status, self.body.source, self.body.line, self.body.column,
+            self.child_status, self.child.source, self.child.line, self.child.column)
     }
     fn from_fields(fields: &std::collections::BTreeMap<String, usize>) -> Self {
         let field = |name| fields.get(name).copied().unwrap_or(0);
@@ -110,12 +190,34 @@ impl Diagnostic {
             observations: field("observations"),
             cleanup_stops: field("cleanup_stops"),
             exit_code: field("exit_code"),
+            failure: field("failure") != 0,
+            body_status: field("body_status"),
+            body: DiagnosticLocation {
+                source: field("body_source"),
+                line: field("body_line"),
+                column: field("body_column"),
+            },
+            child_status: field("child_status"),
+            child: DiagnosticLocation {
+                source: field("child_source"),
+                line: field("child_line"),
+                column: field("child_column"),
+            },
+        }
+    }
+    fn record_failure(&mut self, location: Option<DiagnosticLocation>) {
+        if !self.failure {
+            self.failure = true;
+            self.body_status = usize::from(location.is_some());
+            self.body = location.unwrap_or_default();
         }
     }
 }
 thread_local! {
     static DIAGNOSTIC: std::cell::Cell<Diagnostic> = const { std::cell::Cell::new(Diagnostic {
         mode: 0, phase: 0, assertion: 0, elapsed_ms: 0, observations: 0, cleanup_stops: 0, exit_code: 0,
+        failure: false, body_status: 0, body: DiagnosticLocation { source: 0, line: 0, column: 0 },
+        child_status: 0, child: DiagnosticLocation { source: 0, line: 0, column: 0 },
     }) };
 }
 pub(crate) fn diagnostic_mode(mode: DiagnosticMode) {
@@ -126,6 +228,9 @@ pub(crate) fn diagnostic_mode(mode: DiagnosticMode) {
 }
 pub(crate) fn diagnostic_phase(phase: DiagnosticPhase) {
     DIAGNOSTIC.with(|cell| {
+        if cell.get().failure {
+            return;
+        }
         cell.set(Diagnostic {
             phase: phase as usize,
             assertion: 0,
@@ -137,12 +242,123 @@ pub(crate) fn diagnostic_phase(phase: DiagnosticPhase) {
 // Elapsed is relative to the caller's existing observation budget, not cleanup time.
 pub(crate) fn diagnostic_assertion(assertion: DiagnosticAssertion, elapsed: Duration) {
     DIAGNOSTIC.with(|cell| {
+        if cell.get().failure {
+            return;
+        }
         cell.set(Diagnostic {
             assertion: assertion as usize,
             elapsed_ms: elapsed.as_millis().min(usize::MAX as u128) as usize,
             ..cell.get()
         })
     });
+}
+
+/// Installed only in a dedicated private body, never shared outer libtest.
+/// Other-thread panics are not attributed to this body's observation site.
+pub(crate) fn diagnostic_capture_locations() {
+    assert_eq!(std::env::var(MODE).as_deref(), Ok("body"));
+    let body_thread = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() == body_thread {
+            DIAGNOSTIC.with(|cell| {
+                let mut diagnostic = cell.get();
+                diagnostic.record_failure(info.location().map(|location| {
+                    DiagnosticLocation::from_source(
+                        location.file(),
+                        location.line(),
+                        location.column(),
+                    )
+                }));
+                cell.set(diagnostic);
+            });
+        }
+    }));
+}
+
+fn child_panic_path(report: &std::path::Path) -> std::path::PathBuf {
+    report.with_extension("screen-panic")
+}
+pub(crate) fn diagnostic_child_panic_path() -> std::path::PathBuf {
+    child_panic_path(&std::path::PathBuf::from(std::env::var_os(REPORT).unwrap()))
+}
+const CHILD_RECORD_LIMIT: usize = 128;
+/// First child location wins. No panic payload or arbitrary path is retained.
+pub(crate) fn diagnostic_write_child_panic(
+    path: &std::path::Path,
+    file: &str,
+    line: u32,
+    column: u32,
+) {
+    use std::io::Write;
+    let location = DiagnosticLocation::from_source(file, line, column);
+    let record = format!(
+        "version=1 source={} line={} column={}\n",
+        location.source, location.line, location.column
+    );
+    if record.len() <= CHILD_RECORD_LIMIT {
+        if let Ok(mut output) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            let _ = output.write_all(record.as_bytes());
+        }
+    }
+}
+fn parse_child_location(bytes: &[u8]) -> Option<DiagnosticLocation> {
+    if bytes.len() > CHILD_RECORD_LIMIT {
+        return None;
+    }
+    let mut parts = std::str::from_utf8(bytes).ok()?.split_ascii_whitespace();
+    let mut values = [0usize; 4];
+    for (key, value) in ["version", "source", "line", "column"]
+        .into_iter()
+        .zip(&mut values)
+    {
+        let (name, number) = parts.next()?.split_once('=')?;
+        if name != key || number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *value = number.parse().ok()?;
+    }
+    let [version, source, line, column] = values;
+    if parts.next().is_some()
+        || version != 1
+        || source > DiagnosticSource::BorrowedScope as usize
+        || line == 0
+        || column == 0
+        || line > u32::MAX as usize
+        || column > u32::MAX as usize
+    {
+        return None;
+    }
+    Some(DiagnosticLocation {
+        source,
+        line,
+        column,
+    })
+}
+fn read_child_location(path: &std::path::Path) -> (usize, DiagnosticLocation) {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (0, DiagnosticLocation::default())
+        }
+        Err(_) => return (2, DiagnosticLocation::default()),
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take((CHILD_RECORD_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return (2, DiagnosticLocation::default());
+    }
+    match parse_child_location(&bytes) {
+        Some(location) => (1, location),
+        None => (2, DiagnosticLocation::default()),
+    }
 }
 // Fixed bit meanings: receipt, exit response, member exited, live member at receipt,
 // early PAM close, final PAM close, helper joined. No process identities are retained.
@@ -492,12 +708,18 @@ pub(crate) fn run_exact(test: &str, expected_waits: usize, body: impl FnOnce()) 
             qualify_private_child();
             assert_eq!(std::env::var(TEST).unwrap(), test);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            let mut diagnostic = DIAGNOSTIC.get();
+            if result.is_err() {
+                diagnostic.record_failure(None);
+                DIAGNOSTIC.set(diagnostic);
+            }
             let drain = drain_owned_children();
+            diagnostic.cleanup_stops |= DIAGNOSTIC.get().cleanup_stops;
             let waits = EXPECTED_WAITS.load(Ordering::SeqCst);
             let success = result.is_ok() && waits == expected_waits && drain.adopted == 0;
             write_report(std::env::var_os(REPORT).unwrap(), format!(
                 "body_success={} expected_waits={waits} body_adopted={} body_rescues={} no_children=1 {}",
-                usize::from(success), drain.adopted, drain.rescues, DIAGNOSTIC.get().report_fields()));
+                usize::from(success), drain.adopted, drain.rescues, diagnostic.report_fields()));
             std::process::exit(if success { 0 } else { 101 });
         }
         Some("supervisor") => {
@@ -541,10 +763,13 @@ pub(crate) fn run_exact(test: &str, expected_waits: usize, body: impl FnOnce()) 
             let body_ok =
                 status.is_some_and(|s| s.success()) && fields.get("body_success") == Some(&1);
             let success = body_ok && drain.adopted == 0;
+            let mut diagnostic = Diagnostic::from_fields(&fields);
+            (diagnostic.child_status, diagnostic.child) =
+                read_child_location(&child_panic_path(&report));
             write_report(report, format!(
                 "body_success={} timed_out={} expected_waits={} body_adopted={} body_rescues={} supervisor_adopted={} supervisor_rescues={} no_children=1 {}",
                 usize::from(body_ok), usize::from(status.is_none()), fields.get("expected_waits").copied().unwrap_or(0),
-                fields.get("body_adopted").copied().unwrap_or(0), fields.get("body_rescues").copied().unwrap_or(0), drain.adopted, drain.rescues, Diagnostic::from_fields(&fields).report_fields()));
+                fields.get("body_adopted").copied().unwrap_or(0), fields.get("body_rescues").copied().unwrap_or(0), drain.adopted, drain.rescues, diagnostic.report_fields()));
             std::process::exit(if success { 0 } else { 101 });
         }
         Some(_) => panic!("unknown private borrowed fixture stage"),
@@ -579,9 +804,192 @@ mod tests {
     use super::*;
 
     #[test]
+    fn screen_diagnostic_checkpoint_preserves_phase_and_failure_location() {
+        diagnostic_mode(DiagnosticMode::Unspecified);
+        diagnostic_phase(DiagnosticPhase::ScreenGapRecovery);
+        diagnostic_assertion(
+            DiagnosticAssertion::ScreenRecoveryGap,
+            Duration::from_millis(4),
+        );
+        assert!(format!("{:?}", DIAGNOSTIC.get()).contains("screen-gap-recovery"));
+        diagnostic_phase(DiagnosticPhase::ScreenResize);
+        assert_eq!(DIAGNOSTIC.get().assertion, 0);
+        assert_eq!(DIAGNOSTIC.get().elapsed_ms, 0);
+        diagnostic_assertion(
+            DiagnosticAssertion::ScreenGeometry,
+            Duration::from_millis(7),
+        );
+        let mut failure = DIAGNOSTIC.get();
+        failure.record_failure(Some(DiagnosticLocation::from_source(
+            "screen_native_tests.rs",
+            71,
+            9,
+        )));
+        DIAGNOSTIC.set(failure);
+        diagnostic_phase(DiagnosticPhase::ScreenCleanup);
+        diagnostic_assertion(
+            DiagnosticAssertion::ScreenReservations,
+            Duration::from_millis(90),
+        );
+        diagnostic_cleanup_stops(4);
+        let retained = DIAGNOSTIC.get();
+        assert_eq!(retained.phase, DiagnosticPhase::ScreenResize as usize);
+        assert_eq!(
+            retained.assertion,
+            DiagnosticAssertion::ScreenGeometry as usize
+        );
+        assert_eq!(retained.elapsed_ms, 7);
+        assert_eq!((retained.body.line, retained.body.column), (71, 9));
+        assert_eq!(retained.cleanup_stops, 4);
+        let fields = retained
+            .report_fields()
+            .split_whitespace()
+            .map(|field| {
+                let (key, value) = field.split_once('=').unwrap();
+                (key.to_string(), value.parse().unwrap())
+            })
+            .collect();
+        let forwarded = Diagnostic::from_fields(&fields);
+        assert_eq!(forwarded.body.line, 71);
+        assert!(format!("{forwarded:?}").contains("screen-resize"));
+    }
+
+    #[test]
+    fn diagnostic_location_is_closed_and_payload_free() {
+        for (file, label) in [
+            (
+                "qshd/src/session_owner/screen_native_tests.rs",
+                "screen_native_tests.rs",
+            ),
+            (
+                "qshd/src/session_owner/engine_native_tests.rs",
+                "engine_native_tests.rs",
+            ),
+            ("qshd/src/test_borrowed_scope.rs", "test_borrowed_scope.rs"),
+            ("/private/CANARY-IDENTITY/PAYLOAD.rs", "unknown"),
+        ] {
+            let location = DiagnosticLocation::from_source(file, 41, 7);
+            let mut diagnostic = Diagnostic::default();
+            diagnostic.record_failure(Some(location));
+            let rendered = format!("{diagnostic:?}");
+            assert!(rendered.contains(label), "{rendered}");
+            assert!(rendered.contains("line: 41") && rendered.contains("column: 7"));
+            assert!(!rendered.contains("private") && !rendered.contains("CANARY"));
+            assert!(!rendered.contains("PAYLOAD"));
+            assert_eq!(diagnostic.child_status, 0);
+        }
+        let mut absent = Diagnostic::default();
+        absent.record_failure(None);
+        assert!(absent.failure);
+        assert_eq!(absent.body_status, 0);
+        assert_eq!(absent.body.line, 0);
+        assert!(format!("{absent:?}").contains("unavailable"));
+    }
+
+    #[test]
+    fn diagnostic_location_first_failure_is_sticky() {
+        let mut diagnostic = Diagnostic::default();
+        diagnostic.record_failure(Some(DiagnosticLocation::from_source(
+            "screen_native_tests.rs",
+            12,
+            3,
+        )));
+        diagnostic.record_failure(Some(DiagnosticLocation::from_source(
+            "engine_native_tests.rs",
+            99,
+            8,
+        )));
+        assert_eq!(diagnostic.body.line, 12);
+        assert_eq!(diagnostic.body.column, 3);
+        assert_eq!(diagnostic.body.source, 1);
+        let mut absent = Diagnostic::default();
+        absent.record_failure(None);
+        absent.record_failure(Some(DiagnosticLocation::from_source(
+            "screen_native_tests.rs",
+            99,
+            8,
+        )));
+        assert_eq!(
+            absent.body_status, 0,
+            "a later panic cannot invent the first location"
+        );
+    }
+
+    #[test]
+    fn diagnostic_child_record_is_bounded_and_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("result");
+        let path = child_panic_path(&report);
+        assert_eq!(path, child_panic_path(&report.with_extension("body")));
+        assert_eq!(read_child_location(&path).0, 0);
+        diagnostic_write_child_panic(&path, "screen_native_tests.rs", 19, 4);
+        diagnostic_write_child_panic(&path, "engine_native_tests.rs", 90, 7);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version=1 source=1 line=19 column=4\n"
+        );
+        let (status, location) = read_child_location(&path);
+        assert_eq!(status, 1);
+        assert_eq!(
+            (location.source, location.line, location.column),
+            (1, 19, 4)
+        );
+        let mut diagnostic = Diagnostic::default();
+        diagnostic.record_failure(Some(DiagnosticLocation::from_source(
+            "test_borrowed_scope.rs",
+            7,
+            2,
+        )));
+        diagnostic.child_status = status;
+        diagnostic.child = location;
+        assert_eq!(diagnostic.body.line, 7);
+        assert_eq!(diagnostic.child.line, 19);
+        let mut boundary = b"version=1 source=3 line=4294967295 column=4294967295".to_vec();
+        boundary.resize(128, b' ');
+        std::fs::write(&path, &boundary).unwrap();
+        assert_eq!(read_child_location(&path).0, 1);
+        boundary.push(b' ');
+        std::fs::write(&path, &boundary).unwrap();
+        assert_eq!(read_child_location(&path).0, 2);
+        for bytes in [
+            b"version=1 source=0 line=20 column=2\n".as_slice(),
+            b"version=1 source=1 line=0 column=2\n",
+            b"version=1 source=1 line=1 column=0\n",
+            b"version=2 source=1 line=1 column=2\n",
+            b"version=1 source=99 line=1 column=2\n",
+            b"version=1 source=1 line=1 column=2 payload=CANARY\n",
+            b"version=1 source=1 line=1 line=2\n",
+            b"CANARY-IDENTITY private/path PAYLOAD",
+            &[b'x'; 129],
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let (status, location) = read_child_location(&path);
+            assert_eq!(
+                status,
+                if bytes.starts_with(b"version=1 source=0 ") {
+                    1
+                } else {
+                    2
+                }
+            );
+            let text = format!("{location:?}");
+            assert!(
+                !text.contains("CANARY") && !text.contains("PAYLOAD") && !text.contains("private")
+            );
+        }
+        assert!(format!("{:?}", read_child_location(&path).1).contains("unknown"));
+    }
+
+    #[test]
     fn assertion_failure_stays_failed_after_borrowed_child_cleanup() {
         const NAME: &str = "test_borrowed_scope::tests::assertion_failure_stays_failed_after_borrowed_child_cleanup";
         let result = run_exact(NAME, 0, || {
+            diagnostic_capture_locations();
+            assert_eq!(
+                diagnostic_child_panic_path().file_name(),
+                Some(std::ffi::OsStr::new("result.screen-panic")),
+                "body report must retain the sidecar in the outer report directory"
+            );
             let status = Command::new("/bin/sh")
                 .args(["-c", "sleep 60 & exit 0"])
                 .status()
@@ -610,6 +1018,12 @@ mod tests {
         );
         assert_eq!(result.diagnostic.elapsed_ms, 7);
         assert_eq!(result.diagnostic.cleanup_stops, 2);
+        assert_eq!(result.diagnostic.body_status, 1);
+        assert_eq!(
+            result.diagnostic.body.source,
+            DiagnosticSource::BorrowedScope as usize
+        );
+        assert!(result.diagnostic.body.line > 0 && result.diagnostic.body.column > 0);
         assert_eq!(result.body_adopted, 1);
         assert_eq!(result.body_rescues, 1);
         assert_eq!(result.supervisor_adopted, 0);
@@ -630,6 +1044,15 @@ mod tests {
             ("observations".into(), usize::MAX),
             ("cleanup_stops".into(), usize::MAX),
             ("exit_code".into(), usize::MAX),
+            ("failure".into(), usize::MAX),
+            ("body_status".into(), usize::MAX),
+            ("body_source".into(), usize::MAX),
+            ("body_line".into(), usize::MAX),
+            ("body_column".into(), usize::MAX),
+            ("child_status".into(), usize::MAX),
+            ("child_source".into(), usize::MAX),
+            ("child_line".into(), usize::MAX),
+            ("child_column".into(), usize::MAX),
         ]);
         let diagnostic = Diagnostic::from_fields(&fields);
         let report = format!("{} {}", "9".repeat(512), diagnostic.report_fields());
@@ -688,5 +1111,7 @@ mod tests {
         assert_eq!(result.supervisor_adopted, 1);
         assert_eq!(result.supervisor_rescues, 1);
         assert!(result.no_children);
+        assert_eq!(result.diagnostic.body_status, 0);
+        assert_eq!(result.diagnostic.body.line, 0);
     }
 }
