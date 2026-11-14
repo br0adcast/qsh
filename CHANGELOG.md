@@ -17,10 +17,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Refuse to start `qshd` on a macOS kernel without a qualified process
   ownership contract, naming the observed kernel, instead of refusing every
   channel later. Document the admitted macOS kernels.
+- Spell prerelease tags `alpha.N`, `beta.N` or `rc.N`, and refuse a release tag
+  that does not outrank every other tag of its version, unless the run retries
+  that tag's published immutable release. The next candidate is `0.6.0-rc.2`.
 - Deliberately stop authenticating the withdrawn v0.6.0-rc1 release. Its signed
   `SHA256SUMS` names packages with `~`, and clients now accept one manifest
   layout per version, so rc1's archives are refused too, whether downloaded or
-  from cached evidence. rc1's published assets, signature and tag are unchanged.
+  from cached evidence.
 
 ### Fixed
 
@@ -40,6 +43,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `PATH` lookup. Agent and FIDO keys sign once per SSH attempt, including during
   recovery.
 
+### Removed
+
+- Withdraw `0.6.0-rc1` and delete its release and tag: SemVer orders it above
+  every `0.6.0-rc.N`. Remove any cached `~/.cache/qsh/qshd-0.6.0-rc1-*` daemon
+  from servers, or later candidates keep selecting it.
+
 ### Security
 
 - Release publication waits for approval in the `release` environment and
@@ -47,7 +56,7 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   created as drafts and published after their last asset, and must be
   immutable once published.
 
-## [0.6.0-rc1]
+## [0.6.0-rc1] [YANKED]
 
 ### Changed
 
