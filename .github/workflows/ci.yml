@@ -1244,6 +1244,7 @@ jobs:
         run: |
           sh -n scripts/install.sh
           python3 -B -m unittest discover -s scripts/tests -p 'test_client_install_bootstrap.py'
+          python3 -B -m unittest discover -s scripts/tests -p 'test_no_silent_skips.py'
           python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
           python3 -m unittest discover -s scripts/tests -p 'test_release_version.py'
           python3 -m unittest discover -s scripts/tests -p 'test_rust_version.py'
@@ -1627,7 +1628,7 @@ jobs:
               require(pathlib.Path(artifact['manifest_path']).resolve() == root / 'qshd/Cargo.toml', 'artifact-manifest')
               require(pathlib.Path(artifact['target']['src_path']).resolve() == root / 'qshd/src/lib.rs', 'artifact-source')
               require(sorted(artifact['features']) == ['system'], 'artifact-features')
-              require(policy[:2] == ['--ignored', '85'], 'library-policy')
+              require(policy[:2] == ['--ignored', '102'], 'library-policy')
               git = lambda *args: output(['git', '-C', str(root), *args])
               source_commit = sha(git('rev-parse', 'HEAD'), 'source-commit')
               require(source_commit == os.environ['GITHUB_SHA'], 'source-head')
@@ -1893,10 +1894,10 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 85` is the exact compiled system-library body count:
-          # the prior 75 plus ten isolated host-policy verifier bodies. Each
-          # required host529_policy parent below reexecs exactly one body and
-          # requires that body's successful one-test result. These component
+          # `--ignored 102` is the exact compiled system-library body count:
+          # the prior 85 plus seventeen isolated System bridge bodies. Required
+          # host529_policy and authdispatch529_system parents each reexec one body and
+          # require that body's successful one-test result. These component
           # checks do not substitute for privileged PAM/service qualification.
           # native_observer_process remains an isolated exit-only observer role.
           # Its required native_observer_retains_unrelated_process parent below
@@ -1943,7 +1944,7 @@ jobs:
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 85 \
+          run_suite lib qshd --ignored 102 \
             --require helper::server::tests::host_policy::host529_policy_bad_bounds_wrong_nonce_and_shared_child_cap_refuse_before_fork \
             --require helper::server::tests::host_policy::host529_policy_cancelled_consumer_and_deadline_retain_real_child_until_wait \
             --require helper::server::tests::host_policy::host529_policy_current_account_and_root_restrictions_are_rechecked \
@@ -1954,6 +1955,23 @@ jobs:
             --require helper::server::tests::host_policy::host529_policy_nonce_replay_expiry_shared_capacity_and_recovery \
             --require helper::server::tests::host_policy::host529_policy_real_auth_and_two_policy_checks_do_not_create_logins \
             --require helper::server::tests::host_policy::host529_policy_verdict_before_reap_lost_consumer_stays_charged \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_cancel_submitted_retains_real_child_until_wait \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_cancel_unsubmitted_cleans_only_exact_nonce \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_cap_before_spend_cleans_exact_remaining_nonce \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_close_loses_sink_without_releasing_real_child \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_coalesced_requests_keep_ordered_replies \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_current_policy_rejects_other_real_seam \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_deadline_and_partial_input_expire_inert \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_eof_retires_real_admitted_frontend \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_eof_submitted_drops_sink_not_physical_custody \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_forged_signature_and_unlisted_key_refuse \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_full_sink_stale_real_result_cannot_approve_twin \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_global_nonce_saturation_is_shared \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_host_pending_capacity_is_global \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_late_real_verdict_after_deadline_is_not_applied \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_real_signed_proof_and_current_revocation \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_replay_and_cross_seam_do_not_touch_other_ticket \
+            --require helper::server::tests::system_dispatch::authdispatch529_system_wrong_method_report_and_host_refuse \
             --require process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session \
             --require control::peer_tests::control_peer_root_client_rejects_foreign_server \
             --require control::peer_tests::control_peer_foreign_client_rejects_root_server \

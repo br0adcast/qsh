@@ -106,6 +106,10 @@ use super::protocol::{
 #[allow(dead_code)]
 pub(crate) mod policy_check;
 
+#[path = "local_auth_dispatch.rs"]
+#[allow(dead_code)] // Dormant proof driver; no runtime route is activated.
+mod local_auth_dispatch;
+
 pub(super) enum VerificationDestination {
     LegacyLogin {
         id: super::protocol::AuthRequestId,
@@ -634,6 +638,7 @@ struct LoopState {
     /// HostPolicy nonces are not spendable/releasable by the legacy worker seam.
     /// Both destinations share MAX_OUTSTANDING_NONCES and the same expiry rule.
     host_nonces: HashMap<Nonce, Instant>,
+    host_auth_tickets: Vec<local_auth_dispatch::HostTicket>,
     /// Accounts a `Request::Verify` has admitted, keyed by uid -- the
     /// account exactly as the verifying child resolved and approved it
     /// ([`verify_proof_after_nonce`]), carried back whole on its report
@@ -1218,6 +1223,7 @@ fn serve_inner(
         closing: HashMap::new(),
         nonces: HashMap::new(),
         host_nonces: HashMap::new(),
+        host_auth_tickets: Vec::new(),
         verified: admitted
             .values()
             .map(|account| (account.uid, account.clone()))
@@ -8294,6 +8300,7 @@ pub(crate) mod tests {
             closing: HashMap::new(),
             nonces: HashMap::new(),
             host_nonces: HashMap::new(),
+            host_auth_tickets: Vec::new(),
             verified: HashMap::from([(account.uid, account.clone())]),
             logins,
             monitors: HashMap::new(),
@@ -8364,6 +8371,7 @@ pub(crate) mod tests {
             closing: HashMap::new(),
             nonces: HashMap::new(),
             host_nonces: HashMap::new(),
+            host_auth_tickets: Vec::new(),
             verified: HashMap::new(),
             logins: HashMap::new(),
             monitors: HashMap::new(),
@@ -17767,6 +17775,7 @@ pub(crate) mod tests {
         );
     }
     include!("server_policy_tests.rs");
+    include!("local_auth_dispatch_tests.rs");
     include!("server_open_tests.rs");
     include!("server_account_binding_tests.rs");
     include!("monitor_native_integration_tests.rs");
