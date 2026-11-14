@@ -1,6 +1,10 @@
 """Fail-closed controls for the focused released-peer gate; no product builds."""
 from contextlib import contextmanager, redirect_stdout
 import ast
+import errno
+import gc
+import weakref
+from types import SimpleNamespace
 import fnmatch
 import hashlib
 import importlib.util
@@ -964,6 +968,330 @@ class CleanupFailurePreservationTests(unittest.TestCase):
                                 child.wait(timeout=2)
 
 
+def settle_observer_fixtures(children, custodian):
+    """Take exclusive fixture custody after the synchronous helper has ended."""
+    for child, saved_wait, saved_kill in children:
+        capsule = custodian.active
+        if child.returncode is None:
+            if capsule is None or capsule.observer is not child:
+                raise AssertionError('unsettled fixture lost its exact observer capsule')
+            if capsule.wait_authority != 'owned':
+                raise AssertionError('fixture cannot reacquire lost observer authority')
+            if not capsule.kill_attempted:
+                saved_kill()
+            saved_wait(timeout=2)
+        for pipe in (child.stdout, child.stderr):
+            if not pipe.closed:
+                pipe.close()
+    # The isolated custodian is discarded only after these exact children
+    # have consumed status and closed pipes; no fabricated capsule release.
+
+
+class ObserverCustodyTests(unittest.TestCase):
+    """Pure owned-child models: every wait and signal syscall is intercepted."""
+
+    @contextmanager
+    def model(self, *, waitpid=None, close_failure=False):
+        now = [10.0]
+        class Pipe:
+            def __init__(self, number, chunks):
+                self.number, self.chunks, self.closed = number, chunks, False
+            def fileno(self):
+                return self.number
+            def close(self):
+                if close_failure and self.number == 101:
+                    self.closed = close_failure == 'closed-then-error'
+                    raise OSError('controlled pipe close failure')
+                self.closed = True
+        child = SimpleNamespace(pid=41, args=['owned observer'], returncode=None,
+                                stdout=Pipe(101, [b'41 41 Z\n', b'']),
+                                stderr=Pipe(102, [b'']))
+        child.wait = mock.Mock(side_effect=subprocess.TimeoutExpired('owned observer', .1))
+        child.kill = mock.Mock()
+        class Selector:
+            def __init__(self): self.keys = {}
+            def __enter__(self): return self
+            def __exit__(self, *args): self.keys.clear()
+            def register(self, pipe, event, data=None):
+                self.keys[pipe] = SimpleNamespace(fileobj=pipe, data=data)
+            def unregister(self, pipe): del self.keys[pipe]
+            def get_map(self): return self.keys
+            def select(self, timeout): return [(key, 1) for key in list(self.keys.values())]
+        def read(number, size):
+            return {101: child.stdout, 102: child.stderr}[number].chunks.pop(0)
+        custodian = peer.ObserverCustodian()
+        with mock.patch.object(peer.subprocess, 'Popen', return_value=child) as spawn, mock.patch.object(peer.os, 'waitpid', side_effect=waitpid or (lambda pid, flags: (0, 0))) as waits, mock.patch.object(peer.os, 'kill') as kills, mock.patch.object(peer.signal, 'getsignal', return_value=peer.signal.SIG_DFL), mock.patch.object(peer.time, 'monotonic', side_effect=lambda: now[0]), mock.patch.object(peer.time, 'sleep', side_effect=lambda seconds: now.__setitem__(0, now[0]+seconds)), mock.patch.object(peer.selectors, 'DefaultSelector', Selector), mock.patch.object(peer.os, 'read', side_effect=read):
+            yield SimpleNamespace(child=child, owner=custodian, now=now, spawn=spawn, waits=waits, kills=kills)
+
+    def observe(self, model):
+        return peer.observe_zombie_group(41, 12, custodian=model.owner)
+
+    @contextmanager
+    def positive_timeout(self):
+        original = peer.ObserverCustody.wait
+        def wait(custody, timeout):
+            if custody.kill_attempted:
+                self.assertGreater(timeout, 0)
+                raise subprocess.TimeoutExpired('injected positive owned wait', timeout)
+            return original(custody, timeout)
+        with mock.patch.object(peer.ObserverCustody, 'wait', wait):
+            yield
+
+    def test_positive_cleanup_timeout_retains_exact_observer(self):
+        with self.model() as m, self.positive_timeout():
+            observed = self.observe(m)
+            report = observed.report
+            self.assertEqual(report['classification'], 'unknown')
+            self.assertIsNone(report['status'])
+            self.assertFalse(report['observer_reaped'])
+            self.assertTrue(any(e['operation'] == 'observer-reap' for e in report['errors']))
+            self.assertTrue(m.child.stdout.closed and m.child.stderr.closed)
+            self.assertIsNotNone(m.owner.active, 'bounded return lost explicit observer custody')
+            self.assertIs(m.owner.active.observer, m.child)
+            self.assertIs(observed.custody, m.owner.active)
+            self.assertEqual(m.kills.call_args_list, [mock.call(41, peer.signal.SIGKILL)])
+            m.child.wait.assert_not_called()
+            m.child.kill.assert_not_called()
+
+    def test_exact_wait_status_and_complete_rows_accept_census(self):
+        with self.model(waitpid=lambda pid, flags: (41, 0)) as m:
+            observation = self.observe(m)
+            self.assertEqual(observation.report['classification'], 'zombie-only')
+            self.assertEqual(observation.report['rows'], 1)
+            self.assertTrue(observation.report['observer_reaped'])
+            self.assertEqual(observation.report['status'], 0)
+            self.assertIsNone(m.owner.active)
+            self.assertIsNone(observation.custody)
+            m.kills.assert_not_called()
+
+    def test_report_and_exception_drop_preserve_slot(self):
+        with self.model() as m, self.positive_timeout():
+            observed = self.observe(m)
+            capsule = observed.custody
+            failure = peer.OwnedCleanupError({'census': observed.report}, observer_custody=capsule)
+            json.loads(str(failure).removeprefix('owned cleanup: '))
+            reference = weakref.ref(capsule)
+            del failure, observed, capsule
+            gc.collect()
+            self.assertIsNotNone(reference())
+            self.assertIs(m.owner.active, reference())
+            self.assertIs(m.owner.active.observer, m.child)
+
+    def test_retained_slot_refuses_new_observer_without_spawn(self):
+        with self.model() as m, self.positive_timeout():
+            first = self.observe(m)
+            second = self.observe(m)
+            self.assertEqual(m.spawn.call_count, 1)
+            self.assertIs(m.owner.active, first.custody)
+            self.assertIs(second.custody, first.custody)
+            self.assertEqual(second.report['classification'], 'unknown')
+            self.assertEqual(second.report['rows'], 0)
+
+    def test_wait_only_continuation_settles_without_rewriting_snapshot(self):
+        with self.model() as m, self.positive_timeout():
+            observed = self.observe(m)
+            before = json.loads(json.dumps(observed.report))
+            m.waits.side_effect = lambda pid, flags: (41, 9)
+            signals = m.kills.call_count
+            observed.custody.reap_once()
+            self.assertIsNone(m.owner.active)
+            self.assertEqual(m.child.returncode, -9)
+            self.assertEqual(observed.custody.snapshot()['wait_authority'], 'consumed')
+            consumed_calls = m.waits.call_count
+            observed.custody.reap_once()
+            observed.custody.kill_once()
+            self.assertEqual(m.waits.call_count, consumed_calls)
+            self.assertEqual(m.kills.call_count, signals)
+            self.assertEqual(observed.report, before)
+            self.assertFalse(observed.report['observer_reaped'])
+
+    def test_echild_never_fabricates_status_or_signal_authority(self):
+        for phase in ('normal', 'pre-kill', 'cleanup', 'continuation'):
+            with self.subTest(phase=phase), self.model() as m:
+                capsule = m.owner.reserve()
+                capsule.attach(m.child)
+                if phase == 'continuation':
+                    capsule.finish_observation()
+                if phase == 'cleanup':
+                    capsule.kill_once()
+                m.waits.side_effect = ChildProcessError(errno.ECHILD, 'controlled lost wait authority')
+                if phase in ('normal', 'cleanup'):
+                    with self.assertRaises(ChildProcessError): capsule.wait(.05)
+                elif phase == 'pre-kill':
+                    with self.assertRaises(ChildProcessError): capsule.kill_once()
+                else:
+                    capsule.reap_once()
+                calls, signals = m.waits.call_count, m.kills.call_count
+                capsule.kill_once()
+                capsule.reap_once()
+                self.assertEqual((m.waits.call_count, m.kills.call_count), (calls, signals))
+                self.assertIsNone(m.child.returncode)
+                self.assertIsNone(capsule.snapshot()['status'])
+                self.assertEqual(capsule.snapshot()['wait_authority'], 'lost')
+                self.assertIs(m.owner.active, capsule)
+
+    def test_lost_wait_cannot_accept_synthetic_zero(self):
+        with self.model() as m:
+            m.waits.side_effect = ChildProcessError(errno.ECHILD, 'controlled lost authority')
+            observed = self.observe(m)
+            self.assertEqual(observed.report['classification'], 'unknown')
+            self.assertIsNone(observed.report['status'])
+            self.assertFalse(observed.report['observer_reaped'])
+            m.kills.assert_not_called()
+
+    def test_exact_consumed_status_is_only_wait_proof(self):
+        with self.model(waitpid=lambda pid, flags: (41, 4 << 8)) as m:
+            capsule = m.owner.reserve()
+            capsule.attach(m.child)
+            capsule.reap_once()  # Another caller cannot touch an active producer.
+            m.waits.assert_not_called()
+            self.assertEqual(capsule.wait(.1), 4)
+            self.assertEqual(m.child.returncode, 4)
+            capsule.kill_once()
+            self.assertEqual(m.waits.call_count, 1)
+            m.kills.assert_not_called()
+            self.assertIs(m.owner.active, capsule)  # Pipes still belong to it.
+            capsule.finish_observation()
+            self.assertIsNone(m.owner.active)
+
+    def test_pending_zero_wait_does_not_sleep_or_release(self):
+        with self.model() as m:
+            capsule = m.owner.reserve()
+            capsule.attach(m.child)
+            with self.assertRaises(subprocess.TimeoutExpired): capsule.wait(0)
+            self.assertEqual(m.waits.call_count, 1)
+            self.assertEqual(m.now[0], 10)
+            self.assertIs(m.owner.active, capsule)
+
+    def test_unexpected_pid_and_wait_error_lose_authority(self):
+        for outcome in ((42, 0), OSError(errno.EIO, 'controlled wait failure')):
+            with self.subTest(outcome=outcome), self.model() as m:
+                capsule = m.owner.reserve()
+                capsule.attach(m.child)
+                m.waits.side_effect = outcome if isinstance(outcome, BaseException) else lambda pid, flags: outcome
+                with self.assertRaises((RuntimeError, OSError)): capsule.wait(.1)
+                capsule.kill_once()
+                self.assertEqual(capsule.snapshot()['wait_authority'], 'lost')
+                self.assertIsNone(capsule.snapshot()['status'])
+                m.kills.assert_not_called()
+
+    def test_pipe_close_failure_retains_consumed_debt(self):
+        with self.model(waitpid=lambda pid, flags: (41, 0), close_failure=True) as m:
+            observed = self.observe(m)
+            self.assertEqual(observed.report['classification'], 'unknown')
+            self.assertEqual(m.child.returncode, 0)
+            self.assertIs(m.owner.active, observed.custody)
+            self.assertFalse(observed.custody.snapshot()['pipes_closed'])
+            observed.custody.reap_once()
+            self.assertEqual(m.waits.call_count, 1)
+            self.assertIs(m.owner.active, observed.custody)
+
+    def test_close_error_retains_debt_even_when_pipe_reports_closed(self):
+        with self.model(waitpid=lambda pid, flags: (41, 0), close_failure='closed-then-error') as m:
+            observed = self.observe(m)
+            self.assertEqual(observed.report['classification'], 'unknown')
+            self.assertIsNotNone(m.owner.active, 'close error silently released observer debt')
+            self.assertEqual(m.owner.active.snapshot()['state'], 'pipe-debt')
+            self.assertTrue(m.owner.active.snapshot()['pipes_closed'])
+
+    def test_no_child_failure_releases_own_reservation(self):
+        for kind in ('spawn', 'leader', 'budget', 'sigchld'):
+            with self.subTest(kind=kind), self.model() as m:
+                if kind == 'spawn': m.spawn.side_effect = FileNotFoundError('controlled missing ps')
+                if kind == 'budget': m.now[0] = 12
+                with mock.patch.object(peer.signal, 'getsignal', return_value=peer.signal.SIG_IGN if kind == 'sigchld' else peer.signal.SIG_DFL):
+                    observed = peer.observe_zombie_group(0 if kind == 'leader' else 41, 12, custodian=m.owner)
+                self.assertEqual(observed.report['classification'], 'unknown')
+                self.assertIsNone(m.owner.active)
+                if kind != 'spawn': m.spawn.assert_not_called()
+                m.waits.assert_not_called()
+                m.kills.assert_not_called()
+
+
+    def test_busy_empty_reservation_cannot_be_finished_by_another_observation(self):
+        with self.model() as m:
+            capsule = m.owner.reserve()
+            observed = self.observe(m)
+            self.assertIs(m.owner.active, capsule)
+            self.assertEqual(capsule.snapshot()['state'], 'active-producer')
+            self.assertIs(observed.custody, capsule)
+            m.spawn.assert_not_called()
+
+    def test_external_returncode_cannot_replace_consuming_wait_proof(self):
+        with self.model() as m:
+            capsule = m.owner.reserve()
+            capsule.attach(m.child)
+            m.child.returncode = 0
+            with self.assertRaises(subprocess.TimeoutExpired): capsule.wait(0)
+            self.assertIsNone(capsule.snapshot()['status'])
+            self.assertEqual(capsule.snapshot()['wait_authority'], 'owned')
+
+    def test_stop_owned_preserves_unknown_after_wait_only_settlement(self):
+        with self.model() as m, self.positive_timeout():
+            observed = self.observe(m)
+            before = json.loads(json.dumps(observed.report))
+            m.waits.side_effect = lambda pid, flags: (41, 9)
+            leader = mock.Mock(pid=73, returncode=None)
+            def wait(timeout):
+                leader.returncode = -9
+                return -9
+            leader.wait.side_effect = wait
+            mask = {peer.signal.SIGTERM}
+            with mock.patch.object(peer, 'observe_zombie_group', return_value=observed), mock.patch.object(peer.platform, 'system', return_value='Darwin'), mock.patch.object(peer.os, 'killpg', side_effect=[None, PermissionError(1, 'controlled KILL denial')]), mock.patch.object(peer.signal, 'pthread_sigmask', return_value=mask) as sigmask:
+                with self.assertRaises(peer.OwnedCleanupError) as raised:
+                    peer.stop_owned(leader)
+            failure = raised.exception
+            self.assertIs(failure.observer_custody, observed.custody)
+            self.assertEqual(failure.report['census'], before)
+            self.assertEqual(failure.report['outcome'], 'unresolved')
+            self.assertTrue(failure.report['leader_reaped'])
+            self.assertEqual(failure.report['observer_cleanup']['wait_authority'], 'consumed')
+            self.assertIsNone(m.owner.active)
+            self.assertEqual(sigmask.call_args, mock.call(peer.signal.SIG_SETMASK, mask))
+            json.loads(str(failure).removeprefix('owned cleanup: '))
+
+    def test_stream_preserves_primary_and_observer_debt(self):
+        for kind in (ValueError, KeyboardInterrupt, subprocess.TimeoutExpired):
+            for evidence_failure in ('none', 'write', 'json'):
+                with self.subTest(kind=kind.__name__, evidence_failure=evidence_failure), self.model() as m, self.positive_timeout(), tempfile.TemporaryDirectory() as directory:
+                    observed = self.observe(m)
+                    capsule = observed.custody
+                    report = dict(outcome='unresolved', census=observed.report,
+                                  observer_cleanup=capsule.snapshot(), errors=[])
+                    cleanup_error = peer.OwnedCleanupError(report, observer_custody=capsule)
+                    primary = kind('owned command', 1) if kind is subprocess.TimeoutExpired else kind('controlled original failure')
+                    original_write, original_dumps = Path.write_text, json.dumps
+                    def write(path, *args, **kwargs):
+                        if evidence_failure == 'write' and path.name.endswith('.failure.json'):
+                            raise OSError('controlled receipt write failure')
+                        return original_write(path, *args, **kwargs)
+                    def dumps(value, *args, **kwargs):
+                        if evidence_failure == 'json' and isinstance(value, dict) and 'failure' in value:
+                            raise TypeError('controlled receipt serialization failure')
+                        return original_dumps(value, *args, **kwargs)
+                    path = Path(directory)/'command.log'
+                    def stop(child, target_report):
+                        target_report.update(report)
+                        raise cleanup_error
+                    with mock.patch.object(peer, 'stop_owned', side_effect=stop), mock.patch.object(peer.os, 'read', return_value=b'original failure'), mock.patch.object(peer, 'forward', side_effect=primary), mock.patch.object(Path, 'write_text', write), mock.patch.object(peer.json, 'dumps', side_effect=dumps):
+                        try:
+                            peer.stream_command(['controlled inert command'], {}, path)
+                        except BaseException as actual:
+                            self.assertIs(actual, primary)
+                            self.assertIs(actual.observer_custody, capsule)
+                            self.assertIs(actual.__cause__, cleanup_error)
+                        else:
+                            self.fail('original exception was lost')
+                    self.assertFalse(path.with_suffix('.log.completion.json').exists())
+                    if evidence_failure == 'none':
+                        record = json.loads(path.with_suffix('.log.failure.json').read_text())
+                        self.assertEqual(record['cleanup']['census']['classification'], 'unknown')
+                        self.assertTrue(record['secondary_errors'])
+                    del primary, cleanup_error, observed
+                    gc.collect()
+                    self.assertIs(m.owner.active, capsule)
+
+
 class ZombieCensusTests(unittest.TestCase):
     def test_only_complete_original_group_all_zombie_rows_are_accepted(self):
         self.assertEqual(peer.parse_zombie_group(b' 41 41 Zs\n42 41 Z+\n', 41), 2)
@@ -980,6 +1308,7 @@ class ZombieCensusTests(unittest.TestCase):
         for mode in ('valid', 'stderr', 'nonzero', 'timeout', 'stdout-cap', 'stderr-cap', 'missing', 'live', 'foreign'):
             with self.subTest(mode=mode):
                 children = []
+                custodian = peer.ObserverCustodian()
                 previous = os.environ.get('COMMAND_MODE')
                 deadline = peer.time.monotonic()+2
 
@@ -1002,17 +1331,30 @@ class ZombieCensusTests(unittest.TestCase):
                     if mode == 'timeout': code += 'time.sleep(30);'
                     if mode == 'nonzero': code += 'raise SystemExit(4);'
                     child = original([sys.executable, '-u', '-c', code], **kwargs)
-                    children.append(child)
+                    children.append((child, child.wait, child.kill))
                     return child
 
-                with mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn):
-                    result = peer.observe_zombie_group(41, deadline)
-                self.assertEqual(result['classification'] == 'zombie-only', mode == 'valid', result)
-                self.assertEqual(os.environ.get('COMMAND_MODE'), previous)
-                self.assertLess(peer.time.monotonic(), deadline)
-                self.assertEqual(len(children), 0 if mode == 'missing' else 1)
-                for child in children:
-                    self.assertIsNotNone(child.returncode, result)
+                try:
+                    with mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn):
+                        observation = peer.observe_zombie_group(41, deadline, custodian=custodian)
+                    result = observation.report
+                    snapshot = json.loads(json.dumps(result))
+                    self.assertEqual(result['classification'] == 'zombie-only', mode == 'valid', result)
+                    self.assertEqual(os.environ.get('COMMAND_MODE'), previous)
+                    self.assertLess(peer.time.monotonic(), deadline)
+                    self.assertEqual(len(children), 0 if mode == 'missing' else 1)
+                    for child, _, _ in children:
+                        if child.returncode is None:
+                            self.assertEqual(result['classification'], 'unknown')
+                            self.assertIs(observation.custody.observer, child)
+                            self.assertIs(custodian.active, observation.custody)
+                        else:
+                            self.assertTrue(result['observer_reaped'])
+                finally:
+                    settle_observer_fixtures(children, custodian)
+                self.assertEqual(result, snapshot, 'fixture cleanup rewrote historical evidence')
+                for child, _, _ in children:
+                    self.assertIsNotNone(child.returncode)
                     with self.assertRaises(ChildProcessError):
                         os.waitpid(child.pid, os.WNOHANG)
 
@@ -1025,7 +1367,7 @@ class ZombieCensusTests(unittest.TestCase):
                     return -9
                 child.wait.side_effect = wait
                 errors = [PermissionError(1, 'TERM denied') if term_denied else None, PermissionError(1, 'KILL denied')]
-                with mock.patch.object(peer.platform, 'system', return_value='Linux'), mock.patch.object(peer.os, 'killpg', side_effect=errors) as kill, mock.patch.object(peer.time, 'sleep'), mock.patch.object(peer, 'observe_zombie_group') as observe:
+                with mock.patch.object(peer.platform, 'system', return_value='Linux'), mock.patch.object(peer.os, 'killpg', side_effect=errors) as kill, mock.patch.object(peer.os, 'waitpid', side_effect=AssertionError('unowned synthetic observer wait')), mock.patch.object(peer.os, 'kill', side_effect=AssertionError('unowned synthetic observer signal')), mock.patch.object(peer.time, 'sleep'), mock.patch.object(peer, 'observe_zombie_group') as observe:
                     with self.assertRaises(peer.OwnedCleanupError) as failure:
                         peer.stop_owned(child)
                 self.assertEqual(kill.call_count, 2)
@@ -1058,6 +1400,8 @@ original_spawn, original_killpg = subprocess.Popen, os.killpg
 original_parse, original_observe = peer.parse_zombie_group, peer.observe_zombie_group
 initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
 leaders, observers, signals, censuses = [], [], [], []
+census_custodian = peer.ObserverCustodian()
+observer_methods = {}
 descendant = None
 primary = KeyboardInterrupt('owned native cleanup characterization')
 sentinel = original_spawn([sys.executable, '-c', 'import time;time.sleep(60)'],
@@ -1112,6 +1456,7 @@ def spawn(command, **kwargs):
             if descendant is not None:
                 rows += f'{descendant} {leaders[0].pid} {state(descendant)}\n'
             child = original_spawn([sys.executable, '-c', f'import os;os.write(1,{rows.encode()!r})'], **kwargs)
+        observer_methods[child] = (child.wait, child.kill)
         observers.append(child)
         return child
     assert command[0:2] == ['owned-prepared-harness', 'controlled_native_cleanup']
@@ -1140,7 +1485,7 @@ def observe(leader, deadline):
     if mode == 'cancel-census':
         os.kill(os.getpid(), signal.SIGTERM)
         os.kill(os.getpid(), signal.SIGINT)
-    return original_observe(leader, deadline)
+    return original_observe(leader, deadline, custodian=census_custodian)
 
 def trigger(text):
     global descendant
@@ -1195,9 +1540,14 @@ try:
         try:
             until(lambda: state(anchor.pid) == 'Z')
             # This exact adapter must execute the real native ps on Darwin.
-            with mock.patch.object(peer.subprocess,'Popen',original_spawn), mock.patch.object(peer,'parse_zombie_group',original_parse):
+            def native_spawn(command, **kwargs):
+                child = original_spawn(command, **kwargs)
+                observer_methods[child] = (child.wait, child.kill)
+                observers.append(child)
+                return child
+            with mock.patch.object(peer.subprocess,'Popen',side_effect=native_spawn), mock.patch.object(peer,'parse_zombie_group',original_parse):
                 if native:
-                    native_census = original_observe(anchor.pid,time.monotonic()+2)
+                    native_census = original_observe(anchor.pid,time.monotonic()+2,custodian=census_custodian).report
                     assert native_census['classification'] == 'zombie-only', native_census
         finally:
             anchor.wait(timeout=1)
@@ -1218,10 +1568,24 @@ finally:
         if state(descendant) not in (None,'Z','X'):
             os.kill(descendant,signal.SIGKILL)
         until(lambda: state(descendant) in (None,'Z','X'))
-    for child in leaders+observers:
+    for child in leaders:
         if child.returncode is None:
             child.kill()
             child.wait(timeout=2)
+    # The producer/caller has ended. These saved methods now hold exclusive
+    # fixture authority; never invoke the old capsule again after transfer.
+    for child in observers:
+        saved_wait, saved_kill = observer_methods[child]
+        if child.returncode is None:
+            capsule = census_custodian.active
+            assert capsule is not None and capsule.observer is child
+            assert capsule.wait_authority == 'owned'
+            if not capsule.kill_attempted:
+                saved_kill()
+            saved_wait(timeout=2)
+        for pipe in (child.stdout, child.stderr):
+            if not pipe.closed:
+                pipe.close()
     if descendant is not None and not native:
         until(lambda: os.waitpid(descendant,os.WNOHANG)[0] == descendant)
     sentinel.kill()
@@ -1343,21 +1707,26 @@ class FinalKillDenialTests(unittest.TestCase):
                             child.wait(timeout=2)
 
     def test_observer_reap_failure_is_unknown_and_owned_fallback_reaps_it(self):
-        original_spawn,original_wait=subprocess.Popen,subprocess.Popen.wait
-        children=[]
-        def spawn(command,**kwargs):
-            child=original_spawn([sys.executable,'-c','import time;time.sleep(30)'],**kwargs)
-            child.wait=mock.Mock(side_effect=subprocess.TimeoutExpired('owned observer reap',0))
-            children.append(child)
+        original_spawn = subprocess.Popen
+        children = []
+        custodian = peer.ObserverCustodian()
+        def spawn(command, **kwargs):
+            child = original_spawn([sys.executable, '-c', 'import time;time.sleep(30)'], **kwargs)
+            children.append((child, child.wait, child.kill))
             return child
         try:
-            with mock.patch.object(peer.subprocess,'Popen',side_effect=spawn):
-                result=peer.observe_zombie_group(41,peer.time.monotonic()+.3)
-            self.assertEqual(result['classification'],'unknown')
+            with mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn), mock.patch.object(peer.ObserverCustody, 'wait', side_effect=subprocess.TimeoutExpired('owned observer reap', 0)):
+                observation = peer.observe_zombie_group(41, peer.time.monotonic()+.3, custodian=custodian)
+            result = observation.report
+            self.assertEqual(result['classification'], 'unknown')
             self.assertFalse(result['observer_reaped'])
-            self.assertTrue(any(error['operation']=='observer-reap' for error in result['errors']))
+            self.assertIs(custodian.active, observation.custody)
+            self.assertIs(observation.custody.observer, children[0][0])
+            self.assertTrue(any(error['operation'] == 'observer-reap' for error in result['errors']))
         finally:
-            for child in children:original_wait(child,timeout=2)
+            settle_observer_fixtures(children, custodian)
+        for child, _, _ in children:
+            with self.assertRaises(ChildProcessError): os.waitpid(child.pid, os.WNOHANG)
 
 
 class ObserverExitReserveTests(unittest.TestCase):
@@ -1381,29 +1750,32 @@ class ObserverExitReserveTests(unittest.TestCase):
             def close(self):
                 self.closed = True
 
-        class Observer:
-            def __init__(self):
-                self.stdout = Pipe(101, [b'41 41 Z\n', b''])
-                self.stderr = Pipe(102, [b''])
-                self.returncode = None
+        observer = SimpleNamespace(pid=41, args=['modeled observer'], returncode=None,
+                                   stdout=Pipe(101, [b'41 41 Z\n', b'']),
+                                   stderr=Pipe(102, [b'']))
+        custodian = peer.ObserverCustodian()
+        original_wait = peer.ObserverCustody.wait
+        cleanup_wait = [False]
 
-            def wait(self, timeout):
-                phase = 'cleanup' if 'kill' in events else 'normal'
-                events.append(phase+'-wait')
-                waits.append(dict(phase=phase, timeout=timeout, cutoff=now[0]+timeout))
-                if phase == 'normal':
-                    now[0] = deadline+cleanup_offset
-                    raise subprocess.TimeoutExpired('modeled normal wait', timeout)
-                if timeout <= 0:
-                    raise subprocess.TimeoutExpired('modeled unreaped zero-time wait', timeout)
-                self.returncode = -peer.signal.SIGKILL
-                return self.returncode
+        def wait(capsule, timeout):
+            phase = 'cleanup' if 'kill' in events else 'normal'
+            events.append(phase+'-wait')
+            waits.append(dict(phase=phase, timeout=timeout, cutoff=now[0]+timeout))
+            if phase == 'normal':
+                now[0] = deadline+cleanup_offset
+                raise subprocess.TimeoutExpired('modeled normal wait', timeout)
+            cleanup_wait[0] = True
+            if timeout <= 0:
+                raise subprocess.TimeoutExpired('modeled unreaped zero-time wait', timeout)
+            return original_wait(capsule, timeout)
 
-            def kill(self):
-                case.assertIsNone(self.returncode)
-                events.append('kill')
+        def waitpid(pid, flags):
+            self.assertEqual((pid, flags), (41, os.WNOHANG))
+            return (41, 9) if cleanup_wait[0] else (0, 0)
 
-        observer = Observer()
+        def kill(pid, sig):
+            self.assertEqual((pid, sig), (41, peer.signal.SIGKILL))
+            events.append('kill')
 
         class Selector:
             def __init__(self):
@@ -1439,8 +1811,8 @@ class ObserverExitReserveTests(unittest.TestCase):
             self.assertLessEqual(len(data), size)
             return data
 
-        with mock.patch.object(peer.time, 'monotonic', side_effect=lambda: now[0]), mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn), mock.patch.object(peer.selectors, 'DefaultSelector', Selector), mock.patch.object(peer.os, 'read', side_effect=read):
-            result = peer.observe_zombie_group(41, outer)
+        with mock.patch.object(peer.time, 'monotonic', side_effect=lambda: now[0]), mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn), mock.patch.object(peer.selectors, 'DefaultSelector', Selector), mock.patch.object(peer.os, 'read', side_effect=read), mock.patch.object(peer.os, 'waitpid', side_effect=waitpid), mock.patch.object(peer.os, 'kill', side_effect=kill), mock.patch.object(peer.signal, 'getsignal', return_value=peer.signal.SIG_DFL), mock.patch.object(peer.ObserverCustody, 'wait', wait):
+            result = peer.observe_zombie_group(41, outer, custodian=custodian).report
         self.assertEqual(result['classification'], 'unknown', 'neither model authorizes acceptance')
         self.assertGreaterEqual(outer-deadline+.000001, .1)
         if not initial_budget:
@@ -1504,12 +1876,16 @@ class ObserverExitReserveTests(unittest.TestCase):
     def test_closed_pipes_stalled_observer_forced_expiry_is_truthful(self):
         self.real_observer_case(force_expired=True)
 
-    def real_observer_case(self, force_expired):
+    def test_closed_pipes_stalled_observer_positive_timeout_retains_custody(self):
+        self.real_observer_case(force_expired=False, positive_timeout=True)
+
+    def real_observer_case(self, force_expired, positive_timeout=False):
         original_spawn, original_clock = subprocess.Popen, peer.time.monotonic
+        original_wait, original_kill = peer.ObserverCustody.wait, os.kill
         children, waits, kills, clocks = [], [], [], []
+        custodian = peer.ObserverCustodian()
         returned = snapshot = None
         fallback_completed = False
-        fallback_kill_attempted = False
         started = original_clock()
         outer_deadline = started+2
 
@@ -1525,58 +1901,54 @@ class ObserverExitReserveTests(unittest.TestCase):
             # Real owned child: EOF on both pipes does not establish its exit.
             code = "import os,time;os.write(1,b'41 41 Z\\n');os.close(1);os.close(2);time.sleep(30)"
             child = original_spawn([sys.executable, '-u', '-c', code], **kwargs)
-            real_wait, real_kill = child.wait, child.kill
-            children.append((child, real_wait, real_kill))
-
-            def wait(timeout):
-                phase = 'cleanup' if kills else 'normal'
-                call = dict(phase=phase, timeout=timeout, cutoff=clocks[-1]+timeout,
-                            status=None, injected_timeout=False, outcome='pending')
-                waits.append(call)
-                if force_expired and phase == 'cleanup':
-                    self.assertEqual(timeout, 0)
-                    call.update(injected_timeout=True, outcome='injected-timeout-without-consumption')
-                    raise subprocess.TimeoutExpired('injected zero-time consuming wait', timeout)
-                try:
-                    call['status'] = real_wait(timeout=timeout)
-                    call['outcome'] = 'actual-consumed-status'
-                    return call['status']
-                except subprocess.TimeoutExpired:
-                    call['outcome'] = 'actual-timeout'
-                    raise
-
-            def kill():
-                self.assertIsNone(child.returncode, 'observer identity consumed before kill')
-                kills.append(original_clock())
-                return real_kill()
-
-            child.wait, child.kill = wait, kill
+            children.append((child, child.wait, child.kill))
             return child
 
+        def wait(capsule, timeout):
+            phase = 'cleanup' if kills else 'normal'
+            call = dict(phase=phase, timeout=timeout, cutoff=clocks[-1]+timeout,
+                        status=None, injected_timeout=False, outcome='pending')
+            waits.append(call)
+            if phase == 'cleanup' and (force_expired or positive_timeout):
+                if positive_timeout:
+                    self.assertGreater(timeout, 0)
+                else:
+                    self.assertEqual(timeout, 0)
+                call.update(injected_timeout=True, outcome='injected-timeout-without-consumption')
+                raise subprocess.TimeoutExpired('injected owned consuming wait', timeout)
+            try:
+                call['status'] = original_wait(capsule, timeout)
+                call['outcome'] = 'actual-consumed-status'
+                return call['status']
+            except subprocess.TimeoutExpired:
+                call['outcome'] = 'actual-timeout'
+                raise
+
+        def kill(pid, sig):
+            self.assertEqual((pid, sig), (children[0][0].pid, peer.signal.SIGKILL))
+            self.assertIsNone(children[0][0].returncode)
+            kills.append(original_clock())
+            return original_kill(pid, sig)
+
         try:
-            with mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn), mock.patch.object(peer.time, 'monotonic', side_effect=clock):
-                returned = peer.observe_zombie_group(41, outer_deadline)
-                # Snapshot before fallback changes the actual Popen returncode.
+            with mock.patch.object(peer.subprocess, 'Popen', side_effect=spawn), mock.patch.object(peer.time, 'monotonic', side_effect=clock), mock.patch.object(peer.ObserverCustody, 'wait', wait), mock.patch.object(peer.os, 'kill', side_effect=kill):
+                observation = peer.observe_zombie_group(41, outer_deadline, custodian=custodian)
+                returned = observation.report
                 snapshot = json.loads(json.dumps(returned))
+                if not returned['observer_reaped']:
+                    self.assertIs(custodian.active, observation.custody)
+                    self.assertIs(observation.custody.observer, children[0][0])
         finally:
-            for child, real_wait, real_kill in children:
-                if child.returncode is None:
-                    # Independent custody retains the exact unreaped Popen object.
-                    # Its saved method guards status before signaling; never use
-                    # the numeric PID again after consuming its wait status.
-                    fallback_kill_attempted = True
-                    try:
-                        real_kill()
-                    except OSError:
-                        pass
-                    real_wait(timeout=2)
+            # Transfer exclusive fixture custody only after the synchronous
+            # producer has ended. Never call its capsule again after transfer.
+            settle_observer_fixtures(children, custodian)
             fallback_completed = True
             print('OWNED_OBSERVER_RESERVE '+json.dumps(dict(
-                kind='real-child-with-forced-expiry' if force_expired else 'real-child-real-clock',
-                forced_clock_expiry=force_expired,
+                kind='real-child-positive-timeout' if positive_timeout else
+                     'real-child-with-forced-expiry' if force_expired else 'real-child-real-clock',
+                forced_clock_expiry=force_expired, positive_timeout_injected=positive_timeout,
                 elapsed=original_clock()-started, waits=waits,
                 return_snapshot=snapshot, fallback_completed=fallback_completed,
-                fallback_kill_attempted=fallback_kill_attempted,
                 final_actual_status=[child.returncode for child, _, _ in children],
                 pipes_closed=[child.stdout.closed and child.stderr.closed for child, _, _ in children],
                 production_kill_count=len(kills)), sort_keys=True), flush=True)
@@ -1594,6 +1966,9 @@ class ObserverExitReserveTests(unittest.TestCase):
             self.assertAlmostEqual(normal[0]['cutoff'], observer_deadline-.1, places=6)
         if force_expired:
             self.assertEqual(cleanup[0]['timeout'], 0)
+        if positive_timeout:
+            self.assertGreater(cleanup[0]['timeout'], 0)
+        if force_expired or positive_timeout:
             self.assertTrue(cleanup[0]['injected_timeout'])
         if cleanup[0]['status'] is not None:
             self.assertEqual(cleanup[0]['status'], -peer.signal.SIGKILL)
