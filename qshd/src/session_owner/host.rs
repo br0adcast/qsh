@@ -13,7 +13,10 @@ use super::authorization_contract::{
     AttachGrant, AuthenticatedPrincipalRef, FrontendRegistration, GrantAuthority, GrantBinding,
     GrantLedger, LedgerInstance, PrincipalRegistration,
 };
+use super::host_resources::OwnerProvisioning;
+use super::resource_contract::HostResourceBinding;
 use super::resource_contract::{ResourceLedger, ResourceLimits};
+use std::sync::{Arc, Mutex};
 use transport::session_resume::*;
 
 const NEVER_ESTABLISHED_GRACE_MS: u64 = 30_000;
@@ -172,7 +175,7 @@ pub(crate) struct HostState {
     catalog: Vec<CatalogEntry>,
     offers: Vec<PendingGrant>,
     grants: GrantLedger,
-    resources: ResourceLedger,
+    resources: Arc<Mutex<ResourceLedger>>,
     last_cleanup: u64,
     last_now: u64,
 }
@@ -205,7 +208,7 @@ impl HostState {
             catalog: Vec::new(),
             offers: Vec::new(),
             grants,
-            resources,
+            resources: Arc::new(Mutex::new(resources)),
             last_cleanup: 0,
             last_now: 0,
         })
@@ -255,6 +258,14 @@ impl HostState {
         attempt: AuthenticationAttempt,
         now: u64,
     ) -> Result<SessionLocator, HostError> {
+        self.create_session_provisioned(attempt, now)
+            .map(|(locator, _)| locator)
+    }
+    pub(crate) fn create_session_provisioned(
+        &mut self,
+        attempt: AuthenticationAttempt,
+        now: u64,
+    ) -> Result<(SessionLocator, OwnerProvisioning), HostError> {
         self.observe(now)?;
         let (account, _) = self.authorization.identity(attempt)?;
         if self.catalog.len() >= self.limits.sessions
@@ -281,7 +292,16 @@ impl HostState {
         }
         let registration = self
             .resources
-            .register_fresh_principal(principal, account.uid())
+            .lock()
+            .map_err(|_| HostError::Refused)?
+            .register_host_principal(
+                principal,
+                account.uid(),
+                HostResourceBinding {
+                    host: self.instance,
+                    locator,
+                },
+            )
             .map_err(|_| HostError::Capacity)?;
         self.catalog.push(CatalogEntry {
             locator,
@@ -293,7 +313,15 @@ impl HostState {
             last_epoch: 0,
             cleanup_operation: None,
         });
-        Ok(locator)
+        Ok((
+            locator,
+            OwnerProvisioning::from_catalog(
+                self.instance,
+                locator,
+                self.resources.clone(),
+                registration,
+            ),
+        ))
     }
     fn session_for_attempt(
         &self,
@@ -589,6 +617,8 @@ impl HostState {
         // A real owner completion is still not a resource refund: backing storage
         // must already have its separately authenticated release evidence.
         self.resources
+            .lock()
+            .map_err(|_| HostError::ResourceDebt)?
             .retire_principal(e.resources.ok_or(HostError::Refused)?)
             .map_err(|_| HostError::ResourceDebt)?;
         e.resources = None;
@@ -640,7 +670,10 @@ impl HostState {
                     if now.saturating_sub(e.created_at) >= NEVER_ESTABLISHED_GRACE_MS =>
                 {
                     if let Some(p) = e.resources {
-                        self.resources.retire_principal(p).is_ok()
+                        self.resources
+                            .lock()
+                            .map(|mut resources| resources.retire_principal(p).is_ok())
+                            .unwrap_or(false)
                     } else {
                         false
                     }
@@ -680,3 +713,7 @@ impl OwnerCompletion {
 #[cfg(test)]
 #[path = "host_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "host_resource_tests.rs"]
+mod resource_tests;

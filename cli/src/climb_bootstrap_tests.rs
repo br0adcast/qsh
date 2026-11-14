@@ -495,7 +495,7 @@ fn busy_user_decline_stops_all_routes_before_later_connection_activity() {
                         .next()
                         .unwrap()
                         .trim_matches('\'');
-                    return format!("TRANSPORT-BUSY {}\n",serde_json::json!({"schema":1,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"active_connections":2,"serving_profiles":null,"preservation":"unknown"})).into_bytes();
+                    return format!("TRANSPORT-BUSY {}\n",serde_json::json!({"schema":2,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"active_connections":2,"serving_profiles":null,"preservation":"unknown"})).into_bytes();
                 }
                 if command.ends_with(" bootstrap-capabilities") {
                     return b"{\"schema\":1,\"busy_decisions\":true}\n".to_vec();
@@ -716,15 +716,23 @@ fn selected_fixture(
                         .unwrap()
                         .trim_matches('\'');
                     return format!("TRANSPORT-BUSY {}\n", serde_json::json!({
-                        "schema":1,"attempt":attempt,
+                        "schema":2,"attempt":attempt,
                         "identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42 + round,"generation":if reply==b"modern-uncertain\n" {Some("cd".repeat(16))}else{None}},
                         "candidate":{"build":2,"checksum":"ef".repeat(32)},
-                        "active_connections":2,"serving_profiles":null,"preservation":"unknown"
+                        "active_connections":2,"serving_profiles":null,"preservation":"unknown",
+                        "service_restart":if reply==b"service-uncertain\n" {Some(serde_json::json!({"profile":"personal_transport_v1","uid":1000,"endpoint":"/test/cache/qsh/control.sock","port":60022}))} else {None}
                     })).into_bytes();
                 }
-                if reply == b"modern-uncertain\n" {
-                    assert!(command.contains("--destructive-consent"));
-                    assert!(command.contains("stop_and_restart"));
+                if reply == b"modern-uncertain\n" || reply == b"service-uncertain\n" {
+                    if reply == b"modern-uncertain\n" {
+                        assert!(command.contains("--destructive-consent"));
+                        assert!(command.contains("stop_and_restart"));
+                        assert!(!command.contains("--service-restart-consent"));
+                    } else {
+                        assert!(command.contains("--service-restart-consent"));
+                        assert!(command.contains("restart_account_service"));
+                        assert!(!command.contains("--destructive-consent"));
+                    }
                     let attempt = command
                         .split("--busy-attempt ")
                         .nth(1)
@@ -742,7 +750,7 @@ fn selected_fixture(
                 return reply.clone();
             }
             if command.ends_with(" bootstrap-capabilities") {
-                return b"{\"schema\":1,\"busy_decisions\":true}\n".to_vec();
+                return b"{\"schema\":1,\"busy_decisions\":true,\"account_service_restart_v1\":true}\n".to_vec();
             }
             if command.contains("QSH-TRUST") {
                 return b"QSH-TRUST /test/qshd\n".to_vec();
@@ -941,6 +949,46 @@ fn selected_confirmed_modern_force_uncertainty_stops_all_routes_and_joins_probes
         .contains("no sessions were interrupted"));
     assert_selected_failure(
         selected_fixture(b"3\n2\n", b"modern-uncertain\n".to_vec(), true, false),
+        2,
+        2,
+        1,
+    );
+}
+
+#[test]
+fn selected_confirmed_service_force_uncertainty_stops_all_routes_and_joins_probes() {
+    let _serial = crate::tty::SIGNAL_TESTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let fixture = selected_fixture(b"3\n2\n", b"service-uncertain\n".to_vec(), true, false);
+    let address = &fixture.setup.args.addresses[0];
+    let error = fixture
+        .setup
+        .ssh_step(false, fixture.setup.install_policy(false, false))
+        .run_foreground(
+            address,
+            address.ssh.as_ref().unwrap(),
+            fixture.setup.keypair.public,
+            &knock::Cancel::new(),
+        )
+        .unwrap_err();
+    let SshStepError::SelectedBusyFailed(failure) = error else {
+        panic!("lost selected Force uncertainty: {error:?}");
+    };
+    assert!(
+        matches!(
+            failure.error,
+            bringup::BringUpError::DestructiveRestartUncertain { .. }
+        ),
+        "{:?}",
+        failure.error
+    );
+    assert!(!failure
+        .error
+        .to_string()
+        .contains("no sessions were interrupted"));
+    assert_selected_failure(
+        selected_fixture(b"3\n2\n", b"service-uncertain\n".to_vec(), true, false),
         2,
         2,
         1,

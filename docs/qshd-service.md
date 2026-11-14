@@ -7,9 +7,26 @@ one predetermined shell per connection: the daemon opens a channel, and it
 is the client that decides what to run inside it. It isn't installed over
 SSH and doesn't update itself — unlike `transport-ensure` (which comes up
 automatically when a client connects over SSH, reinstalls itself, and runs
-as the one daemon per machine until a newer version replaces it or it's
+as this account's personal daemon until a newer version replaces it or it's
 stopped explicitly), this mode is started and restarted by the system's
 service manager: `systemd` (Linux) or `launchd` (macOS).
+
+A foreground SSH bootstrap can separately confirm an interrupting update of
+an eligible legacy personal daemon. That confirmation restarts the current
+account's unmanaged `transport-ensure` service, including a different instance
+that takes over while the warning is open. Active qsh sessions are interrupted
+and their commands may terminate. It never restarts `serve`, a managed
+system/user job, another account or a root service. Lost replies leave the
+outcome uncertain; reconnect or inspect the service before trying again.
+Established-session recovery does not offer this operation or install a daemon.
+
+Confirmed service replacement runs a verified private copy of the selected
+helper for the daemon's lifetime. Later updates target the separately checked
+installed helper path. Graceful shutdown removes its private copy; a crash or a
+later update exec may leave a private staging directory.
+
+See the [bootstrap restart contracts](protocol.md) for the scope and platform
+requirements.
 
 Whichever way the daemon comes up — `serve` or `transport-ensure` — from
 there it does the same thing: it hands out channels, and the client decides

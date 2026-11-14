@@ -700,6 +700,17 @@ pub struct EnsureLock {
     _file: std::fs::File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceStopDispatch {
+    Refused,
+    Acknowledged,
+    Uncertain,
+}
+
+#[cfg(test)]
+#[path = "control_service_tests.rs"]
+mod service_tests;
+
 impl EnsureLock {
     /// Attempt immediately, even for a zero budget, then bound contention by
     /// `patience`. This does not bound filesystem operations or the transaction
@@ -796,12 +807,120 @@ impl EnsureLock {
         )
     }
 
+    pub fn stop_service_once(&self) -> ServiceStopDispatch {
+        self.stop_service_once_checked(CLIENT_READ_TIMEOUT, check_control_peer)
+    }
+    fn stop_service_once_checked(
+        &self,
+        timeout: Duration,
+        check: impl FnOnce(&UnixStream) -> Result<()>,
+    ) -> ServiceStopDispatch {
+        let connect = || -> Result<UnixStream> {
+            self.authority.validate_route()?;
+            anyhow::ensure!(
+                self.authority.entry()?.is_some(),
+                "personal service endpoint absent"
+            );
+            let stream = UnixStream::connect(&self.authority.syscall_path)?;
+            self.authority.validate_route()?;
+            check(&stream)?;
+            self.authority.validate_route()?;
+            anyhow::ensure!(
+                self.authority.entry()?.is_some(),
+                "personal service endpoint disappeared before dispatch"
+            );
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+            Ok(stream)
+        };
+        let Ok(mut stream) = connect() else {
+            return ServiceStopDispatch::Refused;
+        };
+        // Once a write is attempted, every failure is possibly committed.
+        // Never reconnect, retry STOP, or infer absence from EOF.
+        if stream.write_all(b"STOP\n").is_err() {
+            return ServiceStopDispatch::Uncertain;
+        }
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream);
+        if std::io::Read::take(&mut reader, 4097)
+            .read_line(&mut line)
+            .is_err()
+            || line.len() > 4096
+            || !line.ends_with('\n')
+            || self.authority.validate_route().is_err()
+        {
+            return ServiceStopDispatch::Uncertain;
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Ack {
+            Legacy { stopped: bool },
+            Current { stopping: bool },
+        }
+        if serde_json::from_str::<Ack>(line.trim_end()).is_ok_and(|ack| match ack {
+            Ack::Legacy { stopped } => stopped,
+            Ack::Current { stopping } => stopping,
+        }) {
+            ServiceStopDispatch::Acknowledged
+        } else {
+            ServiceStopDispatch::Uncertain
+        }
+    }
+
+    /// The consent describes this independently derived personal route only.
+    pub fn personal_service_selector(
+        &self,
+        port: u16,
+    ) -> Option<daemon_bootstrap_protocol::PersonalServiceSelector> {
+        let uid = nix::unistd::geteuid().as_raw();
+        if uid == 0 || uid != nix::unistd::getuid().as_raw() || self.validate_route().is_err() {
+            return None;
+        }
+        let selector = daemon_bootstrap_protocol::PersonalServiceSelector {
+            profile: daemon_bootstrap_protocol::PersonalServiceProfile::PersonalTransportV1,
+            uid,
+            endpoint: self.authority.route.to_str()?.to_owned(),
+            port,
+        };
+        selector.valid().then_some(selector)
+    }
+
+    /// Exercise the actual filesystem primitive on an operation-owned absent
+    /// name before STOP. Cleanup retains only this probe's inode.
+    pub fn preflight_absent_publication(&self) -> std::io::Result<()> {
+        use rand_core::RngCore;
+        use std::os::fd::AsRawFd;
+        self.validate_route()?;
+        let mut random = [0u8; 16];
+        rand_core::OsRng
+            .try_fill_bytes(&mut random)
+            .map_err(std::io::Error::other)?;
+        let route = self
+            .authority
+            .route
+            .with_file_name(format!(".restart-probe-{}", hex::encode(random)));
+        let authority = path::EndpointAuthority::open(&route, false)?;
+        if !path::same(
+            &nix::sys::stat::fstat(self.authority.parent.as_raw_fd())?,
+            &nix::sys::stat::fstat(authority.parent.as_raw_fd())?,
+        ) {
+            return Err(path::refused("the restart preflight parent changed"));
+        }
+        self.validate_route()?;
+        let (_listener, cleanup) = bind_prepared_mode(&authority, |_| {}, false)?;
+        self.validate_route()?;
+        drop(cleanup);
+        Ok(())
+    }
+
     pub fn bind_private_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
         bind_with_authority(&self.authority)
     }
     /// A confirmed destructive restart may publish only into an absent leaf.
     /// A competing endpoint is never removed under the old consent.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn bind_private_absent_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
         bind_prepared_mode(&self.authority, |_| {}, false)
     }
@@ -990,9 +1109,9 @@ fn bind_prepared_mode(
     if replace {
         stage.publish(authority)?;
     } else {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         stage.publish_absent(authority)?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "no-replace restart publication is unavailable",
@@ -1397,7 +1516,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn confirmed_restart_publication_never_replaces_a_new_endpoint() {
         let dir = tempfile::tempdir().unwrap();
@@ -1423,10 +1542,12 @@ mod tests {
     #[test]
     fn confirmed_restart_publication_preserves_non_utf8_leaf_bytes() {
         use std::os::unix::ffi::OsStringExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .join(std::ffi::OsString::from_vec(b"control-\xff.sock".to_vec()));
+        let fixture = PublicationFixture::new();
+        let leaf = std::ffi::OsString::from_vec(b"control-\xff.sock".to_vec());
+        fixture
+            .probe_lock_creation(&leaf)
+            .expect("Linux must create the exact raw lock leaf");
+        let path = fixture.directory.path().join(leaf);
         let transaction = EnsureLock::acquire(&path, Duration::from_secs(1)).unwrap();
         let (listener, cleanup) = transaction.bind_private_absent_owned().unwrap();
         let _client = UnixStream::connect(&path).unwrap();
@@ -1438,7 +1559,185 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct PublicationFixture {
+        directory: tempfile::TempDir,
+        parent: std::fs::File,
+        parent_identity: (u64, u64),
+        sentinel_identity: (u64, u64, u32),
+        names: std::collections::BTreeSet<Vec<u8>>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl PublicationFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::MetadataExt;
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("sentinel"), b"unrelated sentinel").unwrap();
+            let parent = std::fs::File::open(directory.path()).unwrap();
+            let parent_metadata = parent.metadata().unwrap();
+            let sentinel = std::fs::metadata(directory.path().join("sentinel")).unwrap();
+            let mut fixture = Self {
+                directory,
+                parent,
+                parent_identity: (parent_metadata.dev(), parent_metadata.ino()),
+                sentinel_identity: (sentinel.dev(), sentinel.ino(), sentinel.mode()),
+                names: Default::default(),
+            };
+            fixture.names = fixture.current_names();
+            fixture
+        }
+
+        fn current_names(&self) -> std::collections::BTreeSet<Vec<u8>> {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::read_dir(self.directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().as_bytes().to_vec())
+                .collect()
+        }
+
+        fn assert_sentinel_and_parent(&self) {
+            use std::os::unix::fs::MetadataExt;
+            for metadata in [
+                self.parent.metadata().unwrap(),
+                std::fs::metadata(self.directory.path()).unwrap(),
+            ] {
+                assert_eq!((metadata.dev(), metadata.ino()), self.parent_identity);
+            }
+            let sentinel_path = self.directory.path().join("sentinel");
+            let sentinel = std::fs::symlink_metadata(&sentinel_path).unwrap();
+            assert_eq!(
+                (sentinel.dev(), sentinel.ino(), sentinel.mode()),
+                self.sentinel_identity
+            );
+            assert_eq!(std::fs::read(sentinel_path).unwrap(), b"unrelated sentinel");
+        }
+
+        fn assert_unchanged(&self) {
+            assert_eq!(self.current_names(), self.names);
+            self.assert_sentinel_and_parent();
+        }
+
+        fn probe_lock_creation(&self, leaf: &std::ffi::OsStr) -> std::io::Result<()> {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            self.assert_unchanged();
+            let mut lock = leaf.to_owned();
+            lock.push(".lock");
+            let descriptor = nix::fcntl::openat(
+                Some(self.parent.as_raw_fd()),
+                lock.as_os_str(),
+                nix::fcntl::OFlag::O_WRONLY
+                    | nix::fcntl::OFlag::O_CREAT
+                    | nix::fcntl::OFlag::O_EXCL
+                    | nix::fcntl::OFlag::O_NOFOLLOW
+                    | nix::fcntl::OFlag::O_CLOEXEC
+                    | nix::fcntl::OFlag::O_NONBLOCK,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )?;
+            // SAFETY: openat returned this fixture's newly owned descriptor.
+            let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+            let held = nix::sys::stat::fstat(file.as_raw_fd()).unwrap();
+            assert_eq!(held.st_mode & nix::libc::S_IFMT, nix::libc::S_IFREG);
+            assert_eq!(held.st_mode & 0o7777, 0o600);
+            assert_eq!(held.st_uid, nix::unistd::geteuid().as_raw());
+            assert_eq!(held.st_nlink, 1);
+            let mut expected = self.names.clone();
+            expected.insert(lock.as_bytes().to_vec());
+            assert_eq!(self.current_names(), expected);
+            self.assert_sentinel_and_parent();
+            let named = nix::sys::stat::fstatat(
+                Some(self.parent.as_raw_fd()),
+                lock.as_os_str(),
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+            assert!(
+                path::same(&held, &named),
+                "only unlink this probe's exact inode"
+            );
+            nix::unistd::unlinkat(
+                Some(self.parent.as_raw_fd()),
+                lock.as_os_str(),
+                nix::unistd::UnlinkatFlags::NoRemoveDir,
+            )
+            .unwrap();
+            drop(file);
+            self.assert_unchanged();
+            Ok(())
+        }
+
+        fn assert_publication(&self, leaf: &std::ffi::OsStr) {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let endpoint = self.directory.path().join(leaf);
+            let transaction = EnsureLock::acquire(&endpoint, Duration::from_secs(1))
+                .expect("acquiring the exact leaf's ensure lock");
+            let (listener, cleanup) = transaction
+                .bind_private_absent_owned()
+                .expect("exclusively publishing the exact leaf");
+            let mut lock_name = leaf.to_owned();
+            lock_name.push(".lock");
+            let mut expected = self.names.clone();
+            expected.insert(lock_name.as_bytes().to_vec());
+            expected.insert(leaf.as_bytes().to_vec());
+            assert_eq!(self.current_names(), expected);
+            let _client = UnixStream::connect(&endpoint).expect("connecting to the exact leaf");
+            let _accepted = listener.accept().unwrap();
+            self.assert_sentinel_and_parent();
+            drop(cleanup);
+            assert!(matches!(
+                nix::sys::stat::fstatat(
+                    Some(self.parent.as_raw_fd()),
+                    leaf,
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                ),
+                Err(nix::errno::Errno::ENOENT)
+            ));
+            expected.remove(leaf.as_bytes());
+            // Ensure locks intentionally persist after endpoint cleanup.
+            assert_eq!(self.current_names(), expected);
+            self.assert_sentinel_and_parent();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confirmed_restart_publication_obeys_native_non_utf8_leaf_contract() {
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = PublicationFixture::new();
+        let leaf = std::ffi::OsString::from_vec(b"control-\xff.sock".to_vec());
+        // An absent lookup does not establish native creation support. Probe
+        // the exact raw lock leaf, then exercise acquisition from absence.
+        match fixture.probe_lock_creation(&leaf) {
+            Err(error) if error.raw_os_error() == Some(nix::libc::EILSEQ) => {
+                fixture.assert_unchanged();
+                let endpoint = fixture.directory.path().join(&leaf);
+                let error = EnsureLock::acquire(&endpoint, Duration::from_secs(1))
+                    .err()
+                    .expect("native malformed-leaf rejection must refuse acquisition");
+                assert_eq!(error.raw_os_error(), Some(nix::libc::EILSEQ));
+                fixture.assert_unchanged();
+                println!("\nNATIVE_LEAF_CONTRACT eilseq-refusal-no-mutation");
+            }
+            Ok(()) => {
+                fixture.assert_publication(&leaf);
+                println!("\nNATIVE_LEAF_CONTRACT raw-byte-publication");
+            }
+            Err(error) => panic!("unexpected native malformed-lock creation error: {error}"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn confirmed_restart_publication_preserves_non_ascii_utf8_leaf_bytes() {
+        // These characters have stable canonical spelling, without combining marks.
+        let fixture = PublicationFixture::new();
+        fixture.assert_unchanged();
+        fixture.assert_publication(std::ffi::OsStr::new("control-東京.sock"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn confirmed_restart_publication_refuses_race_and_unsupported_primitive() {
         let dir = tempfile::tempdir().unwrap();

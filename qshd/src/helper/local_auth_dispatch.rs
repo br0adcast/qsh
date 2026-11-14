@@ -10,8 +10,9 @@ use crate::session_owner::host_auth_contract::{
 };
 use crate::session_owner::host_protocol::{self, HostDecoder, HostFrame, HostHeader, HostMessage};
 use crate::session_owner::local_channel::HostDispatchChannel;
-use crate::session_owner::protocol::{OwnerProtocolError, OwnerRole};
+use crate::session_owner::protocol::{OwnerProtocolError, OwnerRole, MAX_OWNER_REQUESTS};
 use rand_core::RngCore;
+use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use transport::session_resume::HostInstance;
@@ -62,7 +63,7 @@ pub(super) struct SystemHelperDispatch {
     last_now: u64,
     decoder: HostDecoder,
     input_deadline: Option<u64>,
-    output: Option<Output>,
+    outputs: VecDeque<Output>,
     registration: Option<Registration>,
     authenticated: Option<(AuthenticationAttempt, SystemContext)>,
     current: Option<Current>,
@@ -99,14 +100,14 @@ impl SystemHelperDispatch {
             last_now: 0,
             decoder: HostDecoder::new(),
             input_deadline: None,
-            output: None,
+            outputs: VecDeque::new(),
             registration: None,
             authenticated: None,
             current: None,
         })
     }
     fn queue(&mut self, id: u64, message: HostAuthMessage, now: u64) -> Result<(), BridgeError> {
-        if self.output.is_some() {
+        if self.outputs.len() >= MAX_OWNER_REQUESTS {
             return Err(BridgeError::Refused);
         }
         let frame = HostFrame {
@@ -126,7 +127,7 @@ impl SystemHelperDispatch {
             .ok_or(BridgeError::Refused)?
             .send_at(&frame, now)
             .map_err(BridgeError::Protocol)?;
-        self.output = Some(Output {
+        self.outputs.push_back(Output {
             bytes,
             offset: 0,
             deadline,
@@ -150,7 +151,7 @@ impl SystemHelperDispatch {
     fn retire(&mut self, state: &mut LoopState, host: &mut HostState) {
         self.cancel_registration(state, host);
         self.current = None;
-        self.output = None;
+        self.outputs.clear();
         self.input_deadline = None;
         if let Some(channel) = self.channel.take() {
             let _ = channel.retire(host);
@@ -369,7 +370,7 @@ impl SystemHelperDispatch {
         now: u64,
     ) -> Result<bool, BridgeError> {
         let mut progress = false;
-        if self.output.is_none() {
+        if self.outputs.is_empty() {
             if let Some(registration) = self
                 .registration
                 .as_ref()
@@ -447,13 +448,13 @@ impl SystemHelperDispatch {
             || self
                 .registration
                 .as_ref()
-                .is_some_and(|r| now >= r.deadline)
+                .is_some_and(|r| r.accepted_context.is_none() && now >= r.deadline)
             || self
                 .current
                 .as_ref()
                 .is_some_and(|c| c.outcome.is_none() && now >= c.deadline)
             || self.input_deadline.is_some_and(|d| now >= d)
-            || self.output.as_ref().is_some_and(|o| now >= o.deadline)
+            || self.outputs.front().is_some_and(|o| now >= o.deadline)
         {
             self.retire(state, host);
             return Ok(Step::Closed);
@@ -465,6 +466,51 @@ impl SystemHelperDispatch {
         }
         result
     }
+    // A submitted proof still owes one reply even while its receiver is ready.
+    fn check_batch(&self, frames: usize) -> Result<(), BridgeError> {
+        let proof_debt = usize::from(
+            self.registration
+                .as_ref()
+                .is_some_and(|r| r.proof_request.is_some() && r.accepted_context.is_none()),
+        );
+        if self
+            .outputs
+            .len()
+            .checked_add(frames)
+            .and_then(|n| n.checked_add(proof_debt))
+            .is_none_or(|n| n > MAX_OWNER_REQUESTS)
+        {
+            return Err(BridgeError::Refused);
+        }
+        Ok(())
+    }
+    fn write_one(
+        outputs: &mut VecDeque<Output>,
+        mut write: impl FnMut(&[u8]) -> io::Result<usize>,
+    ) -> Result<bool, BridgeError> {
+        let Some(output) = outputs.front_mut() else {
+            return Ok(false);
+        };
+        match write(&output.bytes[output.offset..]) {
+            Ok(0) => Err(BridgeError::Refused),
+            Ok(n) => {
+                output.offset += n;
+                if output.offset == output.bytes.len() {
+                    outputs.pop_front();
+                }
+                Ok(true)
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(BridgeError::Io(e)),
+        }
+    }
     fn turn(
         &mut self,
         state: &mut LoopState,
@@ -474,53 +520,36 @@ impl SystemHelperDispatch {
         now: u64,
     ) -> Result<Step, BridgeError> {
         let mut progress = false;
-        let mut bytes = [0u8; 4096];
-        match self
-            .channel
-            .as_mut()
-            .ok_or(BridgeError::Refused)?
-            .read(&mut bytes)
-        {
-            Ok(0) => {
-                self.retire(state, host);
-                return Ok(Step::Closed);
-            }
-            Ok(n) => {
-                let frames = self
-                    .decoder
-                    .push(&bytes[..n])
-                    .map_err(BridgeError::Protocol)?;
-                if self.decoder.buffered_len() == 0 {
-                    self.input_deadline = None;
-                } else if self.input_deadline.is_none() {
-                    self.input_deadline = Some(
-                        now.checked_add(self.io_timeout)
-                            .ok_or(BridgeError::Refused)?,
-                    );
-                }
-                for frame in frames {
-                    self.received(frame, state, host, config, switches, now)?;
-                }
-                progress = true;
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                ) => {}
-            Err(e) => return Err(BridgeError::Io(e)),
-        }
-        progress |= self.poll_results(state, host, now)?;
-        if let Some(output) = self.output.as_mut() {
+        // Drain the prior batch before admitting another bounded input chunk.
+        if self.outputs.is_empty() {
+            let mut bytes = [0u8; 4096];
             match self
                 .channel
                 .as_mut()
                 .ok_or(BridgeError::Refused)?
-                .write(&output.bytes[output.offset..])
+                .read(&mut bytes)
             {
-                Ok(0) => return Err(BridgeError::Refused),
+                Ok(0) => {
+                    self.retire(state, host);
+                    return Ok(Step::Closed);
+                }
                 Ok(n) => {
-                    output.offset += n;
+                    let frames = self
+                        .decoder
+                        .push(&bytes[..n])
+                        .map_err(BridgeError::Protocol)?;
+                    if self.decoder.buffered_len() == 0 {
+                        self.input_deadline = None;
+                    } else if self.input_deadline.is_none() {
+                        self.input_deadline = Some(
+                            now.checked_add(self.io_timeout)
+                                .ok_or(BridgeError::Refused)?,
+                        );
+                    }
+                    self.check_batch(frames.len())?;
+                    for frame in frames {
+                        self.received(frame, state, host, config, switches, now)?;
+                    }
                     progress = true;
                 }
                 Err(e)
@@ -530,10 +559,10 @@ impl SystemHelperDispatch {
                     ) => {}
                 Err(e) => return Err(BridgeError::Io(e)),
             }
-            if output.offset == output.bytes.len() {
-                self.output = None;
-            }
         }
+        progress |= self.poll_results(state, host, now)?;
+        let channel = self.channel.as_mut().ok_or(BridgeError::Refused)?;
+        progress |= Self::write_one(&mut self.outputs, |bytes| channel.write(bytes))?;
         Ok(if progress { Step::Progress } else { Step::Idle })
     }
 }
@@ -565,6 +594,214 @@ pub(super) mod assertions {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+    pub(in crate::helper::server) fn queue_state(
+        bridge: &mut SystemHelperDispatch,
+        id: u64,
+        now: u64,
+    ) {
+        assert!(bridge.outputs.is_empty());
+        assert!(bridge.check_batch(MAX_OWNER_REQUESTS).is_ok());
+        assert!(bridge.check_batch(MAX_OWNER_REQUESTS + 1).is_err());
+        let mut outputs = VecDeque::from([
+            Output {
+                bytes: vec![1, 2, 3],
+                offset: 0,
+                deadline: 10,
+            },
+            Output {
+                bytes: vec![4, 5],
+                offset: 0,
+                deadline: 11,
+            },
+        ]);
+        assert!(SystemHelperDispatch::write_one(&mut outputs, |bytes| {
+            assert_eq!(bytes, &[1, 2, 3]);
+            Ok(1)
+        })
+        .unwrap());
+        let snapshot = |q: &VecDeque<Output>| {
+            q.iter()
+                .map(|o| (o.bytes.clone(), o.offset, o.deadline))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(outputs[0].offset, 1);
+        assert_eq!(outputs[1].offset, 0);
+        let before = snapshot(&outputs);
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
+            assert!(!SystemHelperDispatch::write_one(&mut outputs, |bytes| {
+                assert_eq!(bytes, &[2, 3]);
+                Err(kind.into())
+            })
+            .unwrap());
+            assert_eq!(snapshot(&outputs), before);
+        }
+        let mut writes = 0;
+        assert!(SystemHelperDispatch::write_one(&mut outputs, |bytes| {
+            writes += 1;
+            assert_eq!(bytes, &[2, 3]);
+            Ok(bytes.len())
+        })
+        .unwrap());
+        assert_eq!(writes, 1);
+        assert_eq!(snapshot(&outputs), vec![(vec![4, 5], 0, 11)]);
+        assert!(matches!(
+            SystemHelperDispatch::write_one(&mut outputs, |_| Ok(0)),
+            Err(BridgeError::Refused)
+        ));
+        assert_eq!(snapshot(&outputs), vec![(vec![4, 5], 0, 11)]);
+        assert!(matches!(
+            SystemHelperDispatch::write_one(
+                &mut outputs,
+                |_| Err(io::ErrorKind::BrokenPipe.into())
+            ),
+            Err(BridgeError::Io(_))
+        ));
+        assert_eq!(snapshot(&outputs), vec![(vec![4, 5], 0, 11)]);
+        assert!(SystemHelperDispatch::write_one(&mut outputs, |bytes| {
+            assert_eq!(bytes, &[4, 5]);
+            Ok(2)
+        })
+        .unwrap());
+        assert!(outputs.is_empty());
+        assert!(!SystemHelperDispatch::write_one(&mut outputs, |_| panic!(
+            "empty FIFO performs no write"
+        ))
+        .unwrap());
+
+        // Reserve a real correlation request without invoking host authority.
+        let frame = HostFrame {
+            header: HostHeader {
+                role: OwnerRole::Frontend,
+                host: bridge.host,
+                request_id: id,
+            },
+            message: HostMessage::Authentication(HostAuthMessage::Begin {
+                method: AuthMethod::System,
+            }),
+        };
+        bridge
+            .channel
+            .as_mut()
+            .unwrap()
+            .receive_at(&frame, now)
+            .unwrap();
+        let ticket = bridge.registration.as_ref().unwrap().ticket;
+        for _ in 0..MAX_OWNER_REQUESTS {
+            bridge.outputs.push_back(Output {
+                bytes: vec![42],
+                offset: 0,
+                deadline: now + 10,
+            });
+        }
+        let before = snapshot(&bridge.outputs);
+        let reply = HostAuthMessage::ChallengeRefused {
+            method: AuthMethod::System,
+            reason: AuthRefusal::Unavailable,
+        };
+        assert!(matches!(
+            bridge.queue(id, reply.clone(), now),
+            Err(BridgeError::Refused)
+        ));
+        assert_eq!(snapshot(&bridge.outputs), before);
+        assert_eq!(bridge.registration.as_ref().unwrap().ticket, ticket);
+        bridge.outputs.pop_back();
+        assert!(bridge.check_batch(1).is_ok());
+        assert!(bridge.check_batch(2).is_err());
+        bridge.outputs.clear();
+        // The same reply is still admissible: full-queue refusal did not send_at.
+        bridge.queue(id, reply.clone(), now).unwrap();
+        let frame = HostDecoder::new()
+            .push(&bridge.outputs[0].bytes)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(frame.header.request_id, id);
+        assert_eq!(frame.message, HostMessage::Authentication(reply));
+        bridge.outputs.clear();
+    }
+    pub(in crate::helper::server) fn short_output_timeout(bridge: &mut SystemHelperDispatch) {
+        bridge.io_timeout = 2;
+    }
+    pub(in crate::helper::server) fn queued(bridge: &SystemHelperDispatch, count: usize) -> u64 {
+        assert_eq!(bridge.outputs.len(), count);
+        bridge.outputs.front().unwrap().deadline
+    }
+    pub(in crate::helper::server) fn proof_debt_boundaries(bridge: &SystemHelperDispatch) {
+        assert!(bridge.outputs.is_empty());
+        let r = bridge.registration.as_ref().unwrap();
+        assert!(r.proof_request.is_some() && r.accepted_context.is_none());
+        assert!(bridge.check_batch(MAX_OWNER_REQUESTS - 1).is_ok());
+        assert!(bridge.check_batch(MAX_OWNER_REQUESTS).is_err());
+    }
+    pub(in crate::helper::server) fn ready_proof_deferred(
+        bridge: &mut SystemHelperDispatch,
+        state: &mut LoopState,
+        host: &mut HostState,
+        now: u64,
+    ) {
+        assert!(!bridge.outputs.is_empty());
+        assert!(bridge.authenticated.is_none());
+        assert!(!bridge.poll_results(state, host, now).unwrap());
+        let r = bridge.registration.as_ref().unwrap();
+        assert!(r.accepted_context.is_none());
+        // Observe and return the exact real verdict, preserving the one-slot sink.
+        let result = r
+            .receiver
+            .try_recv()
+            .expect("ready real proof stays in its receiver under output backpressure");
+        r.sender.try_send(result).unwrap();
+        assert!(bridge.authenticated.is_none());
+    }
+    pub(in crate::helper::server) fn retired(bridge: &SystemHelperDispatch) {
+        assert!(bridge.channel.is_none());
+        assert!(bridge.outputs.is_empty());
+        assert!(bridge.registration.is_none());
+        assert!(bridge.authenticated.is_none());
+        assert!(bridge.current.is_none());
+        assert!(bridge.input_deadline.is_none());
+    }
+    pub(in crate::helper::server) fn start_queued_current(
+        bridge: &mut SystemHelperDispatch,
+        state: &mut LoopState,
+        host: &mut HostState,
+        config: &HelperConfig,
+        switches: AccountSwitches,
+        now: u64,
+    ) {
+        assert!(!bridge.outputs.is_empty());
+        let attempt = bridge.authenticated.unwrap().0;
+        let locator = host.create_session(attempt, now).unwrap();
+        let intent = host
+            .begin_issue(attempt, locator, now, now + 10_000)
+            .unwrap();
+        bridge
+            .start_current(state, intent, config, switches, now)
+            .unwrap();
+    }
+    pub(in crate::helper::server) fn queued_current_completed(bridge: &SystemHelperDispatch) {
+        assert!(!bridge.outputs.is_empty());
+        assert!(matches!(
+            bridge.current.as_ref().unwrap().outcome.as_ref(),
+            Some(Ok(HostDecision::GrantIssued(_)))
+        ));
+        assert!(bridge.authenticated.is_some());
+    }
+    pub(in crate::helper::server) fn expiring_current(
+        bridge: &mut SystemHelperDispatch,
+        state: &mut LoopState,
+        host: &mut HostState,
+        config: &HelperConfig,
+        switches: AccountSwitches,
+        now: u64,
+    ) -> AuthenticationAttempt {
+        let attempt = bridge.authenticated.unwrap().0;
+        let locator = host.create_session(attempt, now).unwrap();
+        let intent = host.begin_issue(attempt, locator, now, now + 2).unwrap();
+        bridge
+            .start_current(state, intent, config, switches, now)
+            .unwrap();
+        attempt
     }
     pub(in crate::helper::server) fn current_revocation(
         bridge: &mut SystemHelperDispatch,

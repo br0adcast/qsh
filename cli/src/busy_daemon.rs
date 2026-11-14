@@ -4,6 +4,21 @@ use bringup::{BusyChoice, BusyDaemonInfo, BusyDecision, DestructiveRestartConsen
 
 pub const LEGACY_WARNING: &str = "This daemon cannot preserve its active qsh sessions during the update. All active qsh sessions will be interrupted, and running commands may terminate.";
 
+pub enum RestartConsent {
+    Exact(DestructiveRestartConsent),
+    Service(bringup::ServiceRestartConsent),
+}
+impl RestartConsent {
+    fn matches(&self, info: &BusyDaemonInfo) -> bool {
+        match self {
+            Self::Exact(consent) => consent.matches(info),
+            Self::Service(consent) => consent.matches(info),
+        }
+    }
+}
+fn service_warning(account: &str, host: &str) -> String {
+    format!("Restart the personal qshd service for account {} on {}. All active qsh sessions for this service will be interrupted, and running commands may terminate. This also applies if the service process changes while this dialog is open.", crate::report::printable(account), crate::report::printable(host))
+}
 fn parse_choice(input: Option<&str>) -> BusyChoice {
     match input.map(str::trim) {
         Some("2") => BusyChoice::ContinueOld,
@@ -28,28 +43,50 @@ impl BusyPrompt {
         if pending.info().attempt != expected.attempt
             || pending.info().identity != expected.identity
             || pending.info().candidate != expected.candidate
+            || pending.info().service_restart != expected.service_restart
         {
             return None;
         }
         Some(self.pending.take()?.decide(choice))
     }
 }
-fn legacy_consent(
-    info: &BusyDaemonInfo,
-    answer: Option<&str>,
-) -> Option<DestructiveRestartConsent> {
-    (answer.map(str::trim) == Some("2")).then(|| info.confirm_destructive_restart())
+fn legacy_consent(info: &BusyDaemonInfo, answer: Option<&str>) -> Option<RestartConsent> {
+    if answer.map(str::trim) != Some("2") {
+        return None;
+    }
+    let consent = match info.confirm_service_restart() {
+        Some(consent) => RestartConsent::Service(consent),
+        None => RestartConsent::Exact(info.confirm_destructive_restart()),
+    };
+    consent.matches(info).then_some(consent)
 }
+#[cfg(test)]
 pub fn ask(
     tty: &Tty,
     info: BusyDaemonInfo,
     cancel: &knock::Cancel,
-) -> Result<(BusyDecision, Option<DestructiveRestartConsent>), ssh::SshError> {
+) -> Result<(BusyDecision, Option<RestartConsent>), ssh::SshError> {
+    ask_for_target(tty, info, "this account", "the verified SSH server", cancel)
+}
+pub fn ask_for_target(
+    tty: &Tty,
+    info: BusyDaemonInfo,
+    account: &str,
+    host: &str,
+    cancel: &knock::Cancel,
+) -> Result<(BusyDecision, Option<RestartConsent>), ssh::SshError> {
     let mut prompt = BusyPrompt::new(info.clone()).ok_or(ssh::SshError::Cancelled)?;
     let answer = tty.read_choice(&question(&info), cancel)?;
     let mut choice = parse_choice(answer.as_deref());
     let consent = if choice == BusyChoice::ForceUpdate {
-        let warning = format!("{LEGACY_WARNING}\n\n1. Cancel (default)\n2. Restart and interrupt sessions\nChoose [1]:");
+        let scope = if info.service_restart.is_some() {
+            service_warning(account, host)
+        } else {
+            LEGACY_WARNING.to_owned()
+        };
+        let warning = format!(
+            "{scope}\n\n1. Cancel (default)\n2. Restart and interrupt sessions\nChoose [1]:"
+        );
         let answer = tty.read_choice(&warning, cancel)?;
         let consent = legacy_consent(&info, answer.as_deref());
         if consent.is_none() {
@@ -72,7 +109,7 @@ mod tests {
     use super::*;
     fn info() -> bringup::BusyDaemonInfo {
         bringup::BusyDaemonInfo {
-            schema: 1,
+            schema: 2,
             attempt: bringup::BusyAttemptId::from_bytes([1; 16]),
             identity: bringup::BusyDaemonIdentity {
                 version: "0.5.9".into(),
@@ -88,8 +125,86 @@ mod tests {
             active_connections: 2,
             serving_profiles: None,
             preservation: bringup::PreservationCapability::Unknown,
+            service_restart: None,
         }
     }
+    #[test]
+    fn service_confirmation_survives_instance_change_but_not_selector_change() {
+        let mut live = info();
+        live.schema = 2;
+        live.service_restart = Some(bringup::PersonalServiceSelector {
+            profile: bringup::PersonalServiceProfile::PersonalTransportV1,
+            uid: 1000,
+            endpoint: "/fixture/qsh/control.sock".into(),
+            port: 60022,
+        });
+        let consent = legacy_consent(&live, Some("2")).unwrap();
+        let mut changed = live.clone();
+        changed.identity.pid += 1;
+        assert!(
+            consent.matches(&changed),
+            "explicit service scope includes changed processes"
+        );
+        changed.service_restart.as_mut().unwrap().port += 1;
+        assert!(!consent.matches(&changed));
+    }
+
+    #[test]
+    fn service_warning_names_verified_target_and_second_cancel_sends_no_consent() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let _serial = crate::tty::SIGNAL_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (input, expected) in [(&b"3\n2\n"[..], true), (&b"3\n\n"[..], false)] {
+            let mut live = info();
+            live.schema = 2;
+            live.service_restart = Some(bringup::PersonalServiceSelector {
+                profile: bringup::PersonalServiceProfile::PersonalTransportV1,
+                uid: 1000,
+                endpoint: "/fixture/qsh/control.sock".into(),
+                port: 60022,
+            });
+            let pty = nix::pty::openpty(None, None).unwrap();
+            let tty = Tty::at(nix::unistd::ttyname(&pty.slave).unwrap());
+            let mut master = std::fs::File::from(pty.master);
+            master.write_all(input).unwrap();
+            let (decision, consent) = ask_for_target(
+                &tty,
+                live,
+                "fixture-account",
+                "verified-host:22",
+                &knock::Cancel::new(),
+            )
+            .unwrap();
+            assert_eq!(consent.is_some(), expected);
+            assert_eq!(
+                decision.choice,
+                if expected {
+                    BusyChoice::ForceUpdate
+                } else {
+                    BusyChoice::Cancel
+                }
+            );
+            if let Some(consent) = consent {
+                assert!(matches!(consent, RestartConsent::Service(_)));
+            }
+            assert!(
+                unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } >= 0
+            );
+            let mut output = String::new();
+            let _ = master.read_to_string(&mut output);
+            for text in [
+                "fixture-account",
+                "verified-host:22",
+                "service process changes",
+                "Cancel (default)",
+            ] {
+                assert!(output.contains(text), "{output}");
+            }
+        }
+    }
+
     #[test]
     fn pty_choices_leave_canonical_terminal_usable() {
         use std::io::Write;

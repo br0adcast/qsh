@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Select the shipped pair's version from Cargo metadata on standard input."""
+"""Select the shipped pair's version from Cargo metadata on standard input.
+
+With --existing-tags and --releases, instead check a release tag against the
+repository's existing version tags and releases: no Cargo metadata is read.
+"""
 import argparse
 import json
 import re
@@ -25,6 +29,52 @@ def valid_version(value):
     # identifiers may, and must remain verbatim in the selected version.
     return all(not (part.isdigit() and len(part) > 1 and part[0] == '0')
                for part in (match.group(2) or '').split('.'))
+
+
+# Release tags spell prereleases as alpha.N, beta.N or rc.N. SemVer compares a
+# dot-separated number numerically, while an attached one (rc10) compares as
+# text, so rc10 would order before rc2 and every rc.N before rc1 (#554).
+RELEASE_PRERELEASE = re.compile(r'(?:alpha|beta|rc)\.' + NUMBER)
+
+
+def valid_release_version(value):
+    if not valid_version(value):
+        return False
+    prerelease = VERSION.fullmatch(value).group(2)
+    return prerelease is None or RELEASE_PRERELEASE.fullmatch(prerelease) is not None
+
+
+def precedence(value):
+    """SemVer 2.0.0 precedence key of a valid version; build metadata is ignored."""
+    match = VERSION.fullmatch(value)
+    core = tuple(int(part) for part in match.group(1).split('.'))
+    if match.group(2) is None:
+        # A normal version has higher precedence than any of its prereleases.
+        return core, (1,)
+    # Numeric identifiers order before alphanumeric ones; a longer list of
+    # otherwise equal identifiers has higher precedence.
+    identifiers = tuple((0, int(part), '') if part.isdigit() else (1, 0, part)
+                        for part in match.group(2).split('.'))
+    return core, (0, identifiers)
+
+
+def order_error(version, tags):
+    """Describe why a release version cannot follow the existing version tags.
+
+    Every other version tag of the same major.minor.patch must have lower
+    precedence: a prerelease cannot follow a later prerelease or the final
+    version, and another tag with equal precedence would be ambiguous. Older
+    or newer release lines are unconstrained, so patch releases of an earlier
+    line remain possible. Tags that are not versions are ignored.
+    """
+    core, key = precedence(version)
+    for tag in tags:
+        if tag == 'v' + version or not tag.startswith('v') or not valid_version(tag[1:]):
+            continue
+        other_core, other_key = precedence(tag[1:])
+        if other_core == core and other_key >= key:
+            return 'release tag does not follow existing tag ' + tag
+    return None
 
 
 def selected_version(metadata, ref_type, ref_name):
@@ -59,6 +109,54 @@ def selected_version(metadata, ref_type, ref_name):
     version = versions['qsh']
     if ref_type == 'tag' and ref_name != 'v' + version:
         raise ValueError('release tag differs from the qsh/qshd package version')
+    if ref_type == 'tag' and not valid_release_version(version):
+        raise ValueError('release prerelease must be alpha.N, beta.N or rc.N')
+    return version
+
+
+def published_immutable(ref_name, releases_text):
+    """Whether `ref_name` already has a published, immutable release.
+
+    Each line is `TAG<TAB>DRAFT<TAB>IMMUTABLE`, as the publish job lists the
+    repository's releases. Such a run retries a publication instead of
+    starting one: it reuses the release's verified signature and manifest,
+    and the uploader compares every published asset's digest and cannot add
+    assets to an immutable release. A missing or draft release is a new
+    publication, and so is a published release that is not immutable.
+    """
+    rows = []
+    for line in releases_text.splitlines():
+        fields = line.split('\t')
+        if (len(fields) != 3 or fields[1] not in ('true', 'false')
+                or fields[2] not in ('true', 'false')):
+            raise ValueError('invalid release listing')
+        if fields[0] == ref_name:
+            rows.append(fields[1:])
+    if len(rows) > 1:
+        raise ValueError('several releases use the release tag')
+    return rows == [['false', 'true']]
+
+
+def checked_order(ref_type, ref_name, tags_text, releases_text):
+    if ref_type != 'tag':
+        raise ValueError('tag order applies only to a release tag')
+    version = ref_name[1:] if ref_name.startswith('v') else ''
+    if not valid_version(version):
+        raise ValueError('invalid release tag')
+    if not valid_release_version(version):
+        raise ValueError('release prerelease must be alpha.N, beta.N or rc.N')
+    tags = tags_text.splitlines()
+    if ref_name not in tags:
+        raise ValueError('release tag is missing from the existing tags')
+    if published_immutable(ref_name, releases_text):
+        # Retrying a published release is idempotent; newer tags of its
+        # version do not make it a lower-precedence publication.
+        print('release version: retrying published immutable release ' + ref_name,
+              file=sys.stderr)
+        return version
+    error = order_error(version, tags)
+    if error is not None:
+        raise ValueError(error)
     return version
 
 
@@ -66,13 +164,31 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--ref-type', choices=('tag', 'branch'), required=True)
     parser.add_argument('--ref-name', required=True)
+    parser.add_argument('--existing-tags', metavar='FILE',
+                        help='existing tag names, one per line, instead of Cargo metadata')
+    parser.add_argument('--releases', metavar='FILE',
+                        help='existing releases as TAG, DRAFT, IMMUTABLE tab-separated lines; '
+                             'required with --existing-tags')
     args = parser.parse_args()
+    if (args.existing_tags is None) != (args.releases is None):
+        parser.error('--existing-tags and --releases go together')
     try:
-        try:
-            metadata = json.load(sys.stdin)
-        except (ValueError, UnicodeError):
-            raise ValueError('invalid Cargo metadata')
-        version = selected_version(metadata, args.ref_type, args.ref_name)
+        if args.existing_tags is not None:
+            texts = []
+            for path, what in ((args.existing_tags, 'existing tags'),
+                               (args.releases, 'release listing')):
+                try:
+                    with open(path, encoding='utf-8') as source:
+                        texts.append(source.read())
+                except (OSError, UnicodeError):
+                    raise ValueError('unreadable ' + what)
+            version = checked_order(args.ref_type, args.ref_name, *texts)
+        else:
+            try:
+                metadata = json.load(sys.stdin)
+            except (ValueError, UnicodeError):
+                raise ValueError('invalid Cargo metadata')
+            version = selected_version(metadata, args.ref_type, args.ref_name)
     except ValueError as error:
         print('release version: ' + str(error), file=sys.stderr)
         return 1

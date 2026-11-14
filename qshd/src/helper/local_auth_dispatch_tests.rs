@@ -60,7 +60,7 @@ mod system_dispatch {
         assert!(state.logins.is_empty());
     }
 
-    use crate::session_owner::host_auth_contract::{AuthMethod,AuthOutcome,AuthReference,HostAuthMessage};
+    use crate::session_owner::host_auth_contract::{AuthMethod,AuthOutcome,AuthReference,AuthRefusal,HostAuthMessage};
     use crate::session_owner::host_protocol::{self,HostDecoder,HostFrame,HostHeader,HostMessage};
     use crate::session_owner::local_channel::AdmittedChannel;
     use std::collections::VecDeque;
@@ -111,6 +111,21 @@ mod system_dispatch {
         fn send(&mut self,message:HostAuthMessage)->u64{
             self.request+=1;let id=self.request;let bytes=host_protocol::encode(&HostFrame{header:HostHeader{role:OwnerRole::Frontend,host:self.host.instance(),request_id:id},message:HostMessage::Authentication(message)}).unwrap();self.raw(&bytes);id
         }
+        fn coalesce(&mut self, messages: &[HostAuthMessage]) -> Vec<u64> {
+            let mut bytes = Vec::new();
+            let mut ids = Vec::new();
+            for message in messages {
+                self.request += 1;
+                ids.push(self.request);
+                bytes.extend(host_protocol::encode(&HostFrame {
+                    header: HostHeader { role: OwnerRole::Frontend, host: self.host.instance(), request_id: self.request },
+                    message: HostMessage::Authentication(message.clone()),
+                }).unwrap());
+            }
+            assert!(bytes.len() <= 4096);
+            assert_eq!(self.front.as_mut().unwrap().frontend_write(self.host.instance(), HostMode::System, &bytes).unwrap(), bytes.len(), "whole coalesced batch admitted before bridge progress");
+            ids
+        }
         fn receive(&mut self)->HostFrame{
             let until=Instant::now()+TEST_RECV_TIMEOUT;
             loop{
@@ -132,8 +147,174 @@ mod system_dispatch {
     fn real_policy_body(){
         let mut f=Fixture::new();let(ticket,nonce)=f.begin();assert_eq!(f.state.host_auth_tickets.len(),1);assert_eq!(f.state.host_nonces.len(),1);f.submit(ticket,signed(&f.key,nonce));assert_eq!(f.state.pending.verifying(),1);
         let mut pin=helper40_pin_verification(&mut f.state);let AuthOutcome::Accepted(context)=f.outcome() else{panic!("real signed proof must authenticate")};assert_ne!(context,ticket);f.seams.settle(&mut f.state,&f.config);assert!(matches!(pin.observe(&mut crate::process_scope::Native),crate::process_scope::Evidence::Exited));
+        f.clock += 10_001;
+        assert_ne!(f.step().unwrap(), Step::Closed, "accepted authentication survives Begin deadline");
         super::super::local_auth_dispatch::assertions::current_revocation(&mut f.bridge,&mut f.state,&mut f.host,f.seams.seams(),&f.config,UNPRIVILEGED,&mut f.clock);
         assert_eq!(f.host.catalog_len(),1);f.finish();
+    }
+    #[test]
+    fn authdispatch529_system_coalesced_requests_keep_ordered_replies() {
+        isolated("coalesced_body");
+    }
+    #[test]
+    #[ignore = "isolated single-threaded helper fixture"]
+    fn coalesced_body() {
+        let mut f = Fixture::new();
+        let sentinel = [0x61; 16];
+        f.state.nonces.insert(sentinel, Instant::now());
+        let begin = HostAuthMessage::Begin { method: AuthMethod::System };
+        let ids = f.coalesce(&[begin.clone(), begin.clone()]);
+        let first = f.receive();
+        assert_eq!(first.header.request_id, ids[0]);
+        let HostMessage::Authentication(HostAuthMessage::Challenge { ticket, nonce: Some(nonce), .. }) = first.message else { panic!("first coalesced Begin must receive Challenge") };
+        let second = f.receive();
+        assert_eq!(second.header.request_id, ids[1]);
+        assert!(matches!(second.message, HostMessage::Authentication(HostAuthMessage::ChallengeRefused { method: AuthMethod::System, reason: AuthRefusal::Unavailable })));
+        assert_eq!(f.state.host_auth_tickets.len(), 1);
+        assert_eq!(f.state.host_nonces.len(), 1);
+        assert!(f.state.host_nonces.contains_key(&nonce));
+        let cancel = f.send(HostAuthMessage::Cancel { ticket });
+        let reply = f.receive();
+        assert_eq!(reply.header.request_id, cancel);
+        assert!(matches!(reply.message, HostMessage::Authentication(HostAuthMessage::Cancelled { ticket: t }) if t == ticket));
+        assert!(f.state.host_nonces.is_empty());
+        assert!(f.state.nonces.contains_key(&sentinel));
+        let (old, old_nonce) = f.begin();
+        let ids = f.coalesce(&[HostAuthMessage::Cancel { ticket: old }, begin]);
+        let first = f.receive();
+        assert_eq!(first.header.request_id, ids[0]);
+        assert!(matches!(first.message, HostMessage::Authentication(HostAuthMessage::Cancelled { ticket }) if ticket == old));
+        let second = f.receive();
+        assert_eq!(second.header.request_id, ids[1]);
+        let HostMessage::Authentication(HostAuthMessage::Challenge { ticket: fresh, nonce: Some(fresh_nonce), .. }) = second.message else { panic!("Cancel/Begin must receive fresh Challenge") };
+        assert_ne!(fresh, old);
+        assert!(!f.state.host_nonces.contains_key(&old_nonce));
+        assert!(f.state.host_nonces.contains_key(&fresh_nonce));
+        assert_eq!(f.state.host_auth_tickets.len(), 1);
+        let cancel = f.send(HostAuthMessage::Cancel { ticket: fresh });
+        let reply = f.receive();
+        assert_eq!(reply.header.request_id, cancel);
+        assert!(matches!(reply.message, HostMessage::Authentication(HostAuthMessage::Cancelled { ticket }) if ticket == fresh));
+        assert!(f.state.host_nonces.is_empty());
+        assert!(f.state.pending.is_empty());
+        assert!(f.state.logins.is_empty());
+        assert_eq!(f.host.catalog_len(), 0);
+        assert!(f.state.nonces.contains_key(&sentinel));
+        f.finish();
+        coalesced_boundaries();
+    }
+    fn coalesced_boundaries() {
+        use super::super::local_auth_dispatch::assertions;
+        use crate::session_owner::protocol::MAX_OWNER_REQUESTS;
+        let begin = HostAuthMessage::Begin { method: AuthMethod::System };
+        let mut f = Fixture::new();
+        f.begin();
+        f.request += 1;
+        assertions::queue_state(&mut f.bridge, f.request, f.clock);
+        assert_eq!(f.state.host_nonces.len(), 1);
+        assert_eq!(f.state.host_auth_tickets.len(), 1);
+        f.finish();
+
+        // The single chunk covers the exact window and one-over with/without
+        // an already submitted real proof's reserved asynchronous reply.
+        for (debt, count, admitted) in [(false, MAX_OWNER_REQUESTS, true),
+            (false, MAX_OWNER_REQUESTS + 1, false),
+            (true, MAX_OWNER_REQUESTS - 1, true), (true, MAX_OWNER_REQUESTS, false)] {
+            let mut f = Fixture::new();
+            let sentinel = [0x62; 16];
+            f.state.nonces.insert(sentinel, Instant::now());
+            let mut ticket = None;
+            if debt {
+                let (t, nonce) = f.begin();
+                ticket = Some(t);
+                f.submit(t, signed(&f.key, nonce));
+                f.seams.settle(&mut f.state, &f.config);
+                assertions::proof_debt_boundaries(&f.bridge);
+            }
+            let proof_id = f.request;
+            let ids = f.coalesce(&vec![begin.clone(); count]);
+            if admitted {
+                for (i, id) in ids.iter().enumerate() {
+                    let reply = f.receive();
+                    assert_eq!(reply.header.request_id, *id);
+                    if !debt && i == 0 {
+                        let HostMessage::Authentication(HostAuthMessage::Challenge { ticket: t, .. }) = reply.message else { panic!("first Begin owns the one registration") };
+                        ticket = Some(t);
+                    } else {
+                        assert!(matches!(reply.message, HostMessage::Authentication(HostAuthMessage::ChallengeRefused { reason: AuthRefusal::Unavailable, .. })));
+                    }
+                    if debt && i == 0 {
+                        assertions::ready_proof_deferred(&mut f.bridge, &mut f.state, &mut f.host, f.clock);
+                    }
+                }
+                if debt {
+                    let reply = f.receive();
+                    assert_eq!(reply.header.request_id, proof_id);
+                    assert!(matches!(reply.message, HostMessage::Authentication(HostAuthMessage::Result { outcome: AuthOutcome::Accepted(_), .. })));
+                }
+                let ticket = ticket.unwrap();
+                let id = f.send(HostAuthMessage::Cancel { ticket });
+                let reply = f.receive();
+                assert_eq!(reply.header.request_id, id);
+                assert!(matches!(reply.message, HostMessage::Authentication(HostAuthMessage::Cancelled { ticket: t }) if t == ticket));
+            } else {
+                assert!(matches!(f.step(), Err(super::super::local_auth_dispatch::BridgeError::Refused)), "over-window batch must fail before admitting new requests");
+                assert_eq!(f.step().unwrap(), Step::Closed);
+            }
+            assert!(f.state.nonces.contains_key(&sentinel));
+            assert!(f.state.host_auth_tickets.is_empty());
+            assert!(f.state.host_nonces.is_empty());
+            assert!(f.state.pending.is_empty());
+            assert!(f.state.logins.is_empty());
+            assert_eq!(f.host.catalog_len(), 0);
+            f.finish();
+        }
+
+        let mut f = Fixture::new();
+        assertions::short_output_timeout(&mut f.bridge);
+        f.coalesce(&[begin.clone(), begin.clone()]);
+        assert!(matches!(f.receive().message, HostMessage::Authentication(HostAuthMessage::Challenge { .. })));
+        let deadline = assertions::queued(&f.bridge, 1);
+        assert_eq!(deadline, f.clock + 2);
+        f.clock = deadline - 1;
+        assert_eq!(f.step().unwrap(), Step::Closed, "second reply retains its enqueue deadline after first drains");
+        assertions::retired(&f.bridge);
+        assert!(f.state.host_auth_tickets.is_empty());
+        assert!(f.state.host_nonces.is_empty());
+        assert!(f.state.pending.is_empty());
+        f.finish();
+
+        let mut f = Fixture::new();
+        let (ticket, nonce) = f.begin();
+        let proof_deadline = f.clock + 10_000;
+        f.submit(ticket, signed(&f.key, nonce));
+        f.seams.settle(&mut f.state, &f.config);
+        f.coalesce(&[begin.clone(), begin.clone()]);
+        assert!(matches!(f.receive().message, HostMessage::Authentication(HostAuthMessage::ChallengeRefused { .. })));
+        assertions::ready_proof_deferred(&mut f.bridge, &mut f.state, &mut f.host, f.clock);
+        assertions::queued(&f.bridge, 1);
+        f.clock = proof_deadline - 1;
+        assert_eq!(f.step().unwrap(), Step::Closed, "ready proof held by backpressure still expires rather than becoming a late acceptance");
+        assertions::retired(&f.bridge);
+        assert_eq!(f.host.catalog_len(), 0);
+        assert!(f.state.pending.is_empty());
+        f.finish();
+
+        let mut f = Fixture::new();
+        let (ticket, nonce) = f.begin();
+        f.submit(ticket, signed(&f.key, nonce));
+        assert!(matches!(f.outcome(), AuthOutcome::Accepted(_)));
+        f.seams.settle(&mut f.state, &f.config);
+        f.coalesce(&[begin.clone(), begin.clone(), begin]);
+        assert!(matches!(f.receive().message, HostMessage::Authentication(HostAuthMessage::ChallengeRefused { .. })));
+        assertions::queued(&f.bridge, 2);
+        f.clock += 1;
+        assertions::start_queued_current(&mut f.bridge, &mut f.state, &mut f.host, &f.config, UNPRIVILEGED, f.clock);
+        f.seams.settle(&mut f.state, &f.config);
+        f.step().unwrap();
+        assertions::queued(&f.bridge, 1);
+        assertions::queued_current_completed(&f.bridge);
+        f.finish();
     }
     #[test] fn authdispatch529_system_forged_signature_and_unlisted_key_refuse(){isolated("forged_body");}
     #[test] #[ignore="isolated single-threaded helper fixture"]
@@ -161,7 +342,29 @@ mod system_dispatch {
     fn wrong_binding_body(){let mut f=Fixture::new();let mut other=global_host();f.clock+=1;assert!(f.bridge.step(f.seams.seams(),&mut f.state,&mut other,&f.config,UNPRIVILEGED,f.clock).is_err());assert_eq!(other.catalog_len(),0);let(ticket,_)=f.begin();f.send(HostAuthMessage::PersonalReport{ticket,key:[1;32],session_id:1,token:[2;16]});assert!(f.step().is_err());f.finish();let mut f=Fixture::new();f.send(HostAuthMessage::Begin{method:AuthMethod::Personal});assert!(f.step().is_err());f.finish();}
     #[test] fn authdispatch529_system_deadline_and_partial_input_expire_inert(){isolated("deadline_body");}
     #[test] #[ignore="isolated single-threaded helper fixture"]
-    fn deadline_body(){let mut f=Fixture::new();f.begin();f.clock+=10_001;assert_eq!(f.step().unwrap(),Step::Closed);assert!(f.state.host_nonces.is_empty());f.finish();let mut f=Fixture::new();f.raw(b"QSHH");f.step().unwrap();f.clock+=10_001;assert_eq!(f.step().unwrap(),Step::Closed);assert!(f.state.pending.is_empty());f.finish();}
+    fn deadline_body(){let mut f=Fixture::new();f.begin();f.clock+=10_001;assert_eq!(f.step().unwrap(),Step::Closed);assert!(f.state.host_nonces.is_empty());f.finish();let mut f=Fixture::new();f.raw(b"QSHH");f.step().unwrap();f.clock+=10_001;assert_eq!(f.step().unwrap(),Step::Closed);assert!(f.state.pending.is_empty());f.finish();
+        let mut f = Fixture::new();
+        f.config.verify_timeout = Duration::from_millis(80);
+        let (ticket, nonce) = f.begin();
+        f.submit(ticket, signed(&f.key, nonce));
+        assert!(matches!(f.outcome(), AuthOutcome::Accepted(_)));
+        f.seams.settle(&mut f.state, &f.config);
+        f.clock += 10_001;
+        assert_ne!(f.step().unwrap(), Step::Closed);
+        f.clock += 1;
+        let attempt = super::super::local_auth_dispatch::assertions::expiring_current(
+            &mut f.bridge, &mut f.state, &mut f.host, &f.config,
+            AccountSwitches { read_keys: read_keys_that_never_finishes, ..UNPRIVILEGED }, f.clock);
+        assert_eq!(f.state.pending.verifying(), 1);
+        let mut pin = helper40_pin_verification(&mut f.state);
+        f.clock += 1;
+        assert_eq!(f.step().unwrap(), Step::Closed, "unfinished current policy keeps its own deadline after acceptance");
+        assert_eq!(f.state.pending.verifying(), 1, "logical expiry cannot settle physical custody");
+        assert!(f.host.create_session(attempt, f.clock).is_err());
+        f.seams.settle(&mut f.state, &f.config);
+        assert!(matches!(pin.observe(&mut crate::process_scope::Native), crate::process_scope::Evidence::Exited));
+        f.finish();
+    }
 
     #[test] fn authdispatch529_system_close_loses_sink_without_releasing_real_child(){isolated("close_debt_body");}
     #[test] #[ignore="isolated single-threaded helper fixture"]

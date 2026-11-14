@@ -14,6 +14,7 @@ C1_SUFFIXES = (
     'cancel_unsubmitted_cleans_only_exact_nonce',
     'cap_before_spend_cleans_exact_remaining_nonce',
     'close_loses_sink_without_releasing_real_child',
+    'coalesced_requests_keep_ordered_replies',
     'current_policy_rejects_other_real_seam',
     'deadline_and_partial_input_expire_inert',
     'eof_retires_real_admitted_frontend',
@@ -60,7 +61,7 @@ def library_gate():
 
 
 def synthetic_log(required, *, missing=None, renamed=None, ignored=None,
-                  failed=None, body_count=101, filtered=0):
+                  failed=None, body_count=102, filtered=0):
     """Well-counted synthetic outcomes isolate each gate's refusal condition."""
     outcomes = []
     for name in required:
@@ -71,7 +72,7 @@ def synthetic_log(required, *, missing=None, renamed=None, ignored=None,
         status = "ignored" if name == ignored else "FAILED" if name == failed else "ok"
         outcomes.append((name, status))
     # A required ignored wrapper replaces one synthetic ignored body, so the
-    # total remains 101: rejection cannot depend only on a count mismatch.
+    # total remains 102: rejection cannot depend only on a count mismatch.
     bodies = body_count - sum(status == "ignored" for _, status in outcomes)
     outcomes.extend((f"synthetic_parser_body_{i}", "ignored") for i in range(bodies))
     passed = sum(status == "ok" for _, status in outcomes)
@@ -106,7 +107,7 @@ class NoSilentSkipsControls(unittest.TestCase):
                        XDG_CACHE_HOME=directory, TMPDIR=directory, HISTFILE="/dev/null")
             env.pop("SSH_AUTH_SOCK", None)
             env.pop("SSH_AGENT_PID", None)
-            args = ["sh", str(ROOT / "scripts/no-silent-skips.sh"), str(path), "--ignored", "101"]
+            args = ["sh", str(ROOT / "scripts/no-silent-skips.sh"), str(path), "--ignored", "102"]
             for name in required:
                 args.extend(["--require", name])
             args.extend(ALLOWED)
@@ -116,10 +117,10 @@ class NoSilentSkipsControls(unittest.TestCase):
 
     def test_workflow_requires_exact_reviewed_union(self):
         ignored, required, allowed = library_gate()
-        self.assertEqual(ignored, 101)
+        self.assertEqual(ignored, 102)
         actual = [name for name in required if name.startswith(C1_PREFIX)]
         self.assertCountEqual(actual, C1_REQUIRED)
-        self.assertEqual(len(actual), 16)
+        self.assertEqual(len(actual), 17)
         self.assertEqual(tuple(allowed), ALLOWED)
         self.assertIn("python3 -B -m unittest discover -s scripts/tests -p 'test_no_silent_skips.py'",
                       (ROOT / ".github/workflows/ci.yml").read_text())
@@ -149,7 +150,8 @@ class NoSilentSkipsControls(unittest.TestCase):
                 self.assertNotEqual(self.check_log(synthetic_log(self.required, failed=name)).returncode, 0)
 
     def test_wrong_ignored_count_refuses(self):
-        self.assertNotEqual(self.check_log(synthetic_log(self.required, body_count=102)).returncode, 0)
+        for count in (101, 103):
+            self.assertNotEqual(self.check_log(synthetic_log(self.required, body_count=count)).returncode, 0)
 
     def test_zero_passed_refuses_without_requiring_a_wrapper(self):
         self.assertNotEqual(self.check_log(synthetic_log(()), required=()).returncode, 0)

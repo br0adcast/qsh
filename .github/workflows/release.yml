@@ -742,6 +742,25 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/check-release-settings.py --repo "$GITHUB_REPOSITORY"
+      # SemVer precedence drives update offers, downgrade refusal and remote
+      # daemon cache selection. Refuse a tag that does not outrank every other
+      # tag of its major.minor.patch before anything is signed (#554). A
+      # retry of the tag's already published immutable release is exempt:
+      # it reuses the verified signature and cannot change any asset.
+      - name: Require the tag to follow its version's existing tags
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tags="$RUNNER_TEMP/version-tags"
+          releases="$RUNNER_TEMP/version-releases"
+          git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY.git" 'refs/tags/v*' \
+            | awk '{ sub(/^refs\/tags\//, "", $2); print $2 }' > "$tags"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | [.tag_name, (.draft | tostring), (.immutable | tostring)] | @tsv' > "$releases"
+          python3 scripts/check-release-version.py --ref-type "$GITHUB_REF_TYPE" \
+            --ref-name "$GITHUB_REF_NAME" --existing-tags "$tags" --releases "$releases"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
