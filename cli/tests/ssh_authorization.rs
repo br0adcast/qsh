@@ -118,6 +118,7 @@ fn remote_home() -> (tempfile::TempDir, fake::Shell, std::path::PathBuf) {
     let shell = fake::Shell {
         home: home.path().to_path_buf(),
         env,
+        hold: None,
     };
     (home, shell, qshd)
 }
@@ -369,24 +370,24 @@ fn bootstrap() {
     assert!(!shown.contains("Key fingerprint"), "{shown}");
     assert!(!home.path().join("qsh/ssh_bindings.json").exists());
 }
-/// Teardown owns what `start_shell` started: a command that ignores stdin
-/// EOF and keeps its output open, here through a background child too, is
-/// killed with its process group, reaped, and its readers joined before
-/// `Server::drop` returns, even after the client has gone.
-#[test]
-fn shell_fixture_teardown_kills_and_reaps_a_blocking_command() {
-    use client::channel::{ChannelSubstrate, SubstrateEvent};
-    use std::sync::atomic::Ordering;
-    use transport::channel::{ChannelKind, OpenRequest};
-    struct Forward(std::sync::mpsc::Sender<SubstrateEvent>);
-    impl ssh::SshEvents for Forward {
-        fn on_channel(&self, event: SubstrateEvent) {
-            let _ = self.0.send(event);
-        }
-        fn on_closed(&self, _: String) {}
+struct Forward(std::sync::mpsc::Sender<client::channel::SubstrateEvent>);
+impl ssh::SshEvents for Forward {
+    fn on_channel(&self, event: client::channel::SubstrateEvent) {
+        let _ = self.0.send(event);
     }
-    let (remote, shell, _) = remote_home();
-    let ssh = fake::Server::start_shell(shell);
+    fn on_closed(&self, _: String) {}
+}
+/// An SSH login to `ssh` that runs `command` on one channel.
+fn run_on_fixture(
+    ssh: &fake::Server,
+    command: &[u8],
+) -> (
+    ssh::SshConnection,
+    ssh::SshSubstrate,
+    std::sync::mpsc::Receiver<client::channel::SubstrateEvent>,
+) {
+    use client::channel::ChannelSubstrate;
+    use transport::channel::{ChannelKind, OpenRequest};
     let (tx, rx) = std::sync::mpsc::channel();
     let (conn, mut sub) = ssh::connect(
         ssh::SshParams {
@@ -414,9 +415,46 @@ fn shell_fixture_teardown_kills_and_reaps_a_blocking_command() {
         cols: 0,
         rows: 0,
         screen: false,
-        command: b"sleep 600 & echo $! > \"$HOME/background\"; echo $$ > \"$HOME/command\"; echo started; exec sleep 600".to_vec(),
+        command: command.to_vec(),
     })
     .unwrap();
+    (conn, sub, rx)
+}
+/// The pid a fixture command wrote to `name` in the remote home.
+fn recorded_pid(remote: &tempfile::TempDir, name: &str) -> rustix::process::Pid {
+    let raw: i32 = std::fs::read_to_string(remote.path().join(name))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    rustix::process::Pid::from_raw(raw).unwrap()
+}
+/// Whether `pid` is a child of this process that has exited and is not yet
+/// reaped. Asking does not reap it, and a reaped pid is not our child.
+fn exited_unreaped(pid: rustix::process::Pid) -> bool {
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+    matches!(
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+        ),
+        Ok(Some(_))
+    )
+}
+/// Teardown owns what `start_shell` started: a command that ignores stdin
+/// EOF and keeps its output open, here through a background child too, is
+/// killed with its process group, reaped, and its readers joined before
+/// `Server::drop` returns, even after the client has gone.
+#[test]
+fn shell_fixture_teardown_kills_and_reaps_a_blocking_command() {
+    use client::channel::SubstrateEvent;
+    use std::sync::atomic::Ordering;
+    let (remote, shell, _) = remote_home();
+    let ssh = fake::Server::start_shell(shell);
+    let (conn, _sub, rx) = run_on_fixture(
+        &ssh,
+        b"sleep 600 & echo $! > \"$HOME/background\"; echo $$ > \"$HOME/command\"; echo started; exec sleep 600",
+    );
     loop {
         match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
             SubstrateEvent::Data { bytes, .. } if bytes.starts_with(b"started") => break,
@@ -426,20 +464,16 @@ fn shell_fixture_teardown_kills_and_reaps_a_blocking_command() {
             _ => {}
         }
     }
-    let pid = |name: &str| {
-        let raw: i32 = std::fs::read_to_string(remote.path().join(name))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        rustix::process::Pid::from_raw(raw).unwrap()
-    };
-    let (command, background) = (pid("command"), pid("background"));
+    let command = recorded_pid(&remote, "command");
+    let background = recorded_pid(&remote, "background");
     assert_eq!(ssh.activity.running.load(Ordering::SeqCst), 1);
     conn.close();
     let activity = ssh.activity.clone();
     drop(ssh);
     assert_eq!(activity.running.load(Ordering::SeqCst), 0);
+    let decided = activity.teardown.lock().unwrap();
+    assert_eq!(decided.len(), 1);
+    assert!(decided[0].signalled);
     // The command's own child was reaped by its worker before drop returned;
     // the background child, reparented when its parent died, goes as well.
     assert!(rustix::process::test_kill_process(command).is_err());
@@ -447,4 +481,52 @@ fn shell_fixture_teardown_kills_and_reaps_a_blocking_command() {
         background
     )
     .is_err()));
+}
+/// Teardown signals a command's group only while its worker has custody of
+/// the pid. A command that exits by itself is held at each side of the
+/// release while teardown decides: before it, the unreaped zombie still
+/// holds the id and is signalled; after it, before the reap, nothing is
+/// signalled, so a reaped and reused id can never be.
+#[test]
+fn shell_fixture_teardown_signals_only_while_the_worker_has_custody() {
+    use std::sync::atomic::Ordering;
+    for (stage, signalled) in [(fake::Stage::Exited, true), (fake::Stage::Released, false)] {
+        let (remote, mut shell, _) = remote_home();
+        let hold = fake::Hold::at(stage);
+        shell.hold = Some(hold.clone());
+        let ssh = fake::Server::start_shell(shell);
+        let (conn, _sub, _events) = run_on_fixture(&ssh, b"echo $$ > \"$HOME/command\"; exit 7");
+        assert!(
+            hold.reached(),
+            "{stage:?}: the worker never reached the hold"
+        );
+        let child = recorded_pid(&remote, "command");
+        assert!(exited_unreaped(child), "{stage:?}");
+        conn.close();
+        let activity = ssh.activity.clone();
+        let teardown = std::thread::spawn(move || drop(ssh));
+        assert!(
+            wait_until(|| !activity.teardown.lock().unwrap().is_empty()),
+            "{stage:?}: teardown never decided"
+        );
+        // Decided while the worker was still held, before any reaping.
+        assert!(exited_unreaped(child), "{stage:?}");
+        hold.release();
+        teardown.join().unwrap();
+        {
+            let decided = activity.teardown.lock().unwrap();
+            assert_eq!(decided.len(), 1, "{stage:?}");
+            assert_eq!(decided[0].group, child.as_raw_pid(), "{stage:?}");
+            assert_eq!(decided[0].signalled, signalled, "{stage:?}");
+        }
+        assert_eq!(activity.running.load(Ordering::SeqCst), 0, "{stage:?}");
+        let finished = activity.finished.lock().unwrap();
+        assert_eq!(finished.len(), 1, "{stage:?}");
+        // SIGKILL to an exited group changes nothing: the exit stands.
+        assert_eq!(finished[0].code, 7, "{stage:?}");
+        assert!(
+            !exited_unreaped(child),
+            "{stage:?}: the worker did not reap"
+        );
+    }
 }

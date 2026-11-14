@@ -11,7 +11,7 @@ use std::{
     process::{ChildStdin, Stdio},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex, PoisonError,
     },
 };
 #[derive(Default)]
@@ -27,17 +27,80 @@ pub struct Activity {
     /// Commands whose worker has not yet reaped the child and joined its
     /// pipe readers.
     pub running: AtomicUsize,
+    /// What `Server::drop` decided for each command still owned at teardown.
+    pub teardown: Mutex<Vec<Teardown>>,
 }
 pub struct Finished {
     pub command: String,
     pub code: i32,
     pub stdout: Vec<u8>,
 }
+pub struct Teardown {
+    pub group: i32,
+    /// Whether teardown sent SIGKILL to the command's process group.
+    pub signalled: bool,
+}
 /// Where `Server::start_shell` runs commands: `/bin/sh -c` with exactly
 /// `env`, in `home`. Without it every command reports no installed qshd.
 pub struct Shell {
     pub home: PathBuf,
     pub env: Vec<(String, String)>,
+    /// Holds every command's worker at one point of its reaping.
+    pub hold: Option<Arc<Hold>>,
+}
+/// A point in a worker's reaping, after its command has exited.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stage {
+    /// The child is a zombie and the worker still has custody of its pid.
+    Exited,
+    /// The worker has given up custody to reap; the child is not reaped yet.
+    Released,
+}
+/// Stops each worker that reaches `stage` until `release`, or until
+/// `HOLD_LIMIT` passes, so a failed test still lets its commands settle.
+pub struct Hold {
+    stage: Stage,
+    state: Mutex<HoldState>,
+    changed: Condvar,
+}
+#[derive(Default)]
+struct HoldState {
+    reached: bool,
+    released: bool,
+}
+const HOLD_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+impl Hold {
+    pub fn at(stage: Stage) -> Arc<Self> {
+        Arc::new(Self {
+            stage,
+            state: Mutex::default(),
+            changed: Condvar::new(),
+        })
+    }
+    /// Whether a worker reached the stage within 20 seconds.
+    pub fn reached(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(20), |s| !s.reached)
+            .unwrap();
+        state.reached
+    }
+    pub fn release(&self) {
+        self.state.lock().unwrap().released = true;
+        self.changed.notify_all();
+    }
+    fn pass(&self, stage: Stage) {
+        if stage != self.stage {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.reached = true;
+        self.changed.notify_all();
+        let _ = self
+            .changed
+            .wait_timeout_while(state, HOLD_LIMIT, |s| !s.released);
+    }
 }
 pub struct Server {
     pub port: u16,
@@ -48,11 +111,15 @@ pub struct Server {
     running: Arc<Mutex<Vec<Running>>>,
 }
 /// One command `start_shell` started. Its worker owns the child, joins the
-/// child's pipe readers, then reaps it; `settled` disconnects when the
-/// worker ends. Until then the child is unreaped, so its pid, which is also
-/// its process group, cannot be reused.
+/// child's pipe readers, and waits for the exit without reaping, so the
+/// zombie still holds the pid, which is also the group id. Then, under
+/// `reaping`, it marks custody released, and only then reaps. Teardown
+/// signals `group` only under `reaping` while it is unmarked; the id is
+/// this command's for as long as that lock is held. `settled` disconnects
+/// when the worker ends.
 struct Running {
     group: rustix::process::Pid,
+    reaping: Arc<Mutex<bool>>,
     settled: std::sync::mpsc::Receiver<()>,
     worker: std::thread::JoinHandle<()>,
 }
@@ -131,18 +198,26 @@ impl Drop for Server {
         let _ = self.stop.take().unwrap().send(());
         let _ = self.thread.take().unwrap().join();
         let running = std::mem::take(&mut *self.running.lock().unwrap());
-        // Only this server's own unsettled commands, by their whole process
-        // group: a child the command left behind may hold the pipes too.
+        // Only commands whose worker still has custody of the pid, by their
+        // whole process group: a child the command left behind may hold the
+        // pipes too. Holding `reaping` across the signal keeps the worker
+        // from reaping, and so from releasing the id, until it is sent.
         for command in &running {
-            if matches!(
-                command.settled.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ) {
+            let reaping = command
+                .reaping
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let signalled = !*reaping;
+            if signalled {
                 let _ = rustix::process::kill_process_group(
                     command.group,
                     rustix::process::Signal::KILL,
                 );
             }
+            self.activity.teardown.lock().unwrap().push(Teardown {
+                group: command.group.as_raw_pid(),
+                signalled,
+            });
         }
         let deadline = std::time::Instant::now() + SETTLE;
         let mut unsettled = Vec::new();
@@ -276,6 +351,9 @@ impl russh::server::Handler for Handler {
             let (stdout, stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
             let activity = self.activity.clone();
             let (settle, settled) = std::sync::mpsc::channel::<()>();
+            let reaping = Arc::new(Mutex::new(false));
+            let custody = reaping.clone();
+            let hold = shell.hold.clone();
             activity.running.fetch_add(1, Ordering::SeqCst);
             let worker = std::thread::spawn(move || {
                 let _settle = settle;
@@ -289,6 +367,25 @@ impl russh::server::Handler for Handler {
                 };
                 let stdout = out.join().unwrap_or_default();
                 let _ = err.join();
+                // Wait without reaping: the zombie keeps the pid, and so the
+                // group id, this command's while teardown may still signal.
+                loop {
+                    match rustix::process::waitid(
+                        rustix::process::WaitId::Pid(group),
+                        rustix::process::WaitIdOptions::EXITED
+                            | rustix::process::WaitIdOptions::NOWAIT,
+                    ) {
+                        Err(rustix::io::Errno::INTR) => {}
+                        exited => {
+                            exited.expect("wait for the command to exit");
+                            break;
+                        }
+                    }
+                }
+                let pass = |stage| hold.as_ref().map_or((), |hold| hold.pass(stage));
+                pass(Stage::Exited);
+                *custody.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                pass(Stage::Released);
                 let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(255);
                 activity.finished.lock().unwrap().push(Finished {
                     command,
@@ -300,6 +397,7 @@ impl russh::server::Handler for Handler {
             });
             self.running.lock().unwrap().push(Running {
                 group,
+                reaping,
                 settled,
                 worker,
             });
