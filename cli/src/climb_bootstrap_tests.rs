@@ -1275,8 +1275,8 @@ fn successful_selected_connection_discards_boundary_before_established_recovery(
     assert_eq!(fixture.decisions.load(Ordering::SeqCst), 1);
     assert_eq!(
         fixture.activity.connections.load(Ordering::SeqCst),
-        3,
-        "normal recovery may query read-only SSH metadata at its failed first route"
+        2,
+        "recovery reads SSH metadata on its own bring-up login at the failed first route"
     );
     assert_eq!(peer.accepted.load(Ordering::SeqCst), 2);
 }

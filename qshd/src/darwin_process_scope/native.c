@@ -20,8 +20,8 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
-/* Private compatibility layout reviewed against xnu-10063.141.1 and
- * xnu-11417.140.69;
+/* Private compatibility layout reviewed against xnu-10063.141.1,
+ * xnu-11417.140.69 and xnu-12377.1.9 through xnu-12377.121.6;
  * bsd/sys/proc_info_private.h. This is not a stable public SDK promise. */
 struct identity_record {
     uint8_t uuid[16]; uint64_t uniqueid, parent_uniqueid;

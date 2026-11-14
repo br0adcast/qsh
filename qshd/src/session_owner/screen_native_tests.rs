@@ -5,8 +5,17 @@ use crate::session_owner::{
     screen_owner::{HostScreenLease, RetainedScreenFactory},
     screen_recovery::*,
 };
+use crate::test_support::borrowed_scope::{
+    self, DiagnosticAssertion as Check, DiagnosticPhase as Phase,
+};
 use std::io::Write as _;
 use transport::channel_geometry::{GeometryOutcome, ResizeRequestId};
+fn checkpoint(code: Check) {
+    borrowed_scope::diagnostic_assertion(code, Duration::ZERO);
+}
+fn phase(code: Phase) {
+    borrowed_scope::diagnostic_phase(code);
+}
 static TAIL_RETRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const SCREEN_NAME:&str="session_owner::engine_native_tests::screen::owner_engine_screen_child_survives_history_gap_query_and_resize";
 fn quoted(value: &str) -> String {
@@ -177,13 +186,17 @@ impl ScreenHost {
         serial: u8,
     ) -> RecoveryMode {
         let until = Instant::now() + Duration::from_secs(5);
+        checkpoint(Check::ScreenCatalogWait);
         while !engine.catalog_available() {
             assert!(Instant::now() < until);
             tokio::task::yield_now().await;
         }
         let channel = client.cursor().channel;
+        checkpoint(Check::ScreenRequirements);
         let quote = engine.screen_recovery_requirements(channel).unwrap();
+        checkpoint(Check::ScreenCatalog);
         let mut catalog = engine.catalog(front, self.transfer(channel, 0)).unwrap();
+        checkpoint(Check::ScreenAllowance);
         let bytes = self.spec(
             channel,
             ReservationKind::SnapshotTransfer,
@@ -204,6 +217,7 @@ impl ScreenHost {
             quote,
         )
         .unwrap();
+        checkpoint(Check::ScreenRecoveryStart);
         let (request, evidence) = client.request(front.attachment());
         let request_id = RequestId::new(1000 + u64::from(serial)).unwrap();
         let mut producer = engine
@@ -219,23 +233,30 @@ impl ScreenHost {
             .unwrap();
         let mode = producer.start().mode;
         if serial == 2 {
+            checkpoint(Check::ScreenRecoveryGap);
             assert!(
                 producer.start().gap,
                 "detached raw history did not expose its real gap"
             );
         }
+        checkpoint(Check::ScreenRecoveryBegin);
         client.begin(request_id, request, producer.start()).unwrap();
+        checkpoint(Check::ScreenRecoveryChunk);
         while let Some(chunk) = producer.next_chunk().unwrap() {
             client.consume(&chunk).unwrap();
         }
+        checkpoint(Check::ScreenRecoveryEnd);
         let (end, ready) = producer.end().unwrap();
+        checkpoint(Check::ScreenRecoveryAccept);
         catalog
             .accept_consumed(client.finish(end, ready).unwrap())
             .unwrap();
+        checkpoint(Check::ScreenCatalogWait);
         while !engine.catalog_available() {
             assert!(Instant::now() < until);
             tokio::task::yield_now().await;
         }
+        checkpoint(Check::ScreenRecoveryFinish);
         engine.finish_recovery(front, catalog).unwrap();
         mode
     }
@@ -292,6 +313,7 @@ async fn wait_tail(
     needle: &str,
 ) -> String {
     let until = Instant::now() + Duration::from_secs(10);
+    checkpoint(Check::ScreenProgress);
     loop {
         let bytes = tail(engine, front, channel);
         if bytes.contains(needle) {
@@ -305,6 +327,7 @@ async fn wait_tail(
     }
 }
 fn identity_from_tail(bytes: &str, stage: u64) -> Identity {
+    checkpoint(Check::ScreenIdentity);
     observed_identity(
         bytes
             .lines()
@@ -323,6 +346,7 @@ fn compare_client(
     channel: ChannelInstance,
     client: &mut ScreenConsumer,
 ) {
+    checkpoint(Check::ScreenCursor);
     let (boundary, snapshot) = engine.screen_snapshot_for_test(channel);
     let mut buffer = [0; 4096];
     while client.cursor().offset < boundary {
@@ -330,12 +354,15 @@ fn compare_client(
         let want = usize::try_from(boundary - offset)
             .unwrap()
             .min(buffer.len());
+        checkpoint(Check::ScreenCanonicalCopy);
         let n = engine
             .copy_output(front, channel, offset, &mut buffer[..want])
             .unwrap();
         assert!(n > 0);
+        checkpoint(Check::ScreenCanonicalConsume);
         client.consume_live(offset, &buffer[..n]).unwrap();
     }
+    checkpoint(Check::ScreenCanonicalEqual);
     assert_eq!(
         client.snapshot(),
         snapshot,
@@ -346,16 +373,14 @@ fn compare_client(
 fn owner_engine_screen_child_survives_history_gap_query_and_resize() {
     if std::env::var("QSH529_SCREEN_CHILD").as_deref() == Ok("1") {
         // Keep fixed fixture-only panic location evidence available after PTY teardown.
-        let diagnostic = std::env::var_os("QSH529_SCREEN_PANIC").unwrap();
+        let diagnostic = std::path::PathBuf::from(std::env::var_os("QSH529_SCREEN_PANIC").unwrap());
         std::panic::set_hook(Box::new(move |info| {
             if let Some(location) = info.location() {
-                let file = std::path::Path::new(location.file())
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy();
-                let _ = std::fs::write(
+                borrowed_scope::diagnostic_write_child_panic(
                     &diagnostic,
-                    format!("child-panic file={file} line={}\n", location.line()),
+                    location.file(),
+                    location.line(),
+                    location.column(),
                 );
             }
         }));
@@ -363,6 +388,9 @@ fn owner_engine_screen_child_survives_history_gap_query_and_resize() {
         return;
     }
     let outcome = crate::test_support::borrowed_scope::run_exact(SCREEN_NAME, 0, || {
+        borrowed_scope::diagnostic_capture_locations();
+        phase(Phase::ScreenSetup);
+        checkpoint(Check::ScreenRuntime);
         note("screen529 stage=runtime");
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -375,9 +403,8 @@ fn owner_engine_screen_child_survives_history_gap_query_and_resize() {
 }
 async fn screen_body() {
     note("screen529 stage=setup");
-    crate::test_support::borrowed_scope::diagnostic_phase(
-        crate::test_support::borrowed_scope::DiagnosticPhase::Setup,
-    );
+    phase(Phase::ScreenSetup);
+    checkpoint(Check::ScreenSetup);
     let locator = SessionLocator {
         session: RetainedSessionId::new([91; 16]).unwrap(),
         owner: OwnerInstance::new([92; 16]).unwrap(),
@@ -472,10 +499,12 @@ async fn screen_body() {
     let control = host.spec(channel, ReservationKind::ControlQueue, 512 * 1024, None);
     let temp = tempfile::tempdir().unwrap();
     let go = temp.path().join("go");
-    let panic_path = temp.path().join("child-panic");
+    let panic_path = borrowed_scope::diagnostic_child_panic_path();
     let executable = std::env::current_exe().unwrap();
     let command=format!("/usr/bin/env QSH529_SCREEN_CHILD=1 QSH529_SCREEN_GO={} QSH529_SCREEN_PANIC={} {} --exact {SCREEN_NAME} --nocapture",quoted(go.to_str().unwrap()),quoted(panic_path.to_str().unwrap()),quoted(executable.to_str().unwrap())).into_bytes();
     note("screen529 stage=before-open");
+    phase(Phase::ScreenOpen);
+    checkpoint(Check::ScreenOpen);
     engine
         .open_screen(
             &first,
@@ -500,19 +529,20 @@ async fn screen_body() {
         .await
         .unwrap();
     note("screen529 stage=opened");
-    crate::test_support::borrowed_scope::diagnostic_phase(
-        crate::test_support::borrowed_scope::DiagnosticPhase::Identity,
-    );
+    phase(Phase::ScreenInitialIdentity);
     let initial = wait_tail(&engine, &first, channel, "progress 0").await;
     let identity = identity_from_tail(&initial, 0);
     note("screen529 stage=initial-identity");
+    phase(Phase::ScreenInitialRecovery);
+    checkpoint(Check::ScreenClient);
     let mut receiver = host.client(&engine, channel, 97);
-    assert_eq!(
-        host.recover(&engine, &first, &mut receiver, 1).await,
-        RecoveryMode::ScreenReset
-    );
+    let initial_mode = host.recover(&engine, &first, &mut receiver, 1).await;
+    checkpoint(Check::ScreenRecoveryMode);
+    assert_eq!(initial_mode, RecoveryMode::ScreenReset);
     compare_client(&engine, &first, channel, &mut receiver);
     note("screen529 stage=initial-recovery");
+    phase(Phase::ScreenInput);
+    checkpoint(Check::ScreenInput);
     let frontend = Frontend::new();
     let epoch = InputEpoch::new([96; 16]).unwrap();
     let burst = b"BURST529\n";
@@ -522,45 +552,60 @@ async fn screen_body() {
         .accepted()
         .await
         .unwrap();
+    checkpoint(Check::ScreenCommitted);
     wait_committed(&engine, channel, burst.len() as u64).await;
     note("screen529 stage=before-detach");
+    phase(Phase::ScreenFrontendLoss);
+    checkpoint(Check::ScreenBarrier);
     frontend.disappear(true);
     drop(first);
     wait_barrier(&engine).await;
+    checkpoint(Check::ScreenGate);
     std::fs::write(&go, b"go").unwrap();
     note("screen529 stage=detached-go");
     // The gate is released only after owned frontend death and actual fence.
+    phase(Phase::ScreenDetachedBurst);
+    checkpoint(Check::ScreenDetachedBytes);
     let until = Instant::now() + Duration::from_secs(10);
     while engine.output_bounds_for_test(channel).1 < 1_048_576 {
         assert!(Instant::now() < until);
         tokio::task::yield_now().await;
     }
     note("screen529 stage=megabyte-observed");
+    phase(Phase::ScreenReattach);
+    checkpoint(Check::ScreenAttach);
     let second = engine.attach_trusted(attachment(locator, 2)).unwrap();
     let after = wait_tail(&engine, &second, channel, "progress 1").await;
     assert_eq!(identity_from_tail(&after, 1), identity);
     note("screen529 stage=detached-identity");
+    phase(Phase::ScreenGapRecovery);
+    checkpoint(Check::ScreenClient);
     drop(receiver);
     let mut receiver = host.client(&engine, channel, 98);
-    assert_eq!(
-        host.recover(&engine, &second, &mut receiver, 2).await,
-        RecoveryMode::ScreenReset
-    );
+    let gap_mode = host.recover(&engine, &second, &mut receiver, 2).await;
+    checkpoint(Check::ScreenRecoveryMode);
+    assert_eq!(gap_mode, RecoveryMode::ScreenReset);
+    phase(Phase::ScreenQuery);
     wait_tail(&engine, &second, channel, "REPLY529 seen=1").await;
     compare_client(&engine, &second, channel, &mut receiver);
     let check = b"CHECK529\n";
+    checkpoint(Check::ScreenInput);
     engine
         .user_input(&second, channel, epoch, burst.len() as u64, check)
         .unwrap()
         .accepted()
         .await
         .unwrap();
+    checkpoint(Check::ScreenQueryReply);
     wait_tail(&engine, &second, channel, "CHECK529 replies=1").await;
+    phase(Phase::ScreenResize);
+    checkpoint(Check::ScreenGeometry);
     let geometry = engine
         .resize(&second, channel, ResizeRequestId::new(1).unwrap(), 100, 30)
         .unwrap();
     assert_eq!(geometry.outcome, GeometryOutcome::Applied);
     assert_eq!((geometry.cols, geometry.rows), (100, 30));
+    checkpoint(Check::ScreenInputStatus);
     assert!(engine
         .user_input(
             &second,
@@ -570,11 +615,13 @@ async fn screen_body() {
             b""
         )
         .is_err());
-    assert_eq!(
-        host.recover(&engine, &second, &mut receiver, 3).await,
-        RecoveryMode::ScreenReset
-    );
+    phase(Phase::ScreenPostResizeRecovery);
+    let resize_mode = host.recover(&engine, &second, &mut receiver, 3).await;
+    checkpoint(Check::ScreenRecoveryMode);
+    assert_eq!(resize_mode, RecoveryMode::ScreenReset);
     compare_client(&engine, &second, channel, &mut receiver);
+    phase(Phase::ScreenFinalChecks);
+    checkpoint(Check::ScreenInput);
     let request = b"SIZE529\n";
     engine
         .user_input(
@@ -600,10 +647,13 @@ async fn screen_body() {
         identity_from_tail(&tail(&engine, &second, channel), 3),
         identity
     );
+    checkpoint(Check::ScreenQueryReply);
     assert!(!final_tail.contains("REPLY529 seen=2"));
     compare_client(&engine, &second, channel, &mut receiver);
+    checkpoint(Check::ScreenHistory);
     let (start, end) = engine.output_bounds_for_test(channel);
     assert!(start > 0 && end > 1_048_576);
+    checkpoint(Check::ScreenInputStatus);
     let position = engine.input_position(channel).unwrap();
     assert_eq!(position.epoch, epoch);
     assert_eq!(
@@ -611,14 +661,21 @@ async fn screen_body() {
         (burst.len() + check.len() + request.len()) as u64
     );
     note(&format!("screen529 owner={} child={} parent={} tty={} kernel_tty={} group={} session={} start={} output_start={start} output_end={end} epochs=1,2 raw_history_gap=1 query_responses=1 native_resize=100x30 canonical_equal=1 continuation_equal=1 tail_range_retries={}",std::process::id(),identity.child,identity.parent,identity.tty,identity.kernel_tty,identity.group,identity.session,identity.start,TAIL_RETRIES.load(std::sync::atomic::Ordering::Relaxed)));
+    phase(Phase::ScreenCleanup);
+    checkpoint(Check::ScreenReceipts);
     drop(receiver);
     let receipts = engine.close_session().await.unwrap();
     assert_eq!(receipts.len(), 1);
+    checkpoint(Check::ScreenWorkerJoin);
     assert!(receipts[0].workers_joined());
+    checkpoint(Check::ScreenControlJoin);
     assert!(engine.control_joined());
+    checkpoint(Check::ScreenScopeDrain);
     scope.drain().await.unwrap();
     assert_eq!(scope.registered(), 0);
+    checkpoint(Check::ScreenReservations);
     assert_eq!(ledger.lock().unwrap().reservations(), 0);
+    checkpoint(Check::ScreenNoChildren);
     assert_eq!(
         unsafe { libc::waitpid(identity.child as i32, std::ptr::null_mut(), libc::WNOHANG) },
         -1
@@ -627,10 +684,8 @@ async fn screen_body() {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ECHILD)
     );
-    if let Ok(diagnostic) = std::fs::read_to_string(&panic_path) {
-        note(diagnostic.trim());
-    }
     note(&format!("screen529 exact_child_reaped=1 reader_joined=1 writer_joined=1 control_joined=1 resource_reservations=0 frontend_waits=1 code={:?}",receipts[0].code()));
+    checkpoint(Check::ScreenReceiptStatus);
     assert_eq!(
         receipts[0].code(),
         Some(0),

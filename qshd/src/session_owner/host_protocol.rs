@@ -626,6 +626,33 @@ impl HostPeerState {
         value.auth = Some(auth);
         Ok(value)
     }
+    /// Routing state for a privately provisioned QSHH channel, before its
+    /// actual Offer/Ack exchange. This carries no descriptor/peer authority.
+    pub(super) fn for_local_admission(
+        local: OwnerRole,
+        peer: OwnerRole,
+        host: HostInstance,
+        spec: AdmissionSpec,
+    ) -> Result<Self, Error> {
+        let mut state = Self::new(local, peer, host);
+        state.admission = Some(AdmissionState::new(spec, local, peer, host, None)?);
+        Ok(state)
+    }
+    /// Add routing correlation only after actual completed admission. The
+    /// owning channel supplies its HostState-issued generation; this method
+    /// itself never issues authority or accepts another wire admission.
+    pub(super) fn bind_local_authentication(
+        &mut self,
+        frontend: FrontendGeneration,
+        method: AuthMethod,
+        limit: usize,
+    ) -> Result<(), Error> {
+        if self.admission.as_ref().is_none_or(|a| !a.ready()) || self.auth.is_some() {
+            return Err(Error::InvalidState);
+        }
+        self.auth = Some(AuthCorrelation::new(method, frontend, limit)?);
+        Ok(())
+    }
     pub fn send_at(&mut self, f: &HostFrame, now: u64) -> Result<(), Error> {
         self.apply_timed(f, true, Some(now))
     }

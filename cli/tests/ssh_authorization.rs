@@ -41,6 +41,280 @@ fn direct_qsh_without_flag_does_not_probe_ssh_or_create_bindings() {
         0
     );
 }
+/// A first connection from a new machine: the daemon on `port` is pinned,
+/// but neither this client's qsh key nor its SSH key (`-i`) is listed, so
+/// the direct attempt is refused and the bootstrap logs in over `ssh`.
+fn unlisted_client(port: u16, ssh: &fake::Server) -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let peer_key = sshauth::discover::discover(
+        ([127, 0, 0, 1], port).into(),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    sshauth::known_hosts::KnownHosts::open(home.path().join("qsh/known_hosts"))
+        .pin("127.0.0.1", port, &peer_key)
+        .unwrap();
+    let ssh_dir = home.path().join(".ssh");
+    std::fs::create_dir(&ssh_dir).unwrap();
+    std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    qsh::known_hosts::KnownHosts::new(ssh_dir.join("known_hosts"), None)
+        .add("127.0.0.1", ssh.port, "ssh-ed25519", &ssh.wire())
+        .unwrap();
+    let unlisted = ssh_key::PrivateKey::random(
+        &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
+        ssh_key::Algorithm::Ed25519,
+    )
+    .unwrap();
+    let identity = home.path().join("unlisted");
+    support::write_private(
+        &identity,
+        unlisted
+            .to_openssh(ssh_key::LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    (home, identity)
+}
+fn spawn_unlisted(
+    identity: &std::path::Path,
+    port: u16,
+    ssh: &fake::Server,
+    home: &std::path::Path,
+) -> Client {
+    let address = format!("127.0.0.1:{port},ssh={}", ssh.port);
+    spawn_qsh(
+        &["--no-password", "-i", identity.to_str().unwrap(), &address],
+        home,
+    )
+}
+/// The remote side for `fake::Server::start_shell`: a private home with the
+/// sshd sandbox's environment, and the qshd lookup path in its cache.
+fn remote_home() -> (tempfile::TempDir, fake::Shell, std::path::PathBuf) {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let home = tempfile::Builder::new()
+        .prefix("qsh remote ' ")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(home.path().join(".cache/qsh"))
+        .unwrap();
+    std::fs::create_dir_all(home.path().join("bin")).unwrap();
+    let mut env =
+        support_home::ssh_support::shell_env::prepare(home.path(), std::path::Path::new("/bin/sh"));
+    env.push((
+        "PATH".into(),
+        format!("{}/bin:/usr/bin:/bin", home.path().display()),
+    ));
+    let qshd = home.path().join(format!(
+        ".cache/qsh/qshd-{}-{}",
+        qshd::state::QSHD_VERSION,
+        std::env::consts::ARCH
+    ));
+    let shell = fake::Shell {
+        home: home.path().to_path_buf(),
+        env,
+        hold: None,
+    };
+    (home, shell, qshd)
+}
+/// Each recorded command by its role in the bring-up. Commands arrive as
+/// `/bin/sh -c '<script>'`; the scripts' own markers tell them apart.
+fn steps(ssh: &fake::Server) -> Vec<&'static str> {
+    ssh.commands()
+        .iter()
+        .map(|command| {
+            if command.contains("; purpose=execute;") {
+                "trust"
+            } else if command.contains("systemctl is-active --quiet qshd.service") {
+                "lookup"
+            } else if command.contains(" server-info --challenge ") {
+                "server-info"
+            } else if command.contains(" bootstrap-capabilities") {
+                "bootstrap-capabilities"
+            } else if command.contains(" transport-ensure ") {
+                "transport-ensure"
+            } else {
+                "other"
+            }
+        })
+        .collect()
+}
+#[test]
+fn unlisted_key_bootstrap_failure_stays_on_its_single_ssh_login() {
+    use std::sync::atomic::Ordering;
+    let _serial = serialised();
+    let (daemon, _) = start_daemon();
+    let ssh = fake::Server::start();
+    let (home, identity) = unlisted_client(daemon.port, &ssh);
+    let mut client = spawn_unlisted(&identity, daemon.port, &ssh, home.path());
+    let screen = screen(&client);
+    let status = wait_for_exit(&mut client.child).unwrap();
+    assert!(!status.success(), "{}", text(&screen));
+    // The fake reports no installed qshd, so the bring-up ends at its lookup.
+    let activity = &ssh.activity;
+    assert_eq!(
+        activity.connections.load(Ordering::SeqCst),
+        1,
+        "{}",
+        text(&screen)
+    );
+    assert_eq!(activity.sign.load(Ordering::SeqCst), 1);
+    assert_eq!(steps(&ssh), ["lookup"]);
+}
+#[test]
+fn unlisted_key_bootstrap_reads_server_info_then_starts_on_its_single_ssh_login() {
+    use base64::Engine;
+    use std::sync::atomic::Ordering;
+    let _serial = serialised();
+    let (remote, shell, qshd) = remote_home();
+    std::fs::copy(support_home::qshd_path(), &qshd).unwrap();
+    // Declared after `remote`, so it stops the daemon before the home goes.
+    let _daemon =
+        support_home::daemon_guard::DaemonGuard::new(remote.path().join(".cache/qsh/control.sock"));
+    // The daemon that bootstrap will reuse, started as bring-up starts it,
+    // for another client: this one's qsh key is not authorized yet.
+    let port = free_udp_port();
+    let started = std::process::Command::new(&qshd)
+        .args([
+            "transport-ensure",
+            "--name",
+            "console",
+            "--port",
+            &port.to_string(),
+            "--client-pubkey",
+        ])
+        .arg(base64::engine::general_purpose::STANDARD.encode([7u8; 32]))
+        .env_clear()
+        .envs(shell.env.iter().cloned())
+        .current_dir(remote.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{started:?}");
+    let answering = wait_until(|| {
+        sshauth::discover::discover(
+            ([127, 0, 0, 1], port).into(),
+            std::time::Duration::from_millis(200),
+        )
+        .is_ok()
+    });
+    assert!(answering, "the started daemon never answered discovery");
+    let ssh = fake::Server::start_shell(shell);
+    let (home, identity) = unlisted_client(port, &ssh);
+    let mut client = spawn_unlisted(&identity, port, &ssh, home.path());
+    let screen = screen(&client);
+    live(&mut client, &screen);
+    // One login, one signature, and every command on it in bring-up order:
+    // server-info runs after the trust check and before transport-ensure.
+    let activity = &ssh.activity;
+    assert_eq!(
+        activity.connections.load(Ordering::SeqCst),
+        1,
+        "{}",
+        text(&screen)
+    );
+    assert_eq!(activity.sign.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        steps(&ssh),
+        ["lookup", "trust", "server-info", "transport-ensure"]
+    );
+    // The gate saw verified, compatible server info, not unknown metadata:
+    // the reply binds this query's challenge and the pinned daemon key.
+    let finished = activity.finished.lock().unwrap();
+    let query = finished
+        .iter()
+        .find(|f| f.command.contains(" server-info --challenge "))
+        .unwrap();
+    let hex = &query
+        .command
+        .split(" server-info --challenge ")
+        .nth(1)
+        .unwrap()[..64];
+    let challenge: [u8; 32] =
+        std::array::from_fn(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap());
+    let key = sshauth::discover::discover(
+        ([127, 0, 0, 1], port).into(),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    assert_eq!(query.code, 0);
+    let info =
+        ssh::server_info::verify(&query.stdout, &challenge, &key).expect("verified server info");
+    assert_eq!(
+        qsh::server_discovery::decision(Some(info.info())).compatibility,
+        connect::upgrade::Compatibility::Compatible
+    );
+}
+#[test]
+fn verified_incompatible_server_info_stops_the_bootstrap_before_any_change() {
+    use std::sync::atomic::Ordering;
+    let _serial = serialised();
+    // The pinned daemon the client is refused by; its key binds the reply.
+    let (daemon, _) = start_daemon();
+    let peer_key = sshauth::discover::discover(
+        ([127, 0, 0, 1], daemon.port).into(),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    let key: String = peer_key.iter().map(|b| format!("{b:02x}")).collect();
+    let (remote, shell, qshd) = remote_home();
+    // The located qshd answers server-info for the pinned key with a session
+    // profile this client lacks, and records anything else it is asked to do.
+    executable_script(&qshd, &format!(
+        "case \"$1\" in\n\
+         server-info) printf '{{\"challenge\":\"%s\",\"server_pubkey\":\"{key}\",\"generation\":\"{gen}\",\"core_version\":\"9.0.0\",\"session_protocols\":[[1,1,1]]}}' \"$3\" ;;\n\
+         *) printf '%s\\n' \"$*\" >> \"$HOME/forbidden\"; exit 1 ;;\n\
+         esac",
+        gen = "00".repeat(16)
+    ));
+    let ssh = fake::Server::start_shell(shell);
+    let (home, identity) = unlisted_client(daemon.port, &ssh);
+    let mut client = spawn_unlisted(&identity, daemon.port, &ssh, home.path());
+    let screen = screen(&client);
+    let status = wait_for_exit(&mut client.child).unwrap();
+    assert!(!status.success(), "{}", text(&screen));
+    // The client authenticated the reply and reports the incompatibility.
+    assert!(
+        text(&screen)
+            .contains("authenticated qshd 9.0.0 does not support this client's session profile"),
+        "{}",
+        text(&screen)
+    );
+    // One login and signature, and nothing after server-info: no approval,
+    // upload, installation, capability check or transport-ensure.
+    let activity = &ssh.activity;
+    assert_eq!(
+        activity.connections.load(Ordering::SeqCst),
+        1,
+        "{}",
+        text(&screen)
+    );
+    assert_eq!(activity.sign.load(Ordering::SeqCst), 1);
+    assert_eq!(steps(&ssh), ["lookup", "trust", "server-info"]);
+    assert!(!remote.path().join("forbidden").exists());
+    let cached: Vec<_> = std::fs::read_dir(remote.path().join(".cache/qsh"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(cached, [qshd]);
+    // The refusing daemon itself is untouched and still answering.
+    let still = sshauth::discover::discover(
+        ([127, 0, 0, 1], daemon.port).into(),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap();
+    assert_eq!(still, peer_key);
+}
+fn executable_script(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
 fn screen(client: &Client) -> Arc<Mutex<Vec<u8>>> {
     let out = Arc::new(Mutex::new(Vec::new()));
     drain_into(client.master.try_clone().unwrap(), out.clone());
@@ -95,4 +369,164 @@ fn bootstrap() {
     assert!(!shown.contains("Authorize SSH recovery"), "{shown}");
     assert!(!shown.contains("Key fingerprint"), "{shown}");
     assert!(!home.path().join("qsh/ssh_bindings.json").exists());
+}
+struct Forward(std::sync::mpsc::Sender<client::channel::SubstrateEvent>);
+impl ssh::SshEvents for Forward {
+    fn on_channel(&self, event: client::channel::SubstrateEvent) {
+        let _ = self.0.send(event);
+    }
+    fn on_closed(&self, _: String) {}
+}
+/// An SSH login to `ssh` that runs `command` on one channel.
+fn run_on_fixture(
+    ssh: &fake::Server,
+    command: &[u8],
+) -> (
+    ssh::SshConnection,
+    ssh::SshSubstrate,
+    std::sync::mpsc::Receiver<client::channel::SubstrateEvent>,
+) {
+    use client::channel::ChannelSubstrate;
+    use transport::channel::{ChannelKind, OpenRequest};
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (conn, mut sub) = ssh::connect(
+        ssh::SshParams {
+            host: "127.0.0.1".into(),
+            port: ssh.port,
+            username: "fixture".into(),
+            known_host_keys: vec![ssh.wire()],
+            connect_timeout: std::time::Duration::from_secs(5),
+            keepalive_interval: std::time::Duration::from_secs(15),
+            compression: true,
+            tcp_nodelay: true,
+            knock: Vec::new(),
+        },
+        ssh::SshAuthPlan::single(ssh::AuthMethod::Signer(Arc::new(
+            support_home::ssh_support::SoftSigner::random(),
+        ))),
+        Arc::new(knock::NoBind),
+        Arc::new(Forward(tx)),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    sub.open(&OpenRequest {
+        stream: 1,
+        kind: ChannelKind::Command,
+        cols: 0,
+        rows: 0,
+        screen: false,
+        command: command.to_vec(),
+    })
+    .unwrap();
+    (conn, sub, rx)
+}
+/// The pid a fixture command wrote to `name` in the remote home.
+fn recorded_pid(remote: &tempfile::TempDir, name: &str) -> rustix::process::Pid {
+    let raw: i32 = std::fs::read_to_string(remote.path().join(name))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    rustix::process::Pid::from_raw(raw).unwrap()
+}
+/// Whether `pid` is a child of this process that has exited and is not yet
+/// reaped. Asking does not reap it, and a reaped pid is not our child.
+fn exited_unreaped(pid: rustix::process::Pid) -> bool {
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+    matches!(
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+        ),
+        Ok(Some(_))
+    )
+}
+/// Teardown owns what `start_shell` started: a command that ignores stdin
+/// EOF and keeps its output open, here through a background child too, is
+/// killed with its process group, reaped, and its readers joined before
+/// `Server::drop` returns, even after the client has gone.
+#[test]
+fn shell_fixture_teardown_kills_and_reaps_a_blocking_command() {
+    use client::channel::SubstrateEvent;
+    use std::sync::atomic::Ordering;
+    let (remote, shell, _) = remote_home();
+    let ssh = fake::Server::start_shell(shell);
+    let (conn, _sub, rx) = run_on_fixture(
+        &ssh,
+        b"sleep 600 & echo $! > \"$HOME/background\"; echo $$ > \"$HOME/command\"; echo started; exec sleep 600",
+    );
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap() {
+            SubstrateEvent::Data { bytes, .. } if bytes.starts_with(b"started") => break,
+            SubstrateEvent::Exit { .. } | SubstrateEvent::Refused { .. } => {
+                panic!("the blocking command ended early")
+            }
+            _ => {}
+        }
+    }
+    let command = recorded_pid(&remote, "command");
+    let background = recorded_pid(&remote, "background");
+    assert_eq!(ssh.activity.running.load(Ordering::SeqCst), 1);
+    conn.close();
+    let activity = ssh.activity.clone();
+    drop(ssh);
+    assert_eq!(activity.running.load(Ordering::SeqCst), 0);
+    let decided = activity.teardown.lock().unwrap();
+    assert_eq!(decided.len(), 1);
+    assert!(decided[0].signalled);
+    // The command's own child was reaped by its worker before drop returned;
+    // the background child, reparented when its parent died, goes as well.
+    assert!(rustix::process::test_kill_process(command).is_err());
+    assert!(wait_until(|| rustix::process::test_kill_process(
+        background
+    )
+    .is_err()));
+}
+/// Teardown signals a command's group only while its worker has custody of
+/// the pid. A command that exits by itself is held at each side of the
+/// release while teardown decides: before it, the unreaped zombie still
+/// holds the id and is signalled; after it, before the reap, nothing is
+/// signalled, so a reaped and reused id can never be.
+#[test]
+fn shell_fixture_teardown_signals_only_while_the_worker_has_custody() {
+    use std::sync::atomic::Ordering;
+    for (stage, signalled) in [(fake::Stage::Exited, true), (fake::Stage::Released, false)] {
+        let (remote, mut shell, _) = remote_home();
+        let hold = fake::Hold::at(stage);
+        shell.hold = Some(hold.clone());
+        let ssh = fake::Server::start_shell(shell);
+        let (conn, _sub, _events) = run_on_fixture(&ssh, b"echo $$ > \"$HOME/command\"; exit 7");
+        assert!(
+            hold.reached(),
+            "{stage:?}: the worker never reached the hold"
+        );
+        let child = recorded_pid(&remote, "command");
+        assert!(exited_unreaped(child), "{stage:?}");
+        conn.close();
+        let activity = ssh.activity.clone();
+        let teardown = std::thread::spawn(move || drop(ssh));
+        assert!(
+            wait_until(|| !activity.teardown.lock().unwrap().is_empty()),
+            "{stage:?}: teardown never decided"
+        );
+        // Decided while the worker was still held, before any reaping.
+        assert!(exited_unreaped(child), "{stage:?}");
+        hold.release();
+        teardown.join().unwrap();
+        {
+            let decided = activity.teardown.lock().unwrap();
+            assert_eq!(decided.len(), 1, "{stage:?}");
+            assert_eq!(decided[0].group, child.as_raw_pid(), "{stage:?}");
+            assert_eq!(decided[0].signalled, signalled, "{stage:?}");
+        }
+        assert_eq!(activity.running.load(Ordering::SeqCst), 0, "{stage:?}");
+        let finished = activity.finished.lock().unwrap();
+        assert_eq!(finished.len(), 1, "{stage:?}");
+        // SIGKILL to an exited group changes nothing: the exit stands.
+        assert_eq!(finished[0].code, 7, "{stage:?}");
+        assert!(
+            !exited_unreaped(child),
+            "{stage:?}: the worker did not reap"
+        );
+    }
 }

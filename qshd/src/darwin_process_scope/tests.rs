@@ -983,7 +983,107 @@ fn darwin223_family_exact_bases_vendor_revisions_and_native_architectures() {
             }
         }
     }
-    assert_ne!(SOURCE_FAMILIES[0].id, SOURCE_FAMILIES[1].id);
+    for (index, family) in SOURCE_FAMILIES.iter().enumerate() {
+        assert!(SOURCE_FAMILIES[index + 1..]
+            .iter()
+            .all(|other| other.id != family.id && other.major != family.major));
+    }
+}
+#[test]
+fn darwin551_startup_refusal_names_the_observed_kernel_and_admitted_families() {
+    let message = unsupported_runtime_message(
+        "26.0.0",
+        "Darwin Kernel Version 26.0.0: description; root:xnu-13000.1.1~2/RELEASE_ARM64_T6041",
+    );
+    assert_eq!(
+        message,
+        "this macOS kernel has no qualified process ownership contract: Darwin 26.0.0 \
+         (xnu-13000.1.1~2/RELEASE_ARM64_T6041); qshd admits xnu-10063.141.1 (Darwin 23), \
+         xnu-11417.140.69 (Darwin 24), xnu-12377.* (Darwin 25)"
+    );
+    // Observed text is untrusted: control characters are replaced and length is bounded.
+    let hostile = unsupported_runtime_message("25.\n0", "root:xnu-1\u{1b}[2J 2/R");
+    assert!(
+        hostile.contains("Darwin 25.?0 (xnu-1?[2J?2/R);"),
+        "{hostile}"
+    );
+    let long =
+        unsupported_runtime_message(&"2".repeat(200), &format!("root:xnu-{}", "9".repeat(200)));
+    assert!(long.contains(&format!(
+        "Darwin {} (xnu-{});",
+        "2".repeat(64),
+        "9".repeat(64)
+    )));
+    assert!(long.len() < 400);
+    assert!(unsupported_runtime_message("25.5.0", "no token").contains("(xnu-unknown)"));
+}
+#[test]
+fn darwin551_line_family_admits_every_macos_26_revision_and_nothing_else() {
+    // The published macOS 26.0-26.5 revisions, then later revisions of the
+    // same line that the line admission deliberately covers.
+    for (base, release, build) in [
+        ("12377.1.9", "25.0.0", "25A354"),
+        ("12377.41.6", "25.1.0", "25B78"),
+        ("12377.61.12", "25.2.0", "25C56"),
+        ("12377.81.4", "25.3.0", "25D125"),
+        ("12377.101.15", "25.4.0", "25E246"),
+        ("12377.121.6", "25.5.0", "25F71"),
+        ("12377.141.2", "25.6.0", "25G5"),
+        ("12377.999.1", "25.9.1", "25Z9999a"),
+    ] {
+        for (machine, arch, flavor) in [
+            ("arm64", "aarch64", "ARM64"),
+            ("x86_64", "x86_64", "X86_64"),
+        ] {
+            for revision in ["", ".1", ".702.4"] {
+                for hardware in ["", "_VMAPPLE", "_T6041"] {
+                    let token = format!("{base}{revision}~2/RELEASE_{flavor}{hardware}");
+                    let observed = runtime_contract(
+                        release,
+                        &observed_version(release, &token),
+                        build,
+                        machine,
+                        arch,
+                    )
+                    .unwrap();
+                    assert_eq!(observed.family.id, "xnu-12377-line-conditional-v1");
+                    assert_eq!(
+                        observed.family.public_source,
+                        "xnu-12377.1.9..xnu-12377.121.6"
+                    );
+                    assert_eq!(observed.kernel_token, token);
+                }
+            }
+        }
+    }
+    for (release, token, build) in [
+        // The line belongs to Darwin 25 only.
+        ("24.6.0", "12377.121.6~2/RELEASE_ARM64", "24H232"),
+        ("26.0.0", "12377.121.6~2/RELEASE_ARM64", "26A100"),
+        ("25.5.0", "12377.121.6~2/RELEASE_ARM64", "24F71"),
+        // Neighbouring and malformed lines stay unadmitted.
+        ("25.5.0", "12378.1.1~2/RELEASE_ARM64", "25F71"),
+        ("25.5.0", "12376.121.6~2/RELEASE_ARM64", "25F71"),
+        ("25.5.0", "1237.121.6~2/RELEASE_ARM64", "25F71"),
+        ("25.5.0", "123770.1.1~2/RELEASE_ARM64", "25F71"),
+        ("25.5.0", "12377.121~2/RELEASE_ARM64", "25F71"),
+        ("25.5.0", "12377~2/RELEASE_ARM64", "25F71"),
+        ("25.5.0", "11417.140.69~2/RELEASE_ARM64", "25F71"),
+        // The next macOS major (Darwin 26) is not reviewed.
+        ("26.0.0", "13000.1.1~2/RELEASE_ARM64", "26A100"),
+    ] {
+        assert!(
+            runtime_contract(
+                release,
+                &observed_version(release, token),
+                build,
+                "arm64",
+                "aarch64"
+            )
+            .is_none(),
+            "{release} {token} {build}"
+        );
+    }
 }
 #[test]
 fn darwin223_family_refuses_malformed_uncovered_or_injected_observations() {
@@ -1129,6 +1229,15 @@ fn darwin223_family_receipt_owns_actual_metadata_and_preserves_ci_text() {
     version.clear();
     assert_eq!(observed.receipt(), "darwin223 public_source=xnu-10063.141.1 runtime_release=23.6.1 os_build=23G456a kernel_build=10063.141.1.999~7/RELEASE_ARM64_T8103 machine=arm64 native_arch=aarch64 premise=conditional");
     assert!(!observed.receipt().contains("PRIVATE_DESCRIPTION_CANARY"));
+    let observed = runtime_contract(
+        "25.5.0",
+        &observed_version("25.5.0", "12377.121.6.502.3~4/RELEASE_ARM64_VMAPPLE"),
+        "25F71",
+        "arm64",
+        "aarch64",
+    )
+    .unwrap();
+    assert_eq!(observed.receipt(), "darwin223 public_source=xnu-12377.1.9..xnu-12377.121.6 runtime_release=25.5.0 os_build=25F71 kernel_build=12377.121.6.502.3~4/RELEASE_ARM64_VMAPPLE machine=arm64 native_arch=aarch64 premise=conditional");
     assert!(!observed.receipt().contains("24H232"));
     let release = format!("24.{}.0", "1".repeat(58));
     assert_eq!(release.len(), 63);

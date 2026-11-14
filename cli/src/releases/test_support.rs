@@ -35,10 +35,9 @@ pub fn fixture_manifest(request: &ImageRequest, sha: &[u8; 32]) -> Vec<u8> {
     ] {
         names.push(format!("qsh-{v}-{target}.tar.gz"));
     }
-    let deb = v.replacen('-', "~", 1);
     for tool in ["qsh", "qshd"] {
         for arch in ["amd64", "arm64"] {
-            names.push(format!("{tool}_{deb}-1_{arch}.deb"));
+            names.push(format!("{tool}_{v}-1_{arch}.deb"));
         }
         for arch in ["x86_64", "aarch64"] {
             names.push(format!("{tool}-{v}-1.{arch}.rpm"));
