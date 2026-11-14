@@ -177,20 +177,27 @@ jobs:
             cargo deb -p qsh --target "$target" --no-build --no-strip
             cargo generate-rpm -p cli --target "$target"
           done
-          cp target/*/debian/*.deb dist/
-          cp target/*/generate-rpm/*.rpm dist/
           case "$NATIVE_TARGET" in
             x86_64-*) deb_arch=amd64; rpm_arch=x86_64 ;;
             aarch64-*) deb_arch=arm64; rpm_arch=aarch64 ;;
             *) echo 'unsupported package architecture' >&2; exit 1 ;;
           esac
-          for package in dist/*.deb; do
-            python3 scripts/check-release-output.py package --format deb --program qsh \
-              --version "$VERSION" --arch "$deb_arch" --probe "$package"
-          done
-          for package in dist/*.rpm; do
-            python3 scripts/check-release-output.py package --format rpm --program qsh \
-              --version "$VERSION" --arch "$rpm_arch" --probe "$package"
+          # The generators name files after the package version, whose '~'
+          # GitHub rewrites on upload (#526). Publish the release-version name.
+          for fmt in deb rpm; do
+            if [ "$fmt" = deb ]; then
+              arch=$deb_arch; built=(target/"$NATIVE_TARGET"/debian/*.deb)
+            else
+              arch=$rpm_arch; built=(target/"$NATIVE_TARGET"/generate-rpm/*.rpm)
+            fi
+            if [ "${#built[@]}" -ne 1 ] || [ ! -f "${built[0]}" ]; then
+              echo "expected exactly one built $fmt package" >&2; exit 1
+            fi
+            name=$(python3 scripts/check-release-output.py package-name --format "$fmt" \
+              --program qsh --version "$VERSION" --arch "$arch")
+            cp "${built[0]}" "dist/$name"
+            python3 scripts/check-release-output.py package --format "$fmt" --program qsh \
+              --version "$VERSION" --arch "$arch" --probe "dist/$name"
           done
 
       - name: Exercise shipped Linux clients before upload
@@ -201,16 +208,18 @@ jobs:
             aarch64-*) deb_arch=arm64; rpm_arch=aarch64 ;;
             *) echo 'unsupported client runtime architecture' >&2; exit 1 ;;
           esac
-          deb_version=$(python3 -c 'import runpy,sys; print(runpy.run_path("scripts/check-release-output.py")["debian_version"](sys.argv[1]))' "$RELEASE_VERSION")
-          rpm_version=$(python3 -c 'import runpy,sys; print(runpy.run_path("scripts/check-release-output.py")["rpm_version"](sys.argv[1]))' "$RELEASE_VERSION")
+          deb=$(python3 scripts/check-release-output.py package-name --format deb \
+            --program qsh --version "$RELEASE_VERSION" --arch "$deb_arch")
+          rpm=$(python3 scripts/check-release-output.py package-name --format rpm \
+            --program qsh --version "$RELEASE_VERSION" --arch "$rpm_arch")
           archive="dist/qsh-$RELEASE_VERSION-$NATIVE_TARGET.tar.gz"
           python3 packaging/client-acceptance.py --archive "$archive" \
             --version "$RELEASE_VERSION" --target "$NATIVE_TARGET"
           python3 packaging/client-acceptance.py --archive "$archive" \
-            --package "dist/qsh_${deb_version}_${deb_arch}.deb" \
+            --package "dist/$deb" \
             --version "$RELEASE_VERSION" --target "$NATIVE_TARGET"
           python3 packaging/client-acceptance.py --archive "$archive" \
-            --package "dist/qsh-$rpm_version-1.$rpm_arch.rpm" \
+            --package "dist/$rpm" \
             --version "$RELEASE_VERSION" --target "$NATIVE_TARGET"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -689,10 +698,16 @@ jobs:
     if: github.ref_type == 'tag' && github.repository == 'br0adcast/qsh'
     needs: [release, ordinary-ci, released-peer-acceptance, release-verifier]
     runs-on: ubuntu-latest
+    # Its required reviewer approves each publication before any step runs.
+    # The tagged commit supplies this file, so the tag ruleset, not this
+    # line, limits who can publish; see docs/release-security.md.
+    environment: release
     permissions:
       contents: write
       id-token: write
       attestations: write
+      # Reads the release environment's protection rules.
+      actions: read
     # One publication per tag at a time: another run waits for this one
     # rather than racing it, and a running publication is never cancelled.
     # GitHub keeps one waiting run per group; a newer one replaces it.
@@ -720,6 +735,13 @@ jobs:
           test "$GITHUB_REF_TYPE" = tag
           test -n "$RELEASE_VERSION"
           test "$GITHUB_REF" = "refs/tags/v$RELEASE_VERSION"
+      # Read-only, before a signature can be requested: a release run stops
+      # if the tag ruleset or the environment reviewer has been removed.
+      # Immutability is checked on the published release by the uploader.
+      - name: Require the release authority settings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check-release-settings.py --repo "$GITHUB_REPOSITORY"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist

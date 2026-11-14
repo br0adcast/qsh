@@ -489,3 +489,27 @@ async fn channel_owner_prepared_target_retains_registered_resources_until_guarde
         .unwrap();
     assert_eq!(session.occupied(), 0);
 }
+
+#[tokio::test]
+async fn channel_owner_model_transfer_is_one_time_exact_and_does_not_extract_custody() {
+    let registry = ChannelOpenRegistry::new(Default::default());
+    let mut owner = RetainedChannelSet::new(registry.clone());
+    let (job, channel, session, reaped) = ready(&registry, 0);
+    let identity = job.request().identity;
+    let (_, watch) = tokio::sync::watch::channel(RestartSignal::IDLE);
+    owner.install(job, channel, identity, &watch).unwrap();
+    let mut wrong = identity;
+    wrong.generation += 1;
+    assert!(owner.take_model(wrong).is_err());
+    let (model, resize) = owner.take_model(identity).unwrap();
+    assert!(!model.has_screen());
+    assert!(owner.take_model(identity).is_err());
+    assert_eq!(session.occupied(), 1);
+    assert!(!reaped.load(Ordering::SeqCst));
+    drop(model);
+    drop(resize);
+    owner.close_all();
+    owner.next_cleanup().await;
+    assert_eq!(session.occupied(), 0);
+    assert!(reaped.load(Ordering::SeqCst));
+}

@@ -1,6 +1,8 @@
 //! Global-host IPC has no owner-instance field or owner-zero sentinel.
 //! Decoding and role checks are not host authentication or grant minting.
 use super::authorization_contract::*;
+use super::host_auth_contract::{AuthCorrelation, AuthMethod, HostAuthMessage};
+use super::local_admission_contract::{AdmissionSpec, AdmissionState, LocalAdmission};
 use super::protocol::{
     OwnerProtocolError as Error, OwnerRole, MAX_OWNER_FRAME, MAX_OWNER_REQUESTS,
 };
@@ -26,6 +28,8 @@ pub struct HostHeader {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostMessage {
+    Admission(LocalAdmission),
+    Authentication(HostAuthMessage),
     StatusRequest {
         frontend: FrontendGeneration,
         cursor: Option<StatusCursor>,
@@ -76,6 +80,8 @@ pub enum HostMessage {
 impl HostMessage {
     pub const fn kind(&self) -> u8 {
         match self {
+            Self::Admission(a) => a.kind(),
+            Self::Authentication(a) => a.kind(),
             Self::StatusRequest { .. } => 0x20,
             Self::Status(_) => 0x21,
             Self::Reserve { .. } => 0x22,
@@ -92,6 +98,14 @@ impl HostMessage {
     }
     fn role(&self) -> OwnerRole {
         match self {
+            Self::Admission(a) => {
+                if a.kind() == 3 {
+                    OwnerRole::Frontend
+                } else {
+                    OwnerRole::Host
+                }
+            }
+            Self::Authentication(a) => a.role(),
             Self::StatusRequest { .. }
             | Self::Reserve { .. }
             | Self::Release { .. }
@@ -102,6 +116,8 @@ impl HostMessage {
     }
     fn body_len(&self) -> usize {
         match self {
+            Self::Admission(a) => a.len(),
+            Self::Authentication(a) => a.len(),
             Self::StatusRequest { cursor, .. } => 17 + cursor.map_or(0, |_| 24),
             Self::Status(p) => p.len(),
             Self::Reserve { reservation, .. } | Self::Reserved { reservation, .. } => {
@@ -119,6 +135,8 @@ impl HostMessage {
     }
     fn request_kind(&self) -> Option<u8> {
         match self {
+            Self::Admission(a) => (a.kind() == 3).then_some(3),
+            Self::Authentication(a) => a.request_kind(),
             Self::StatusRequest { .. } => Some(0x20),
             Self::Reserve { .. } => Some(0x22),
             Self::Release { .. } => Some(0x25),
@@ -129,6 +147,8 @@ impl HostMessage {
     }
     fn reply_kind(&self) -> Option<u8> {
         match self {
+            Self::Admission(a) => (a.kind() == 4).then_some(3),
+            Self::Authentication(a) => a.reply_kind(),
             Self::Status(_) => Some(0x20),
             Self::Reserved { .. } | Self::ReservationRefused { .. } => Some(0x22),
             Self::Released { .. } => Some(0x25),
@@ -139,6 +159,8 @@ impl HostMessage {
     }
     fn matches_reply(&self, reply: &Self) -> bool {
         match (self, reply) {
+            (Self::Admission(a), Self::Admission(b)) => a.matches_reply(b),
+            (Self::Authentication(a), Self::Authentication(b)) => a.matches_reply(b),
             (Self::StatusRequest { frontend, cursor }, Self::Status(p)) => {
                 *frontend == p.frontend.generation
                     && match cursor {
@@ -210,6 +232,13 @@ fn validate(frame: &HostFrame) -> Result<(), Error> {
         return Err(Error::Binding);
     }
     match &frame.message {
+        HostMessage::Admission(a) => {
+            a.validate()?;
+            if !a.role_allowed(frame.header.role, false) {
+                return Err(Error::Binding);
+            }
+        }
+        HostMessage::Authentication(a) => a.validate()?,
         HostMessage::AttachAuthorized { binding, .. } => binding.validate()?,
         HostMessage::Status(p) => {
             p.validate()?;
@@ -252,6 +281,8 @@ pub fn encode(frame: &HostFrame) -> Result<Vec<u8>, Error> {
     out.extend_from_slice(frame.header.host.as_bytes());
     out.extend_from_slice(&frame.header.request_id.to_be_bytes());
     match &frame.message {
+        HostMessage::Admission(a) => a.put(&mut out),
+        HostMessage::Authentication(a) => a.put(&mut out),
         HostMessage::StatusRequest { frontend, cursor } => {
             out.extend_from_slice(frontend.as_bytes());
             if let Some(c) = cursor {
@@ -334,6 +365,16 @@ fn parse_header(bytes: &[u8]) -> Result<(HostHeader, u8, usize), Error> {
         return Err(Error::TooLarge);
     }
     let (min, max) = match kind {
+        3 => (52, 52),
+        4 => (50, 50),
+        0x30 => (1, 1),
+        0x31 => (3, 42),
+        0x32 => (73, 8192),
+        0x33 => (72, 72),
+        0x34 => (18, 33),
+        0x35 | 0x36 => (16, 16),
+        0x37 => (48, 48),
+        0x38 => (50, 169),
         0x10 => (64, 64),
         0x11 => (120, 120),
         0x12 => (65, 65),
@@ -351,7 +392,16 @@ fn parse_header(bytes: &[u8]) -> Result<(HostHeader, u8, usize), Error> {
     if len < min {
         return Err(Error::Malformed);
     }
-    let expected_role = if matches!(kind, 0x10 | 0x14 | 0x20 | 0x22 | 0x25) {
+    if (kind == 0x31 && !matches!(len, 3 | 26 | 42))
+        || (kind == 0x34 && !matches!(len, 18 | 33))
+        || (kind == 0x38 && !matches!(len, 50 | 169))
+    {
+        return Err(Error::Malformed);
+    }
+    let expected_role = if matches!(
+        kind,
+        3 | 0x30 | 0x32 | 0x33 | 0x35 | 0x37 | 0x10 | 0x14 | 0x20 | 0x22 | 0x25
+    ) {
         OwnerRole::Frontend
     } else {
         OwnerRole::Host
@@ -381,6 +431,8 @@ fn decode(bytes: &[u8]) -> Result<HostFrame, Error> {
     }
     let mut r = Reader::new(&bytes[HOST_HEADER_LEN..]);
     let message = match kind {
+        3 | 4 => HostMessage::Admission(LocalAdmission::read(kind, &mut r)?),
+        0x30..=0x38 => HostMessage::Authentication(HostAuthMessage::read(kind, &mut r)?),
         0x20 => {
             let frontend = r.frontend()?;
             let cursor = match r.byte()? {
@@ -531,6 +583,8 @@ impl HostDecoder {
 /// Bounded bidirectional monotonic request correlation with semantic reply binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPeerState {
+    admission: Option<AdmissionState>,
+    auth: Option<AuthCorrelation>,
     local: OwnerRole,
     peer: OwnerRole,
     host: HostInstance,
@@ -542,6 +596,8 @@ pub struct HostPeerState {
 impl HostPeerState {
     pub fn new(local: OwnerRole, peer: OwnerRole, host: HostInstance) -> Self {
         Self {
+            admission: None,
+            auth: None,
             local,
             peer,
             host,
@@ -550,6 +606,58 @@ impl HostPeerState {
             outgoing: BTreeMap::new(),
             incoming: BTreeMap::new(),
         }
+    }
+    /// Opt-in routing gate only. Method, frontend and registration limit come
+    /// from the caller's trusted seam configuration, never a decoded Begin.
+    /// This does not authenticate a descriptor or register a host attempt.
+    pub fn with_admission(
+        local: OwnerRole,
+        peer: OwnerRole,
+        host: HostInstance,
+        spec: AdmissionSpec,
+        frontend: FrontendGeneration,
+        method: AuthMethod,
+        registration_limit: usize,
+    ) -> Result<Self, Error> {
+        let admission = AdmissionState::new(spec, local, peer, host, None)?;
+        let auth = AuthCorrelation::new(method, frontend, registration_limit)?;
+        let mut value = Self::new(local, peer, host);
+        value.admission = Some(admission);
+        value.auth = Some(auth);
+        Ok(value)
+    }
+    /// Routing state for a privately provisioned QSHH channel, before its
+    /// actual Offer/Ack exchange. This carries no descriptor/peer authority.
+    pub(super) fn for_local_admission(
+        local: OwnerRole,
+        peer: OwnerRole,
+        host: HostInstance,
+        spec: AdmissionSpec,
+    ) -> Result<Self, Error> {
+        let mut state = Self::new(local, peer, host);
+        state.admission = Some(AdmissionState::new(spec, local, peer, host, None)?);
+        Ok(state)
+    }
+    /// Add routing correlation only after actual completed admission. The
+    /// owning channel supplies its HostState-issued generation; this method
+    /// itself never issues authority or accepts another wire admission.
+    pub(super) fn bind_local_authentication(
+        &mut self,
+        frontend: FrontendGeneration,
+        method: AuthMethod,
+        limit: usize,
+    ) -> Result<(), Error> {
+        if self.admission.as_ref().is_none_or(|a| !a.ready()) || self.auth.is_some() {
+            return Err(Error::InvalidState);
+        }
+        self.auth = Some(AuthCorrelation::new(method, frontend, limit)?);
+        Ok(())
+    }
+    pub fn send_at(&mut self, f: &HostFrame, now: u64) -> Result<(), Error> {
+        self.apply_timed(f, true, Some(now))
+    }
+    pub fn receive_at(&mut self, f: &HostFrame, now: u64) -> Result<(), Error> {
+        self.apply_timed(f, false, Some(now))
     }
     pub fn outstanding(&self) -> usize {
         self.outgoing.len()
@@ -570,6 +678,46 @@ impl HostPeerState {
         self.apply(f, false)
     }
     fn apply(&mut self, f: &HostFrame, sending: bool) -> Result<(), Error> {
+        self.apply_timed(f, sending, None)
+    }
+    fn apply_timed(&mut self, f: &HostFrame, sending: bool, now: Option<u64>) -> Result<(), Error> {
+        let mut admission = self.admission.clone();
+        let mut auth = self.auth.clone();
+        let mut retired = None;
+        match &f.message {
+            HostMessage::Admission(m) => admission.as_mut().ok_or(Error::InvalidState)?.apply(
+                f.header.request_id,
+                f.header.role,
+                m,
+            )?,
+            _ => {
+                if admission.as_ref().is_some_and(|a| !a.ready()) {
+                    return Err(Error::InvalidState);
+                }
+                if let HostMessage::Authentication(m) = &f.message {
+                    if admission.as_ref().is_none_or(|a| !a.ready()) {
+                        return Err(Error::InvalidState);
+                    }
+                    retired = auth.as_mut().ok_or(Error::InvalidState)?.apply(
+                        f.header.request_id,
+                        m,
+                        now.ok_or(Error::InvalidState)?,
+                    )?;
+                }
+            }
+        }
+        self.apply_correlated(f, sending)?;
+        if let Some(r) = retired {
+            self.outgoing
+                .retain(|_, m| !matches!(m,HostMessage::Authentication(a)if a.retired_by(r)));
+            self.incoming
+                .retain(|_, m| !matches!(m,HostMessage::Authentication(a)if a.retired_by(r)));
+        }
+        self.admission = admission;
+        self.auth = auth;
+        Ok(())
+    }
+    fn apply_correlated(&mut self, f: &HostFrame, sending: bool) -> Result<(), Error> {
         validate(f)?;
         if f.header.role != if sending { self.local } else { self.peer }
             || f.header.host != self.host

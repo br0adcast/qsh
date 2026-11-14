@@ -1152,7 +1152,15 @@ mod tests {
             finish.find("phase=after").unwrap()
                 < finish.find("failure_final_manager_wait_entry").unwrap()
         );
-        assert!(finish.contains("let result = self.manager.await;"));
+        // #548: the last manager wait after rescue is bounded, never bare.
+        assert!(!finish.contains("self.manager.await"));
+        let bounded = finish
+            .find("let result = super::wait_or_end_blocked(")
+            .unwrap();
+        assert!(finish.find("failure_final_manager_wait_entry").unwrap() < bounded);
+        assert!(finish[bounded..].starts_with(
+            "let result = super::wait_or_end_blocked(\n                        &mut self.manager,\n                        FAILURE_MANAGER_BOUND,"
+        ));
         let terminal = source
             .split("pub(super) fn terminal()")
             .nth(1)

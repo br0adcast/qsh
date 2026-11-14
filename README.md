@@ -146,13 +146,18 @@ or switch console clients.
 On Linux, the portable binaries use static musl builds. The packaged system-mode
 `qshd` instead links glibc and PAM and has a minimum supported system version.
 macOS builds target Darwin and use macOS system libraries; they are not musl
-binaries. Windows packages are not currently produced.
+binaries. On macOS, `qshd` runs on macOS 14.6, 15.6 and 26; see
+[macOS kernel support](docs/qshd-service.md#macos-kernel-support) for the
+exact kernels. Windows packages are not currently produced.
 
 <details>
 <summary><strong>Package and archive installation examples</strong></summary>
 
 Replace `0.5.0` with the version you downloaded. On Linux ARM64, use `_arm64.deb`,
-`.aarch64.rpm`, or the `aarch64-unknown-linux-musl` archive.
+`.aarch64.rpm`, or the `aarch64-unknown-linux-musl` archive. Prerelease package
+files carry the release version, for example `qsh_0.6.0-rc.2-1_amd64.deb`; the
+version inside the package is `0.6.0~rc.2-1`, so package managers order it
+before `0.6.0`.
 
 ```sh
 # Debian / Ubuntu: the client; install qshd separately if this is a server
