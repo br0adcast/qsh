@@ -866,19 +866,48 @@ impl Recovery {
 
     /// Querying metadata is read-only. RestartOnly is a distinct, existing
     /// recovery phase and is never invoked for a proven incompatible peer.
+    /// `restart` is one SSH login: it calls the gate it is given with that
+    /// login's query, before its mutating phase. A current proof needs no query.
     fn recover_after_discovery(
         &self,
         attempt: &SshAttempt,
         addr: usize,
-        query: impl FnOnce() -> Result<Option<AuthenticatedServerInfo>, crate::ssh_step::SshStepError>,
-        restart: impl FnOnce() -> Result<bringup::Ready, crate::ssh_step::SshStepError>,
+        restart: impl FnOnce(
+            Option<&dyn Fn(Option<AuthenticatedServerInfo>) -> bool>,
+        ) -> Result<bringup::Ready, crate::ssh_step::SshStepError>,
     ) -> Option<Result<bringup::Ready, crate::ssh_step::SshStepError>> {
         if !self.current_ssh(attempt, addr) {
             return None;
         }
-        // Unsupported legacy queries and unavailable credentials leave metadata
-        // unknown; they do not add an admission denial or an installation path.
-        let queried = query().ok().flatten();
+        if let Some((info, _)) = self.server_info_for(attempt, addr) {
+            if !self.permits_after_query(attempt, addr, Some(info)) {
+                return None;
+            }
+            return Some(restart(None));
+        }
+        let decided = std::cell::Cell::new(None);
+        let gate = |queried: Option<AuthenticatedServerInfo>| {
+            let permitted = self.permits_after_query(attempt, addr, queried);
+            decided.set(Some(permitted));
+            permitted
+        };
+        let result = restart(Some(&gate));
+        // A login that never reached its query left metadata unknown, as an
+        // unavailable query always has.
+        let permitted = decided
+            .get()
+            .unwrap_or_else(|| self.permits_after_query(attempt, addr, None));
+        permitted.then_some(result)
+    }
+
+    /// Unsupported legacy queries and unavailable credentials leave metadata
+    /// unknown; they do not add an admission denial or an installation path.
+    fn permits_after_query(
+        &self,
+        attempt: &SshAttempt,
+        addr: usize,
+        queried: Option<AuthenticatedServerInfo>,
+    ) -> bool {
         // QSH remains independent while SSH runs. A proof arriving during the
         // query must be checked before the mutating recovery phase begins.
         let current_incompatible = self
@@ -892,7 +921,7 @@ impl Recovery {
         if current_incompatible.is_some() {
             // Reusing a current QSH proof did not perform a new SSH query.
             if matches!(queried, Some(AuthenticatedServerInfo::Bootstrap(_))) {
-                return None;
+                return false;
             }
             if queried.as_ref().is_some_and(|proof| {
                 crate::server_discovery::decision(Some(proof.info())).compatibility
@@ -910,12 +939,9 @@ impl Recovery {
                     );
                 }
             }
-            return None;
+            return false;
         }
-        if !self.discovery_permits_recovery(attempt, addr, queried) {
-            return None;
-        }
-        Some(restart())
+        self.discovery_permits_recovery(attempt, addr, queried)
     }
 
     pub fn retry_now(&self) {
@@ -1117,17 +1143,25 @@ impl Recovery {
                         // All SSH auth and remote exec operations use this generation's
                         // token. Reset, QSH success and owner cancellation revoke it.
                         recovery.observe_ssh(&attempt, AddressId(i));
-                        let result = recovery.recover_after_discovery(&attempt, i,
-                            || {
-                                if let Some((info, _)) = recovery.server_info_for(&attempt, i) {
-                                    return Ok(Some(info));
+                        // One login queries, restarts and reads the ready daemon.
+                        let after = std::cell::RefCell::new(None);
+                        let read_after = |info: Option<&ssh::VerifiedSshServerInfo>| {
+                            *after.borrow_mut() = Some(info.cloned());
+                        };
+                        let result = recovery.recover_after_discovery(&attempt, i, |gate| {
+                            let before = gate.map(|gate| {
+                                move |info: Option<&ssh::VerifiedSshServerInfo>| {
+                                    gate(info.cloned().map(AuthenticatedServerInfo::Ssh))
                                 }
-                                setup.discover_server_info(address, &attempt.cancel)
-                                    .map(|proof| proof.map(AuthenticatedServerInfo::Ssh))
-                            },
-                            || setup.bring_up_observed(address, &attempt.cancel, || {
-                                recovery.observe_ssh(&attempt, AddressId(i))
-                            }));
+                            });
+                            setup.bring_up_observed(
+                                address,
+                                &attempt.cancel,
+                                before.as_ref().map(|before| before as bringup::ServerInfoGate<'_>),
+                                Some(&read_after),
+                                || recovery.observe_ssh(&attempt, AddressId(i)),
+                            )
+                        });
                         let Some(result) = result else {
                             recovery.finish_ssh(&attempt);
                             continue;
@@ -1146,9 +1180,9 @@ impl Recovery {
                                         port,
                                     ));
                                     if let Some(query) = recovery.next_ssh_metadata(&attempt, i) {
-                                        match setup.discover_server_info(address, &query.cancel) {
-                                            Ok(Some(proof)) => { recovery.publish_server_info(&query, i, AuthenticatedServerInfo::Ssh(proof)); }
-                                            _ => recovery.complete_ssh_unknown(&query, i),
+                                        match after.take().flatten() {
+                                            Some(proof) => { recovery.publish_server_info(&query, i, AuthenticatedServerInfo::Ssh(proof)); }
+                                            None => recovery.complete_ssh_unknown(&query, i),
                                         }
                                     }
                                 }

@@ -35,6 +35,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `qsh_0.6.0-rc.2-1_amd64.deb`, so the signed `SHA256SUMS` matches the names
   GitHub publishes, and authenticate prerelease manifests under those names.
   Package metadata keeps `0.6.0~rc.2`.
+- Read a pinned daemon's server info on the SSH bootstrap's own login, through
+  the located and trust-checked `qshd`, instead of a separate SSH login and a
+  `PATH` lookup. Agent and FIDO keys sign once per SSH attempt, including during
+  recovery.
 
 ### Security
 
