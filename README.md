@@ -192,15 +192,35 @@ See the [service guide](docs/qshd-service.md) for platform requirements.
 
 </details>
 
-Verify downloads against the checksums from the same release:
+Verify downloads in two steps. First authenticate `SHA256SUMS` with the
+`SHA256SUMS.sigstore.json` bundle from the same release, using
+[GitHub CLI](https://cli.github.com/). Verifying a local bundle needs no GitHub
+login. Set `VERSION` to the release you downloaded, without the leading `v`:
 
 ```sh
-# Linux
-sha256sum --ignore-missing -c SHA256SUMS
-
-# macOS
-shasum -a 256 --ignore-missing -c SHA256SUMS
+VERSION=0.6.0
+gh attestation verify SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+  --repo br0adcast/qsh \
+  --cert-identity "https://github.com/br0adcast/qsh/.github/workflows/release.yml@refs/tags/v$VERSION" \
+  --predicate-type https://github.com/br0adcast/qsh/release-manifest/v1 \
+  --deny-self-hosted-runners
 ```
+
+Then check each downloaded file by its exact name. The lookup fails unless the
+verified manifest lists that name exactly once, so a file missing from the
+manifest fails instead of being skipped. Set `FILE` to each file in turn; on
+macOS, use `shasum -a 256 -c` for `sha256sum -c`:
+
+```sh
+FILE=qsh_0.6.0-1_amd64.deb
+awk -v f="$FILE" '$2 == f { print; n++ } END { exit (n != 1) }' SHA256SUMS > "$FILE.sha256" &&
+  sha256sum -c "$FILE.sha256"
+```
+
+Releases without `SHA256SUMS.sigstore.json`, such as v0.5.0, are unsigned;
+their checksums only detect damaged downloads. See
+[release authentication](docs/release-security.md#independent-verification)
+for what this checks and for authenticating the first-install executable.
 
 ### Installing a missing daemon over SSH
 
