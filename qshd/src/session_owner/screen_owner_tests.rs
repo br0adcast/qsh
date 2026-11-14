@@ -121,9 +121,9 @@ fn screen_host_factory_requires_exact_registered_capsule_and_drops_only_its_mode
 fn screen_host_resize_pins_receipts_and_cancellation_preserves_actual_model() {
     let (client, ledger) = setup();
     let mut lease = lease(client.clone(), 1);
-    let old = lease.admitted.reservation();
+    let old = lease.storage.admitted().reservation();
     let receipt = ReservationReceipt {
-        id: lease.admitted.cleanup(),
+        id: lease.storage.admitted().cleanup(),
         reservation: old.id,
         locator: old.locator,
         channel: old.channel,
