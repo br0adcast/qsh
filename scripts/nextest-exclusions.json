@@ -182,6 +182,14 @@
     {
       "binary": "qshd",
       "tests": [
+        "endpoint::tests::private_parent_foreign_owner_refused"
+      ],
+      "reason": "Requires disposable root foreign-owner endpoint fixture",
+      "owner": "CI container job: run_suite lib qshd"
+    },
+    {
+      "binary": "qshd",
+      "tests": [
         "session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup"
       ],
       "reason": "Requires the maintained disposable root/foreign-UID fixture and the exact current qshd child entry",

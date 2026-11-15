@@ -946,6 +946,71 @@ jobs:
           grep -F 'validated 13 isolated detachment cases' "$runtime/detach-results.log"
           grep -F 'validated bounded parent wait and partial-ready cleanup' "$runtime/detach-results.log"
           grep -F 'validated 8 closed-stdio runtime preconditions' "$runtime/detach-results.log"
+      - name: Portable dormant host endpoint contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-host-endpoint.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
+          unset SSH_AUTH_SOCK SSH_AGENT_PID
+          # Actual foreign-UID ownership runs only in the disposable root library.
+          cargo test -p qshd --lib --locked endpoint::tests:: -- \
+            --skip endpoint::tests::private_parent_foreign_owner_refused --nocapture --test-threads=1 --color=never \
+            2>&1 | tee "$runtime/endpoint-results.log"
+          for name in \
+            endpoint::tests::private_parent_policy_is_opt_in_and_rechecked \
+            endpoint::tests::private_open_does_not_create_or_repair \
+            endpoint::tests::private_lock_substitution_preserves_replacement \
+            endpoint::tests::private_bind_policy_change_cannot_publish \
+            endpoint::tests::private_no_replace_failure_preserves_competitor; do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/endpoint-results.log"
+          done
+          grep -Fx 'running 5 tests' "$runtime/endpoint-results.log"
+          grep -F 'test result: ok. 5 passed; 0 failed; 0 ignored;' "$runtime/endpoint-results.log"
+          cargo test -p qshd --lib --locked session_owner::host_endpoint_tests:: -- \
+            --nocapture --test-threads=1 --color=never \
+            2>&1 | tee "$runtime/host-endpoint-results.log"
+          for name in \
+            session_owner::host_endpoint_tests::host_endpoint_publication_is_private_and_distinct \
+            session_owner::host_endpoint_tests::host_endpoint_rejects_unsafe_or_missing_parent_before_lock \
+            session_owner::host_endpoint_tests::host_endpoint_never_replaces_an_existing_entry \
+            session_owner::host_endpoint_tests::host_endpoint_holds_lock_through_publication_lifetime \
+            session_owner::host_endpoint_tests::host_endpoint_cleanup_retains_original_parent \
+            session_owner::host_endpoint_tests::host_endpoint_cleanup_preserves_replaced_socket \
+            session_owner::host_endpoint_tests::host_endpoint_refuses_silent_unprovisioned_connection \
+            session_owner::host_endpoint_tests::host_endpoint_refuses_protocol_bytes_without_dispatch \
+            session_owner::host_endpoint_tests::host_endpoint_refusal_consumes_one_connection_per_call; do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/host-endpoint-results.log"
+          done
+          grep -Fx 'running 9 tests' "$runtime/host-endpoint-results.log"
+          grep -F 'test result: ok. 9 passed; 0 failed; 0 ignored;' "$runtime/host-endpoint-results.log"
+          if grep -Fq SKIPPED "$runtime/endpoint-results.log" "$runtime/host-endpoint-results.log"; then
+            echo '::error::portable host endpoint contracts reported a runtime skip'
+            exit 1
+          fi
+
       - name: Native cold executable checksum regression
         shell: bash
         run: |
@@ -1587,6 +1652,71 @@ jobs:
         run: |
           df -h / "$RUNNER_TEMP" /mnt 2>/dev/null || true
           du -sh target "$HOME/.cargo" "$HOME/.rustup" "$RUNNER_TEMP" 2>/dev/null || true
+
+      - name: Portable dormant host endpoint contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-host-endpoint.XXXXXX")
+          trap 'rm -rf "$runtime"' EXIT
+          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
+          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
+          unset SSH_AUTH_SOCK SSH_AGENT_PID
+          # Actual foreign-UID ownership runs only in the disposable root library.
+          cargo test -p qshd --lib --locked endpoint::tests:: -- \
+            --skip endpoint::tests::private_parent_foreign_owner_refused --nocapture --test-threads=1 --color=never \
+            2>&1 | tee "$runtime/endpoint-results.log"
+          for name in \
+            endpoint::tests::private_parent_policy_is_opt_in_and_rechecked \
+            endpoint::tests::private_open_does_not_create_or_repair \
+            endpoint::tests::private_lock_substitution_preserves_replacement \
+            endpoint::tests::private_bind_policy_change_cannot_publish \
+            endpoint::tests::private_no_replace_failure_preserves_competitor; do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/endpoint-results.log"
+          done
+          grep -Fx 'running 5 tests' "$runtime/endpoint-results.log"
+          grep -F 'test result: ok. 5 passed; 0 failed; 0 ignored;' "$runtime/endpoint-results.log"
+          cargo test -p qshd --lib --locked session_owner::host_endpoint_tests:: -- \
+            --nocapture --test-threads=1 --color=never \
+            2>&1 | tee "$runtime/host-endpoint-results.log"
+          for name in \
+            session_owner::host_endpoint_tests::host_endpoint_publication_is_private_and_distinct \
+            session_owner::host_endpoint_tests::host_endpoint_rejects_unsafe_or_missing_parent_before_lock \
+            session_owner::host_endpoint_tests::host_endpoint_never_replaces_an_existing_entry \
+            session_owner::host_endpoint_tests::host_endpoint_holds_lock_through_publication_lifetime \
+            session_owner::host_endpoint_tests::host_endpoint_cleanup_retains_original_parent \
+            session_owner::host_endpoint_tests::host_endpoint_cleanup_preserves_replaced_socket \
+            session_owner::host_endpoint_tests::host_endpoint_refuses_silent_unprovisioned_connection \
+            session_owner::host_endpoint_tests::host_endpoint_refuses_protocol_bytes_without_dispatch \
+            session_owner::host_endpoint_tests::host_endpoint_refusal_consumes_one_connection_per_call; do
+            awk -v expected="test $name ... " '
+              index($0, expected) == 1 {
+                seen++; pending = 1
+                if ($0 == expected "ok") { passed++; pending = 0 }
+                next
+              }
+              pending && $0 == "ok" { passed++; pending = 0 }
+              END { exit !(seen == 1 && passed == 1) }
+            ' "$runtime/host-endpoint-results.log"
+          done
+          grep -Fx 'running 9 tests' "$runtime/host-endpoint-results.log"
+          grep -F 'test result: ok. 9 passed; 0 failed; 0 ignored;' "$runtime/host-endpoint-results.log"
+          if grep -Fq SKIPPED "$runtime/endpoint-results.log" "$runtime/host-endpoint-results.log"; then
+            echo '::error::portable host endpoint contracts reported a runtime skip'
+            exit 1
+          fi
 
       # nextest does not run doctests.
       - name: Doc tests
@@ -2497,6 +2627,7 @@ jobs:
             --require helper::server::tests::worker_parent::worker508_init_failure_before_stage_acceptance_settles \
             --require helper::server::tests::worker_parent::worker508_post_stage_unread_stop_settles_failed \
             --require helper::server::tests::worker_parent::worker508_terminal_before_pending_send_suppresses_stop \
+            --require endpoint::tests::private_parent_foreign_owner_refused \
             --require session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup \
             drop_worker_privileges_refuses_without_root \
             own_capability_sets_parses_and_reports_none_for_an_ordinary_process \

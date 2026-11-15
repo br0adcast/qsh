@@ -17,9 +17,9 @@ import unittest
 from unittest import mock
 
 WORKFLOW = Path(__file__).resolve().parents[2] / '.github/workflows/ci.yml'
-# Frozen exact execution contract from actual main90031dd; never read from the workflow under test.
-M_POLICY = '          run_suite lib qshd --ignored 85 \\\n            --require helper::server::tests::host_policy::host529_policy_bad_bounds_wrong_nonce_and_shared_child_cap_refuse_before_fork \\\n            --require helper::server::tests::host_policy::host529_policy_cancelled_consumer_and_deadline_retain_real_child_until_wait \\\n            --require helper::server::tests::host_policy::host529_policy_current_account_and_root_restrictions_are_rechecked \\\n            --require helper::server::tests::host_policy::host529_policy_forged_signature_and_wrong_key_refuse \\\n            --require helper::server::tests::host_policy::host529_policy_key_revocation_between_issue_and_consume_is_current \\\n            --require helper::server::tests::host_policy::host529_policy_late_real_verdict_after_cancel_or_revocation_cannot_grant \\\n            --require helper::server::tests::host_policy::host529_policy_nonce_cannot_be_redirected_to_legacy_login \\\n            --require helper::server::tests::host_policy::host529_policy_nonce_replay_expiry_shared_capacity_and_recovery \\\n            --require helper::server::tests::host_policy::host529_policy_real_auth_and_two_policy_checks_do_not_create_logins \\\n            --require helper::server::tests::host_policy::host529_policy_verdict_before_reap_lost_consumer_stays_charged \\\n            --require process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session \\\n            --require control::peer_tests::control_peer_root_client_rejects_foreign_server \\\n            --require control::peer_tests::control_peer_foreign_client_rejects_root_server \\\n            --require transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \\\n            --require transport_daemon::peer_tests::control_peer_foreign_server_rejects_root_client \\\n            --require serve::tests::the_system_flag_is_accepted_and_moves_the_host_key \\\n            --require helper::monitor::tests::pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks \\\n            --require helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks \\\n            --require log::tests::path_diagnostics_relative_preparation_rotates_after_detach_cwd_change \\\n            --require log::tests::path_diagnostics_foreground_failure_warns_once_and_survives_in_status \\\n            --require helper::server::tests::worker_parent::worker508_pre_stage_stop_is_retained_without_publication \\\n            --require helper::server::tests::worker_parent::worker508_init_failure_before_stage_acceptance_settles \\\n            --require helper::server::tests::worker_parent::worker508_post_stage_unread_stop_settles_failed \\\n            --require helper::server::tests::worker_parent::worker508_terminal_before_pending_send_suppresses_stop \\\n            drop_worker_privileges_refuses_without_root \\\n            own_capability_sets_parses_and_reports_none_for_an_ordinary_process \\\n            an_undeliverable_signal_is_reported_to_the_helper \\\n            a_rotation_that_cannot_rename_is_reported_and_bounds_file_growth'
-# Reviewed union: immutable actual main90031dd policy plus the sole root launch requirement.
+# Frozen exact25-name actual-main50e5efae policy; never read from the candidate workflow.
+M_POLICY = '          run_suite lib qshd --ignored 85 \\\n            --require helper::server::tests::host_policy::host529_policy_bad_bounds_wrong_nonce_and_shared_child_cap_refuse_before_fork \\\n            --require helper::server::tests::host_policy::host529_policy_cancelled_consumer_and_deadline_retain_real_child_until_wait \\\n            --require helper::server::tests::host_policy::host529_policy_current_account_and_root_restrictions_are_rechecked \\\n            --require helper::server::tests::host_policy::host529_policy_forged_signature_and_wrong_key_refuse \\\n            --require helper::server::tests::host_policy::host529_policy_key_revocation_between_issue_and_consume_is_current \\\n            --require helper::server::tests::host_policy::host529_policy_late_real_verdict_after_cancel_or_revocation_cannot_grant \\\n            --require helper::server::tests::host_policy::host529_policy_nonce_cannot_be_redirected_to_legacy_login \\\n            --require helper::server::tests::host_policy::host529_policy_nonce_replay_expiry_shared_capacity_and_recovery \\\n            --require helper::server::tests::host_policy::host529_policy_real_auth_and_two_policy_checks_do_not_create_logins \\\n            --require helper::server::tests::host_policy::host529_policy_verdict_before_reap_lost_consumer_stays_charged \\\n            --require process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session \\\n            --require control::peer_tests::control_peer_root_client_rejects_foreign_server \\\n            --require control::peer_tests::control_peer_foreign_client_rejects_root_server \\\n            --require transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \\\n            --require transport_daemon::peer_tests::control_peer_foreign_server_rejects_root_client \\\n            --require serve::tests::the_system_flag_is_accepted_and_moves_the_host_key \\\n            --require helper::monitor::tests::pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks \\\n            --require helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks \\\n            --require log::tests::path_diagnostics_relative_preparation_rotates_after_detach_cwd_change \\\n            --require log::tests::path_diagnostics_foreground_failure_warns_once_and_survives_in_status \\\n            --require helper::server::tests::worker_parent::worker508_pre_stage_stop_is_retained_without_publication \\\n            --require helper::server::tests::worker_parent::worker508_init_failure_before_stage_acceptance_settles \\\n            --require helper::server::tests::worker_parent::worker508_post_stage_unread_stop_settles_failed \\\n            --require helper::server::tests::worker_parent::worker508_terminal_before_pending_send_suppresses_stop \\\n            --require endpoint::tests::private_parent_foreign_owner_refused \\\n            drop_worker_privileges_refuses_without_root \\\n            own_capability_sets_parses_and_reports_none_for_an_ordinary_process \\\n            an_undeliverable_signal_is_reported_to_the_helper \\\n            a_rotation_that_cannot_rename_is_reported_and_bounds_file_growth'
+# Reviewed union: immutable actual main50e5efae policy plus the sole root launch requirement.
 ROOT_LAUNCH = 'session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup'
 BASELINE_POLICY = M_POLICY.replace('--ignored 85', '--ignored 102').replace(
     '            drop_worker_privileges_refuses_without_root',
@@ -339,12 +339,71 @@ class LibraryReceiptTests(unittest.TestCase):
                 fx.sync()
                 self.refused(fx)
 
+    def test_endpoint_foreign_owner_requirement_rejects_missing_renamed_ignored_or_failed(self):
+        name = 'endpoint::tests::private_parent_foreign_owner_refused'
+        script = WORKFLOW.resolve().parents[2] / 'scripts/no-silent-skips.sh'
+        calls = 0
+        for state in ('ok', 'missing', 'renamed', 'ignored', 'FAILED'):
+            outcomes = [('synthetic_ordinary', 'ok')]
+            if state != 'missing':
+                outcomes.append((name + '_renamed' if state == 'renamed' else name,
+                                 'ok' if state == 'renamed' else state))
+            bodies = 85 - sum(status == 'ignored' for _, status in outcomes)
+            outcomes.extend((f'synthetic_body_{i}', 'ignored') for i in range(bodies))
+            passed = sum(status == 'ok' for _, status in outcomes)
+            failed = sum(status == 'FAILED' for _, status in outcomes)
+            result = 'FAILED' if failed else 'ok'
+            log = '\n'.join([*(f'test {test} ... {status}' for test, status in outcomes),
+                             f'test result: {result}. {passed} passed; {failed} failed; 85 ignored; '
+                             '0 measured; 0 filtered out; finished in 0.00s', ''])
+            with self.subTest(state=state), tempfile.TemporaryDirectory(prefix='endpoint-gate-pure-') as directory:
+                path = Path(directory) / 'synthetic.log'
+                path.write_text(log)
+                check = subprocess.run(['sh', str(script), str(path), '--ignored', '85', '--require', name],
+                                       capture_output=True, text=True, timeout=10)
+                calls += 1
+                self.assertEqual(check.returncode == 0, state == 'ok', check.stderr)
+        self.assertEqual(calls, 5)
+
+    def test_composed_root_policy_requires_every_exact_outcome(self):
+        # Literal main50e5 + sole Launch root contract, not workflow-derived.
+        required = re.findall(r'--require (\S+)', BASELINE_POLICY)
+        self.assertEqual(len(required), 26)
+        self.assertIn('endpoint::tests::private_parent_foreign_owner_refused', required)
+        self.assertIn(ROOT_LAUNCH, required)
+        allowances = ['drop_worker_privileges_refuses_without_root',
+                      'own_capability_sets_parses_and_reports_none_for_an_ordinary_process',
+                      'an_undeliverable_signal_is_reported_to_the_helper',
+                      'a_rotation_that_cannot_rename_is_reported_and_bounds_file_growth']
+        policy = ['--ignored', '102'] + [part for name in required for part in ('--require', name)] + allowances
+        script = WORKFLOW.resolve().parents[2] / 'scripts/no-silent-skips.sh'
+        for target in ('endpoint::tests::private_parent_foreign_owner_refused', ROOT_LAUNCH):
+            for state in ('ok', 'missing', 'renamed', 'ignored', 'FAILED'):
+                with self.subTest(target=target, state=state), tempfile.TemporaryDirectory(prefix='composed-policy-synthetic-') as directory:
+                    outcomes = [('synthetic_ordinary', 'ok')] + [(name, 'ok') for name in required] + [(name, 'ok') for name in allowances]
+                    if state == 'missing': outcomes = [(name, status) for name, status in outcomes if name != target]
+                    elif state != 'ok': outcomes = [(name + '_wrong' if name == target and state == 'renamed' else name,
+                                                   state if name == target and state != 'renamed' else status) for name, status in outcomes]
+                    ignored = sum(status == 'ignored' for _, status in outcomes)
+                    outcomes += [(f'synthetic_ignored_{i}', 'ignored') for i in range(102 - ignored)]
+                    passed = sum(status == 'ok' for _, status in outcomes)
+                    failed = sum(status == 'FAILED' for _, status in outcomes)
+                    result = 'FAILED' if failed else 'ok'
+                    log = '\n'.join([*(f'test {name} ... {status}' for name, status in outcomes),
+                                     *(f'SKIPPED {name}: synthetic allowed control' for name in allowances),
+                                     f'test result: {result}. {passed} passed; {failed} failed; 102 ignored; '
+                                     '0 measured; 0 filtered out; finished in 0.00s', ''])
+                    path = Path(directory) / 'synthetic.log'
+                    path.write_text(log)
+                    check = subprocess.run(['sh', str(script), str(path), *policy], capture_output=True, text=True, timeout=10)
+                    self.assertEqual(check.returncode == 0, state == 'ok', 'exact required identity/outcome must be checked')
+
     def test_workflow_preserves_library_execution_and_policy(self):
         workflow = WORKFLOW.read_text()
         step = workflow.split('      - name: Run the root-gated suites, one binary per fresh container\n', 1)[1]
         self.assertIn(BASELINE_DOCKER, step)
         self.assertIn(BASELINE_POLICY, step)
-        self.assertEqual(BASELINE_POLICY.count('--require '), 25)
+        self.assertEqual(BASELINE_POLICY.count('--require '), 26)
         self.assertIn(BASELINE_BUILD, workflow)
         before = step.index('qshd_library_receipt before "$bin" "$@"')
         run = step.index(BASELINE_DOCKER)
@@ -359,8 +418,8 @@ class LibraryReceiptTests(unittest.TestCase):
         self.assertIn('failures=$((failures + 1))\n                echo "::endgroup::"\n                return', step)
 
     def test_launch_policy_is_exact_and_rejects_stale_cardinality(self):
-        self.assertEqual(M_POLICY.count('--require '), 24)
-        self.assertEqual(BASELINE_POLICY.count('--require '), 25)
+        self.assertEqual(M_POLICY.count('--require '), 25)
+        self.assertEqual(BASELINE_POLICY.count('--require '), 26)
         self.assertIn('--require ' + ROOT_LAUNCH, BASELINE_POLICY)
         for count in ('85', '101', '103'):
             fx = self.fixture()

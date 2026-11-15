@@ -46,5 +46,10 @@ pub(crate) mod local_channel;
 #[allow(dead_code)] // Dormant host-issued resource custody; no runtime activated.
 pub(crate) mod host_resources;
 
+#[allow(dead_code)] // Dormant private listener; no production route constructs it.
+pub(crate) mod host_endpoint;
+#[cfg(test)]
+mod host_endpoint_tests;
+
 #[allow(dead_code)] // Dormant inherited-launch parcel; no production caller.
 pub(crate) mod inherited_launch;
