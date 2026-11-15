@@ -1467,6 +1467,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
       - name: Verify the exact source commit
         shell: bash
         run: |
@@ -1562,7 +1563,6 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_rpm_query.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_consumer_authority_generator.py'
           python3 -B -m unittest discover -s scripts/tests -p 'test_selinux_consumer_rpm_check.py'
-          python3 -I -B scripts/tests/test_selinux_consumer_rpm_check.py --native -v
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_policy_build.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_api.py'
           python3 -m unittest discover -s scripts/tests -p 'test_selinux_files.py'
@@ -1583,6 +1583,13 @@ jobs:
           # Functional wrapper controls only; no native three-channel run.
           python3 -I -B scripts/test_three_channel_functional.py
           QSH_TEST_NEXTEST=cargo-nextest python3 -m unittest discover -s scripts/tests -p 'test_nextest_report.py'
+          python3 -I -B - <<'PY_PACKAGE_SCOPE_TESTS'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('scripts/tests', pattern='test_ci_package_scope.py')
+          count = suite.countTestCases()
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if count > 0 and result.wasSuccessful() and not result.skipped else 1)
+          PY_PACKAGE_SCOPE_TESTS
 
       # Release signing orchestration, including the real native verifier's
       # rejections; none of these controls may be skipped.
@@ -1721,6 +1728,248 @@ jobs:
       # nextest does not run doctests.
       - name: Doc tests
         run: cargo test --workspace --doc --locked
+
+      - name: Determine native package fixture applicability
+        id: package_scope
+        shell: bash
+        run: |
+          python3 -I -B - <<'PY_SCOPE'
+          # BEGIN_PACKAGE_SCOPE
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          class UncertainScope(ValueError):
+              pass
+
+          def git(*args):
+              result = subprocess.run(['git', '--no-pager', *args], capture_output=True,
+                                      timeout=10, check=False)
+              if result.returncode or len(result.stdout) > 4 * 1024 * 1024:
+                  raise UncertainScope()
+              return result.stdout
+
+          def commit(value):
+              if type(value) is not str or not re.fullmatch(r'[0-9a-f]{40}', value) or value == '0' * 40:
+                  raise UncertainScope()
+              if git('cat-file', '-t', value) != b'commit\n':
+                  raise UncertainScope()
+              return value
+
+          NATIVE = 'python3 -I -B scripts/tests/test_selinux_consumer_rpm_check.py --native -v'
+          POLICY = '\n'.join([
+              "python3 -I -B - <<'PY_PACKAGE_SCOPE_TESTS'",
+              'import unittest',
+              "suite = unittest.defaultTestLoader.discover('scripts/tests', pattern='test_ci_package_scope.py')",
+              'count = suite.countTestCases()',
+              'result = unittest.TextTestRunner(verbosity=2).run(suite)',
+              'raise SystemExit(0 if count > 0 and result.wasSuccessful() and not result.skipped else 1)',
+              'PY_PACKAGE_SCOPE_TESTS']) + '\n'
+          DECISION = 'Determine native package fixture applicability'
+          NATIVE_STEP = 'Native package fixture controls'
+          evidence = {}
+
+          def workflow_file(revision, path):
+              entry = git('ls-tree', '-z', revision, '--', path)
+              if not entry.endswith(b'\0') or entry.count(b'\0') != 1:
+                  raise UncertainScope()
+              identity, name = entry[:-1].split(b'\t', 1)
+              fields = identity.split()
+              if len(fields) != 3 or fields[:2] != [b'100644', b'blob'] or name.decode('ascii') != path:
+                  raise UncertainScope()
+              value = git('cat-file', 'blob', fields[2].decode('ascii'))
+              if not value:
+                  raise UncertainScope()
+              return value.decode('utf-8')
+
+          def workflow_contract(source):
+              # Strip only the complete approved relocation/policy envelope.
+              jobs = list(re.finditer(r'(?m)^  check:\n', source))
+              if len(jobs) != 1 or '\r' in source:
+                  raise UncertainScope()
+              start = jobs[0].end()
+              following = re.search(r'(?m)^  [a-z][a-z0-9_-]*:\n', source[start:])
+              job = source[start:start + following.start()] if following else source[start:]
+
+              def one_step(name):
+                  found = list(re.finditer(r'(?m)^      - name: ' + re.escape(name) + r'\n', job))
+                  if len(found) != 1:
+                      raise UncertainScope()
+                  tail = job[found[0].start():]
+                  next_step = re.search(r'(?m)^      - ', tail[found[0].end() - found[0].start():])
+                  if next_step:
+                      tail = tail[:found[0].end() - found[0].start() + next_step.start()]
+                  lines = []
+                  for line in tail.splitlines():
+                      if line.strip() and (not line.startswith('      ') or line.startswith('      #')):
+                          break
+                      lines.append(line)
+                  return '\n'.join(lines).rstrip() + '\n'
+
+              bundle = one_step('Build and release script controls')
+              prefix = '      - name: Build and release script controls\n        run: |\n'
+              if not bundle.startswith(prefix):
+                  raise UncertainScope()
+              policy_block = ''.join('          ' + line + '\n' for line in POLICY.splitlines())
+              body = bundle[len(prefix):]
+              policy_count = body.count(policy_block)
+              if policy_count > 1 or (policy_count == 1 and not body.endswith(policy_block)):
+                  raise UncertainScope()
+              commands = []
+              for line in body.removesuffix(policy_block).splitlines():
+                  if line.strip() and not line.startswith('          '):
+                      raise UncertainScope()
+                  command = line.strip()
+                  if command and not command.startswith('#'):
+                      if not command.startswith(('python3 ', 'sh -n ', 'QSH_TEST_NEXTEST=cargo-nextest python3 ')):
+                          raise UncertainScope()
+                      if any(token in command for token in (';', '&&', '||', '`', '$(', '\\')):
+                          raise UncertainScope()
+                      commands.append(command)
+              native_line = '          ' + NATIVE + '\n'
+              decisions = len(re.findall(r'(?m)^      - name: ' + re.escape(DECISION) + r'\n', job))
+              natives = len(re.findall(r'(?m)^      - name: ' + re.escape(NATIVE_STEP) + r'\n', job))
+              checkout = ('      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n'
+                          '        with:\n          ref: ' + '$' + '{{ github.sha }}\n')
+              if decisions == natives == 0 and commands.count(NATIVE) == 1 and policy_count == 0:
+                  if job.count(checkout) != 1 or '          fetch-depth:' in job:
+                      raise UncertainScope()
+                  return source.replace(native_line, '', 1), 'old'
+              if decisions != 1 or natives != 1 or NATIVE in commands or policy_count != 1:
+                  raise UncertainScope()
+              native = one_step(NATIVE_STEP)
+              condition = '$' + "{{ steps.package_scope.outputs.required != 'false' }}"
+              expected_native = ('      - name: ' + NATIVE_STEP + '\n        if: ' + condition
+                                 + '\n        run: |\n' + native_line)
+              if native != expected_native:
+                  raise UncertainScope()
+              decision = one_step(DECISION)
+              beginning = ('      - name: ' + DECISION + '\n        id: package_scope\n'
+                           "        shell: bash\n        run: |\n          python3 -I -B - <<'PY_SCOPE'\n"
+                           '          # BEGIN_PACKAGE_SCOPE\n')
+              ending = '          # END_PACKAGE_SCOPE\n          PY_SCOPE\n'
+              if not decision.startswith(beginning) or not decision.endswith(ending):
+                  raise UncertainScope()
+              if source.count('          # BEGIN_PACKAGE_SCOPE\n') != 1 or source.count('          # END_PACKAGE_SCOPE\n') != 1:
+                  raise UncertainScope()
+              body = decision[len(beginning):-len(ending)]
+              if not body.strip() or any(line.strip() and not line.startswith('          ') for line in body.splitlines()):
+                  raise UncertainScope()
+              doc = one_step('Doc tests')
+              if doc != '      - name: Doc tests\n        run: cargo test --workspace --doc --locked\n':
+                  raise UncertainScope()
+              doc_end = source.index(doc, start) + len(doc)
+              native_start = source.index(native, start)
+              native_end = native_start + len(native)
+              if native_start < doc_end or source[doc_end:native_end] != '\n' + decision + '\n' + native:
+                  raise UncertainScope()
+              full_checkout = checkout + '          fetch-depth: 0\n'
+              if job.count(full_checkout) != 1:
+                  raise UncertainScope()
+              normalized = source[:doc_end] + source[native_end:]
+              normalized = normalized.replace(policy_block, '', 1).replace(full_checkout, checkout, 1)
+              return normalized, 'new'
+
+          def protected_policy(base, head):
+              old, old_shape = workflow_contract(workflow_file(base, '.github/workflows/ci.yml'))
+              new, new_shape = workflow_contract(workflow_file(head, '.github/workflows/ci.yml'))
+              workflow_file(head, 'scripts/tests/test_ci_package_scope.py')
+              if old_shape == 'new':
+                  workflow_file(base, 'scripts/tests/test_ci_package_scope.py')
+              matched = new_shape == 'new' and old == new
+              if matched:
+                  evidence['contract'] = hashlib.sha256(old.encode('utf-8')).hexdigest()
+              return matched
+
+          def decide():
+              event_name = os.environ.get('GITHUB_EVENT_NAME')
+              if event_name not in ('pull_request', 'push'):
+                  return True, 'NON_BRANCH_EVENT'
+              ref = os.environ.get('GITHUB_REF', '')
+              if ref.startswith('refs/tags/'):
+                  return True, 'TAG'
+              repository = os.environ.get('GITHUB_REPOSITORY')
+              caller = os.environ.get('GITHUB_WORKFLOW_REF')
+              if repository != 'br0adcast/qsh' or caller != repository + '/.github/workflows/ci.yml@' + ref:
+                  return True, 'OTHER_CALLER'
+              raw = Path(os.environ['GITHUB_EVENT_PATH']).read_bytes()
+              if len(raw) > 2 * 1024 * 1024:
+                  raise UncertainScope()
+              event = json.loads(raw)
+              if type(event) is not dict:
+                  raise UncertainScope()
+              source = commit(os.environ.get('GITHUB_SHA'))
+              if git('rev-parse', 'HEAD').strip().decode('ascii') != source:
+                  raise UncertainScope()
+              if event_name == 'pull_request':
+                  number = event.get('number')
+                  if type(number) is not int or number < 1 or ref != f'refs/pull/{number}/merge':
+                      raise UncertainScope()
+                  base = commit(event['pull_request']['base']['sha'])
+                  head = commit(event['pull_request']['head']['sha'])
+                  headers = git('cat-file', '-p', source).split(b'\n\n', 1)[0].splitlines()
+                  parents = [line[7:].decode('ascii') for line in headers if line.startswith(b'parent ')]
+                  if parents != [base, head]:
+                      raise UncertainScope()
+              else:
+                  if ref != 'refs/heads/main' or event.get('ref') != ref:
+                      raise UncertainScope()
+                  base, head = commit(event.get('before')), commit(event.get('after'))
+                  if source != head:
+                      raise UncertainScope()
+              evidence.update(source=source, base=base, head=head)
+              raw_paths = git('diff', '--no-ext-diff', '--no-textconv', '--no-renames',
+                              '--name-only', '-z', base, head, '--')
+              if not raw_paths or not raw_paths.endswith(b'\0'):
+                  raise UncertainScope()
+              paths = [path.decode('utf-8') for path in raw_paths[:-1].split(b'\0')]
+              if any(not path or path.startswith('/') or any(part in ('', '.', '..')
+                     for part in path.split('/')) for path in paths):
+                  raise UncertainScope()
+              package = {'scripts/check-selinux-consumer-rpm.py',
+                         'scripts/generate-selinux-consumer-authority.py',
+                         'scripts/tests/test_selinux_consumer_rpm_check.py'}
+              if any(path.startswith('packaging/') or path in package for path in paths):
+                  return True, 'PACKAGE_INPUT'
+              dependencies = {'Cargo.toml', 'Cargo.lock', 'rust-toolchain', 'rust-toolchain.toml',
+                              'requirements.txt', 'pyproject.toml', 'uv.lock', 'poetry.lock'}
+              if any(path.rsplit('/', 1)[-1] in dependencies for path in paths):
+                  return True, 'DEPENDENCY_INPUT'
+              policy = {'.github/workflows/ci.yml', 'scripts/tests/test_ci_package_scope.py'}
+              if any(path in policy for path in paths):
+                  if not set(paths) <= policy or not protected_policy(base, head):
+                      return True, 'POLICY_CONTRACT_CHANGED'
+                  return False, 'PROTECTED_POLICY_ONLY'
+              unrelated = {'.github/workflows/native-crypto.yml', 'scripts/tests/test_build_openssl.py',
+                           'scripts/tests/test_native_verifier_paths.py',
+                           'scripts/tests/test_released_peer_acceptance.py'}
+              if all(path.startswith(('crates/', 'qshd/')) or path in unrelated for path in paths):
+                  return False, 'CORE_ONLY'
+              return True, 'UNCLASSIFIED_INPUT'
+
+          try:
+              required, reason = decide()
+          except (UncertainScope, OSError, ValueError, KeyError, TypeError, UnicodeError,
+                  subprocess.SubprocessError):
+              required, reason = True, 'UNCERTAIN'
+          value = 'true' if required else 'false'
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('required=' + value + '\n')
+          print('Native package fixture required=' + value + ' reason=' + reason)
+          print('Native package fixture source=' + evidence.get('source', 'unavailable')
+                + ' base=' + evidence.get('base', 'unavailable')
+                + ' head=' + evidence.get('head', 'unavailable')
+                + ' contract=' + evidence.get('contract', 'unavailable'))
+          # END_PACKAGE_SCOPE
+          PY_SCOPE
+
+      - name: Native package fixture controls
+        if: ${{ steps.package_scope.outputs.required != 'false' }}
+        run: |
+          python3 -I -B scripts/tests/test_selinux_consumer_rpm_check.py --native -v
 
   # The privileged tier. Everything `check` above cannot do: create and
   # remove real accounts, overwrite `/etc/pam.d/qshd`, start a real
