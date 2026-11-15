@@ -151,6 +151,32 @@ mod integrated {
         resize_calls: std::sync::atomic::AtomicUsize,
         resize_fail: std::sync::atomic::AtomicBool,
         resize_size: std::sync::atomic::AtomicUsize,
+        exits: Mutex<std::collections::BTreeMap<u8, ExitGate>>,
+    }
+    /// Per-stream exit fixture: an independent gate, actual exit code and
+    /// observed kill/reap/held-poll events for one channel.
+    #[derive(Default)]
+    struct ExitGate {
+        held: bool,
+        code: Option<i32>,
+        kills: usize,
+        reaps: usize,
+        held_polls: usize,
+    }
+    impl Io {
+        fn gate(&self, stream: u8, code: i32, held: bool) {
+            let mut exits = self.exits.lock().unwrap();
+            let gate = exits.entry(stream).or_default();
+            gate.code = Some(code);
+            gate.held = held;
+        }
+        fn release(&self, stream: u8) {
+            self.exits.lock().unwrap().get_mut(&stream).unwrap().held = false;
+            self.changed.notify_all();
+        }
+        fn exit(&self, stream: u8, f: impl FnOnce(&ExitGate) -> usize) -> usize {
+            f(self.exits.lock().unwrap().entry(stream).or_default())
+        }
     }
     struct Reader {
         io: Arc<Io>,
@@ -224,23 +250,49 @@ mod integrated {
         }
     }
 
-    struct Wait(Arc<Io>);
+    struct Wait(Arc<Io>, u8);
+    impl Wait {
+        /// The actual exit code once killed and not held by this stream's gate.
+        fn exited(&self) -> Option<Option<i32>> {
+            let killed = self.0.state.lock().unwrap().0;
+            let mut exits = self.0.exits.lock().unwrap();
+            let gate = exits.entry(self.1).or_default();
+            if killed && gate.held {
+                gate.held_polls += 1;
+            }
+            (killed && !gate.held).then_some(gate.code.or(Some(0)))
+        }
+    }
     impl ChannelWait for Wait {
         fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
-            Some(if self.0.state.lock().unwrap().0 {
-                LeaderStatus::Exited { code: Some(0) }
-            } else {
-                LeaderStatus::Running
+            Some(match self.exited() {
+                Some(code) => LeaderStatus::Exited { code },
+                None => LeaderStatus::Running,
             })
         }
         fn poll_exit(&mut self) -> ChildStatus {
-            if self.0.state.lock().unwrap().0 {
-                ChildStatus::Reaped { code: Some(0) }
-            } else {
-                ChildStatus::Running
+            match self.exited() {
+                Some(code) => {
+                    self.0
+                        .exits
+                        .lock()
+                        .unwrap()
+                        .entry(self.1)
+                        .or_default()
+                        .reaps += 1;
+                    ChildStatus::Reaped { code }
+                }
+                None => ChildStatus::Running,
             }
         }
         fn kill(&mut self) {
+            self.0
+                .exits
+                .lock()
+                .unwrap()
+                .entry(self.1)
+                .or_default()
+                .kills += 1;
             self.0.state.lock().unwrap().0 = true;
             self.0.changed.notify_all();
         }
@@ -316,7 +368,7 @@ mod integrated {
                 Box::new(NoScreen)
             };
             Ok(custody
-                .protect(Box::new(Wait(self.io.clone())), model)
+                .protect(Box::new(Wait(self.io.clone(), request.stream)), model)
                 .finish(
                     Box::new(Reader {
                         io: self.io.clone(),
@@ -2804,5 +2856,73 @@ mod integrated {
         assert_eq!(done.len(), 2);
         assert!(done.iter().all(|r| r.workers_joined()));
         assert_eq!(f.ledger.lock().unwrap().reservations(), 0);
+    }
+    #[tokio::test]
+    async fn cancelled_close_keeps_completed_receipt_and_retry_returns_both_once() {
+        use std::future::Future;
+        let (mut f, front) = Fixture::new();
+        let (one, two) = (
+            ChannelInstance::new(1).unwrap(),
+            ChannelInstance::new(2).unwrap(),
+        );
+        f.io.gate(16, 3, false);
+        f.io.gate(17, 4, true);
+        f.open(&front, 1).await;
+        f.open(&front, 2).await;
+        let before = f.ledger.lock().unwrap().reservations();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        // Cancel a close only once it has consumed channel 1's actual receipt
+        // while channel 2's cleanup is observed pending behind its gate.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let close = f.engine.close_session();
+                    tokio::pin!(close);
+                    while f.io.exit(16, |g| g.reaps) == 0 || f.io.exit(17, |g| g.held_polls) == 0 {
+                        assert!(close.as_mut().poll(&mut cx).is_pending());
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(close.as_mut().poll(&mut cx).is_pending());
+                }
+                if f.engine.retained.channels() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close consumed the first receipt before deadline");
+        assert_eq!(f.io.exit(17, |g| g.reaps), 0, "gated cleanup completed");
+        assert_eq!(
+            f.ledger.lock().unwrap().reservations(),
+            before,
+            "cancelled close refunded backing of incomplete cleanup"
+        );
+        let first_kills = f.io.exit(16, |g| g.kills);
+        f.io.release(17);
+        let done = f.engine.close_session().await.unwrap();
+        let mut facts: Vec<_> = done
+            .iter()
+            .map(|r| (r.instance(), r.stream(), r.code(), r.workers_joined()))
+            .collect();
+        facts.sort_by_key(|r| r.0.get());
+        assert_eq!(
+            facts,
+            [(one, 16, Some(3), true), (two, 17, Some(4), true)],
+            "retry lost or fabricated a receipt consumed by the cancelled close"
+        );
+        assert_eq!(
+            f.io.exit(16, |g| g.kills),
+            first_kills,
+            "first cleanup repeated"
+        );
+        assert_eq!(f.io.exit(16, |g| g.reaps), 1);
+        assert_eq!(f.io.exit(17, |g| g.reaps), 1);
+        assert_eq!(f.ledger.lock().unwrap().reservations(), 0);
+        assert!(
+            f.engine.close_session().await.unwrap().is_empty(),
+            "completed receipts were returned twice"
+        );
+        drop(front);
     }
 }
