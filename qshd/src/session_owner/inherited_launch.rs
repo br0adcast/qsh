@@ -107,6 +107,10 @@ struct Capsule {
     #[cfg(test)]
     setup_read_fault: Option<io::Error>,
     #[cfg(test)]
+    setup_shutdown_fault: Option<io::Error>,
+    #[cfg(test)]
+    setup_shutdown_calls: usize,
+    #[cfg(test)]
     first_unknown: Option<observation::Event>,
     #[cfg(test)]
     first_rejection: Option<observation::Rejection>,
@@ -146,17 +150,39 @@ impl Capsule {
         if self.wait == WaitState::NotCreated {
             self.close_child_copies();
         }
+        // One attempt handled, not proof of EOF, child wait or descriptor closure.
         if !self.write_shutdown {
             self.write_shutdown = true;
             if let Some(setup) = self.setup.as_ref() {
                 if let Ok(fd) = setup.fd() {
-                    if unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_WR) } != 0 {
-                        #[cfg(test)]
-                        {
-                            let errno = io::Error::last_os_error().raw_os_error();
-                            self.observe_unknown(observation::Origin::SetupShutdown, errno);
+                    let shutdown = || {
+                        if unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_WR) } == 0 {
+                            Ok(())
+                        } else {
+                            Err(io::Error::last_os_error())
                         }
-                        self.unknown = true;
+                    };
+                    #[cfg(not(test))]
+                    let result = shutdown();
+                    #[cfg(test)]
+                    let result = {
+                        self.setup_shutdown_calls += 1;
+                        match self.setup_shutdown_fault.take() {
+                            Some(error) => Err(error),
+                            None => shutdown(),
+                        }
+                    };
+                    if let Err(error) = result {
+                        // Disconnection does not lose the retained socket's custody.
+                        // The read/wait/local-close finalizer still supplies settlement.
+                        if error.raw_os_error() != Some(libc::ENOTCONN) {
+                            #[cfg(test)]
+                            self.observe_unknown(
+                                observation::Origin::SetupShutdown,
+                                error.raw_os_error(),
+                            );
+                            self.unknown = true;
+                        }
                     }
                 }
             }
@@ -457,6 +483,10 @@ impl FrontendLaunches {
             interrupt_setup_read: false,
             #[cfg(test)]
             setup_read_fault: None,
+            #[cfg(test)]
+            setup_shutdown_fault: None,
+            #[cfg(test)]
+            setup_shutdown_calls: 0,
             #[cfg(test)]
             first_unknown: None,
             #[cfg(test)]

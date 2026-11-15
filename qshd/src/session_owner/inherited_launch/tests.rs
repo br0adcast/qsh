@@ -351,6 +351,7 @@ fn launch529_wait_and_eof_are_independent_receipts() {
         assert_eq!(launches.in_use(), 0);
     }
     reset_read_receipt_orders();
+    shutdown_disconnection_receipt_orders();
 }
 #[test]
 #[ignore = "ordinary nonroot owned-FD fixture; explicitly selected in maintained CI"]
@@ -401,6 +402,7 @@ fn launch529_lost_wait_and_uncertain_close_never_refund() {
         assert_eq!(launches.budget.in_use(), 1);
     }
     reset_uncertainties_stay_charged();
+    shutdown_uncertainties_stay_charged();
 }
 #[test]
 #[ignore = "ordinary nonroot owned-FD fixture; explicitly selected in maintained CI"]
@@ -1151,4 +1153,288 @@ fn prepare_observation_sites() {
     assert!(launches.prepare_observer.first.is_none());
     launches.cancel(&handle);
     assert_eq!(launches.poll(&handle), super::LaunchProgress::Settled);
+}
+
+// A child-free model of Command::spawn returning Err, not an actual exec/wait proof.
+// The setup peer copies and all other local descriptors are still genuinely owned.
+fn shutdown_model(exec_refused: bool) -> (super::FrontendLaunches, super::LaunchHandle) {
+    let (launches, handle) = reset_model();
+    if exec_refused {
+        let capsule = launches.find(&handle).unwrap();
+        let mut c = capsule.lock().unwrap();
+        c.export = super::ExportDisposition::ExecRefused;
+        c.wait = super::WaitState::NotCreated;
+        c.modeled_child = false;
+        c.close_child_copies();
+    }
+    (launches, handle)
+}
+fn inject_shutdown(launches: &super::FrontendLaunches, handle: &super::LaunchHandle, errno: i32) {
+    launches
+        .find(handle)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .setup_shutdown_fault = Some(std::io::Error::from_raw_os_error(errno));
+}
+fn shutdown_disconnection_receipt_orders() {
+    use super::{ExportDisposition, LaunchProgress, WaitState};
+    use std::os::fd::AsRawFd;
+    for extra_copy in [false, true] {
+        let (mut launches, handle) = shutdown_model(true);
+        let capsule = launches.find(&handle).unwrap();
+        let (deadline, setup, remote, extra) = {
+            let c = capsule.lock().unwrap();
+            (
+                c.deadline.local(),
+                c.setup.as_ref().unwrap().fd().unwrap().as_raw_fd(),
+                std::ptr::from_ref(c.remote.as_ref().unwrap()),
+                extra_copy.then(|| c.setup.as_ref().unwrap().duplicate().unwrap()),
+            )
+        };
+        inject_shutdown(&launches, &handle, nix::libc::ENOTCONN);
+        {
+            let mut c = capsule.lock().unwrap();
+            c.retire();
+            c.interrupt_setup_read = true;
+            assert_eq!(
+                c.poll(),
+                LaunchProgress::Closing,
+                "disconnection is not lost custody"
+            );
+            assert!(c.cancelled() && !c.eof && !c.unknown && !c.kill_attempted);
+            assert_eq!(c.export, ExportDisposition::ExecRefused);
+            assert_eq!(c.wait, WaitState::NotCreated);
+            assert!(c.child.is_none() && c.status.is_none() && c.first_unknown.is_none());
+            assert_eq!(c.setup.as_ref().unwrap().fd().unwrap().as_raw_fd(), setup);
+            assert_eq!(std::ptr::from_ref(c.remote.as_ref().unwrap()), remote);
+            assert_eq!(c.setup_shutdown_calls, 1);
+            assert!(c.write_shutdown && c.setup_shutdown_fault.is_none());
+            c.interrupt_setup_read = true;
+        }
+        assert_eq!(launches.in_use(), 1);
+        assert_eq!(launches.budget.in_use(), 1);
+        assert_eq!(launches.poll(&handle), LaunchProgress::Closing);
+        {
+            let mut c = capsule.lock().unwrap();
+            assert!(!c.eof && c.setup.is_some() && c.remote.is_some());
+            assert_eq!(c.deadline.local(), deadline);
+            c.retire();
+            assert_eq!(
+                c.setup_shutdown_calls, 1,
+                "retirement never retries shutdown"
+            );
+        }
+        assert_eq!(
+            launches.budget.in_use(),
+            1,
+            "interruption supplies no EOF or credit"
+        );
+        let progress = launches.poll(&handle); // genuine read of EOF after actual peer closes
+        assert_eq!(
+            progress,
+            if extra_copy {
+                LaunchProgress::Closing
+            } else {
+                LaunchProgress::Settled
+            }
+        );
+        {
+            let c = capsule.lock().unwrap();
+            assert!(c.eof && c.status.is_none() && !c.unknown && c.child.is_none());
+            assert_eq!(c.wait, WaitState::NotCreated);
+            assert_eq!(c.deadline.local(), deadline);
+            assert_eq!(c.setup_shutdown_calls, 1);
+        }
+        if extra_copy {
+            assert_eq!(
+                launches.budget.in_use(),
+                1,
+                "a tracked local duplicate retains debt after EOF"
+            );
+            assert!(matches!(
+                launches.prepare(config(), Instant::now() + Duration::from_secs(60)),
+                Err(local_channel::AdmissionError::Capacity)
+            ));
+        }
+        drop(extra); // actual known close, not a ledger edit
+        assert_eq!(launches.poll(&handle), LaunchProgress::Settled);
+        assert_eq!(launches.in_use(), 0);
+        assert_eq!(launches.budget.in_use(), 0);
+        assert!(
+            !launches.test_publish(&handle),
+            "retired launch cannot become admission"
+        );
+        let next = launches
+            .prepare(config(), Instant::now() + Duration::from_secs(60))
+            .unwrap();
+        launches.cancel(&next);
+        assert_eq!(launches.poll(&next), LaunchProgress::Settled);
+    }
+    for eof_first in [false, true] {
+        let (mut launches, handle) = shutdown_model(false);
+        let capsule = launches.find(&handle).unwrap();
+        inject_shutdown(&launches, &handle, nix::libc::ENOTCONN);
+        capsule.lock().unwrap().retire();
+        assert_eq!(launches.poll(&handle), LaunchProgress::Closing);
+        if eof_first {
+            launches.test_eof(&handle);
+        } else {
+            launches.test_wait(&handle, false);
+        }
+        assert_eq!(
+            launches.poll(&handle),
+            LaunchProgress::Closing,
+            "one receipt after disconnection never settles"
+        );
+        {
+            let c = capsule.lock().unwrap();
+            assert_eq!(c.eof, eof_first);
+            assert_eq!(
+                c.wait,
+                if eof_first {
+                    WaitState::Pending
+                } else {
+                    WaitState::Terminal
+                }
+            );
+            assert!(
+                c.child.is_none() && c.status.is_none(),
+                "terminal wait is explicitly modeled"
+            );
+            assert_eq!(c.setup_shutdown_calls, 1);
+        }
+        assert_eq!(launches.budget.in_use(), 1);
+        if eof_first {
+            launches.test_wait(&handle, false);
+        } else {
+            launches.test_eof(&handle);
+        }
+        assert_eq!(launches.poll(&handle), LaunchProgress::Settled);
+        assert_eq!(launches.budget.in_use(), 0);
+    }
+    // Default seam behavior performs the real SHUT_WR while its real peer remains open.
+    let (mut launches, handle) = shutdown_model(false);
+    let capsule = launches.find(&handle).unwrap();
+    capsule.lock().unwrap().retire();
+    assert_eq!(launches.poll(&handle), LaunchProgress::Closing);
+    {
+        let c = capsule.lock().unwrap();
+        assert!(!c.eof && !c.unknown && c.first_unknown.is_none());
+        assert_eq!(c.setup_shutdown_calls, 1);
+    }
+    launches.test_wait(&handle, false);
+    launches.test_eof(&handle);
+    assert_eq!(launches.poll(&handle), LaunchProgress::Settled);
+    assert_eq!(launches.budget.in_use(), 0);
+}
+fn shutdown_uncertainties_stay_charged() {
+    use super::{observation::Origin, LaunchProgress, WaitState};
+    use std::os::fd::AsRawFd;
+    for errno in [
+        nix::libc::EBADF,
+        nix::libc::ENOTSOCK,
+        nix::libc::EINVAL,
+        nix::libc::EINTR,
+        nix::libc::EIO,
+    ] {
+        let (mut launches, handle) = shutdown_model(true);
+        let capsule = launches.find(&handle).unwrap();
+        inject_shutdown(&launches, &handle, errno);
+        let deadline = capsule.lock().unwrap().deadline.local();
+        let first = {
+            let mut c = capsule.lock().unwrap();
+            c.retire();
+            c.interrupt_setup_read = true;
+            assert_eq!(c.poll(), LaunchProgress::Unknown);
+            let first = c.first_unknown.unwrap();
+            assert_eq!(first.origin, Origin::SetupShutdown);
+            assert_eq!(
+                first.errno,
+                Some(errno),
+                "synthetic shutdown result reaches the real Unknown branch"
+            );
+            let fd = c.setup.as_ref().unwrap().fd().unwrap().as_raw_fd();
+            assert!(
+                unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) } >= 0,
+                "injected EBADF never forges or destroys FD ownership"
+            );
+            c.setup_shutdown_fault = Some(std::io::Error::from_raw_os_error(nix::libc::ENOTCONN));
+            c.retire();
+            assert_eq!(c.setup_shutdown_calls, 1);
+            assert!(
+                c.setup_shutdown_fault.is_some(),
+                "one-shot guard leaves later fault unused"
+            );
+            assert_eq!(c.first_unknown, Some(first));
+            first
+        };
+        assert_eq!(launches.poll(&handle), LaunchProgress::Unknown);
+        let c = capsule.lock().unwrap();
+        assert!(c.eof && c.unknown && !c.kill_attempted && c.setup.is_some() && c.remote.is_some());
+        assert_eq!(c.first_unknown, Some(first));
+        assert_eq!(c.deadline.local(), deadline);
+        drop(c);
+        assert_eq!(launches.budget.in_use(), 1);
+    }
+    for lost_before in [false, true] {
+        let (mut launches, handle) = shutdown_model(false);
+        let capsule = launches.find(&handle).unwrap();
+        if lost_before {
+            launches.test_wait(&handle, true);
+        }
+        inject_shutdown(&launches, &handle, nix::libc::ENOTCONN);
+        capsule.lock().unwrap().retire();
+        if !lost_before {
+            launches.test_wait(&handle, true);
+        }
+        let first = launches.observation(&handle).first.unwrap();
+        assert_eq!(first.origin, Origin::ModeledLostWait);
+        launches.test_eof(&handle); // actual setup peer closes, never a direct EOF assignment
+        assert_eq!(launches.poll(&handle), LaunchProgress::Unknown);
+        {
+            let mut c = capsule.lock().unwrap();
+            c.kill_owned();
+            assert!(c.eof && c.unknown && !c.kill_attempted && c.status.is_none());
+            assert_eq!(c.wait, WaitState::Unknown);
+            assert_eq!(c.first_unknown, Some(first));
+            assert_eq!(c.setup_shutdown_calls, 1);
+        }
+        assert_eq!(launches.budget.in_use(), 1);
+    }
+    for close_before in [false, true] {
+        let (mut launches, handle) = shutdown_model(true);
+        let capsule = launches.find(&handle).unwrap();
+        let mut extra = Some(
+            capsule
+                .lock()
+                .unwrap()
+                .setup
+                .as_ref()
+                .unwrap()
+                .duplicate()
+                .unwrap(),
+        );
+        if close_before {
+            extra.as_mut().unwrap().test_uncertain_close();
+            drop(extra.take());
+        }
+        inject_shutdown(&launches, &handle, nix::libc::ENOTCONN);
+        capsule.lock().unwrap().retire();
+        if !close_before {
+            extra.as_mut().unwrap().test_uncertain_close();
+            drop(extra.take());
+        }
+        assert_eq!(launches.poll(&handle), LaunchProgress::Unknown);
+        let first = launches.observation(&handle).first.unwrap();
+        assert_eq!(first.origin, Origin::RemoteSettlement);
+        assert!(first.snapshot.debt.unwrap().uncertain.unwrap());
+        launches.cancel(&handle);
+        assert_eq!(launches.poll(&handle), LaunchProgress::Unknown);
+        assert_eq!(launches.observation(&handle).first, Some(first));
+        assert_eq!(launches.budget.in_use(), 1);
+        let c = capsule.lock().unwrap();
+        assert!(c.eof && c.unknown && !c.kill_attempted && c.status.is_none());
+        assert_eq!(c.setup_shutdown_calls, 1);
+    }
 }
