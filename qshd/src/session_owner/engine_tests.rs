@@ -170,12 +170,33 @@ mod integrated {
             gate.code = Some(code);
             gate.held = held;
         }
+        /// Infallible, so it can run while a test failure is unwinding.
         fn release(&self, stream: u8) {
-            self.exits.lock().unwrap().get_mut(&stream).unwrap().held = false;
+            self.exits
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(stream)
+                .or_default()
+                .held = false;
             self.changed.notify_all();
         }
         fn exit(&self, stream: u8, f: impl FnOnce(&ExitGate) -> usize) -> usize {
             f(self.exits.lock().unwrap().entry(stream).or_default())
+        }
+    }
+    /// Owns one held exit gate. Dropping it, including during unwinding,
+    /// releases the gate so the exact reaper can observe the real exit.
+    struct HeldExit(Arc<Io>, u8);
+    impl HeldExit {
+        fn arm(io: &Arc<Io>, stream: u8, code: i32) -> Self {
+            let held = Self(io.clone(), stream);
+            io.gate(stream, code, true);
+            held
+        }
+    }
+    impl Drop for HeldExit {
+        fn drop(&mut self) {
+            self.0.release(self.1);
         }
     }
     struct Reader {
@@ -2857,22 +2878,11 @@ mod integrated {
         assert!(done.iter().all(|r| r.workers_joined()));
         assert_eq!(f.ledger.lock().unwrap().reservations(), 0);
     }
-    #[tokio::test]
-    async fn cancelled_close_keeps_completed_receipt_and_retry_returns_both_once() {
+    /// Cancels close only once it has consumed channel 1's actual receipt
+    /// while channel 2's cleanup is observed pending behind its held gate.
+    async fn cancel_after_first_receipt(f: &mut Fixture) {
         use std::future::Future;
-        let (mut f, front) = Fixture::new();
-        let (one, two) = (
-            ChannelInstance::new(1).unwrap(),
-            ChannelInstance::new(2).unwrap(),
-        );
-        f.io.gate(16, 3, false);
-        f.io.gate(17, 4, true);
-        f.open(&front, 1).await;
-        f.open(&front, 2).await;
-        let before = f.ledger.lock().unwrap().reservations();
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        // Cancel a close only once it has consumed channel 1's actual receipt
-        // while channel 2's cleanup is observed pending behind its gate.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 {
@@ -2893,21 +2903,44 @@ mod integrated {
         .await
         .expect("close consumed the first receipt before deadline");
         assert_eq!(f.io.exit(17, |g| g.reaps), 0, "gated cleanup completed");
+    }
+    async fn bounded_close(f: &mut Fixture) -> Vec<RetainedCleanup> {
+        tokio::time::timeout(Duration::from_secs(5), f.engine.close_session())
+            .await
+            .expect("close finished before deadline")
+            .unwrap()
+    }
+    fn receipt_facts(done: &[RetainedCleanup]) -> Vec<(ChannelInstance, u8, Option<i32>, bool)> {
+        let mut facts: Vec<_> = done
+            .iter()
+            .map(|r| (r.instance(), r.stream(), r.code(), r.workers_joined()))
+            .collect();
+        facts.sort_by_key(|r| r.0.get());
+        facts
+    }
+    #[tokio::test]
+    async fn cancelled_close_keeps_completed_receipt_and_retry_returns_both_once() {
+        let (mut f, front) = Fixture::new();
+        let (one, two) = (
+            ChannelInstance::new(1).unwrap(),
+            ChannelInstance::new(2).unwrap(),
+        );
+        f.io.gate(16, 3, false);
+        let held = HeldExit::arm(&f.io, 17, 4);
+        f.open(&front, 1).await;
+        f.open(&front, 2).await;
+        let before = f.ledger.lock().unwrap().reservations();
+        cancel_after_first_receipt(&mut f).await;
         assert_eq!(
             f.ledger.lock().unwrap().reservations(),
             before,
             "cancelled close refunded backing of incomplete cleanup"
         );
         let first_kills = f.io.exit(16, |g| g.kills);
-        f.io.release(17);
-        let done = f.engine.close_session().await.unwrap();
-        let mut facts: Vec<_> = done
-            .iter()
-            .map(|r| (r.instance(), r.stream(), r.code(), r.workers_joined()))
-            .collect();
-        facts.sort_by_key(|r| r.0.get());
+        drop(held);
+        let done = bounded_close(&mut f).await;
         assert_eq!(
-            facts,
+            receipt_facts(&done),
             [(one, 16, Some(3), true), (two, 17, Some(4), true)],
             "retry lost or fabricated a receipt consumed by the cancelled close"
         );
@@ -2920,9 +2953,43 @@ mod integrated {
         assert_eq!(f.io.exit(17, |g| g.reaps), 1);
         assert_eq!(f.ledger.lock().unwrap().reservations(), 0);
         assert!(
-            f.engine.close_session().await.unwrap().is_empty(),
+            bounded_close(&mut f).await.is_empty(),
             "completed receipts were returned twice"
         );
+        drop(front);
+    }
+    #[tokio::test]
+    async fn held_exit_gate_released_by_unwinding_lets_actual_cleanup_finish() {
+        let (mut f, front) = Fixture::new();
+        f.io.gate(16, 3, false);
+        let held = HeldExit::arm(&f.io, 17, 4);
+        f.open(&front, 1).await;
+        f.open(&front, 2).await;
+        cancel_after_first_receipt(&mut f).await;
+        // A test failure while channel 2 is held must not leave its fake wait
+        // reporting Running, or the exact reaper and runtime teardown never end.
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = held;
+            panic!("controlled fixture failure while channel 2 is held");
+        }));
+        assert!(failure.is_err());
+        assert_eq!(
+            f.io.exit(17, |g| usize::from(g.held)),
+            0,
+            "unwinding left the exit gate held"
+        );
+        let done = bounded_close(&mut f).await;
+        assert_eq!(
+            receipt_facts(&done),
+            [
+                (ChannelInstance::new(1).unwrap(), 16, Some(3), true),
+                (ChannelInstance::new(2).unwrap(), 17, Some(4), true)
+            ],
+            "released gate did not reach the actual reaper and worker joins"
+        );
+        assert_eq!(f.engine.retained.channels(), 0);
+        assert_eq!(f.io.exit(17, |g| g.reaps), 1);
+        assert_eq!(f.ledger.lock().unwrap().reservations(), 0);
         drop(front);
     }
 }
