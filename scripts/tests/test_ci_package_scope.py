@@ -242,21 +242,33 @@ class PackageScopeTests(unittest.TestCase):
         source = source.replace(following, '          ' + NATIVE + '\n' + following)
         return source.replace('          fetch-depth: 0\n', '', 1)
 
-    def policy_decision(self, *, old=False, changed=None, extra=None, event_name='pull_request'):
+    def policy_decision(self, *, old=False, changed=None, extra=None, event_name='pull_request',
+                        expected_reason=None, relocate=None, event_factory=None, **execute_kwargs):
         fixture = GitFixture()
         self.addCleanup(fixture.close)
         fixture.write('.github/workflows/ci.yml', self.old_workflow() if old else self.source)
         if not old:
             fixture.write('scripts/tests/test_ci_package_scope.py', '# authored policy fixture\n')
+        if relocate:
+            fixture.write(relocate[0])
         base = fixture.commit()
         fixture.write('.github/workflows/ci.yml', self.source if changed is None else changed)
         fixture.write('scripts/tests/test_ci_package_scope.py', '# changed authored policy fixture\n')
         for name in extra or ():
             fixture.write(name)
+        if relocate:
+            (fixture.root / relocate[0]).unlink()
+            if relocate[1]:
+                fixture.write(relocate[1])
         head = fixture.commit()
-        result, fields = fixture.execute(actual_helper(self.source), base, head, event_name=event_name)
+        if event_factory is not None:
+            execute_kwargs['event'] = event_factory(base, head)
+        result, fields = fixture.execute(actual_helper(self.source), base, head,
+                                        event_name=event_name, **execute_kwargs)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(fields.get('required'), ('true', 'false'), result.stdout)
+        if expected_reason is not None:
+            self.assertIn(' reason=' + expected_reason + '\n', result.stdout)
         return fields['required']
 
     def test_initial_policy_only_delta_requires_protected_contract(self):
@@ -272,8 +284,60 @@ class PackageScopeTests(unittest.TestCase):
     def test_policy_and_package_mixed_delta_requires_native(self):
         self.assertEqual(self.policy_decision(old=True, extra=['packaging/selinux/new-input']), 'true')
 
-    def test_policy_and_core_mixed_delta_is_not_a_policy_only_exception(self):
-        self.assertEqual(self.policy_decision(extra=['qshd/src/engine.rs']), 'true')
+    def test_protected_policy_and_core_compositions_keep_native_optional(self):
+        paths = ('qshd/src/helper/server.rs', 'crates/transport/src/lib.rs',
+                 '.github/workflows/native-crypto.yml', 'scripts/tests/test_build_openssl.py',
+                 'scripts/tests/test_native_verifier_paths.py',
+                 'scripts/tests/test_released_peer_acceptance.py')
+        for old in (True, False):
+            for event in ('pull_request', 'push'):
+                for path in paths:
+                    with self.subTest(old=old, event=event, path=path):
+                        self.assertEqual(self.policy_decision(old=old, extra=[path],
+                            event_name=event), 'false')
+
+    def test_policy_core_composition_reports_its_distinct_protected_reason(self):
+        self.assertEqual(self.policy_decision(extra=['qshd/src/helper/server.rs'],
+            expected_reason='PROTECTED_POLICY_AND_CORE'), 'false')
+
+    def test_policy_core_compositions_preserve_package_dependency_and_unknown_refusals(self):
+        for old in (True, False):
+            for event in ('pull_request', 'push'):
+                for path in ('packaging/selinux/new-input', 'scripts/check-selinux-consumer-rpm.py',
+                             'qshd/Cargo.toml', 'crates/toolchain/rust-toolchain.toml',
+                             'scripts/unclassified.py', 'unclassified/new-input'):
+                    with self.subTest(old=old, event=event, path=path):
+                        self.assertEqual(self.policy_decision(old=old, event_name=event,
+                            extra=['qshd/src/helper/server.rs', path]), 'true')
+
+    def test_policy_core_compositions_retain_renamed_deleted_and_missing_input_guards(self):
+        for old in (True, False):
+            for event in ('pull_request', 'push'):
+                for move in (('packaging/old-input', None),
+                             ('packaging/old-input', 'qshd/moved-input'),
+                             ('qshd/old-input', 'packaging/moved-input'),
+                             ('scripts/tests/test_ci_package_scope.py', None)):
+                    with self.subTest(old=old, event=event, move=move):
+                        self.assertEqual(self.policy_decision(old=old, event_name=event,
+                            extra=['qshd/src/helper/server.rs'], relocate=move), 'true')
+
+    def test_policy_core_compositions_still_require_protected_workflow(self):
+        for name, changed in self.protected_workflow_mutations().items():
+            for old in (True, False):
+                with self.subTest(old=old, mutation=name):
+                    self.assertNotEqual(changed, self.source)
+                    self.assertEqual(self.policy_decision(old=old, changed=changed,
+                        extra=['qshd/src/helper/server.rs']), 'true')
+
+    def test_policy_core_compositions_keep_event_and_caller_binding(self):
+        for old in (True, False):
+            for kwargs in ({'event': {}}, {'source': '1' * 40},
+                           {'event_factory': lambda base, head: {'number': 605, 'pull_request': {
+                               'base': {'sha': head}, 'head': {'sha': head}}}},
+                           {'caller': 'br0adcast/qsh/.github/workflows/release.yml@refs/pull/605/merge'}):
+                with self.subTest(old=old, context=kwargs):
+                    self.assertEqual(self.policy_decision(old=old,
+                        extra=['qshd/src/helper/server.rs'], **kwargs), 'true')
 
     def test_original_core_controls_and_job_contract_are_unconditional(self):
         body = run_block(step(self.source, 'Build and release script controls'))
@@ -387,7 +451,7 @@ class PackageScopeTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(fields.get('required'), 'true')
 
-    def test_protected_workflow_contract_rejects_residual_mutations(self):
+    def protected_workflow_mutations(self):
         native = semantic_step(step(self.source, NATIVE_STEP))
         mutations = {
             'native argv': self.source.replace(native, native.replace(' --native -v', ' --native'), 1),
@@ -412,7 +476,10 @@ class PackageScopeTests(unittest.TestCase):
         before_doc = self.source.replace(native, '', 1)
         mutations['native before core completion'] = before_doc.replace(
             '      - name: Doc tests\n', native + '\n      - name: Doc tests\n', 1)
-        for name, source in mutations.items():
+        return mutations
+
+    def test_protected_workflow_contract_rejects_residual_mutations(self):
+        for name, source in self.protected_workflow_mutations().items():
             with self.subTest(mutation=name):
                 self.assertNotEqual(source, self.source)
                 self.assertEqual(self.policy_decision(changed=source), 'true')
