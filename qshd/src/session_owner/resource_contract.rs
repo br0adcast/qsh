@@ -186,11 +186,17 @@ struct Entry {
     cleanup: RequestId,
     pinned: Option<ReservationId>,
 }
+/// Private registration policy; never reconstructed from a request or receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HostResourceBinding {
+    pub host: HostInstance,
+    pub locator: SessionLocator,
+}
 #[derive(Debug)]
 pub struct ResourceLedger {
     limits: ResourceLimits,
     scope: LedgerInstance,
-    principals: Vec<(PrincipalRegistration, u32)>,
+    principals: Vec<(PrincipalRegistration, u32, Option<HostResourceBinding>)>,
     last_registration: u64,
     entries: Vec<Entry>,
     last_id: u64,
@@ -222,7 +228,7 @@ impl ResourceLedger {
         p: AuthenticatedPrincipalRef,
         canonical_uid: u32,
     ) -> Result<PrincipalRegistration, Error> {
-        if self.principals.iter().any(|(old, _)| old.principal == p) {
+        if self.principals.iter().any(|(old, _, _)| old.principal == p) {
             return Err(Error::Binding);
         }
         if self.principals.len() >= self.limits.max_reservations {
@@ -237,9 +243,30 @@ impl ResourceLedger {
             serial,
             principal: p,
         };
-        self.principals.push((handle, canonical_uid));
+        self.principals.push((handle, canonical_uid, None));
         self.last_registration = serial;
         Ok(handle)
+    }
+    pub(super) fn register_host_principal(
+        &mut self,
+        principal: AuthenticatedPrincipalRef,
+        uid: u32,
+        binding: HostResourceBinding,
+    ) -> Result<PrincipalRegistration, Error> {
+        let registration = self.register_fresh_principal(principal, uid)?;
+        self.principals.last_mut().expect("just registered").2 = Some(binding);
+        Ok(registration)
+    }
+    pub(super) fn host_binding(
+        &self,
+        registration: PrincipalRegistration,
+    ) -> Result<Option<HostResourceBinding>, Error> {
+        self.canonical_uid(registration)?;
+        self.principals
+            .iter()
+            .find(|(p, _, _)| *p == registration)
+            .map(|(_, _, binding)| *binding)
+            .ok_or(Error::Binding)
     }
     /// Retirement is refused until the principal's exact final resource receipt.
     /// It does not reset IDs, rebind a live UID, or alter another owner's charge.
@@ -247,7 +274,7 @@ impl ResourceLedger {
         let i = self
             .principals
             .iter()
-            .position(|(old, _)| *old == p && p.ledger == self.scope)
+            .position(|(old, _, _)| *old == p && p.ledger == self.scope)
             .ok_or(Error::Binding)?;
         if self
             .entries
@@ -270,8 +297,8 @@ impl ResourceLedger {
         }
         self.principals
             .iter()
-            .find(|(p, _)| *p == registration)
-            .map(|(_, uid)| *uid)
+            .find(|(p, _, _)| *p == registration)
+            .map(|(_, uid, _)| *uid)
             .ok_or(Error::Binding)
     }
     pub fn principals(&self) -> usize {
@@ -293,8 +320,8 @@ impl ResourceLedger {
         let account = self
             .principals
             .iter()
-            .find(|(p, _)| *p == principal)
-            .map(|(_, a)| *a)
+            .find(|(p, _, _)| *p == principal)
+            .map(|(_, a, _)| *a)
             .ok_or(Error::Binding)?;
         if r.id.get() <= self.last_id {
             return Err(Error::ReusedRequest);

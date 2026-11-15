@@ -1509,7 +1509,7 @@ fn report_mode_offers_busy_choice_before_compatibility_or_mutation() {
             assert_eq!(out.lines().count(), 1, "{out}");
             let busy: serde_json::Value =
                 serde_json::from_str(out.strip_prefix("TRANSPORT-BUSY ").unwrap().trim()).unwrap();
-            assert_eq!(busy["schema"], 1);
+            assert_eq!(busy["schema"], 2);
             let mut expected = scripted_identity(false);
             if protocol.is_some() {
                 expected["generation"] = "cd".repeat(16).into();
@@ -1758,7 +1758,7 @@ fn bootstrap_capability_query_is_read_only_before_any_daemon_state_exists() {
     );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap(),
-        serde_json::json!({"schema":1,"busy_decisions":true})
+        serde_json::json!({"schema":1,"busy_decisions":true,"account_service_restart_v1":true})
     );
     assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
 }
@@ -1819,13 +1819,14 @@ fn confirmed_modern_helper_restarts_only_after_old_exact_exit() {
     };
     let info: qshd::control::DestructiveRestartInfoResponse = serde_json::from_str(&line).unwrap();
     let busy = BusyDaemonInfo {
-        schema: 1,
+        schema: 2,
         attempt: BusyAttemptId::from_bytes([1; 16]),
         identity: info.identity,
         candidate: serde_json::from_value(scripted_candidate()).unwrap(),
         active_connections: 1,
         serving_profiles: None,
         preservation: PreservationCapability::Unknown,
+        service_restart: None,
     };
     let consent = busy.confirm_destructive_restart();
     let decision = PendingBusy::new(busy)

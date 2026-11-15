@@ -530,16 +530,33 @@ def rpm_version(version):
     return version.replace('-', '~')
 
 
+# GitHub rewrites other characters in uploaded asset names, and leading or
+# trailing periods; rc1's '~' became '.' (#526).
+GITHUB_SAFE_NAME = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?')
+
+
+def github_safe_name(name):
+    return GITHUB_SAFE_NAME.fullmatch(name) is not None
+
+
+def package_file_name(fmt, program, version, arch):
+    # The release version as in the tag and archive names, then revision 1.
+    # Package metadata keeps debian_version()/rpm_version() and their '~'.
+    if fmt == 'deb':
+        name = '{}_{}-1_{}.deb'.format(program, version, arch)
+    else:
+        name = '{}-{}-1.{}.rpm'.format(program, version, arch)
+    if not github_safe_name(name):
+        raise ValueError('package file name would be renamed on upload')
+    return name
+
+
 def check_fields(fmt, fields, filename, program, version, arch):
     if fmt == 'deb':
-        package_version = debian_version(version)
-        expected = [program, package_version, arch]
-        name = '{}_{}_{}.deb'.format(program, package_version, arch)
+        expected = [program, debian_version(version), arch]
     else:
-        package_version = rpm_version(version)
-        expected = [program, package_version, '1', arch]
-        name = '{}-{}-1.{}.rpm'.format(program, package_version, arch)
-    if fields != expected or Path(filename).name != name:
+        expected = [program, rpm_version(version), '1', arch]
+    if fields != expected or Path(filename).name != package_file_name(fmt, program, version, arch):
         raise ValueError('package metadata or filename differs from selected version/identity')
 
 
@@ -589,14 +606,15 @@ def check_package(path, fmt, program, version, arch, probe=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command')
-    for name in ('archive', 'package', 'text', 'fields'):
+    for name in ('archive', 'package', 'text', 'fields', 'package-name'):
         command = sub.add_parser(name)
         command.add_argument('--version', required=name != 'text')
         if name != 'archive':
             command.add_argument('--program', choices=('qsh', 'qshd'), required=True)
-        if name in ('package', 'fields'):
+        if name in ('package', 'fields', 'package-name'):
             command.add_argument('--format', choices=('deb', 'rpm'), required=True)
             command.add_argument('--arch', required=True)
+        if name in ('package', 'fields'):
             command.add_argument('path')
         if name == 'archive':
             command.add_argument('--inputs', required=True)
@@ -617,6 +635,8 @@ def main():
                           darwin_metadata=args.darwin_metadata,native_prefix=args.native_prefix)
         elif args.command == 'package':
             check_package(args.path, args.format, args.program, args.version, args.arch, args.probe)
+        elif args.command == 'package-name':
+            print(package_file_name(args.format, args.program, args.version, args.arch))
         else:
             data = sys.stdin.buffer.read(LIMIT + 1)
             if len(data) > LIMIT:

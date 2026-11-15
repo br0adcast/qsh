@@ -21,7 +21,8 @@ mod trust;
 pub use daemon_bootstrap_protocol::{
     BusyAttemptId, BusyChoice, BusyDaemonIdentity, BusyDaemonInfo, BusyDecision,
     CandidateImageIdentity, DestructiveRestartAction, DestructiveRestartConsent, PendingBusy,
-    PreservationCapability,
+    PersonalServiceProfile, PersonalServiceSelector, PreservationCapability, ServiceRestartAction,
+    ServiceRestartConsent,
 };
 
 pub use image::{
@@ -35,16 +36,53 @@ pub use timing::InstallTiming;
 pub struct BringUpRequest {
     /// Opt in to a non-ready busy decision; ordinary/background callers use false.
     pub report_busy: bool,
-    /// Consent for precisely the daemon identity reported in this attempt.
+    /// The observed choice. Continue and exact Force bind the instance;
+    /// explicit service Force carries its separately approved service scope.
     pub busy_decision: Option<BusyDecision>,
-    /// Separate interrupting-restart confirmation; currently always refused without
-    /// qualified exact-instance authority. ForceUpdate alone cannot imply it.
+    /// Separate exact-instance interruption confirmation; qualified receipt
+    /// and exit authority are still required. ForceUpdate alone cannot imply it.
     pub destructive_consent: Option<DestructiveRestartConsent>,
+    pub service_restart_consent: Option<ServiceRestartConsent>,
+    pub pending_busy_target: Option<BusySshTarget>,
     pub name: String,
     pub ssh: ssh::SshParams,
     pub auth: ssh::SshAuthPlan,
     pub qsh_port: u16,
     pub client_pubkey: [u8; 32],
+}
+
+/// Decides whether a bring-up continues, given the running daemon's server info.
+pub type ServerInfoGate<'a> = &'a dyn Fn(Option<&ssh::VerifiedSshServerInfo>) -> bool;
+/// Receives the ready daemon's server info.
+pub type ServerInfoSink<'a> = &'a dyn Fn(Option<&ssh::VerifiedSshServerInfo>);
+
+/// The running daemon's `server-info`, read inside the bring-up's own SSH
+/// session through the located, trust-checked `qshd`; never a second login.
+#[derive(Clone, Copy)]
+pub struct ServerInfoProbe<'a> {
+    /// The pinned qsh key the reply must name.
+    pub expected_key: [u8; 32],
+    /// Called once, after lookup and before installation or startup, with
+    /// the verified reply or `None` when it is unknown. `false` ends the
+    /// bring-up with [`BringUpError::ServerInfoRefused`], the daemon unchanged.
+    pub before: Option<ServerInfoGate<'a>>,
+    /// Called once after readiness with a fresh query in the same session.
+    pub after_ready: Option<ServerInfoSink<'a>>,
+}
+
+/// Local authenticated observation binding. Never supplied by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusySshTarget {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub host_key: ssh::HostKeyInfo,
+    pub helper_path: String,
+}
+#[derive(Debug)]
+pub struct ObservedBusy {
+    pub info: BusyDaemonInfo,
+    pub target: BusySshTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +123,8 @@ impl Ready {
 pub enum BringUpError {
     /// A preflight choice requiring caller consent before registration/readiness.
     BusyDaemon(Box<BusyDaemonInfo>),
-    /// No qualified preservation transaction or exact-instance destructive authority.
+    ObservedBusy(Box<ObservedBusy>),
+    /// The requested destructive operation was refused before dispatch.
     DestructiveRestartUnavailable,
     /// A confirmed command may have committed but did not yield verified readiness.
     DestructiveRestartUncertain {
@@ -110,20 +149,24 @@ pub enum BringUpError {
     EnsureFailed(String),
     /// `transport-ensure` said it succeeded but its answer does not parse.
     BadReady(String),
+    /// The caller's [`ServerInfoProbe`] stopped the bring-up before any
+    /// installation or startup.
+    ServerInfoRefused,
 }
 
 impl fmt::Display for BringUpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            BringUpError::ObservedBusy(observation) => write!(f, "{}", BringUpError::BusyDaemon(Box::new(observation.info.clone()))),
             BringUpError::BusyDaemon(info) => write!(f,
                 "running qshd {} has {} active connections; the new daemon cannot start. choose Cancel, Continue with old daemon, or Force update.",
                 info.identity.version, info.active_connections),
-            BringUpError::BusyReportingUnavailable => write!(f, "the installed qshd helper did not advertise support for busy-daemon choices; update that executable before retrying. The running daemon was left unchanged"),
+            BringUpError::BusyReportingUnavailable => write!(f, "the installed qshd helper did not advertise support for busy-daemon choices; update that executable before retrying. No daemon restart was requested"),
             BringUpError::DestructiveRestartUncertain {cause}=> {
                 write!(f,"forced update may have committed, but replacement readiness was not proved; rediscover before trying again")?;
                 if let Some(cause)=cause {write!(f,": {cause}")?;}Ok(())
             },
-            BringUpError::DestructiveRestartUnavailable => write!(f, "forced update is unavailable: this daemon cannot prove an exact-instance restart; no sessions were interrupted"),
+            BringUpError::DestructiveRestartUnavailable => write!(f, "forced update was refused before destructive dispatch; rediscover before trying again"),
             BringUpError::InvalidRequest(reason) => write!(f, "invalid bring-up request: {reason}"),
             BringUpError::UnsupportedPlatform(platform) => {
                 write!(f, "unsupported server platform: {platform}")
@@ -146,6 +189,11 @@ impl fmt::Display for BringUpError {
                  bringing it up over SSH will not help"
             ),
             BringUpError::EnsureFailed(t) | BringUpError::BadReady(t) => write!(f, "{t}"),
+            BringUpError::ServerInfoRefused => write!(
+                f,
+                "the running qshd's authenticated server info stopped the bring-up; \
+                 the daemon was left unchanged"
+            ),
         }
     }
 }
@@ -215,7 +263,20 @@ pub fn bring_up_identified(
     bind: std::sync::Arc<dyn knock::SocketBind>,
     cancel: &knock::Cancel,
 ) -> Result<IdentifiedReady, BringUpError> {
-    install::bring_up(req, policy, hooks, bind, cancel)
+    install::bring_up(req, policy, hooks, None, bind, cancel)
+}
+
+/// `bring_up_identified` that also reads the running daemon's server info
+/// on the same SSH login, as `probe` asks.
+pub fn bring_up_probed(
+    req: BringUpRequest,
+    policy: InstallPolicy,
+    hooks: BringUpHooks,
+    probe: Option<ServerInfoProbe<'_>>,
+    bind: std::sync::Arc<dyn knock::SocketBind>,
+    cancel: &knock::Cancel,
+) -> Result<IdentifiedReady, BringUpError> {
+    install::bring_up(req, policy, hooks, probe, bind, cancel)
 }
 
 /// What the lookup's run says: the qshd to start, or why there is none. The

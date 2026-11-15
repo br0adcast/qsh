@@ -1339,3 +1339,389 @@ async fn authdispatch529_personal_queued_success_deadline_crossed_during_policy_
         assert_eq!(h.catalog_len(), 0);
     }
 }
+
+struct LifecycleFixture {
+    host: HostState,
+    budget: AdmissionBudget,
+    peer: Peer,
+    dispatch: PersonalAuthDispatch,
+    tickets: Vec<AuthReference>,
+}
+impl LifecycleFixture {
+    fn new(count: usize) -> Self {
+        Self::with_limits(count, count, 1)
+    }
+    fn with_limits(count: usize, limit: usize, admissions: usize) -> Self {
+        assert!((2..=63).contains(&count));
+        assert!((count..=63).contains(&limit));
+        let mut host = host(mode(), limit);
+        let budget = AdmissionBudget::new(admissions).unwrap();
+        let (mut peer, mut dispatch) = setup(
+            &mut host,
+            &budget,
+            Arc::new(Mutex::new(vec![])),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let tickets = (0..count)
+            .map(|n| challenge(&mut peer, &mut dispatch, &mut host, n as u64 + 2))
+            .collect();
+        assert!(dispatch.ordinary.is_empty());
+        assert!(dispatch.writing.is_none());
+        Self {
+            host,
+            budget,
+            peer,
+            dispatch,
+            tickets,
+        }
+    }
+    fn send_cancels(&mut self) {
+        let first = self.tickets.len() as u64 + 2;
+        let mut batch = Vec::new();
+        for (n, ticket) in self.tickets.iter().enumerate() {
+            batch.extend(
+                crate::session_owner::host_protocol::encode(&HostFrame {
+                    header: HostHeader {
+                        role: OwnerRole::Frontend,
+                        host: self.peer.host,
+                        request_id: first + n as u64,
+                    },
+                    message: HostMessage::Authentication(HostAuthMessage::Cancel {
+                        ticket: *ticket,
+                    }),
+                })
+                .unwrap(),
+            );
+        }
+        self.peer.send_bytes(&batch);
+    }
+    fn drain(&mut self, trace: &mut Vec<u8>) {
+        for _ in 0..self.tickets.len() * 16 + 16 {
+            if self.dispatch.slots.is_empty()
+                && self.dispatch.lifecycle.is_none()
+                && self.dispatch.writing.is_none()
+                && self.dispatch.ordinary.is_empty()
+            {
+                return;
+            }
+            lifecycle_write(&mut self.dispatch, &mut self.host, trace, 17).unwrap();
+        }
+        panic!("finite lifecycle replies did not drain");
+    }
+    fn finish(mut self) {
+        self.dispatch.close(&mut self.host).unwrap();
+        drop(self.peer);
+        assert_eq!(self.budget.in_use(), 0);
+        assert_eq!(self.host.catalog_len(), 0);
+    }
+}
+fn lifecycle_write(
+    dispatch: &mut PersonalAuthDispatch,
+    host: &mut HostState,
+    trace: &mut Vec<u8>,
+    maximum: usize,
+) -> Result<(), DispatchError> {
+    dispatch.step_with_writer(host, &mut |_, bytes| {
+        let n = maximum.min(bytes.len());
+        trace.extend_from_slice(&bytes[..n]);
+        Ok(n)
+    })
+}
+fn lifecycle_frames(trace: &[u8]) -> Vec<HostFrame> {
+    let mut decoder = HostDecoder::new();
+    let frames = decoder.push(trace).unwrap();
+    decoder.finish().unwrap();
+    assert_eq!(decoder.buffered_len(), 0);
+    frames
+}
+
+#[test]
+fn authdispatch529_personal_lifecycle_backpressure_defers_in_window_cancels() {
+    for count in [2, 63] {
+        for outcome in 0..3 {
+            let mut f = LifecycleFixture::new(count);
+            f.send_cancels();
+            f.dispatch.step(&mut f.host).unwrap();
+            let deadline = f.dispatch.lifecycle.as_ref().unwrap().deadline;
+            let mut trace = Vec::new();
+            let result = f
+                .dispatch
+                .step_with_writer(&mut f.host, &mut |_, bytes| match outcome {
+                    0 => Err(std::io::ErrorKind::WouldBlock.into()),
+                    1 => Err(std::io::ErrorKind::Interrupted.into()),
+                    _ => {
+                        let n = 7.min(bytes.len());
+                        trace.extend_from_slice(&bytes[..n]);
+                        Ok(n)
+                    }
+                });
+            assert_eq!(
+                result,
+                Ok(()),
+                "second valid cancellation consumed: count={count} outcome={outcome}"
+            );
+            assert!(f.dispatch.channel.is_some());
+            assert!(!f.dispatch.slots.contains_key(&f.tickets[0]));
+            assert_eq!(f.dispatch.slots.len(), count - 1);
+            assert!(f.tickets[1..]
+                .iter()
+                .all(|t| f.dispatch.slots.contains_key(t)));
+            let writing = f.dispatch.writing.as_ref().unwrap();
+            assert!(!writing.ordinary);
+            assert_eq!(writing.offset, if outcome == 2 { 7 } else { 0 });
+            assert_eq!(writing.deadline, deadline);
+            assert!(f.dispatch.lifecycle.is_none());
+            assert!(f.dispatch.ordinary.is_empty());
+            f.drain(&mut trace);
+            let frames = lifecycle_frames(&trace);
+            assert_eq!(frames.len(), count);
+            for (n, (frame, ticket)) in frames.iter().zip(&f.tickets).enumerate() {
+                assert_eq!(frame.header.request_id, count as u64 + 2 + n as u64);
+                assert_eq!(frame.header.role, OwnerRole::Host);
+                assert_eq!(frame.header.host, f.peer.host);
+                assert!(
+                    matches!(&frame.message, HostMessage::Authentication(HostAuthMessage::Cancelled { ticket: got }) if got == ticket)
+                );
+            }
+            assert!(f.dispatch.slots.is_empty());
+            assert!(f.dispatch.channel.is_some());
+            f.finish();
+        }
+    }
+}
+
+#[test]
+fn authdispatch529_personal_lifecycle_queued_behind_partial_ordinary_defers_input() {
+    // A separate frontend exhausts the actual global attempt bound while this
+    // frontend still has local correlation credit for the refused Begin.
+    let mut f = LifecycleFixture::with_limits(2, 3, 2);
+    let (mut sentinel_peer, mut sentinel) = setup(
+        &mut f.host,
+        &f.budget,
+        Arc::new(Mutex::new(vec![])),
+        Arc::new(AtomicU64::new(0)),
+    );
+    let sentinel_ticket = challenge(&mut sentinel_peer, &mut sentinel, &mut f.host, 2);
+    f.peer.send(
+        4,
+        HostAuthMessage::Begin {
+            method: AuthMethod::Personal,
+        },
+    );
+    f.dispatch.step(&mut f.host).unwrap();
+    f.peer.send(
+        5,
+        HostAuthMessage::Cancel {
+            ticket: f.tickets[0],
+        },
+    );
+    let mut trace = Vec::new();
+    lifecycle_write(&mut f.dispatch, &mut f.host, &mut trace, 7).unwrap();
+    let ordinary_deadline = f.dispatch.writing.as_ref().unwrap().deadline;
+    let lifecycle_deadline = f.dispatch.lifecycle.as_ref().unwrap().deadline;
+    assert!(f.dispatch.writing.as_ref().unwrap().ordinary);
+    assert_eq!(f.dispatch.writing.as_ref().unwrap().offset, 7);
+    f.peer.send(
+        6,
+        HostAuthMessage::Cancel {
+            ticket: f.tickets[1],
+        },
+    );
+    assert_eq!(
+        f.dispatch.step_with_writer(&mut f.host, &mut |_, _| Err(
+            std::io::ErrorKind::WouldBlock.into()
+        )),
+        Ok(()),
+        "queued lifecycle reply must defer the second cancellation"
+    );
+    assert!(f.dispatch.channel.is_some());
+    assert!(f.dispatch.slots.contains_key(&f.tickets[1]));
+    assert_eq!(f.dispatch.writing.as_ref().unwrap().offset, 7);
+    assert_eq!(
+        f.dispatch.writing.as_ref().unwrap().deadline,
+        ordinary_deadline
+    );
+    assert_eq!(
+        f.dispatch.lifecycle.as_ref().unwrap().deadline,
+        lifecycle_deadline
+    );
+    f.drain(&mut trace);
+    let frames = lifecycle_frames(&trace);
+    assert_eq!(frames.len(), 3);
+    assert_eq!(
+        frames
+            .iter()
+            .map(|f| f.header.request_id)
+            .collect::<Vec<_>>(),
+        vec![4, 5, 6]
+    );
+    assert!(matches!(
+        frames[0].message,
+        HostMessage::Authentication(HostAuthMessage::ChallengeRefused {
+            method: AuthMethod::Personal,
+            reason: AuthRefusal::Unavailable
+        })
+    ));
+    for (frame, ticket) in frames[1..].iter().zip(&f.tickets) {
+        assert!(
+            matches!(&frame.message, HostMessage::Authentication(HostAuthMessage::Cancelled { ticket: got }) if got == ticket)
+        );
+    }
+    assert!(f.dispatch.channel.is_some());
+    assert!(sentinel.slots.contains_key(&sentinel_ticket));
+    sentinel.close(&mut f.host).unwrap();
+    drop(sentinel_peer);
+    f.finish();
+}
+
+#[test]
+fn authdispatch529_personal_lifecycle_backpressure_keeps_fixed_output_deadline() {
+    let mut h = host(mode(), 2);
+    let budget = AdmissionBudget::new(2).unwrap();
+    let clock = Arc::new(AtomicU64::new(0));
+    let allowlist = Arc::new(Mutex::new(vec![]));
+    let (mut peer, mut dispatch) = setup(&mut h, &budget, allowlist.clone(), clock.clone());
+    let (mut other_peer, mut other) = setup(&mut h, &budget, allowlist, clock.clone());
+    let ticket = challenge(&mut peer, &mut dispatch, &mut h, 2);
+    clock.store(10, Ordering::Release);
+    peer.send(3, HostAuthMessage::Cancel { ticket });
+    dispatch.step(&mut h).unwrap();
+    assert!(dispatch.slots.is_empty());
+    assert_eq!(dispatch.lifecycle.as_ref().unwrap().deadline, 1010);
+    let mut calls = 0;
+    for (n, now) in [11, 20, 100, 600, 1009].into_iter().enumerate() {
+        clock.store(now, Ordering::Release);
+        dispatch
+            .step_with_writer(&mut h, &mut |_, _| {
+                calls += 1;
+                Err(if n % 2 == 0 {
+                    std::io::ErrorKind::WouldBlock
+                } else {
+                    std::io::ErrorKind::Interrupted
+                }
+                .into())
+            })
+            .unwrap();
+        let writing = dispatch.writing.as_ref().unwrap();
+        assert_eq!(writing.deadline, 1010);
+        assert_eq!(writing.offset, 0);
+        assert!(dispatch.channel.is_some());
+    }
+    assert_eq!(calls, 5);
+    clock.store(1010, Ordering::Release);
+    assert_eq!(
+        dispatch.step_with_writer(&mut h, &mut |_, _| {
+            calls += 1;
+            panic!("expired lifecycle output reached writer")
+        }),
+        Err(DispatchError::Deadline)
+    );
+    assert_eq!(calls, 5);
+    assert!(dispatch.channel.is_none());
+    assert!(dispatch.writing.is_none());
+    assert!(dispatch.lifecycle.is_none());
+    challenge(&mut other_peer, &mut other, &mut h, 2);
+    other.close(&mut h).unwrap();
+    drop((peer, other_peer));
+    assert_eq!(budget.in_use(), 0);
+    assert_eq!(h.catalog_len(), 0);
+}
+
+#[test]
+fn authdispatch529_personal_lifecycle_backpressure_preserves_close_and_eof() {
+    for prefix in [0, 7] {
+        for outcome in 0..5 {
+            let mut h = host(mode(), 4);
+            let budget = AdmissionBudget::new(2).unwrap();
+            let clock = Arc::new(AtomicU64::new(0));
+            let allowlist = Arc::new(Mutex::new(vec![]));
+            let (mut peer, mut dispatch) = setup(&mut h, &budget, allowlist.clone(), clock.clone());
+            let (mut other_peer, mut other) = setup(&mut h, &budget, allowlist, clock);
+            let ticket = challenge(&mut peer, &mut dispatch, &mut h, 2);
+            let unrelated = challenge(&mut peer, &mut dispatch, &mut h, 3);
+            let sentinel = challenge(&mut other_peer, &mut other, &mut h, 2);
+            peer.send(4, HostAuthMessage::Cancel { ticket });
+            dispatch.step(&mut h).unwrap();
+            assert!(dispatch.slots.contains_key(&unrelated));
+            let expected = crate::session_owner::host_protocol::encode(&HostFrame {
+                header: HostHeader {
+                    role: OwnerRole::Host,
+                    host: peer.host,
+                    request_id: 4,
+                },
+                message: HostMessage::Authentication(HostAuthMessage::Cancelled { ticket }),
+            })
+            .unwrap();
+            let mut peer = Some(peer);
+            let mut trace = Vec::new();
+            let mut calls = 0;
+            if prefix != 0 {
+                dispatch
+                    .step_with_writer(&mut h, &mut |_, bytes| {
+                        calls += 1;
+                        let n = prefix.min(bytes.len());
+                        trace.extend_from_slice(&bytes[..n]);
+                        Ok(n)
+                    })
+                    .unwrap();
+                assert_eq!(trace, expected[..prefix]);
+            }
+            if outcome == 4 {
+                dispatch
+                    .step_with_writer(&mut h, &mut |_, _| {
+                        calls += 1;
+                        Err(std::io::ErrorKind::WouldBlock.into())
+                    })
+                    .unwrap();
+                assert!(dispatch.channel.is_some());
+                assert!(dispatch.slots.contains_key(&unrelated));
+                drop(peer.take());
+                // Completing this owned trace isolates resumed input/EOF from
+                // the separate write-side closure cases, without an OS claim.
+                dispatch
+                    .step_with_writer(&mut h, &mut |_, bytes| {
+                        calls += 1;
+                        trace.extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    })
+                    .unwrap();
+                assert_eq!(trace, expected);
+                assert_eq!(calls, usize::from(prefix != 0) + 2);
+            } else {
+                dispatch
+                    .step_with_writer(&mut h, &mut |_, _| {
+                        calls += 1;
+                        match outcome {
+                            0 => Ok(0),
+                            1 => Err(std::io::ErrorKind::BrokenPipe.into()),
+                            2 => Err(std::io::ErrorKind::ConnectionReset.into()),
+                            3 => Err(std::io::ErrorKind::NotConnected.into()),
+                            _ => unreachable!(),
+                        }
+                    })
+                    .unwrap();
+                assert_eq!(trace, expected[..prefix]);
+                assert_eq!(calls, usize::from(prefix != 0) + 1);
+            }
+            assert!(dispatch.channel.is_none());
+            assert!(dispatch.slots.is_empty());
+            assert!(dispatch.writing.is_none());
+            assert!(dispatch.lifecycle.is_none());
+            let completed_calls = calls;
+            dispatch
+                .step_with_writer(&mut h, &mut |_, _| {
+                    calls += 1;
+                    panic!("closed dispatcher reached writer")
+                })
+                .unwrap();
+            assert_eq!(calls, completed_calls);
+            assert!(other.channel.is_some());
+            assert!(other.slots.contains_key(&sentinel));
+            challenge(&mut other_peer, &mut other, &mut h, 3);
+            other.close(&mut h).unwrap();
+            drop((peer, other_peer));
+            assert_eq!(budget.in_use(), 0);
+            assert_eq!(h.catalog_len(), 0);
+        }
+    }
+}

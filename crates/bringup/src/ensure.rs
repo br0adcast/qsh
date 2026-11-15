@@ -19,6 +19,12 @@ pub(crate) fn tool_supports_busy(code: i32, out: &str) -> bool {
             .is_ok_and(|capabilities| capabilities.schema == 1 && capabilities.busy_decisions)
 }
 
+pub(crate) fn tool_supports_service_restart(code: i32, out: &str) -> bool {
+    tool_supports_busy(code, out)
+        && serde_json::from_str::<daemon_bootstrap_protocol::BootstrapToolCapabilities>(out.trim())
+            .is_ok_and(|capabilities| capabilities.account_service_restart_v1)
+}
+
 pub(crate) fn command(path: &str, name: &str, port: u16, client_pubkey: &[u8; 32]) -> String {
     format!(
         "{} transport-ensure --name {} --port {port} --client-pubkey {}",
@@ -32,6 +38,7 @@ pub(crate) struct BusyCommand<'a> {
     pub attempt: Option<&'a BusyAttemptId>,
     pub decision: Option<&'a BusyDecision>,
     pub destructive_consent: Option<&'a daemon_bootstrap_protocol::DestructiveRestartConsent>,
+    pub service_restart_consent: Option<&'a daemon_bootstrap_protocol::ServiceRestartConsent>,
 }
 pub(crate) fn command_for_policy(
     path: &str,
@@ -45,6 +52,7 @@ pub(crate) fn command_for_policy(
         attempt: busy_attempt,
         decision: busy_decision,
         destructive_consent,
+        service_restart_consent,
     } = busy;
     let mut command = command(path, name, port, client_pubkey);
     if matches!(policy, crate::InstallPolicy::RestartOnly) {
@@ -67,6 +75,16 @@ pub(crate) fn command_for_policy(
         command.push_str(" --destructive-consent ");
         command.push_str(&shell::quote(&serde_json::to_string(consent).map_err(
             |_| BringUpError::InvalidRequest("invalid destructive consent".into()),
+        )?));
+    }
+    if let Some(consent) = service_restart_consent {
+        // This is the already selected/trusted helper path, never argv[0] or
+        // a new destination supplied by the destructive consent payload.
+        command.push_str(" --service-candidate-helper ");
+        command.push_str(&shell::quote(path));
+        command.push_str(" --service-restart-consent ");
+        command.push_str(&shell::quote(&serde_json::to_string(consent).map_err(
+            |_| BringUpError::InvalidRequest("invalid service consent".into()),
         )?));
     }
     Ok(command)
@@ -216,7 +234,7 @@ mod tests {
     }
 
     fn busy_json() -> serde_json::Value {
-        serde_json::json!({"schema":1,"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"active_connections":2,"serving_profiles":null,"preservation":"unknown"})
+        serde_json::json!({"schema":2,"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"active_connections":2,"serving_profiles":null,"preservation":"unknown"})
     }
 
     #[test]
@@ -300,7 +318,7 @@ mod tests {
         let Err(BringUpError::BusyDaemon(info)) = parse(0, &record) else {
             panic!("expected typed Busy");
         };
-        assert_eq!(info.schema, 1);
+        assert_eq!(info.schema, 2);
         assert_eq!(info.identity.version, "0.5.0");
         assert_eq!(info.active_connections, 2);
         assert_eq!(info.serving_profiles, None);
@@ -324,7 +342,7 @@ mod tests {
             assert!(matches!(parse(0, &output), Err(BringUpError::BadReady(_))));
         }
         for (field, value) in [
-            ("schema", serde_json::json!(2)),
+            ("schema", serde_json::json!(1)),
             ("active_connections", serde_json::json!(0)),
             ("attempt", serde_json::json!("")),
         ] {

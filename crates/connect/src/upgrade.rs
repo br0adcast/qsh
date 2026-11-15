@@ -92,12 +92,27 @@ mod tests {
             ),
             ("1.2.3", "1.3.0-rc.1", ReleaseChannel::Stable, None),
             (
+                "1.3.0-rc.2",
+                "1.3.0-rc.10",
+                ReleaseChannel::Preview,
+                Some("1.3.0-rc.10"),
+            ),
+            ("1.3.0-rc.10", "1.3.0-rc.2", ReleaseChannel::Preview, None),
+            // SemVer compares an attached number as text: rc10 orders before
+            // rc2 and every rc.N before rc1. The release workflow therefore
+            // refuses such prerelease tags (#554).
+            (
                 "1.3.0-rc10",
                 "1.3.0-rc2",
                 ReleaseChannel::Preview,
                 Some("1.3.0-rc2"),
             ),
-            ("1.3.0-rc2", "1.3.0-rc10", ReleaseChannel::Preview, None),
+            (
+                "0.6.0-rc.2",
+                "0.6.0-rc1",
+                ReleaseChannel::Preview,
+                Some("0.6.0-rc1"),
+            ),
             (
                 "1.3.0-rc.2",
                 "1.3.0",

@@ -12,12 +12,6 @@ fn good_claims() -> sigstore_crypto::FulcioCiClaims {
     c
 }
 fn names(version: &str) -> Vec<String> {
-    let deb = match version {
-        "0.6.0-rc.1" => "0.6.0~rc.1",
-        "0.6.0-rc1" => "0.6.0~rc1",
-        _ => version,
-    };
-    let rpm = version.replace('-', "~");
     let mut n = Vec::new();
     for target in [
         "x86_64-unknown-linux-musl",
@@ -29,10 +23,10 @@ fn names(version: &str) -> Vec<String> {
     }
     for tool in ["qsh", "qshd"] {
         for arch in ["amd64", "arm64"] {
-            n.push(format!("{tool}_{deb}-1_{arch}.deb"));
+            n.push(format!("{tool}_{version}-1_{arch}.deb"));
         }
         for arch in ["x86_64", "aarch64"] {
-            n.push(format!("{tool}-{rpm}-1.{arch}.rpm"));
+            n.push(format!("{tool}-{version}-1.{arch}.rpm"));
         }
     }
     n.sort();
@@ -60,30 +54,47 @@ fn canonical_twelve_product_manifest_accepts_release_and_prerelease() {
         "0.6.0-rc1",
         "0.6.0-123",
         "0.6.0-alpha",
-        "0.6.0+build.7",
     ] {
         assert_eq!(contracts::manifest(v, &sums(v)).unwrap().len(), 12);
     }
 }
+// Assembly refuses names GitHub would rewrite, so no release with build
+// metadata can be signed and its manifest has no canonical form.
 #[test]
-fn prerelease_manifest_rejects_old_rpm_version_spelling() {
-    let old = names("0.6.0-rc1")
-        .into_iter()
-        .map(|name| {
-            if name.ends_with(".rpm") {
-                name.replace("~rc1", "-rc1")
-            } else {
-                name
-            }
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .map(|name| format!("{}  {name}\n", "a".repeat(64)))
-        .collect::<String>();
-    assert_eq!(
-        contracts::manifest("0.6.0-rc1", old.as_bytes()).unwrap_err(),
-        "noncanonical release manifest"
-    );
+fn versions_with_unpublishable_names_have_no_manifest() {
+    for v in ["0.6.0+build.7", "0.6.0-rc.1+b"] {
+        assert_eq!(
+            contracts::manifest(v, &sums(v)).unwrap_err(),
+            "release version has no publishable product names"
+        );
+    }
+}
+// Compatibility: the `~` package spelling that v0.6.0-rc1 signed is refused,
+// for the package format alone or both, so one version has one manifest.
+#[test]
+fn prerelease_manifest_rejects_earlier_tilde_package_spelling() {
+    for (version, tilde) in [("0.6.0-rc1", "0.6.0~rc1"), ("0.6.0-rc.2", "0.6.0~rc.2")] {
+        for suffix in [&[".deb"][..], &[".rpm"], &[".deb", ".rpm"]] {
+            let old = names(version)
+                .into_iter()
+                .map(|name| {
+                    if suffix.iter().any(|s| name.ends_with(s)) {
+                        name.replace(version, tilde)
+                    } else {
+                        name
+                    }
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|name| format!("{}  {name}\n", "a".repeat(64)))
+                .collect::<String>();
+            assert_eq!(
+                contracts::manifest(version, old.as_bytes()).unwrap_err(),
+                "noncanonical release manifest",
+                "{version} {suffix:?}"
+            );
+        }
+    }
 }
 #[test]
 fn exact_qsh_statement_binds_original_manifest_and_commit() {
@@ -220,7 +231,9 @@ fn manifest_refuses_alternate_text_names_order_counts_hashes_and_versions() {
     let prerelease = String::from_utf8(sums("0.6.0-rc.1")).unwrap();
     assert!(contracts::manifest(
         "0.6.0-rc.1",
-        prerelease.replace("~rc.1", "-rc.1").as_bytes()
+        prerelease
+            .replace("0.6.0-rc.1-1", "0.6.0.rc.1-1")
+            .as_bytes()
     )
     .is_err());
 }
@@ -235,4 +248,98 @@ fn json_depth_trailing_and_nested_duplicate_controls() {
     ] {
         assert!(json::parse(s).is_err());
     }
+}
+// Cross-component: the real release assembly receives producer outputs named
+// by this contract, and the SHA256SUMS it writes must be the canonical
+// manifest. Assembly refuses inputs it does not expect, so drift in either
+// direction fails here. Python 3 is required wherever this test runs.
+fn assemble(
+    version: &str,
+    artifacts: &std::path::Path,
+    output: &std::path::Path,
+) -> std::process::Output {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/assemble-release-assets.py");
+    std::process::Command::new("python3")
+        .args(["-I", "-B"])
+        .arg(script)
+        .arg("--artifacts")
+        .arg(artifacts)
+        .arg("--version")
+        .arg(version)
+        .arg("--output")
+        .arg(output)
+        .output()
+        .expect("python3 must be available to run release assembly")
+}
+#[test]
+fn release_assembly_writes_the_manifest_this_contract_accepts() {
+    for version in ["0.6.0", "1.2.3", "0.6.0-rc.2", "0.7.0-alpha.1", "0.6.0-rc1"] {
+        let work = tempfile::tempdir().unwrap();
+        let artifacts = work.path().join("artifacts");
+        let products = contracts::products(version).unwrap();
+        for name in &products {
+            let producer = if name.contains("-apple-darwin") {
+                "macos"
+            } else if name.starts_with("qshd") {
+                "server-packages"
+            } else if ["x86_64", "amd64"].iter().any(|arch| name.contains(arch)) {
+                "linux-x86_64-unknown-linux-musl"
+            } else {
+                "linux-aarch64-unknown-linux-musl"
+            };
+            let directory = artifacts.join(producer);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(name), name).unwrap();
+        }
+        let output = work.path().join("release");
+        let run = assemble(version, &artifacts, &output);
+        assert!(
+            run.status.success() && run.stdout.is_empty() && run.stderr.is_empty(),
+            "{version}: {run:?}"
+        );
+        let mut published: Vec<_> = std::fs::read_dir(&output)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        published.sort();
+        let mut expected = products.clone();
+        expected.push("SHA256SUMS".into());
+        expected.sort();
+        assert_eq!(published, expected, "{version}");
+        let manifest = std::fs::read(output.join("SHA256SUMS")).unwrap();
+        let assets = contracts::manifest(version, &manifest).unwrap();
+        for name in &products {
+            assert_eq!(
+                assets.get(name).unwrap(),
+                &<[u8; 32]>::from(Sha256::digest(name.as_bytes())),
+                "{version} {name}"
+            );
+        }
+        // Client and daemon image selection look up only these archive names.
+        for target in [
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+        ] {
+            assert!(assets.contains_key(&format!("qsh-{version}-{target}.tar.gz")));
+        }
+    }
+}
+#[test]
+fn release_assembly_and_this_contract_both_refuse_build_metadata() {
+    let work = tempfile::tempdir().unwrap();
+    let version = "0.6.0+build.7";
+    let run = assemble(
+        version,
+        &work.path().join("artifacts"),
+        &work.path().join("release"),
+    );
+    assert_eq!(run.status.code(), Some(1), "{run:?}");
+    assert_eq!(
+        run.stderr,
+        b"release assembly: product name would be renamed on upload\n"
+    );
+    assert!(contracts::products(version).is_none());
 }

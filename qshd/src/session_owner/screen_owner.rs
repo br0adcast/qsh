@@ -1,7 +1,9 @@
 //! Actual retained screen model authority; no peer can mint cleanup or resize credit.
 use super::protocol::OwnerProtocolError;
-use super::resource_contract::{Reservation, ReservationKind, ReservationReceipt, ScreenCharge};
-use super::resources::{AdmittedReservation, OwnerResourceClient, PreparedScreenAccounting};
+use super::resource_contract::{Reservation, ReservationKind, ScreenCharge};
+use super::resources::{
+    AdmittedReservation, OwnerResourceClient, PreparedScreenAccounting, StorageCharge,
+};
 use crate::screen_budget::{BackingSlots, ScreenEnvelope};
 use terminal_size::TerminalSize;
 
@@ -14,7 +16,7 @@ fn charge(slots: BackingSlots, models: u64) -> Result<ScreenCharge, String> {
 }
 pub struct HostScreenLease {
     client: OwnerResourceClient,
-    admitted: AdmittedReservation,
+    storage: Box<StorageCharge>,
     envelope: ScreenEnvelope,
     current: TerminalSize,
 }
@@ -37,9 +39,49 @@ impl HostScreenLease {
             return Err(OwnerProtocolError::Binding);
         }
         let admitted = client.reserve(reservation, cleanup)?;
+        let storage = Box::new(StorageCharge::owned(client.clone(), admitted, cleanup));
         Ok(Self {
             client,
-            admitted,
+            storage,
+            envelope,
+            current: size,
+        })
+    }
+    /// Consumes an already charged exact host token before model allocation.
+    /// Validation refusal returns untouched custody, never a release receipt.
+    #[allow(dead_code)] // Dormant host-issued provisioning; no runtime caller is activated.
+    pub(crate) fn admit_reserved(
+        client: OwnerResourceClient,
+        admitted: AdmittedReservation,
+        size: TerminalSize,
+    ) -> Result<Self, Box<(OwnerProtocolError, AdmittedReservation)>> {
+        let envelope = ScreenEnvelope::new(size);
+        let validated = (|| {
+            client.validate_admitted(&admitted, None)?;
+            let required = charge(
+                envelope
+                    .charge()
+                    .map_err(|_| OwnerProtocolError::TooLarge)?,
+                1,
+            )
+            .map_err(|_| OwnerProtocolError::TooLarge)?;
+            let reservation = admitted.reservation();
+            if reservation.kind != ReservationKind::ScreenModel
+                || reservation.bytes != 0
+                || reservation.screen_charge != Some(required)
+            {
+                return Err(OwnerProtocolError::Binding);
+            }
+            Ok(())
+        })();
+        if let Err(error) = validated {
+            return Err(Box::new((error, admitted)));
+        }
+        let cleanup = admitted.cleanup();
+        let storage = Box::new(StorageCharge::owned(client.clone(), admitted, cleanup));
+        Ok(Self {
+            client,
+            storage,
             envelope,
             current: size,
         })
@@ -53,8 +95,8 @@ impl HostScreenLease {
     ) -> bool {
         self.client.same_host(client)
             && self.client.principal() == client.principal()
-            && self.admitted.reservation().locator == locator
-            && self.admitted.reservation().channel == channel
+            && self.storage.admitted().reservation().locator == locator
+            && self.storage.admitted().reservation().channel == channel
             && self.current == size
     }
     pub(crate) fn size(&self) -> TerminalSize {
@@ -77,7 +119,7 @@ impl HostScreenLease {
             Some(
                 self.client
                     .prepare_screen_commit(
-                        &self.admitted,
+                        self.storage.admitted(),
                         charge(pending, 0)?,
                         charge(retained, 1)?,
                     )
@@ -95,17 +137,8 @@ impl HostScreenLease {
 }
 impl Drop for HostScreenLease {
     fn drop(&mut self) {
-        let r = self.admitted.reservation();
-        // PtyScreen declares the terminal before this lease: backing has gone.
-        let _ = self.client.release(
-            &self.admitted,
-            ReservationReceipt {
-                id: self.admitted.cleanup(),
-                reservation: r.id,
-                locator: r.locator,
-                channel: r.channel,
-            },
-        );
+        // PtyScreen declares its terminal before this sole lease.
+        self.storage.allow_release();
     }
 }
 pub struct HostResizeReservation<'a> {
@@ -121,7 +154,7 @@ impl HostResizeReservation<'_> {
     }
     pub fn commit(mut self) {
         if let Some(accounting) = self.accounting.take() {
-            self.lease.admitted = accounting.commit();
+            self.lease.storage.replace_admitted(accounting.commit());
         }
         self.lease.envelope = self.envelope;
         self.lease.current = self.size;
@@ -195,7 +228,7 @@ impl RetainedScreenFactory {
                 .canonical_uid()
                 .map_err(|_| "retained screen principal unavailable")?
                 != r.owner.uid
-            || lease.admitted.reservation().channel != r.identity.instance
+            || lease.storage.admitted().reservation().channel != r.identity.instance
             || (lease.size().cols(), lease.size().rows()) != (r.request.cols, r.request.rows)
         {
             return Err("retained screen OPEN binding".into());

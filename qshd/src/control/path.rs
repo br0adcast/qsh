@@ -11,8 +11,8 @@ use nix::sys::stat::{self, Mode, SFlag};
 /// One atomic no-replace move between the retained staging and endpoint
 /// directories. Use the kernel operation: the nix/libc wrapper is unavailable
 /// on some supported musl toolchains. There is deliberately no fallback.
-#[cfg(target_os = "linux")]
-fn rename_linux_absent(
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_absent(
     source: &File,
     source_name: &std::ffi::OsStr,
     destination: &File,
@@ -26,6 +26,7 @@ fn rename_linux_absent(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in control endpoint name"))?;
     // SAFETY: both retained directories and checked NUL-terminated relative
     // names stay live through this call; pointers and FDs use native ABI types.
+    #[cfg(target_os = "linux")]
     let result = unsafe {
         nix::libc::syscall(
             nix::libc::SYS_renameat2,
@@ -34,6 +35,16 @@ fn rename_linux_absent(
             destination.as_raw_fd(),
             destination_name.as_ptr(),
             nix::libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        nix::libc::renameatx_np(
+            source.as_raw_fd(),
+            source_name.as_ptr(),
+            destination.as_raw_fd(),
+            destination_name.as_ptr(),
+            nix::libc::RENAME_EXCL,
         )
     };
     if result == 0 {
@@ -288,7 +299,7 @@ impl Stage {
         self.socket.as_ref().expect("bound before publication")
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn publish_absent(&mut self, authority: &EndpointAuthority) -> io::Result<()> {
         self.publish_mode(authority, false)
     }
@@ -327,14 +338,14 @@ impl Stage {
                 authority.leaf.as_os_str(),
             )?;
         } else {
-            #[cfg(target_os = "linux")]
-            rename_linux_absent(
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            rename_absent(
                 &self.directory,
                 std::ffi::OsStr::new(super::STAGED_NAME),
                 &authority.parent,
                 authority.leaf.as_os_str(),
             )?;
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "exclusive restart publication is unavailable",

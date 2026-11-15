@@ -260,6 +260,8 @@ pub struct SshStep<'a> {
     /// Lifecycle policy is independent of whether authentication may prompt.
     pub install_policy: bringup::InstallPolicy,
     pub images: Arc<dyn bringup::ImageSource>,
+    /// The running daemon's server info, read on this step's own login.
+    pub server_info: Option<bringup::ServerInfoProbe<'a>>,
 }
 
 /// Who answers the login's questions, and -- in the background -- the one
@@ -277,36 +279,6 @@ impl Prompter {
 }
 
 impl SshStep<'_> {
-    /// Read-only fallback using the configured account and remembered host keys.
-    /// Discovery never broadens credentials or asks a background question.
-    pub fn discover_server_info(
-        &self,
-        addr: &::connect::Address,
-        route: &::connect::SshRoute,
-        expected: &::connect::server_identity::ServerIdentity,
-        cancel: &knock::Cancel,
-    ) -> Result<Option<ssh::VerifiedSshServerInfo>, SshStepError> {
-        if self.login != expected.username {
-            return Ok(None);
-        }
-        let keys = self
-            .known_hosts
-            .lookup(&addr.host, route.port)
-            .map_err(|e| plain(e.to_string()))?;
-        if keys.known.is_empty() {
-            return Ok(None);
-        }
-        let request = self.request(addr, route, [0; 32], &keys, Arc::new(ssh::NoPrompts));
-        ssh::discover_server_info(
-            request.ssh,
-            request.auth,
-            Arc::new(knock::NoBind),
-            expected.qsh_key,
-            cancel,
-        )
-        .map_err(|e| plain(e.to_string()))
-    }
-
     fn prompter(&self) -> Prompter {
         if self.no_password {
             // `--no-password` asks nothing anywhere: a login that needed an
@@ -346,6 +318,8 @@ impl SshStep<'_> {
             report_busy: false,
             busy_decision: None,
             destructive_consent: None,
+            service_restart_consent: None,
+            pending_busy_target: None,
             name: "console".into(),
             ssh: ssh::SshParams {
                 host: addr.host.clone(),
@@ -385,6 +359,8 @@ impl SshStep<'_> {
         let prompter = self.prompter();
         let mut decision = None;
         let mut consent = None;
+        let mut service_consent = None;
+        let mut pending_target = None;
         let mut selected = None;
         let result = loop {
             let mut request =
@@ -394,7 +370,9 @@ impl SshStep<'_> {
                 && self.install_policy != bringup::InstallPolicy::RestartOnly;
             request.busy_decision = decision.take();
             request.destructive_consent = consent.take();
-            let result = bringup::bring_up_identified(
+            request.service_restart_consent = service_consent.take();
+            request.pending_busy_target = pending_target.clone();
+            let result = bringup::bring_up_probed(
                 request,
                 self.install_policy.clone(),
                 bringup::BringUpHooks {
@@ -403,31 +381,51 @@ impl SshStep<'_> {
                     observer: Arc::new(InstallProgress::new(self.background)),
                     timing: bringup::InstallTiming::default(),
                 },
+                self.server_info,
                 Arc::new(knock::NoBind),
                 cancel,
             );
             match result {
-                Err(bringup::BringUpError::BusyDaemon(info)) => {
-                    let (answer, confirmed) =
-                        crate::busy_daemon::ask(self.tty, (*info).clone(), cancel).map_err(
-                            |error| match selected.take() {
-                                Some(info) => {
-                                    Attempted::SelectedBusyFailed(Box::new(SelectedBusyFailure {
-                                        info,
-                                        error: bringup::BringUpError::Ssh(error),
-                                    }))
-                                }
-                                None => Attempted::Ssh(error),
-                            },
-                        )?;
+                Err(bringup::BringUpError::ObservedBusy(observation)) => {
+                    let bringup::ObservedBusy { info, target } = *observation;
+                    let (answer, confirmed) = crate::busy_daemon::ask_for_target(
+                        self.tty,
+                        info.clone(),
+                        self.login,
+                        &format!("{}:{}", target.host, target.port),
+                        cancel,
+                    )
+                    .map_err(|error| match selected.take() {
+                        Some(info) => {
+                            Attempted::SelectedBusyFailed(Box::new(SelectedBusyFailure {
+                                info,
+                                error: bringup::BringUpError::Ssh(error),
+                            }))
+                        }
+                        None => Attempted::Ssh(error),
+                    })?;
                     if answer.choice == bringup::BusyChoice::Cancel {
                         return Err(Attempted::BusyCancelled);
                     }
                     // Fresh BUSY observations replace every prior decision and
                     // consent on this route. Cancellation above performs no operation.
-                    selected = Some(*info);
+                    selected = Some(info);
+                    pending_target = Some(target);
                     decision = Some(answer);
-                    consent = confirmed;
+                    match confirmed {
+                        Some(crate::busy_daemon::RestartConsent::Exact(value)) => {
+                            consent = Some(value);
+                            service_consent = None;
+                        }
+                        Some(crate::busy_daemon::RestartConsent::Service(value)) => {
+                            service_consent = Some(value);
+                            consent = None;
+                        }
+                        None => {
+                            consent = None;
+                            service_consent = None;
+                        }
+                    }
                 }
                 other => break other,
             }
@@ -782,6 +780,7 @@ mod tests {
                     images: Arc::new(crate::releases::GitHubImages::new(Some(
                         home.path().join("cache"),
                     ))),
+                    server_info: None,
                 };
                 let route = ::connect::SshRoute {
                     port: 22,
@@ -857,6 +856,7 @@ mod tests {
             background: true,
             install_policy: bringup::InstallPolicy::RestartOnly,
             images: source.clone(),
+            server_info: None,
         };
         let route = ::connect::SshRoute {
             port: sb.sshd.port,

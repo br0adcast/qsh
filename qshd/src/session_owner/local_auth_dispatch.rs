@@ -51,6 +51,8 @@ struct Output {
 /// Nonclone custody and logical registrations stay in one serial owner. step
 /// never blocks; one write quantum and at most two exact-length reads per turn
 /// keep cancellation serviceable even while ordinary output cannot drain.
+/// A retained lifecycle reply suspends intake until it drains or its fixed
+/// output deadline expires, preserving the one reserved lifecycle credit.
 /// Call close or keep driving step through EOF; Drop alone cannot borrow a host
 /// to refund its logical registration (the same rule as HostDispatchChannel).
 pub(crate) struct PersonalAuthDispatch {
@@ -314,11 +316,15 @@ impl PersonalAuthDispatch {
                 s.lease.slot.binding.frontend,
             )
     }
-    fn write_turn(
+    fn write_turn<W>(
         &mut self,
         host: &mut HostState,
         now: u64,
-    ) -> Result<WriteProgress, DispatchError> {
+        writer: &mut W,
+    ) -> Result<WriteProgress, DispatchError>
+    where
+        W: FnMut(&mut HostDispatchChannel, &[u8]) -> io::Result<usize>,
+    {
         // A lifecycle frame may preempt only a frame for which no byte escaped.
         if self.lifecycle.is_some()
             && self
@@ -359,12 +365,10 @@ impl PersonalAuthDispatch {
             return Err(DispatchError::Deadline);
         }
         let end = (output.offset + WRITE_QUANTUM).min(output.bytes.len());
-        match self
-            .channel
-            .as_mut()
-            .ok_or(DispatchError::Refused)?
-            .write(&output.bytes[output.offset..end])
-        {
+        match writer(
+            self.channel.as_mut().ok_or(DispatchError::Refused)?,
+            &output.bytes[output.offset..end],
+        ) {
             Ok(0) => Ok(WriteProgress::PeerClosed),
             Ok(n) => {
                 output.offset += n;
@@ -639,6 +643,16 @@ impl PersonalAuthDispatch {
         }
     }
     pub(crate) fn step(&mut self, host: &mut HostState) -> Result<(), DispatchError> {
+        self.step_with_writer(host, &mut HostDispatchChannel::write)
+    }
+    fn step_with_writer<W>(
+        &mut self,
+        host: &mut HostState,
+        writer: &mut W,
+    ) -> Result<(), DispatchError>
+    where
+        W: FnMut(&mut HostDispatchChannel, &[u8]) -> io::Result<usize>,
+    {
         if self.channel.is_none() {
             return Ok(());
         }
@@ -652,13 +666,16 @@ impl PersonalAuthDispatch {
             }
             self.last_now = now;
             self.expire(host, now)?;
-            match self.write_turn(host, now)? {
+            match self.write_turn(host, now, writer)? {
                 WriteProgress::PeerClosed => {
                     self.decoder.finish().map_err(|_| DispatchError::Protocol)?;
                     self.close(host)?;
                     return Ok(());
                 }
                 WriteProgress::Open => {}
+            }
+            if self.credit(true).is_err() {
+                return Ok(());
             }
             match self.read_turn(now.max((self.clock)()))? {
                 Input::Frame(frame) => {

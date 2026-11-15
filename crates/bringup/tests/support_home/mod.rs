@@ -174,6 +174,8 @@ impl Sandbox {
             report_busy: false,
             busy_decision: None,
             destructive_consent: None,
+            service_restart_consent: None,
+            pending_busy_target: None,
             name: "console".into(),
             ssh: self.params(),
             auth: ssh::SshAuthPlan::single(ssh::AuthMethod::Signer(Arc::new(signer))),

@@ -257,17 +257,66 @@ class ReleaseOutputTests(unittest.TestCase):
                 self.assertEqual(output.debian_version(raw), expected)
 
     def test_rpm_prerelease_version_and_filename(self):
-        for raw, expected in [('0.6.0-rc1', '0.6.0~rc1'),
-                              ('0.6.0-rc.1+build.2', '0.6.0~rc.1+build.2'),
-                              ('0.6.0', '0.6.0')]:
+        self.assertEqual(output.rpm_version('0.6.0-rc.1+build.2'), '0.6.0~rc.1+build.2')
+        for raw, expected in [('0.6.0-rc1', '0.6.0~rc1'), ('0.6.0', '0.6.0')]:
             with self.subTest(raw=raw):
                 self.assertEqual(output.rpm_version(raw), expected)
                 output.check_fields('rpm', ['qsh', expected, '1', 'x86_64'],
-                                    f'qsh-{expected}-1.x86_64.rpm', 'qsh', raw, 'x86_64')
+                                    f'qsh-{raw}-1.x86_64.rpm', 'qsh', raw, 'x86_64')
                 if raw != expected:
                     with self.assertRaises(ValueError):
                         output.check_fields('rpm', ['qsh', raw, '1', 'x86_64'],
                                             f'qsh-{raw}-1.x86_64.rpm', 'qsh', raw, 'x86_64')
+                    # The generator's own name, which GitHub rewrites, is not published.
+                    with self.assertRaises(ValueError):
+                        output.check_fields('rpm', ['qsh', expected, '1', 'x86_64'],
+                                            f'qsh-{expected}-1.x86_64.rpm', 'qsh', raw, 'x86_64')
+
+    def test_package_file_names_use_the_release_version_and_revision(self):
+        for fmt, program, version, arch, name in [
+                ('deb', 'qsh', '0.6.0', 'amd64', 'qsh_0.6.0-1_amd64.deb'),
+                ('rpm', 'qshd', '0.6.0', 'aarch64', 'qshd-0.6.0-1.aarch64.rpm'),
+                ('deb', 'qshd', '0.6.0-rc.2', 'arm64', 'qshd_0.6.0-rc.2-1_arm64.deb'),
+                ('rpm', 'qsh', '0.6.0-rc.2', 'x86_64', 'qsh-0.6.0-rc.2-1.x86_64.rpm')]:
+            with self.subTest(name=name):
+                self.assertEqual(output.package_file_name(fmt, program, version, arch), name)
+                self.assertTrue(output.github_safe_name(name))
+        # Stable names are what the generators already produce.
+        self.assertEqual(output.package_file_name('deb', 'qsh', '0.6.0', 'amd64'),
+                         'qsh_{}_amd64.deb'.format(output.debian_version('0.6.0')))
+        self.assertEqual(output.package_file_name('rpm', 'qsh', '0.6.0', 'x86_64'),
+                         'qsh-{}-1.x86_64.rpm'.format(output.rpm_version('0.6.0')))
+        with self.assertRaises(ValueError):
+            output.package_file_name('deb', 'qsh', '0.6.0+build.1', 'amd64')
+        fields = [['qsh', '0.6.0~rc.2-1', 'amd64'], ['qsh', '0.6.0~rc.2', '1', 'x86_64']]
+        for (fmt, arch), metadata in zip([('deb', 'amd64'), ('rpm', 'x86_64')], fields):
+            with self.subTest(fmt=fmt):
+                # Metadata keeps '~', so dpkg and rpm order the prerelease first.
+                output.check_fields(fmt, metadata,
+                                    output.package_file_name(fmt, 'qsh', '0.6.0-rc.2', arch),
+                                    'qsh', '0.6.0-rc.2', arch)
+
+    def test_github_safe_name_matches_names_github_keeps(self):
+        for name in ['SHA256SUMS', 'SHA256SUMS.sigstore.json', 'qsh_0.6.0-rc.2-1_amd64.deb',
+                     'qsh-0.6.0-rc1-x86_64-unknown-linux-musl.tar.gz', 'a', 'a_']:
+            with self.subTest(name=name):
+                self.assertTrue(output.github_safe_name(name))
+        for name in ['qsh_0.6.0~rc1-1_amd64.deb', 'qsh-0.6.0+b-1.x86_64.rpm', '.hidden',
+                     'trailing.', '_leading', 'a b', 'a/b', '', 'qsh\u00e9']:
+            with self.subTest(name=name):
+                self.assertFalse(output.github_safe_name(name))
+
+    def test_package_name_cli_contract(self):
+        script = str(ROOT / 'scripts/check-release-output.py')
+        for version, expected in [('0.6.0-rc.2', b'qshd-0.6.0-rc.2-1.x86_64.rpm\n'),
+                                  ('0.6.0+build.1', b''), ('not-a-version', b'')]:
+            with self.subTest(version=version):
+                result = subprocess.run(
+                    [sys.executable, script, 'package-name', '--format', 'rpm',
+                     '--program', 'qshd', '--version', version, '--arch', 'x86_64'],
+                    capture_output=True, timeout=5)
+                self.assertEqual(result.stdout, expected)
+                self.assertEqual(result.returncode, 0 if expected else 1)
 
     def test_package_fields_and_filename_must_both_match(self):
         for fmt, fields, filename, arch in [

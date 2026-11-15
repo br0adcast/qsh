@@ -1,8 +1,11 @@
 //! Trusted local host resource adapter. All owners share the host's actual ledger.
 use super::authorization_contract::{AuthenticatedPrincipalRef, PrincipalRegistration};
 use super::host_protocol::HostMessage;
+use super::owner_resource_contract::OwnerResourceRequest;
 use super::protocol::OwnerProtocolError;
-use super::resource_contract::{Reservation, ReservationReceipt, ResourceLedger};
+use super::resource_contract::{
+    HostResourceBinding, Reservation, ReservationReceipt, ResourceLedger,
+};
 use std::sync::{Arc, Mutex, Weak};
 use transport::session_resume::RequestId;
 
@@ -73,10 +76,15 @@ impl OwnerResourceClient {
         reservation: Reservation,
         cleanup: RequestId,
     ) -> Result<AdmittedReservation, OwnerProtocolError> {
-        self.ledger
+        let mut ledger = self
+            .ledger
             .lock()
-            .map_err(|_| OwnerProtocolError::InvalidState)?
-            .reserve(self.registration, reservation, cleanup)?;
+            .map_err(|_| OwnerProtocolError::InvalidState)?;
+        if ledger.host_binding(self.registration)?.is_some() {
+            return Err(OwnerProtocolError::Binding);
+        }
+        ledger.reserve(self.registration, reservation, cleanup)?;
+        drop(ledger);
         // This local host adapter acknowledges only the actual ledger decision.
         AdmittedReservation::from_reserved(
             self,
@@ -87,6 +95,90 @@ impl OwnerResourceClient {
                 cleanup,
             },
         )
+    }
+    pub(super) fn reserve_host(
+        &self,
+        binding: HostResourceBinding,
+        request: OwnerResourceRequest,
+        cleanup: RequestId,
+    ) -> Result<AdmittedReservation, OwnerProtocolError> {
+        request.validate()?;
+        if request.locator != binding.locator {
+            return Err(OwnerProtocolError::Binding);
+        }
+        let mut ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| OwnerProtocolError::InvalidState)?;
+        if ledger.host_binding(self.registration)? != Some(binding) {
+            return Err(OwnerProtocolError::Binding);
+        }
+        let reservation = Reservation {
+            id: ledger.next_reservation_id()?,
+            principal: self.registration.principal,
+            locator: request.locator,
+            channel: request.channel,
+            kind: request.kind,
+            bytes: request.bytes,
+            screen_charge: request.screen_charge,
+        };
+        ledger.reserve(self.registration, reservation, cleanup)?;
+        drop(ledger);
+        AdmittedReservation::from_reserved(
+            self,
+            reservation,
+            cleanup,
+            HostMessage::Reserved {
+                reservation,
+                cleanup,
+            },
+        )
+    }
+    pub(super) fn validate_admitted(
+        &self,
+        admitted: &AdmittedReservation,
+        expected: Option<HostResourceBinding>,
+    ) -> Result<(), OwnerProtocolError> {
+        if admitted.registration != self.registration
+            || !Weak::ptr_eq(&admitted.ledger, &Arc::downgrade(&self.ledger))
+            || admitted.reservation.principal != self.registration.principal
+        {
+            return Err(OwnerProtocolError::Binding);
+        }
+        let ledger = self
+            .ledger
+            .lock()
+            .map_err(|_| OwnerProtocolError::InvalidState)?;
+        let actual = ledger.host_binding(self.registration)?;
+        if expected.is_some() && expected != actual {
+            return Err(OwnerProtocolError::Binding);
+        }
+        if actual.is_some_and(|binding| binding.locator != admitted.reservation.locator) {
+            return Err(OwnerProtocolError::Binding);
+        }
+        Ok(())
+    }
+    // Only the exact sealed storage finalizer calls this.
+    // Public release reports never reach this path for host-issued registrations.
+    fn release_destroyed(
+        &self,
+        admitted: &AdmittedReservation,
+        cleanup: RequestId,
+    ) -> Result<(), OwnerProtocolError> {
+        self.validate_admitted(admitted, None)?;
+        let r = admitted.reservation;
+        self.ledger
+            .lock()
+            .map_err(|_| OwnerProtocolError::InvalidState)?
+            .release(
+                r,
+                ReservationReceipt {
+                    id: cleanup,
+                    reservation: r.id,
+                    locator: r.locator,
+                    channel: r.channel,
+                },
+            )
     }
     pub(super) fn prepare_screen_commit(
         &self,
@@ -133,10 +225,14 @@ impl OwnerResourceClient {
         {
             return Err(OwnerProtocolError::Binding);
         }
-        self.ledger
+        let mut ledger = self
+            .ledger
             .lock()
-            .map_err(|_| OwnerProtocolError::InvalidState)?
-            .release(admitted.reservation, receipt)
+            .map_err(|_| OwnerProtocolError::InvalidState)?;
+        if ledger.host_binding(self.registration)?.is_some() {
+            return Err(OwnerProtocolError::Binding);
+        }
+        ledger.release(admitted.reservation, receipt)
     }
 }
 /// Never exposed to a peer. Prepared metadata pins the exact live entries.
@@ -150,17 +246,15 @@ pub(super) struct PreparedScreenAccounting {
 }
 impl PreparedScreenAccounting {
     pub(super) fn commit(mut self) -> AdmittedReservation {
-        self.client
-            .ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .finish_screen_commit(
+        if let Ok(mut ledger) = self.client.ledger.lock() {
+            ledger.finish_screen_commit(
                 self.base,
                 self.provisional,
                 self.replacement,
                 self.cleanup,
                 true,
             );
+        }
         self.finished = true;
         AdmittedReservation {
             reservation: self.replacement,
@@ -173,17 +267,15 @@ impl PreparedScreenAccounting {
 impl Drop for PreparedScreenAccounting {
     fn drop(&mut self) {
         if !self.finished {
-            self.client
-                .ledger
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .finish_screen_commit(
+            if let Ok(mut ledger) = self.client.ledger.lock() {
+                ledger.finish_screen_commit(
                     self.base,
                     self.provisional,
                     self.replacement,
                     self.cleanup,
                     false,
                 );
+            }
         }
     }
 }
@@ -201,12 +293,27 @@ impl StorageCharge {
         admitted: AdmittedReservation,
         cleanup: RequestId,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::owned(client, admitted, cleanup))
+    }
+    pub(super) fn owned(
+        client: OwnerResourceClient,
+        admitted: AdmittedReservation,
+        cleanup: RequestId,
+    ) -> Self {
+        Self {
             client,
             admitted,
             cleanup,
             releasable: std::sync::atomic::AtomicBool::new(false),
-        })
+        }
+    }
+    pub(super) fn admitted(&self) -> &AdmittedReservation {
+        &self.admitted
+    }
+    /// Only an exact prepared Screen consolidation supplies the replacement.
+    pub(super) fn replace_admitted(&mut self, admitted: AdmittedReservation) {
+        self.cleanup = admitted.cleanup;
+        self.admitted = admitted;
     }
     pub(super) fn bytes(&self) -> u64 {
         self.admitted.reservation.bytes
@@ -220,16 +327,7 @@ impl StorageCharge {
 impl Drop for StorageCharge {
     fn drop(&mut self) {
         if self.releasable.load(std::sync::atomic::Ordering::Acquire) {
-            let r = self.admitted.reservation;
-            let _ = self.client.release(
-                &self.admitted,
-                ReservationReceipt {
-                    id: self.cleanup,
-                    reservation: r.id,
-                    locator: r.locator,
-                    channel: r.channel,
-                },
-            );
+            let _ = self.client.release_destroyed(&self.admitted, self.cleanup);
         }
     }
 }
