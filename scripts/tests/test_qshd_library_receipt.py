@@ -6,6 +6,8 @@ import hashlib
 import io
 import json
 import os
+import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -487,6 +489,234 @@ class LaunchArtifactReceiptTests(unittest.TestCase):
                 elif case == 'source': (fx.root / 'qshd/src/main.rs').write_text('changed')
                 elif case == 'profile': fx.bins[0]['profile']['opt_level'] = '2'
                 self.refused(fx, 'after')
+
+# These extracted-shell controls use synthetic executable/data fixtures only.
+# A passing control is not native execution or a Cargo/compiler qualification.
+_DRIVER_TOOL = r'''#!__PYTHON__
+import json, os, pathlib, subprocess, sys
+name = pathlib.Path(sys.argv[0]).name
+args = sys.argv[1:]
+root = pathlib.Path(os.environ['LAUNCH_CONTROL_ROOT'])
+fault = os.environ.get('LAUNCH_CONTROL_FAULT', '')
+with pathlib.Path(os.environ['LAUNCH_CONTROL_LEDGER']).open('a') as out:
+    out.write(json.dumps({'tool': name, 'argv': args, 'daemon_name': pathlib.Path(os.environ.get('QSH_TEST_QSHD', '')).name}) + '\n')
+if name == 'cargo':
+    if args[:1] == ['metadata']:
+        if fault == 'metadata': sys.exit(73)
+        print(json.dumps({'packages': [{'name':'qshd','id':'synthetic-qshd'}], 'workspace_members':['synthetic-qshd']}))
+    else:
+        kind = 'bin' if args[:1] == ['build'] else 'lib'
+        if (kind == 'bin' and fault == 'daemon-build') or (kind == 'lib' and fault == 'harness-build'): sys.exit(73)
+        if kind == 'lib' and '--no-run' not in args: sys.exit(99)
+        features = ['system'] if '--features' in args else []
+        configuration = 'system' if features else 'default'
+        print(json.dumps({'reason':'compiler-artifact','package_id':'synthetic-qshd',
+            'profile':{'test':kind == 'lib','opt_level':'1','debuginfo':1}, 'features':features,
+            'target':{'name':'qshd','kind':[kind], 'src_path':str(root / ('qshd/src/main.rs' if kind == 'bin' else 'qshd/src/lib.rs'))},
+            'manifest_path':str(root / 'qshd/Cargo.toml'),
+            'executable':str(root / 'target' / (('daemon-' if kind == 'bin' else 'harness-') + configuration))}))
+elif name == 'git':
+    tail = args[2:]
+    if tail == ['rev-parse','HEAD']: print('c' * 40)
+    elif tail == ['rev-parse','HEAD^{tree}']: print('d' * 40)
+    elif tail == ['ls-files','-z']: sys.stdout.write('\0'.join(json.loads(os.environ['LAUNCH_CONTROL_TRACKED'])) + '\0')
+    elif tail != ['diff','HEAD','--quiet']: sys.exit(99)
+elif name == 'rustc':
+    print('synthetic compiler control\nrelease: 1.98.1')
+elif name == 'sed':
+    if fault == 'path-substitution': sys.exit(73)
+    if fault == 'empty-path': sys.exit(0)
+    if fault == 'missing-path': print(root / 'absent-synthetic-executable')
+    elif fault == 'invalid-path': print(root / 'tracked.txt')
+    else: os.execv('/usr/bin/sed', ['/usr/bin/sed', *args])
+elif name == 'tee':
+    if fault in ('tee-failure', 'empty-log'):
+        sys.stdin.buffer.read()
+        if args: pathlib.Path(args[0]).write_bytes(b'')
+        sys.exit(73 if fault == 'tee-failure' else 0)
+    os.execv('/usr/bin/tee', ['/usr/bin/tee', *args])
+elif name == 'python3':
+    if args and args[0] == 'scripts/run-nextest-ci.py' and fault == 'exact-parser': sys.exit(73)
+    stage = args[1] if len(args) > 1 and args[0] == '-' else None
+    if (stage == 'before' and fault == 'before-helper') or (stage == 'after' and fault == 'after-helper'): sys.exit(73)
+    if stage in ('before', 'after') and fault in ('missing-before-output', 'duplicate-before-output', 'missing-after-output', 'duplicate-after-output'):
+        result = subprocess.run([sys.executable, *args], input=sys.stdin.buffer.read(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        sys.stderr.buffer.write(result.stderr)
+        data = result.stdout
+        if fault == 'missing-' + stage + '-output': data = b''
+        if fault == 'duplicate-' + stage + '-output': data += data
+        sys.stdout.buffer.write(data)
+        sys.exit(result.returncode)
+    os.execv(sys.executable, [sys.executable, *args])
+elif name.startswith('harness-'):
+    if '--exact' not in args: sys.exit(99)
+    selected = args[args.index('--exact') + 1]
+    if '--list' in args:
+        if fault == 'list-failure': sys.exit(73)
+        if fault in ('list-zero','list-missing'): print('0 tests, 0 benchmarks')
+        elif fault == 'list-duplicate': print(selected + ': test\n' + selected + ': test\n\n2 tests, 0 benchmarks')
+        elif fault == 'list-wrong': print('synthetic::wrong: test\n\n1 test, 0 benchmarks')
+        else: print(selected + ': test\n\n1 test, 0 benchmarks')
+    else:
+        if fault == 'changed-artifact':
+            with pathlib.Path(sys.argv[0]).open('a') as out: out.write('\n# synthetic identity mutation\n')
+        if fault == 'body-zero': print('running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s')
+        else:
+            actual = 'synthetic::wrong' if fault == 'body-wrong' else selected
+            result = 'ignored' if fault == 'body-ignored' else 'ok'
+            passed, ignored = (0, 1) if fault == 'body-ignored' else (1, 0)
+            print('running 1 test\ntest ' + actual + ' ... ' + result)
+            summary = f'test result: ok. {passed} passed; 0 failed; {ignored} ignored; 0 measured; 0 filtered out; finished in 0.00s'
+            print('\n' + summary)
+            if fault == 'body-duplicate': print(summary)
+            if fault == 'body-skipped': print('SKIPPED synthetic control')
+        if fault == 'body-nonzero': sys.exit(73)
+else:
+    sys.exit(99)  # The synthetic daemon is never an executable test owner.
+'''
+
+
+class LaunchDriverFixture:
+    def __init__(self, directory, block, fault='', mutation=None, conditional=False):
+        self.fx = Fixture(directory)
+        self.root = self.fx.root
+        self.ledger = Path(directory) / 'invocations.jsonl'
+        self.tools = Path(directory) / 'synthetic-tools'
+        self.tools.mkdir(mode=0o700)
+        self.fx.tracked.append('qshd/src/main.rs')
+        (self.root / 'qshd/src/main.rs').write_text('synthetic source fixture')
+        scripts = self.root / 'scripts'
+        scripts.mkdir(mode=0o700)
+        for name in ('run-nextest-ci.py', 'nextest_report.py'):
+            shutil.copyfile(WORKFLOW.parents[2] / 'scripts' / name, scripts / name)
+        tool = _DRIVER_TOOL.replace('__PYTHON__', sys.executable)
+        for name in ('cargo', 'git', 'rustc', 'sed', 'tee', 'python3'):
+            path = self.tools / name
+            path.write_text(tool)
+            path.chmod(0o700)
+        for configuration in ('default', 'system'):
+            for kind in ('daemon', 'harness'):
+                path = self.root / 'target' / (kind + '-' + configuration)
+                path.write_text(tool)
+                path.chmod(0o700)
+        isolated = Path(directory) / 'isolated'
+        isolated.mkdir(mode=0o700)
+        for name in ('home', 'config', 'cache', 'tmp', 'runner'):
+            (isolated / name).mkdir(mode=0o700)
+        for path in self.root.rglob('*'):
+            if path.is_dir(): path.chmod(0o700)
+        self.root.chmod(0o700)
+        self.fx.runtime.chmod(0o700)
+        self.env = dict(self.fx.env, PATH=str(self.tools) + ':/usr/bin:/bin',
+                        HOME=str(isolated / 'home'), XDG_CONFIG_HOME=str(isolated / 'config'),
+                        XDG_CACHE_HOME=str(isolated / 'cache'), TMPDIR=str(isolated / 'tmp'),
+                        RUNNER_TEMP=str(isolated / 'runner'), HISTFILE='/dev/null',
+                        GITHUB_SHA='c' * 40, LAUNCH_CONTROL_ROOT=str(self.root),
+                        LAUNCH_CONTROL_LEDGER=str(self.ledger), LAUNCH_CONTROL_TRACKED=json.dumps(self.fx.tracked),
+                        LAUNCH_CONTROL_FAULT=fault)
+        self.text = block
+        if mutation == 'early-zero':
+            self.text, count = re.subn(r'(?m)^(\s*)(cargo metadata .+)$', r'\1exit 0\n\1\2', self.text, count=1)
+            if count != 1: raise AssertionError('metadata mutation anchor missing')
+        elif mutation == 'omit-case':
+            anchor = 'for name in "${portable_names[@]}" "${native_names[@]}"; do'
+            if anchor not in self.text: raise AssertionError('case mutation anchor missing')
+            self.text = self.text.replace(anchor, anchor + '\n  [ "$name" != "' + NATIVE_LAUNCH[-1] + '" ] || continue', 1)
+        elif mutation == 'omit-system':
+            self.text, count = re.subn(r'for configuration in [^\n]+; do', 'for configuration in default; do', self.text, count=1)
+            if count != 1: raise AssertionError('configuration mutation anchor missing')
+        if conditional:
+            self.text = 'if (\n' + self.text + '\n); then exit 0; else exit $?; fi\n'
+
+    def invoke(self):
+        result = subprocess.run(['/bin/bash', '-c', self.text], cwd=self.root, env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=40)
+        calls = [json.loads(line) for line in self.ledger.read_text().splitlines()] if self.ledger.exists() else []
+        return result, calls
+
+
+class LaunchDriverExecutionTests(unittest.TestCase):
+    def blocks(self):
+        workflow = WORKFLOW.read_text()
+        values = workflow.split('# launch529 BEGIN controlled ordinary\n')[1:]
+        self.assertEqual(len(values), 2)
+        return [textwrap.dedent(value.split('          # launch529 END controlled ordinary', 1)[0]) for value in values]
+
+    def run_driver(self, block, fault='', mutation=None, conditional=False):
+        directory = tempfile.TemporaryDirectory(prefix='launch-driver-synthetic-')
+        self.addCleanup(directory.cleanup)
+        return LaunchDriverFixture(directory.name, block, fault, mutation, conditional).invoke()
+
+    def refused(self, block, fault='', mutation=None, conditional=False):
+        result, calls = self.run_driver(block, fault, mutation, conditional)
+        self.assertNotEqual(result.returncode, 0, (fault, mutation, 'must fail closed'))
+        self.assertNotIn('launch529_execution_complete ', result.stdout)
+        return calls
+
+    def test_launch_driver_executes_exact_configurations_and_cases(self):
+        expected = set(PORTABLE_LAUNCH + NATIVE_LAUNCH)
+        for index, block in enumerate(self.blocks()):
+            with self.subTest(driver=index):
+                result, calls = self.run_driver(block, conditional=True)
+                self.assertEqual(result.returncode, 0, 'valid synthetic extracted driver')
+                configurations = ('default',) if index == 0 else ('default', 'system')
+                for configuration in configurations:
+                    harness = [c for c in calls if c['tool'] == 'harness-' + configuration]
+                    bodies = [c for c in harness if '--list' not in c['argv']]
+                    lists = [c for c in harness if '--list' in c['argv']]
+                    selected = lambda values: [c['argv'][c['argv'].index('--exact') + 1] for c in values]
+                    self.assertEqual(len(bodies), 21)
+                    self.assertEqual(set(selected(bodies)), expected)
+                    self.assertEqual(len(lists), 21, 'each body requires exact positive membership first')
+                    self.assertEqual(set(selected(lists)), expected)
+                    for body in bodies:
+                        self.assertEqual(body['daemon_name'], 'daemon-' + configuration)
+                        self.assertEqual(body['argv'], ['--include-ignored', '--exact', selected([body])[0], '--show-output', '--test-threads=1', '--color=never'])
+                builds = [c['argv'] for c in calls if c['tool'] == 'cargo' and c['argv'][0] != 'metadata']
+                self.assertEqual(len(builds), 2 * len(configurations))
+                expected_builds = []
+                for configuration in configurations:
+                    feature_args = ['--features', 'system'] if configuration == 'system' else []
+                    expected_builds += [
+                        ['build', '-p', 'qshd', '--bin', 'qshd', '--profile', 'test', '--locked', *feature_args, '--message-format=json-render-diagnostics'],
+                        ['test', '-p', 'qshd', '--lib', '--locked', '--no-run', *feature_args, '--message-format=json-render-diagnostics']]
+                self.assertEqual(builds, expected_builds)
+                self.assertEqual(sum('--features' in argv for argv in builds), 0 if index == 0 else 2)
+                for argv in builds:
+                    if '--features' in argv: self.assertEqual(argv[argv.index('--features') + 1], 'system')
+                    self.assertIn('--locked', argv)
+                    self.assertIn('--message-format=json-render-diagnostics', argv)
+                receipts = [json.loads(line.split(' ', 1)[1]) for line in result.stdout.splitlines() if line.startswith('launch529_artifact_receipt ')]
+                self.assertEqual(len(receipts), 2 * len(configurations))
+                complete = [json.loads(line.split(' ', 1)[1]) for line in result.stdout.splitlines() if line.startswith('launch529_execution_complete ')]
+                self.assertEqual(len(complete), 1, 'parent positive execution audit is mandatory')
+                self.assertEqual(complete[0]['case_executions'], 21 * len(configurations))
+
+    def test_launch_driver_propagates_build_artifact_and_substitution_failures(self):
+        for index, block in enumerate(self.blocks()):
+            for fault in ('metadata', 'daemon-build', 'harness-build', 'before-helper', 'path-substitution',
+                          'invalid-path', 'missing-path', 'empty-path', 'after-helper', 'changed-artifact'):
+                with self.subTest(driver=index, fault=fault):
+                    self.refused(block, fault, conditional=True)
+
+    def test_launch_driver_requires_exact_list_and_body_evidence(self):
+        for index, block in enumerate(self.blocks()):
+            for fault in ('list-failure', 'list-zero', 'list-missing', 'list-duplicate', 'list-wrong',
+                          'body-nonzero', 'body-zero', 'body-ignored', 'body-wrong', 'body-duplicate',
+                          'body-skipped', 'tee-failure', 'empty-log', 'exact-parser'):
+                with self.subTest(driver=index, fault=fault):
+                    calls = self.refused(block, fault, conditional=True)
+                    if fault.startswith('list-'):
+                        self.assertFalse(any(c['tool'].startswith('harness-') and '--list' not in c['argv'] for c in calls), 'invalid membership must prevent body execution')
+
+    def test_launch_driver_rejects_early_subshell_success_without_receipts(self):
+        for index, block in enumerate(self.blocks()):
+            for mutation in ('early-zero', 'omit-case') + (('omit-system',) if index else ()):
+                with self.subTest(driver=index, mutation=mutation):
+                    self.refused(block, mutation=mutation, conditional=True)
+            for fault in ('missing-before-output', 'duplicate-before-output', 'missing-after-output', 'duplicate-after-output'):
+                with self.subTest(driver=index, fault=fault):
+                    self.refused(block, fault, conditional=True)
 
 
 if __name__ == '__main__':

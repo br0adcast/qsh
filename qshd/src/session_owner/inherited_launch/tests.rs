@@ -346,6 +346,7 @@ fn launch529_wait_and_eof_are_independent_receipts() {
         assert_eq!(launches.poll(&handle), super::LaunchProgress::Settled);
         assert_eq!(launches.in_use(), 0);
     }
+    reset_read_receipt_orders();
 }
 #[test]
 #[ignore = "ordinary nonroot owned-FD fixture; explicitly selected in maintained CI"]
@@ -395,6 +396,7 @@ fn launch529_lost_wait_and_uncertain_close_never_refund() {
         assert_eq!(launches.observation(&handle).first, first.first);
         assert_eq!(launches.budget.in_use(), 1);
     }
+    reset_uncertainties_stay_charged();
 }
 #[test]
 #[ignore = "ordinary nonroot owned-FD fixture; explicitly selected in maintained CI"]
@@ -721,6 +723,7 @@ fn launch529_unknown_observation_is_bounded_and_non_authoritative() {
             errno: Some(i32::MIN),
             snapshot,
         }),
+        rejection: Some(d::Rejection { errno: None }),
         current: Some(snapshot),
         unavailable: None,
     };
@@ -728,6 +731,7 @@ fn launch529_unknown_observation_is_bounded_and_non_authoritative() {
     let rendered = d::render(Subcase::RecordReservedPrefix, &report);
     assert!(rendered.len() <= 2048);
     assert!(rendered.contains("subcase=record_reserved_prefix"));
+    assert!(rendered.contains("rejection=Some(Rejection { errno: None })"));
     assert_eq!(report, saved, "observation cannot mutate custody state");
     let fallback = d::render_capped(Subcase::RecordMagic, &report, 64);
     assert!(
@@ -742,9 +746,215 @@ fn launch529_unknown_observation_is_bounded_and_non_authoritative() {
     ] {
         let report = Report {
             first: None,
+            rejection: None,
             current: None,
             unavailable: Some(reason),
         };
         assert!(d::render(Subcase::Other, &report).len() <= 2048);
+    }
+}
+
+// Only setup I/O is faulted; actual peer EOF is read from the owned socket.
+// The terminal/lost wait setters below remain explicit child-free models.
+fn inject_setup_read(
+    launches: &mut super::FrontendLaunches,
+    handle: &super::LaunchHandle,
+    error: std::io::Error,
+) {
+    launches
+        .find(handle)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .setup_read_fault = Some(error);
+}
+fn reset_model() -> (super::FrontendLaunches, super::LaunchHandle) {
+    let mut launches = super::FrontendLaunches::new(1).unwrap();
+    let handle = launches
+        .prepare(config(), Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    launches.test_started(&handle);
+    (launches, handle)
+}
+fn reset_read_receipt_orders() {
+    use std::os::fd::AsRawFd;
+    for eof_first in [false, true] {
+        let (mut launches, handle) = reset_model();
+        let setup = launches
+            .find(&handle)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .setup
+            .as_ref()
+            .unwrap()
+            .fd()
+            .unwrap()
+            .as_raw_fd();
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            inject_setup_read(&mut launches, &handle, std::io::Error::from(kind));
+            assert_eq!(launches.poll(&handle), super::LaunchProgress::Preparing);
+            let capsule = launches.find(&handle).unwrap();
+            let c = capsule.lock().unwrap();
+            assert!(!c.cancelled() && !c.eof && !c.unknown);
+        }
+        let expected_errno = if eof_first {
+            Some(nix::libc::ECONNRESET)
+        } else {
+            None
+        };
+        for repeat in 0..2 {
+            let error = if repeat == 0 && !eof_first {
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset)
+            } else {
+                std::io::Error::from_raw_os_error(nix::libc::ECONNRESET)
+            };
+            inject_setup_read(&mut launches, &handle, error);
+            assert_eq!(
+                launches.poll(&handle),
+                super::LaunchProgress::Closing,
+                "reset rejects setup without losing physical custody"
+            );
+            let capsule = launches.find(&handle).unwrap();
+            let c = capsule.lock().unwrap();
+            assert!(c.cancelled() && !c.eof && !c.unknown && !c.kill_attempted);
+            assert_eq!(c.wait, super::WaitState::Pending);
+            assert!(c.status.is_none() && c.first_unknown.is_none());
+            assert_eq!(
+                c.first_rejection,
+                Some(super::observation::Rejection {
+                    errno: expected_errno
+                })
+            );
+            assert_eq!(c.setup.as_ref().unwrap().fd().unwrap().as_raw_fd(), setup);
+            assert!(c.remote.is_some() && c.setup_child.is_some());
+        }
+        // Missing optional diagnostic data cannot change physical settlement.
+        if !eof_first {
+            launches
+                .find(&handle)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .first_rejection = None;
+        }
+        // With the real peer still open the next actual read is WouldBlock.
+        assert_eq!(launches.poll(&handle), super::LaunchProgress::Closing);
+        assert_eq!(launches.in_use(), 1);
+        assert_eq!(launches.budget.in_use(), 1);
+        assert!(matches!(
+            launches.prepare(config(), Instant::now() + Duration::from_secs(60)),
+            Err(local_channel::AdmissionError::Capacity)
+        ));
+        assert!(!launches.test_publish(&handle));
+        if eof_first {
+            launches.test_eof(&handle);
+        } else {
+            launches.test_wait(&handle, false);
+        }
+        assert_eq!(
+            launches.poll(&handle),
+            super::LaunchProgress::Closing,
+            "one physical receipt is insufficient"
+        );
+        {
+            let capsule = launches.find(&handle).unwrap();
+            let c = capsule.lock().unwrap();
+            assert_eq!(c.eof, eof_first);
+            assert_eq!(
+                c.wait,
+                if eof_first {
+                    super::WaitState::Pending
+                } else {
+                    super::WaitState::Terminal
+                }
+            );
+            assert!(
+                c.status.is_none(),
+                "modeled wait is not an actual ExitStatus"
+            );
+        }
+        assert_eq!(launches.in_use(), 1);
+        assert_eq!(launches.budget.in_use(), 1);
+        if eof_first {
+            launches.test_wait(&handle, false);
+        } else {
+            launches.test_eof(&handle);
+        }
+        assert_eq!(launches.poll(&handle), super::LaunchProgress::Settled);
+        assert_eq!(launches.in_use(), 0);
+        assert_eq!(launches.budget.in_use(), 0);
+    }
+}
+fn reset_uncertainties_stay_charged() {
+    for failure in [
+        "lost-wait",
+        "uncertain-close",
+        "preexisting-unknown",
+        "other-read",
+    ] {
+        let (mut launches, handle) = reset_model();
+        if failure == "preexisting-unknown" {
+            launches.test_wait(&handle, true);
+        }
+        inject_setup_read(
+            &mut launches,
+            &handle,
+            std::io::Error::from_raw_os_error(nix::libc::ECONNRESET),
+        );
+        assert_eq!(
+            launches.poll(&handle),
+            if failure == "preexisting-unknown" {
+                super::LaunchProgress::Unknown
+            } else {
+                super::LaunchProgress::Closing
+            }
+        );
+        if failure == "lost-wait" {
+            launches.test_wait(&handle, true);
+        }
+        if failure == "uncertain-close" {
+            launches.test_wait(&handle, false);
+            launches.test_uncertain_close(&handle);
+        }
+        if failure == "other-read" {
+            inject_setup_read(
+                &mut launches,
+                &handle,
+                std::io::Error::from(std::io::ErrorKind::Other),
+            );
+            assert_eq!(launches.poll(&handle), super::LaunchProgress::Unknown);
+        }
+        let report = launches.observation(&handle);
+        assert!(
+            report.rejection.is_some(),
+            "logical rejection is separate from first physical uncertainty"
+        );
+        let original = report.first;
+        if failure != "uncertain-close" {
+            assert!(original.is_some());
+        }
+        launches.test_eof(&handle); // closes real owned setup peer copies
+        assert_eq!(launches.poll(&handle), super::LaunchProgress::Unknown);
+        let physical = launches.observation(&handle).first.unwrap();
+        if let Some(original) = original {
+            assert_eq!(physical, original);
+        }
+        inject_setup_read(
+            &mut launches,
+            &handle,
+            std::io::Error::from_raw_os_error(nix::libc::ECONNRESET),
+        );
+        // EOF may already suppress further reads; neither case can clear Unknown.
+        assert_eq!(launches.poll(&handle), super::LaunchProgress::Unknown);
+        assert_eq!(launches.observation(&handle).first, Some(physical));
+        assert_eq!(launches.in_use(), 1);
+        assert_eq!(launches.budget.in_use(), 1);
+        let capsule = launches.find(&handle).unwrap();
+        let c = capsule.lock().unwrap();
+        assert!(c.eof && c.unknown && !c.kill_attempted && c.status.is_none());
     }
 }

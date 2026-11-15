@@ -105,7 +105,11 @@ struct Capsule {
     #[cfg(test)]
     interrupt_setup_read: bool,
     #[cfg(test)]
+    setup_read_fault: Option<io::Error>,
+    #[cfg(test)]
     first_unknown: Option<observation::Event>,
+    #[cfg(test)]
+    first_rejection: Option<observation::Rejection>,
 }
 impl Capsule {
     fn cancelled(&self) -> bool {
@@ -205,6 +209,8 @@ impl Capsule {
                     #[cfg(test)]
                     let result = if std::mem::take(&mut self.interrupt_setup_read) {
                         Err(io::Error::from(io::ErrorKind::Interrupted))
+                    } else if let Some(error) = self.setup_read_fault.take() {
+                        Err(error)
                     } else {
                         launch::read(fd, &mut byte)
                     };
@@ -226,6 +232,15 @@ impl Capsule {
                                 e.kind(),
                                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                             ) => {}
+                        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {
+                            // Communication rejection does not lose the retained Child/FD.
+                            // It supplies neither EOF nor wait; physical settlement stays gated.
+                            #[cfg(test)]
+                            self.first_rejection.get_or_insert(observation::Rejection {
+                                errno: error.raw_os_error(),
+                            });
+                            self.retire();
+                        }
                         Err(_error) => {
                             #[cfg(test)]
                             self.observe_unknown(
@@ -425,7 +440,11 @@ impl FrontendLaunches {
             #[cfg(test)]
             interrupt_setup_read: false,
             #[cfg(test)]
+            setup_read_fault: None,
+            #[cfg(test)]
             first_unknown: None,
+            #[cfg(test)]
+            first_rejection: None,
         }));
         // Retain the physical capsule before any socketpair or duplicate allocation.
         self.slots.push(Arc::clone(&capsule));
@@ -813,6 +832,7 @@ impl FrontendLaunches {
                     return Report {
                         unavailable: None,
                         first: c.first_unknown,
+                        rejection: c.first_rejection,
                         current: Some(c.observation_scalars()),
                     }
                 }
@@ -826,6 +846,7 @@ impl FrontendLaunches {
         Report {
             unavailable: Some(unavailable.unwrap_or(Origin::RegistryMissing)),
             first: None,
+            rejection: None,
             current: None,
         }
     }
@@ -944,10 +965,16 @@ mod observation {
             }
         }
     }
+    // A rejected read is diagnostic data, never physical custody evidence.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Rejection {
+        pub errno: Option<i32>,
+    }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) struct Report {
         pub unavailable: Option<Origin>,
         pub first: Option<Event>,
+        pub rejection: Option<Rejection>,
         pub current: Option<Snapshot>,
     }
     pub(super) fn render(case: Subcase, report: &Report) -> String {
@@ -956,9 +983,10 @@ mod observation {
     pub(super) fn render_capped(case: Subcase, report: &Report, cap: usize) -> String {
         // Only closed enums, optional bounded integers and booleans are rendered.
         let rendered = format!(
-            "launch529_diag_v1 subcase={} first={:?} current={:?} unavailable={:?}",
+            "launch529_diag_v1 subcase={} first={:?} rejection={:?} current={:?} unavailable={:?}",
             case.label(),
             report.first,
+            report.rejection,
             report.current,
             report.unavailable
         );

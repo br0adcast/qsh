@@ -381,15 +381,16 @@ jobs:
         run: |
           # launch529 BEGIN controlled ordinary
           set -euo pipefail
-          umask 077
-          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
-          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-inherited-launch.XXXXXX")
-          trap 'rm -rf "$runtime"' EXIT
-          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
-          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
-          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
-          unset SSH_AUTH_SOCK
+          umask 077 || exit 1
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" || exit 1
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" || exit 1
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-inherited-launch.XXXXXX") || exit 1
+          test -n "$runtime" || exit 1
+          trap 'rm -rf "$runtime"' EXIT || exit 1
+          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp" || exit 1
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache" || exit 1
+          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null || exit 1
+          unset SSH_AUTH_SOCK || exit 1
           launch_artifacts() {
             python3 - "$@" <<'PYLAUNCH'
           import hashlib, json, os, pathlib, re, subprocess, sys
@@ -464,6 +465,67 @@ jobs:
               sys.exit(1)
           PYLAUNCH
           }
+          launch_execution_guard() {
+            python3 - "$@" <<'PYLAUNCHEXEC'
+          import importlib.util, json, os, pathlib, sys
+          class Error(Exception):
+              pass
+          def require(value, code):
+              if not value:
+                  raise Error(code)
+          def listing(path, name):
+              lines = [line for line in path.read_text().splitlines() if line]
+              require(lines == [name + ': test', '1 test, 0 benchmarks'], 'exact-list')
+          def main():
+              require(len(sys.argv) >= 2, 'arguments')
+              mode = sys.argv[1]
+              if mode == 'list':
+                  require(len(sys.argv) == 4, 'arguments')
+                  listing(pathlib.Path(sys.argv[2]), sys.argv[3])
+                  return
+              require(mode == 'audit' and len(sys.argv) >= 5, 'arguments')
+              runtime, names_path = map(pathlib.Path, sys.argv[2:4])
+              configurations = sys.argv[4:]
+              require(configurations in (['default'], ['default', 'system']), 'configurations')
+              names = names_path.read_text().splitlines()
+              require(len(names) == 21 and len(set(names)) == 21, 'case-names')
+              require((runtime / 'completed-configurations').read_text().splitlines() == configurations, 'configuration-completion')
+              root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
+              sys.path.insert(0, str(root / 'scripts'))
+              spec = importlib.util.spec_from_file_location('launch_exact_result_guard', root / 'scripts/run-nextest-ci.py')
+              checker = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(checker)
+              for configuration in configurations:
+                  require((runtime / (configuration + '-completed')).read_text().splitlines() == names, 'case-completion')
+                  pair = []
+                  for stage in ('before', 'after'):
+                      lines = (runtime / (configuration + '-' + stage + '-receipt.log')).read_text().splitlines()
+                      require(len(lines) == 1 and lines[0].startswith('launch529_artifact_receipt '), 'artifact-receipt')
+                      receipt = json.loads(lines[0].split(' ', 1)[1])
+                      require(receipt.pop('stage') == stage, 'artifact-stage')
+                      require(receipt['features'] == ([] if configuration == 'default' else ['system']), 'artifact-features')
+                      pair.append(receipt)
+                  require(pair[0] == pair[1], 'artifact-pair')
+                  for name in names:
+                      log = runtime / (configuration + '-' + name + '.log')
+                      require(log.is_file() and log.stat().st_size > 0, 'case-log')
+                      listing(runtime / (configuration + '-' + name + '.list'), name)
+                      checker.check_exact_libtest(log, name)
+              summary = dict(schema=1, configurations=len(configurations), portable_cases_per_configuration=17,
+                             native_cases_per_configuration=4, case_executions=21 * len(configurations))
+              text = 'launch529_execution_complete ' + json.dumps(summary, sort_keys=True)
+              require(len(text.encode()) <= 512, 'summary-size')
+              print(text)
+          try:
+              main()
+          except Error as error:
+              print('launch529_execution_error ' + str(error), file=sys.stderr)
+              sys.exit(1)
+          except Exception:
+              print('launch529_execution_error invalid-input', file=sys.stderr)
+              sys.exit(1)
+          PYLAUNCHEXEC
+          }
           portable_names=(
             session_owner::inherited_launch::tests::launch529_cancel_before_and_after_start_wins_late_admission
             session_owner::inherited_launch::tests::launch529_deadline_is_absolute_across_partial_setup
@@ -489,29 +551,52 @@ jobs:
             session_owner::inherited_launch::native_tests::launch529_exec_failure_and_cancel_keep_exact_custody
             session_owner::inherited_launch::native_tests::launch529_foreign_or_invalid_inheritance_refuses
           )
-          test "${#portable_names[@]}" -eq 17
-          test "${#native_names[@]}" -eq 4
-          cargo metadata --no-deps --format-version=1 --locked > "$runtime/workspace.json"
-          for configuration in default; do
-            features=()
-            if [ "$configuration" = system ]; then features=(--features system); fi
-            cargo build -p qshd --bin qshd --profile test --locked "${features[@]}" \
-              --message-format=json-render-diagnostics > "$runtime/$configuration-daemon.jsonl"
-            cargo test -p qshd --lib --locked --no-run "${features[@]}" \
-              --message-format=json-render-diagnostics > "$runtime/$configuration-harness.jsonl"
-            launch_artifacts before "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
-              "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration"
-            export QSH_TEST_QSHD="$(sed -n '1p' "$runtime/$configuration.paths")"
-            harness=$(sed -n '2p' "$runtime/$configuration.paths")
-            for name in "${portable_names[@]}" "${native_names[@]}"; do
-              log="$runtime/$configuration-$name.log"
-              "$harness" --include-ignored --exact "$name" --show-output --test-threads=1 --color=never \
-                2>&1 | tee "$log"
-              python3 scripts/run-nextest-ci.py --check-exact-libtest "$log" --require-exact-test "$name"
+          test "${#portable_names[@]}" -eq 17 || exit 1
+          test "${#native_names[@]}" -eq 4 || exit 1
+          configurations=(default)
+          printf '%s\n' "${portable_names[@]}" "${native_names[@]}" > "$runtime/expected-names" || exit 1
+          # Only this supervised phase may build or execute. A bare zero exit is not proof.
+          (
+            cargo metadata --no-deps --format-version=1 --locked > "$runtime/workspace.json" || exit 1
+            for configuration in "${configurations[@]}"; do
+              build_command=(cargo build -p qshd --bin qshd --profile test --locked)
+              test_command=(cargo test -p qshd --lib --locked --no-run)
+              if [ "$configuration" = system ]; then
+                build_command+=(--features system)
+                test_command+=(--features system)
+              fi
+              build_command+=(--message-format=json-render-diagnostics)
+              test_command+=(--message-format=json-render-diagnostics)
+              "${build_command[@]}" > "$runtime/$configuration-daemon.jsonl" || exit 1
+              "${test_command[@]}" > "$runtime/$configuration-harness.jsonl" || exit 1
+              launch_artifacts before "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
+                "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration" \
+                > "$runtime/$configuration-before-receipt.log" || exit 1
+              cat "$runtime/$configuration-before-receipt.log" || exit 1
+              daemon=$(sed -n '1p' "$runtime/$configuration.paths") || exit 1
+              harness=$(sed -n '2p' "$runtime/$configuration.paths") || exit 1
+              test -n "$daemon" && test -x "$daemon" || exit 1
+              test -n "$harness" && test -x "$harness" || exit 1
+              export QSH_TEST_QSHD="$daemon" || exit 1
+              for name in "${portable_names[@]}" "${native_names[@]}"; do
+                list="$runtime/$configuration-$name.list"
+                "$harness" --include-ignored --exact "$name" --list --color=never > "$list" || exit 1
+                launch_execution_guard list "$list" "$name" || exit 1
+                log="$runtime/$configuration-$name.log"
+                "$harness" --include-ignored --exact "$name" --show-output --test-threads=1 --color=never \
+                  2>&1 | tee "$log" || exit 1
+                python3 scripts/run-nextest-ci.py --check-exact-libtest "$log" --require-exact-test "$name" || exit 1
+                printf '%s\n' "$name" >> "$runtime/$configuration-completed" || exit 1
+              done
+              launch_artifacts after "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
+                "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration" \
+                > "$runtime/$configuration-after-receipt.log" || exit 1
+              cat "$runtime/$configuration-after-receipt.log" || exit 1
+              printf '%s\n' "$configuration" >> "$runtime/completed-configurations" || exit 1
             done
-            launch_artifacts after "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
-              "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration"
-          done
+          ) || exit 1
+          # Parent-side audit remains outside the phase even if its shell exits early with zero.
+          launch_execution_guard audit "$runtime" "$runtime/expected-names" "${configurations[@]}" || exit 1
           # launch529 END controlled ordinary
       - name: Keeper failure settlement bound
         shell: bash
@@ -1613,15 +1698,16 @@ jobs:
         run: |
           # launch529 BEGIN controlled ordinary
           set -euo pipefail
-          umask 077
-          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
-          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-inherited-launch.XXXXXX")
-          trap 'rm -rf "$runtime"' EXIT
-          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
-          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
-          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
-          unset SSH_AUTH_SOCK
+          umask 077 || exit 1
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" || exit 1
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" || exit 1
+          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-inherited-launch.XXXXXX") || exit 1
+          test -n "$runtime" || exit 1
+          trap 'rm -rf "$runtime"' EXIT || exit 1
+          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp" || exit 1
+          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache" || exit 1
+          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null || exit 1
+          unset SSH_AUTH_SOCK || exit 1
           launch_artifacts() {
             python3 - "$@" <<'PYLAUNCH'
           import hashlib, json, os, pathlib, re, subprocess, sys
@@ -1696,6 +1782,67 @@ jobs:
               sys.exit(1)
           PYLAUNCH
           }
+          launch_execution_guard() {
+            python3 - "$@" <<'PYLAUNCHEXEC'
+          import importlib.util, json, os, pathlib, sys
+          class Error(Exception):
+              pass
+          def require(value, code):
+              if not value:
+                  raise Error(code)
+          def listing(path, name):
+              lines = [line for line in path.read_text().splitlines() if line]
+              require(lines == [name + ': test', '1 test, 0 benchmarks'], 'exact-list')
+          def main():
+              require(len(sys.argv) >= 2, 'arguments')
+              mode = sys.argv[1]
+              if mode == 'list':
+                  require(len(sys.argv) == 4, 'arguments')
+                  listing(pathlib.Path(sys.argv[2]), sys.argv[3])
+                  return
+              require(mode == 'audit' and len(sys.argv) >= 5, 'arguments')
+              runtime, names_path = map(pathlib.Path, sys.argv[2:4])
+              configurations = sys.argv[4:]
+              require(configurations in (['default'], ['default', 'system']), 'configurations')
+              names = names_path.read_text().splitlines()
+              require(len(names) == 21 and len(set(names)) == 21, 'case-names')
+              require((runtime / 'completed-configurations').read_text().splitlines() == configurations, 'configuration-completion')
+              root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
+              sys.path.insert(0, str(root / 'scripts'))
+              spec = importlib.util.spec_from_file_location('launch_exact_result_guard', root / 'scripts/run-nextest-ci.py')
+              checker = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(checker)
+              for configuration in configurations:
+                  require((runtime / (configuration + '-completed')).read_text().splitlines() == names, 'case-completion')
+                  pair = []
+                  for stage in ('before', 'after'):
+                      lines = (runtime / (configuration + '-' + stage + '-receipt.log')).read_text().splitlines()
+                      require(len(lines) == 1 and lines[0].startswith('launch529_artifact_receipt '), 'artifact-receipt')
+                      receipt = json.loads(lines[0].split(' ', 1)[1])
+                      require(receipt.pop('stage') == stage, 'artifact-stage')
+                      require(receipt['features'] == ([] if configuration == 'default' else ['system']), 'artifact-features')
+                      pair.append(receipt)
+                  require(pair[0] == pair[1], 'artifact-pair')
+                  for name in names:
+                      log = runtime / (configuration + '-' + name + '.log')
+                      require(log.is_file() and log.stat().st_size > 0, 'case-log')
+                      listing(runtime / (configuration + '-' + name + '.list'), name)
+                      checker.check_exact_libtest(log, name)
+              summary = dict(schema=1, configurations=len(configurations), portable_cases_per_configuration=17,
+                             native_cases_per_configuration=4, case_executions=21 * len(configurations))
+              text = 'launch529_execution_complete ' + json.dumps(summary, sort_keys=True)
+              require(len(text.encode()) <= 512, 'summary-size')
+              print(text)
+          try:
+              main()
+          except Error as error:
+              print('launch529_execution_error ' + str(error), file=sys.stderr)
+              sys.exit(1)
+          except Exception:
+              print('launch529_execution_error invalid-input', file=sys.stderr)
+              sys.exit(1)
+          PYLAUNCHEXEC
+          }
           portable_names=(
             session_owner::inherited_launch::tests::launch529_cancel_before_and_after_start_wins_late_admission
             session_owner::inherited_launch::tests::launch529_deadline_is_absolute_across_partial_setup
@@ -1721,29 +1868,52 @@ jobs:
             session_owner::inherited_launch::native_tests::launch529_exec_failure_and_cancel_keep_exact_custody
             session_owner::inherited_launch::native_tests::launch529_foreign_or_invalid_inheritance_refuses
           )
-          test "${#portable_names[@]}" -eq 17
-          test "${#native_names[@]}" -eq 4
-          cargo metadata --no-deps --format-version=1 --locked > "$runtime/workspace.json"
-          for configuration in default system; do
-            features=()
-            if [ "$configuration" = system ]; then features=(--features system); fi
-            cargo build -p qshd --bin qshd --profile test --locked "${features[@]}" \
-              --message-format=json-render-diagnostics > "$runtime/$configuration-daemon.jsonl"
-            cargo test -p qshd --lib --locked --no-run "${features[@]}" \
-              --message-format=json-render-diagnostics > "$runtime/$configuration-harness.jsonl"
-            launch_artifacts before "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
-              "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration"
-            export QSH_TEST_QSHD="$(sed -n '1p' "$runtime/$configuration.paths")"
-            harness=$(sed -n '2p' "$runtime/$configuration.paths")
-            for name in "${portable_names[@]}" "${native_names[@]}"; do
-              log="$runtime/$configuration-$name.log"
-              "$harness" --include-ignored --exact "$name" --show-output --test-threads=1 --color=never \
-                2>&1 | tee "$log"
-              python3 scripts/run-nextest-ci.py --check-exact-libtest "$log" --require-exact-test "$name"
+          test "${#portable_names[@]}" -eq 17 || exit 1
+          test "${#native_names[@]}" -eq 4 || exit 1
+          configurations=(default system)
+          printf '%s\n' "${portable_names[@]}" "${native_names[@]}" > "$runtime/expected-names" || exit 1
+          # Only this supervised phase may build or execute. A bare zero exit is not proof.
+          (
+            cargo metadata --no-deps --format-version=1 --locked > "$runtime/workspace.json" || exit 1
+            for configuration in "${configurations[@]}"; do
+              build_command=(cargo build -p qshd --bin qshd --profile test --locked)
+              test_command=(cargo test -p qshd --lib --locked --no-run)
+              if [ "$configuration" = system ]; then
+                build_command+=(--features system)
+                test_command+=(--features system)
+              fi
+              build_command+=(--message-format=json-render-diagnostics)
+              test_command+=(--message-format=json-render-diagnostics)
+              "${build_command[@]}" > "$runtime/$configuration-daemon.jsonl" || exit 1
+              "${test_command[@]}" > "$runtime/$configuration-harness.jsonl" || exit 1
+              launch_artifacts before "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
+                "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration" \
+                > "$runtime/$configuration-before-receipt.log" || exit 1
+              cat "$runtime/$configuration-before-receipt.log" || exit 1
+              daemon=$(sed -n '1p' "$runtime/$configuration.paths") || exit 1
+              harness=$(sed -n '2p' "$runtime/$configuration.paths") || exit 1
+              test -n "$daemon" && test -x "$daemon" || exit 1
+              test -n "$harness" && test -x "$harness" || exit 1
+              export QSH_TEST_QSHD="$daemon" || exit 1
+              for name in "${portable_names[@]}" "${native_names[@]}"; do
+                list="$runtime/$configuration-$name.list"
+                "$harness" --include-ignored --exact "$name" --list --color=never > "$list" || exit 1
+                launch_execution_guard list "$list" "$name" || exit 1
+                log="$runtime/$configuration-$name.log"
+                "$harness" --include-ignored --exact "$name" --show-output --test-threads=1 --color=never \
+                  2>&1 | tee "$log" || exit 1
+                python3 scripts/run-nextest-ci.py --check-exact-libtest "$log" --require-exact-test "$name" || exit 1
+                printf '%s\n' "$name" >> "$runtime/$configuration-completed" || exit 1
+              done
+              launch_artifacts after "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
+                "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration" \
+                > "$runtime/$configuration-after-receipt.log" || exit 1
+              cat "$runtime/$configuration-after-receipt.log" || exit 1
+              printf '%s\n' "$configuration" >> "$runtime/completed-configurations" || exit 1
             done
-            launch_artifacts after "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
-              "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration"
-          done
+          ) || exit 1
+          # Parent-side audit remains outside the phase even if its shell exits early with zero.
+          launch_execution_guard audit "$runtime" "$runtime/expected-names" "${configurations[@]}" || exit 1
           # launch529 END controlled ordinary
       - name: Build all workspace test targets at the supported Rust floor
         run: |

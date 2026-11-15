@@ -214,6 +214,45 @@ fn settled_case(
     if success {
         assert!(c.status.unwrap().success());
     }
+    use observation::Subcase as S;
+    if matches!(
+        case,
+        S::RecordMagic
+            | S::RecordHostZero
+            | S::RecordChannelZero
+            | S::RecordChallengeZero
+            | S::RecordUid
+            | S::RecordFrontendRole
+            | S::RecordHostRole
+            | S::RecordMinVersion
+            | S::RecordMaxVersion
+            | S::RecordReservedPrefix
+            | S::RecordDeadlineZero
+            | S::RecordTailVersion
+            | S::RecordReservedTail
+    ) {
+        assert_eq!(
+            c.wait,
+            WaitState::Terminal,
+            "malformed record created an exact owned child"
+        );
+        assert!(
+            c.status.is_some(),
+            "native wait must retain actual ExitStatus"
+        );
+    }
+    let local_closes = c.host.is_none()
+        && c.admitted.is_none()
+        && c.frontend.is_none()
+        && c.setup.is_none()
+        && c.setup_child.is_none()
+        && c.duplicates.iter().all(Option::is_none)
+        && c.remote.is_none()
+        && c.child.is_none();
+    assert!(local_closes);
+    let receipt = format!("launch529_settlement_v1 subcase={} rejection={:?} eof={} wait={:?} status={:?} local_closes={} remote_charge=0", case.label(), c.first_rejection, c.eof, c.wait, observation::Status::capture(c.status.as_ref()), local_closes);
+    assert!(receipt.len() <= 512, "bounded settlement receipt");
+    println!("{receipt}");
     println!(
         "launch529 cleanup eof={} owned_wait={} local_closes=true remote_charge=0",
         c.eof,
