@@ -532,6 +532,9 @@ impl HostDecoder {
             failed: None,
         }
     }
+    pub(super) fn remaining_frame_bytes(&self) -> usize {
+        self.expected.unwrap_or(HOST_HEADER_LEN) - self.buf.len()
+    }
     pub fn buffered_len(&self) -> usize {
         self.buf.len()
     }
@@ -658,6 +661,18 @@ impl HostPeerState {
     }
     pub fn receive_at(&mut self, f: &HostFrame, now: u64) -> Result<(), Error> {
         self.apply_timed(f, false, Some(now))
+    }
+    /// Trusted local expiry/retirement, never an authority decision. Preserve
+    /// request high-water marks while retiring only this exact correlation.
+    pub(super) fn retire_local_ticket(&mut self, ticket: super::host_auth_contract::AuthReference) {
+        if let Some(retired) = self.auth.as_mut().and_then(|a| a.retire_local(ticket)) {
+            self.outgoing.retain(
+                |_, m| !matches!(m,HostMessage::Authentication(a) if a.retired_by(retired)),
+            );
+            self.incoming.retain(
+                |_, m| !matches!(m,HostMessage::Authentication(a) if a.retired_by(retired)),
+            );
+        }
     }
     pub fn outstanding(&self) -> usize {
         self.outgoing.len()

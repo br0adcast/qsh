@@ -924,3 +924,25 @@ fn frontendio529_host_and_owner_endpoints_transfer_no_bytes() {
         }
     }
 }
+
+/// Test-only prefill of this fixture's real nonblocking socket output. The
+/// bytes are explicitly drained as fixture occupancy before QSHH decoding;
+/// they are not a successful mock response or a resource-cleanup receipt.
+pub(crate) fn fill_dispatch_output(channel: &mut HostDispatchChannel) -> usize {
+    let socket = stream(channel.channel.custody.fd.as_ref().unwrap());
+    let mut peer = &*socket;
+    let bytes = [0xa5; 4096];
+    let mut filled = 0;
+    loop {
+        assert!(
+            filled < 8 * 1024 * 1024,
+            "fixture socket output must be bounded"
+        );
+        match peer.write(&bytes) {
+            Ok(0) => panic!("unexpected zero fixture write"),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return filled,
+            Err(e) => panic!("prefilling fixture socket: {e}"),
+        }
+    }
+}
