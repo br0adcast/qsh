@@ -178,3 +178,9 @@ pub fn darwin_runtime_admission() -> anyhow::Result<()> {
 pub mod server_info;
 
 pub mod session_owner;
+
+/// Private fixed-descriptor child entry; performs no normal daemon dispatch.
+#[doc(hidden)]
+pub fn frontend_admission_entry(args: &[std::ffi::OsString]) -> Option<std::io::Result<()>> {
+    session_owner::inherited_launch::child::entry(args)
+}

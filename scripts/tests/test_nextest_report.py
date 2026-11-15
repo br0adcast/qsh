@@ -201,6 +201,18 @@ class ReportTests(unittest.TestCase):
         workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
         self.assertIn("--require " + name, workflow)
 
+    def test_inherited_launch_root_case_has_one_exact_disposable_owner(self):
+        name = 'session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup'
+        expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
+        key = ("qshd", name)
+        self.assertEqual(len(expected), 75)
+        self.assertEqual([entry for entry in expected if entry[1] == name], [key])
+        self.assertEqual(expected[key]["owner"], "CI container job: run_suite lib qshd")
+        self.assertIn("binary_id(=qshd)", self.module.exclusion_filter({key: expected[key]}))
+        self.assertIn(f"test(={name})", self.module.exclusion_filter({key: expected[key]}))
+        workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
+        self.assertEqual(workflow.count("--require " + name), 1)
+
     def test_expected_exclusions_are_distinct_from_executed_tests(self):
         result = self.check([("tests::root", "skipped", self.module.FILTER_REASON),
                              ("tests::safe", "stdout", "<&> ordinary output"),

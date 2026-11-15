@@ -596,3 +596,329 @@ pub(crate) fn admit_channel(
 #[cfg(test)]
 #[path = "local_channel_tests.rs"]
 mod tests;
+
+/// Sealed launch-only transfer. The host expectation remains with its parent.
+pub(super) mod launch {
+    use super::*;
+    use crate::session_owner::inherited_launch::record::SetupRecord;
+    use nix::libc;
+
+    #[derive(Default, Debug)]
+    struct LocalCloses {
+        live: usize,
+        uncertain: bool,
+    }
+    /// Tracks every new parent-owned copy; a failed close is never retried.
+    pub(in crate::session_owner) struct LocalFd {
+        fd: Option<OwnedFd>,
+        ledger: Arc<Mutex<LocalCloses>>,
+        closer: fn(RawFd) -> bool,
+    }
+    impl LocalFd {
+        pub(in crate::session_owner) fn fd(&self) -> Result<&OwnedFd, AdmissionError> {
+            self.fd.as_ref().ok_or(AdmissionError::Refused)
+        }
+        #[cfg(test)]
+        pub(in crate::session_owner) fn test_uncertain_close(&mut self) {
+            fn close_but_report_uncertain(raw: RawFd) -> bool {
+                let _ = close_once(raw);
+                false
+            }
+            self.closer = close_but_report_uncertain;
+        }
+        pub(in crate::session_owner) fn duplicate(&self) -> Result<Self, AdmissionError> {
+            let raw = unsafe { libc::fcntl(self.fd()?.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+            if raw < 0 {
+                return Err(AdmissionError::Unavailable);
+            }
+            Ok(Self::track(
+                unsafe { OwnedFd::from_raw_fd(raw) },
+                Arc::clone(&self.ledger),
+            ))
+        }
+        fn track(fd: OwnedFd, ledger: Arc<Mutex<LocalCloses>>) -> Self {
+            if let Ok(mut state) = ledger.lock() {
+                if let Some(next) = state.live.checked_add(1) {
+                    state.live = next;
+                } else {
+                    state.uncertain = true;
+                }
+            }
+            Self {
+                fd: Some(fd),
+                ledger,
+                closer: close_once,
+            }
+        }
+        pub(in crate::session_owner) fn close(&mut self) {
+            if let Some(fd) = self.fd.take() {
+                let confirmed = (self.closer)(fd.into_raw_fd());
+                if let Ok(mut state) = self.ledger.lock() {
+                    state.live = state.live.saturating_sub(1);
+                    state.uncertain |= !confirmed;
+                }
+            }
+        }
+    }
+    impl Drop for LocalFd {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+    pub(in crate::session_owner) struct PreparedFrontendEnd {
+        pub(in crate::session_owner) fd: LocalFd,
+        host: HostInstance,
+        channel: [u8; 16],
+        challenge: [u8; 32],
+        uid: u32,
+    }
+    pub(in crate::session_owner) struct RemoteEndObligation {
+        pair: Arc<PairCharge>,
+        index: usize,
+        ledger: Arc<Mutex<LocalCloses>>,
+        settled: bool,
+    }
+    pub(in crate::session_owner) fn validate_config(
+        config: TrustedChannelConfig,
+    ) -> Result<(), AdmissionError> {
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0
+            || config.mode != (HostMode::Personal { canonical_uid: uid })
+            || config.owner.is_some()
+            || config.requester != OwnerRole::Frontend
+            || config.min_version != 1
+            || config.max_version != 1
+        {
+            return Err(AdmissionError::InvalidConfig);
+        }
+        Ok(())
+    }
+    pub(in crate::session_owner) fn split_frontend(
+        mut expected: ExpectedAdmission,
+    ) -> Result<(PreparedFrontendEnd, RemoteEndObligation), AdmissionError> {
+        validate_config(expected.config)?;
+        if expected.local != OwnerRole::Frontend || expected.peer != OwnerRole::Host {
+            return Err(AdmissionError::Refused);
+        }
+        validate_personal_fd(
+            expected
+                .custody
+                .fd
+                .as_ref()
+                .ok_or(AdmissionError::Refused)?,
+            unsafe { libc::geteuid() },
+        )?;
+        let fd = expected.custody.fd.take().ok_or(AdmissionError::Refused)?;
+        let ledger = Arc::new(Mutex::new(LocalCloses::default()));
+        let prepared = PreparedFrontendEnd {
+            fd: LocalFd::track(fd, Arc::clone(&ledger)),
+            host: expected.config.host,
+            channel: expected.channel,
+            challenge: expected.challenge,
+            uid: unsafe { libc::geteuid() },
+        };
+        let remote = RemoteEndObligation {
+            pair: Arc::clone(&expected.custody.pair),
+            index: expected.custody.index,
+            ledger,
+            settled: false,
+        };
+        Ok((prepared, remote))
+    }
+    impl PreparedFrontendEnd {
+        fn check_uid(&self, uid: u32) -> Result<(), AdmissionError> {
+            if uid == 0 || uid != self.uid {
+                return Err(AdmissionError::Refused);
+            }
+            Ok(())
+        }
+        pub(in crate::session_owner) fn for_spawn(&self) -> Result<(), AdmissionError> {
+            let uid = unsafe { libc::geteuid() };
+            self.check_uid(uid)?;
+            validate_personal_fd(self.fd.fd()?, uid)
+        }
+        #[cfg(test)]
+        pub(in crate::session_owner) fn test_check_uid(
+            &self,
+            uid: u32,
+        ) -> Result<(), AdmissionError> {
+            self.check_uid(uid)
+        }
+        pub(in crate::session_owner) fn setup(&self, deadline: u64) -> SetupRecord {
+            SetupRecord {
+                host: self.host,
+                channel: self.channel,
+                challenge: self.challenge,
+                uid: self.uid,
+                deadline,
+            }
+        }
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(in crate::session_owner) enum SettlementStatus {
+        Pending,
+        Settled,
+        Unknown,
+    }
+    impl RemoteEndObligation {
+        pub(in crate::session_owner) fn track(&self, fd: OwnedFd) -> LocalFd {
+            LocalFd::track(fd, Arc::clone(&self.ledger))
+        }
+        /// Requires the retained capsule's sealed terminal/no-export receipt;
+        /// every known local copy must also have a confirmed close.
+        pub(in crate::session_owner) fn settle(
+            &mut self,
+            _receipt: crate::session_owner::inherited_launch::Settlement,
+        ) -> SettlementStatus {
+            let Ok(local) = self.ledger.lock() else {
+                return SettlementStatus::Unknown;
+            };
+            if local.uncertain {
+                return SettlementStatus::Unknown;
+            }
+            if local.live != 0 {
+                return SettlementStatus::Pending;
+            }
+            let Ok(mut ends) = self.pair.ends.lock() else {
+                return SettlementStatus::Unknown;
+            };
+            match ends[1 - self.index] {
+                EndState::Live => return SettlementStatus::Pending,
+                EndState::Uncertain => return SettlementStatus::Unknown,
+                EndState::Closed => {}
+            }
+            let Ok(mut budget) = self.pair.budget.lock() else {
+                return SettlementStatus::Unknown;
+            };
+            if ends[self.index] != EndState::Live || budget.used == 0 {
+                return SettlementStatus::Unknown;
+            }
+            // Credit and the remote-end terminal fact commit under the original
+            // local ledger locks; poison cannot silently discard the charge.
+            ends[self.index] = EndState::Closed;
+            budget.used -= 1;
+            self.settled = true;
+            SettlementStatus::Settled
+        }
+    }
+    pub(in crate::session_owner) fn validate_personal_fd(
+        fd: &OwnedFd,
+        uid: u32,
+    ) -> Result<(), AdmissionError> {
+        if uid == 0 || uid != unsafe { libc::geteuid() } {
+            return Err(AdmissionError::Refused);
+        }
+        validate_socket(
+            fd,
+            TrustedChannelConfig {
+                host: HostInstance::new([1; 16]).unwrap(),
+                owner: None,
+                requester: OwnerRole::Frontend,
+                mode: HostMode::Personal { canonical_uid: uid },
+                system_uid: uid,
+                min_version: 1,
+                max_version: 1,
+            },
+        )?;
+        if crate::control::peer_uid(fd)? != uid {
+            return Err(AdmissionError::Refused);
+        }
+        Ok(())
+    }
+    pub(in crate::session_owner) fn read(fd: &OwnedFd, bytes: &mut [u8]) -> io::Result<usize> {
+        (&*stream(fd)).read(bytes)
+    }
+    pub(in crate::session_owner) fn write_setup(
+        fd: &OwnedFd,
+        bytes: &[u8; 112],
+        deadline: Instant,
+    ) -> Result<(), AdmissionError> {
+        let mut bytes = *bytes;
+        transfer(fd, &mut bytes, true, deadline)
+    }
+    pub(in crate::session_owner) fn read_setup(
+        fd: &OwnedFd,
+        bytes: &mut [u8],
+        deadline: Instant,
+    ) -> Result<(), AdmissionError> {
+        transfer(fd, bytes, false, deadline)
+    }
+    pub(in crate::session_owner) fn restore_frontend(
+        claimed: crate::session_owner::inherited_launch::child::ClaimedFrontend,
+    ) -> Result<ExpectedAdmission, AdmissionError> {
+        let (fd, record) = claimed.into_parts();
+        let config = TrustedChannelConfig {
+            host: record.host,
+            owner: None,
+            requester: OwnerRole::Frontend,
+            mode: HostMode::Personal {
+                canonical_uid: record.uid,
+            },
+            system_uid: record.uid,
+            min_version: 1,
+            max_version: 1,
+        };
+        validate_config(config)?;
+        validate_personal_fd(&fd, record.uid)?;
+        // This process owns one local end only. No parent Arc/ledger crosses exec.
+        let budget = Arc::new(Mutex::new(BudgetState {
+            limit: 1,
+            used: 1,
+            uncertain_ends: 0,
+        }));
+        let pair = Arc::new(PairCharge {
+            budget,
+            ends: Mutex::new([EndState::Live, EndState::Closed]),
+        });
+        Ok(ExpectedAdmission {
+            custody: Custody {
+                fd: Some(fd),
+                pair,
+                index: 0,
+                closer: close_once,
+            },
+            config,
+            local: OwnerRole::Frontend,
+            peer: OwnerRole::Host,
+            channel: record.channel,
+            challenge: record.challenge,
+        })
+    }
+    #[cfg(test)]
+    pub(in crate::session_owner) fn write_prefix(
+        fd: &OwnedFd,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), AdmissionError> {
+        let mut bytes = bytes.to_vec();
+        transfer(fd, &mut bytes, true, deadline)
+    }
+    #[cfg(test)]
+    pub(in crate::session_owner) fn test_evidence(channel: &mut AdmittedChannel) -> bool {
+        channel.take_frontend_evidence(channel.config.mode).is_ok()
+    }
+    #[cfg(test)]
+    pub(in crate::session_owner) fn test_write(fd: &OwnedFd, bytes: &[u8]) -> io::Result<usize> {
+        (&*stream(fd)).write(bytes)
+    }
+    #[cfg(test)]
+    impl RemoteEndObligation {
+        pub(in crate::session_owner) fn test_in_use(&self) -> usize {
+            self.pair
+                .budget
+                .lock()
+                .map(|state| state.used)
+                .unwrap_or(usize::MAX)
+        }
+        pub(in crate::session_owner) fn test_uncertain(&mut self) {
+            self.ledger.lock().unwrap().uncertain = true;
+        }
+    }
+    impl Drop for RemoteEndObligation {
+        fn drop(&mut self) {
+            if !self.settled {
+                self.pair.terminal(self.index, false);
+            }
+        }
+    }
+}
