@@ -408,7 +408,7 @@ fn directory_post_publication_failure_cleans_only_its_owned_socket() {
     let before = fs::metadata(&replacement_path).unwrap();
     let old = dir.path().join("old-cache");
     let changed_parent = parent.clone();
-    let result = bind_prepared(&transaction.authority, |stage| {
+    let result = bind_prepared(transaction.endpoint.authority(), |stage| {
         stage.after_publish = Some(Box::new(move || {
             fs::rename(&changed_parent, &old).unwrap();
             fs::create_dir(&changed_parent).unwrap();

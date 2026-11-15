@@ -24,6 +24,13 @@
 
 mod path;
 
+pub use crate::endpoint::SocketCleanup;
+#[cfg(test)]
+use crate::endpoint::{
+    bind_prepared, remove_if_stale_prepared, sweep_stale_staging, STAGED_NAME, STALE_STAGING_AFTER,
+};
+use crate::endpoint::{bind_prepared_mode, bind_with_authority};
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -696,8 +703,7 @@ fn daemon_gone(pid: u32, sock: &Path) -> bool {
 /// Drop only closes this descriptor, never LOCK_UN: a fork inherits the same
 /// open-file description, so the lock ends only after its last copy closes.
 pub struct EnsureLock {
-    authority: path::EndpointAuthority,
-    _file: std::fs::File,
+    endpoint: crate::endpoint::EndpointLock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -724,83 +730,20 @@ impl EnsureLock {
         patience: Duration,
         opened: impl FnOnce(),
     ) -> std::io::Result<Self> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
         let authority = path::EndpointAuthority::open(socket, true)?;
-        authority.entry()?;
-        let file = authority.open_lock()?;
-        let metadata = file.metadata()?;
-        let identity = nix::sys::stat::fstat(file.as_raw_fd())?;
-        if !metadata.is_file()
-            || metadata.uid() != nix::unistd::geteuid().as_raw()
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o7777 != 0o600
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "the ensure lock must be a private, singly linked regular file owned by this user",
-            ));
-        }
-        opened();
-        let deadline = std::time::Instant::now()
-            .checked_add(patience)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "ensure lock wait budget is too large",
-                )
-            })?;
-        let mut attempted = false;
-        loop {
-            // There is one immediate attempt, including with zero patience.
-            // Neither contention nor EINTR grants another attempt after expiry.
-            if attempted && std::time::Instant::now() >= deadline {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("timed out after {patience:?} waiting for another transport ensure transaction"),
-                ));
-            }
-            attempted = true;
-            // SAFETY: the descriptor remains owned by file throughout the call.
-            if unsafe {
-                nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB)
-            } == 0
-            {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            match error.kind() {
-                std::io::ErrorKind::Interrupted => continue,
-                std::io::ErrorKind::WouldBlock => std::thread::sleep(
-                    Duration::from_millis(25)
-                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
-                ),
-                _ => return Err(error),
-            }
-        }
-        authority.validate_route()?;
-        let current = nix::sys::stat::fstatat(
-            Some(authority.parent.as_raw_fd()),
-            authority.lock.as_os_str(),
-            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
-        )?;
-        if !path::same(&current, &identity) {
-            return Err(path::refused("the ensure lock changed while waiting"));
-        }
         Ok(Self {
-            authority,
-            _file: file,
+            endpoint: crate::endpoint::EndpointLock::acquire_prepared(authority, patience, opened)?,
         })
     }
 
     /// Reject an observed route change; never move an active transaction.
     pub fn validate_route(&self) -> std::io::Result<()> {
-        self.authority.validate_route()
+        self.endpoint.validate_route()
     }
 
     pub fn request(&self, request: &ControlRequest) -> Result<ControlReply> {
         client_request_at(
-            &self.authority,
+            self.endpoint.authority(),
             request,
             CLIENT_READ_TIMEOUT,
             check_control_peer,
@@ -816,17 +759,17 @@ impl EnsureLock {
         check: impl FnOnce(&UnixStream) -> Result<()>,
     ) -> ServiceStopDispatch {
         let connect = || -> Result<UnixStream> {
-            self.authority.validate_route()?;
+            self.endpoint.authority().validate_route()?;
             anyhow::ensure!(
-                self.authority.entry()?.is_some(),
+                self.endpoint.authority().entry()?.is_some(),
                 "personal service endpoint absent"
             );
-            let stream = UnixStream::connect(&self.authority.syscall_path)?;
-            self.authority.validate_route()?;
+            let stream = UnixStream::connect(&self.endpoint.authority().syscall_path)?;
+            self.endpoint.authority().validate_route()?;
             check(&stream)?;
-            self.authority.validate_route()?;
+            self.endpoint.authority().validate_route()?;
             anyhow::ensure!(
-                self.authority.entry()?.is_some(),
+                self.endpoint.authority().entry()?.is_some(),
                 "personal service endpoint disappeared before dispatch"
             );
             stream.set_read_timeout(Some(timeout))?;
@@ -849,7 +792,7 @@ impl EnsureLock {
             .is_err()
             || line.len() > 4096
             || !line.ends_with('\n')
-            || self.authority.validate_route().is_err()
+            || self.endpoint.authority().validate_route().is_err()
         {
             return ServiceStopDispatch::Uncertain;
         }
@@ -881,7 +824,7 @@ impl EnsureLock {
         let selector = daemon_bootstrap_protocol::PersonalServiceSelector {
             profile: daemon_bootstrap_protocol::PersonalServiceProfile::PersonalTransportV1,
             uid,
-            endpoint: self.authority.route.to_str()?.to_owned(),
+            endpoint: self.endpoint.authority().route.to_str()?.to_owned(),
             port,
         };
         selector.valid().then_some(selector)
@@ -898,12 +841,13 @@ impl EnsureLock {
             .try_fill_bytes(&mut random)
             .map_err(std::io::Error::other)?;
         let route = self
-            .authority
+            .endpoint
+            .authority()
             .route
             .with_file_name(format!(".restart-probe-{}", hex::encode(random)));
         let authority = path::EndpointAuthority::open(&route, false)?;
         if !path::same(
-            &nix::sys::stat::fstat(self.authority.parent.as_raw_fd())?,
+            &nix::sys::stat::fstat(self.endpoint.authority().parent.as_raw_fd())?,
             &nix::sys::stat::fstat(authority.parent.as_raw_fd())?,
         ) {
             return Err(path::refused("the restart preflight parent changed"));
@@ -916,13 +860,13 @@ impl EnsureLock {
     }
 
     pub fn bind_private_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
-        bind_with_authority(&self.authority)
+        bind_with_authority(self.endpoint.authority())
     }
     /// A confirmed destructive restart may publish only into an absent leaf.
     /// A competing endpoint is never removed under the old consent.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn bind_private_absent_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
-        bind_prepared_mode(&self.authority, |_| {}, false)
+        bind_prepared_mode(self.endpoint.authority(), |_| {}, false)
     }
 
     /// Check the retained parent, not a pathname reopened independently.
@@ -930,7 +874,7 @@ impl EnsureLock {
     pub(crate) fn require_private_parent(&self, uid: u32) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         self.validate_route()?;
-        let m = self.authority.parent.metadata()?;
+        let m = self.endpoint.authority().parent.metadata()?;
         if m.uid() != uid || m.mode() & 0o7777 != 0o700 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -942,101 +886,9 @@ impl EnsureLock {
 
     pub fn endpoint_exists(&self) -> std::io::Result<bool> {
         self.validate_route()?;
-        Ok(self.authority.entry()?.is_some())
+        Ok(self.endpoint.authority().entry()?.is_some())
     }
 }
-
-/// Owns removal of one published socket, including startup errors. Keeping a
-/// listener reference until removal prevents another ensure from observing a
-/// refused endpoint between the serving future's drop and this cleanup.
-/// The duplicate is close-on-exec; only the original listener crosses update
-/// handover, whose resumed owner creates its own guard before serving.
-pub struct SocketCleanup {
-    parent: std::fs::File,
-    leaf: std::ffi::OsString,
-    device: nix::libc::dev_t,
-    inode: nix::libc::ino_t,
-    remove_on_drop: bool,
-    _listener: UnixListener,
-}
-
-impl SocketCleanup {
-    /// A daemonization parent cannot infer child death from a wait error.
-    /// Leave publication to the child's inherited guard (or stale recovery).
-    pub fn leave_to_child(&mut self) {
-        self.remove_on_drop = false;
-    }
-
-    /// The caller must know that this path names this listener: an owned
-    /// private staging path, or a cooperatively inherited update listener.
-    /// A live inherited listener prevents another ensure from replacing it;
-    /// arbitrary external same-UID pathname mutation is outside this contract.
-    pub fn capture(listener: &UnixListener, path: &Path) -> std::io::Result<Self> {
-        let authority = path::EndpointAuthority::open(path, false)?;
-        authority.validate_route()?;
-        let metadata = authority.entry()?.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "the control publication is missing",
-            )
-        })?;
-        if metadata.st_mode & 0o7777 != 0o600 {
-            return Err(path::refused(
-                "the inherited control publication must be private",
-            ));
-        }
-        Self::from_authority(listener, &authority, &metadata)
-    }
-
-    fn from_authority(
-        listener: &UnixListener,
-        authority: &path::EndpointAuthority,
-        metadata: &nix::libc::stat,
-    ) -> std::io::Result<Self> {
-        let parent = authority.parent.try_clone()?;
-        Ok(Self {
-            parent,
-            leaf: authority.leaf.clone(),
-            device: metadata.st_dev,
-            inode: metadata.st_ino,
-            remove_on_drop: true,
-            _listener: listener.try_clone()?,
-        })
-    }
-}
-
-impl Drop for SocketCleanup {
-    fn drop(&mut self) {
-        if !self.remove_on_drop {
-            return;
-        }
-        use nix::fcntl::AtFlags;
-        use nix::sys::stat::{fstatat, SFlag};
-        use std::os::fd::AsRawFd;
-        if let Ok(current) = fstatat(
-            Some(self.parent.as_raw_fd()),
-            self.leaf.as_os_str(),
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-        ) {
-            if current.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFSOCK.bits()
-                && current.st_dev == self.device
-                && current.st_ino == self.inode
-            {
-                let _ = nix::unistd::unlinkat(
-                    Some(self.parent.as_raw_fd()),
-                    self.leaf.as_os_str(),
-                    nix::unistd::UnlinkatFlags::NoRemoveDir,
-                );
-            }
-        }
-    }
-}
-
-/// Name of the staged socket inside the staging directory. One byte, kept
-/// short for the same reason the directory name is (see [`bind_private`]'s
-/// doc, Minor 1 of the task 6 review): a long staging path could refuse to
-/// bind at a length a plain bind at the final name would have accepted.
-const STAGED_NAME: &str = "s";
 
 /// Low-level pathname-bind fixture for the original permission/length tests.
 /// Production binds through the verified exclusive stage in `path::Stage`.
@@ -1078,215 +930,6 @@ pub fn bind_private(path: &Path) -> std::io::Result<UnixListener> {
 /// Standalone binding convenience; production ensure uses its retained lock.
 pub fn bind_private_owned(path: &Path) -> std::io::Result<(UnixListener, SocketCleanup)> {
     bind_with_authority(&path::EndpointAuthority::open(path, false)?)
-}
-
-fn bind_with_authority(
-    authority: &path::EndpointAuthority,
-) -> std::io::Result<(UnixListener, SocketCleanup)> {
-    bind_prepared(authority, |_| {})
-}
-
-fn bind_prepared(
-    authority: &path::EndpointAuthority,
-    configure: impl FnOnce(&mut path::Stage),
-) -> std::io::Result<(UnixListener, SocketCleanup)> {
-    bind_prepared_mode(authority, configure, true)
-}
-fn bind_prepared_mode(
-    authority: &path::EndpointAuthority,
-    configure: impl FnOnce(&mut path::Stage),
-    replace: bool,
-) -> std::io::Result<(UnixListener, SocketCleanup)> {
-    authority.validate_route()?;
-    authority.entry()?;
-    sweep_stale_staging_at(&authority.parent, std::time::SystemTime::now());
-    let mut stage = path::Stage::create(authority)?;
-    configure(&mut stage);
-    let listener = stage.bind(authority)?;
-    // Allocate every cleanup descriptor before publication. On a later error,
-    // this guard owns only this socket in this pinned parent, never a new route.
-    let cleanup = SocketCleanup::from_authority(&listener, authority, stage.socket())?;
-    if replace {
-        stage.publish(authority)?;
-    } else {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        stage.publish_absent(authority)?;
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "no-replace restart publication is unavailable",
-        ));
-    }
-    Ok((listener, cleanup))
-}
-
-/// Minimum staging age for conservative crash recovery. Age is a heuristic;
-/// the separate PID check also preserves every process visible to this caller.
-/// Neither check proves that an inaccessible PID namespace has no live owner.
-const STALE_STAGING_AFTER: Duration = Duration::from_secs(60);
-
-/// The pid in a staging directory's name, if the name is exactly what
-/// [`bind_private`] writes: `.c` and a positive pid in decimal, no leading
-/// zero, nothing after it.
-fn staging_pid(name: &str) -> Option<i32> {
-    let digits = name.strip_prefix(".c")?;
-    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse::<i32>().ok().filter(|&pid| pid > 0)
-}
-
-/// Whether a process with this pid exists (a zombie counts), as far as
-/// this process can tell: only `ESRCH` says it does not.
-fn process_exists(pid: i32) -> bool {
-    !matches!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-        Err(nix::errno::Errno::ESRCH)
-    )
-}
-
-/// Remove the staging directories that daemons of this user left in
-/// `parent` when they died between [`bind_private`]'s `mkdir` and its
-/// cleanup (final review of slice 5, M4): only the next run with the same
-/// pid would otherwise remove one. Best effort, and conservative: a
-/// directory is removed only if every one of these holds --
-///
-/// - its name is `.c<pid>` exactly (see [`staging_pid`]);
-/// - it is a directory, not a symlink to one: it is opened with
-///   `O_NOFOLLOW`, and what that descriptor shows is what gets emptied;
-/// - it belongs to this process's effective uid and its mode is `0700`, as
-///   `bind_private` makes it;
-/// - it has gone unchanged for [`STALE_STAGING_AFTER`] as of `now`;
-/// - no process with its pid exists (a pid in use by anyone is left alone,
-///   whatever that process is);
-/// - it is empty, or holds only the staged socket (`s`, a socket, this
-///   uid's) -- which is dead then: its pid is gone.
-///
-/// The socket is unlinked through the directory's descriptor, the
-/// directory by name with `AT_REMOVEDIR`, which removes only an empty
-/// directory and never follows a symlink. Anything else in `parent` is
-/// never touched. Returns how many directories were removed.
-#[cfg(test)]
-fn sweep_stale_staging(parent: &Path, now: std::time::SystemTime) -> usize {
-    let Ok(authority) = path::EndpointAuthority::open(&parent.join("control.sock"), false) else {
-        return 0;
-    };
-    sweep_stale_staging_at(&authority.parent, now)
-}
-
-fn sweep_stale_staging_at(parent: &std::fs::File, now: std::time::SystemTime) -> usize {
-    use nix::dir::Dir;
-    use nix::fcntl::OFlag;
-    use nix::sys::stat::Mode;
-    use std::os::fd::AsRawFd;
-    let Ok(mut entries) = Dir::openat(
-        Some(parent.as_raw_fd()),
-        ".",
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    ) else {
-        return 0;
-    };
-    let mut removed = 0;
-    for entry in entries.iter().flatten() {
-        let Ok(name) = entry.file_name().to_str() else {
-            continue;
-        };
-        let Some(pid) = staging_pid(name) else {
-            continue;
-        };
-        if remove_if_stale(parent.as_raw_fd(), name, pid, now) {
-            removed += 1;
-        }
-    }
-    removed
-}
-
-/// One directory of [`sweep_stale_staging`]: whether it was removed.
-fn remove_if_stale(
-    parent: std::os::fd::RawFd,
-    name: &str,
-    pid: i32,
-    now: std::time::SystemTime,
-) -> bool {
-    remove_if_stale_prepared(parent, name, pid, now, || {})
-}
-
-fn remove_if_stale_prepared(
-    parent: std::os::fd::RawFd,
-    name: &str,
-    pid: i32,
-    now: std::time::SystemTime,
-    before_remove: impl FnOnce(),
-) -> bool {
-    use nix::dir::Dir;
-    use nix::fcntl::{AtFlags, OFlag};
-    use nix::sys::stat::{fstat, fstatat, Mode, SFlag};
-    use nix::unistd::{geteuid, unlinkat, UnlinkatFlags};
-    use std::os::fd::AsRawFd;
-
-    let Ok(mut dir) = Dir::openat(
-        Some(parent),
-        name,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    ) else {
-        return false;
-    };
-    let fd = dir.as_raw_fd();
-    let uid = geteuid().as_raw();
-    let Ok(st) = fstat(fd) else {
-        return false;
-    };
-    if st.st_uid != uid || st.st_mode & 0o7777 != 0o700 {
-        return false;
-    }
-    let (Ok(secs), Ok(nanos)) = (u64::try_from(st.st_mtime), u32::try_from(st.st_mtime_nsec))
-    else {
-        return false;
-    };
-    let changed = std::time::UNIX_EPOCH + Duration::new(secs, nanos);
-    if now
-        .duration_since(changed)
-        .map_or(true, |age| age < STALE_STAGING_AFTER)
-    {
-        return false;
-    }
-    if process_exists(pid) {
-        return false;
-    }
-    let mut socket = false;
-    for entry in dir.iter() {
-        let Ok(entry) = entry else {
-            return false;
-        };
-        let entry_name = entry.file_name().to_bytes();
-        if entry_name == b"." || entry_name == b".." {
-            continue;
-        }
-        if entry_name != STAGED_NAME.as_bytes() {
-            return false;
-        }
-        let Ok(staged) = fstatat(Some(fd), STAGED_NAME, AtFlags::AT_SYMLINK_NOFOLLOW) else {
-            return false;
-        };
-        let kind = SFlag::from_bits_truncate(staged.st_mode) & SFlag::S_IFMT;
-        if kind != SFlag::S_IFSOCK || staged.st_uid != uid {
-            return false;
-        }
-        socket = true;
-    }
-    if socket && unlinkat(Some(fd), STAGED_NAME, UnlinkatFlags::NoRemoveDir).is_err() {
-        return false;
-    }
-    before_remove();
-    let Ok(current) = fstatat(Some(parent), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
-        return false;
-    };
-    if !path::same(&current, &st) {
-        return false;
-    }
-    unlinkat(Some(parent), name, UnlinkatFlags::RemoveDir).is_ok()
 }
 
 #[cfg(test)]
@@ -1339,7 +982,7 @@ mod tests {
         let dir = super::private_test_dir().unwrap();
         let socket = dir.path().join("control.sock");
         let held = EnsureLock::acquire(&socket, Duration::from_secs(1)).unwrap();
-        let inherited = held._file.try_clone().unwrap();
+        let inherited = held.endpoint.file_for_test().try_clone().unwrap();
         let contender = std::fs::OpenOptions::new()
             .write(true)
             .open(dir.path().join("control.sock.lock"))
@@ -1392,7 +1035,9 @@ mod tests {
         let path = dir.path().join("control.sock");
         let listener = bind_private(&path).unwrap();
         let cleanup = SocketCleanup::capture(&listener, &path).unwrap();
-        let flags = unsafe { nix::libc::fcntl(cleanup._listener.as_raw_fd(), nix::libc::F_GETFD) };
+        let flags = unsafe {
+            nix::libc::fcntl(cleanup.listener_for_test().as_raw_fd(), nix::libc::F_GETFD)
+        };
         assert!(
             flags >= 0 && flags & nix::libc::FD_CLOEXEC != 0,
             "the cleanup duplicate must not leak through update exec"
