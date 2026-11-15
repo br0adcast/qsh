@@ -87,11 +87,26 @@ pub(super) mod prepare_observation {
         Syscall,
         Predicate,
     }
+    #[derive(Clone, Copy)]
+    pub(in crate::session_owner) enum AcceptFault {
+        Errno(i32),
+        Length,
+        Listening,
+    }
+    #[derive(Default)]
+    pub(in crate::session_owner) struct SocketProbe {
+        pub accept_fault: Option<AcceptFault>,
+        pub peer_error: Option<i32>,
+        pub accept_calls: usize,
+        pub peer_calls: usize,
+        pub uid_calls: usize,
+    }
     #[derive(Default)]
     pub(in crate::session_owner) struct Observer {
         pub first: Option<Event>,
         pub fault: Option<(Site, FaultKind)>,
         pub suppressed: bool,
+        pub(in crate::session_owner) socket_probe: SocketProbe,
     }
     impl Observer {
         pub fn begin(&mut self) {
@@ -550,28 +565,65 @@ fn socket_option(
 ) -> Result<i32, AdmissionError> {
     let mut value = 0i32;
     let mut size = std::mem::size_of_val(&value) as nix::libc::socklen_t;
-    if unsafe {
+    #[cfg(test)]
+    let mut observer = observer;
+    #[cfg(test)]
+    let injected = if name == nix::libc::SO_ACCEPTCONN {
+        observer.as_deref_mut().and_then(|observer| {
+            observer.socket_probe.accept_calls += 1;
+            observer.socket_probe.accept_fault
+        })
+    } else {
+        None
+    };
+    let get_option = |value: &mut i32, size: &mut nix::libc::socklen_t| unsafe {
         nix::libc::getsockopt(
             fd.as_raw_fd(),
             nix::libc::SOL_SOCKET,
             name,
-            (&mut value as *mut i32).cast(),
-            &mut size,
+            (value as *mut i32).cast(),
+            size,
         )
-    } != 0
-    {
+    };
+    #[cfg(not(test))]
+    let result = get_option(&mut value, &mut size);
+    #[cfg(test)]
+    let result = match injected {
+        Some(prepare_observation::AcceptFault::Errno(_)) => -1,
+        Some(prepare_observation::AcceptFault::Length) => {
+            size = 0;
+            0
+        }
+        Some(prepare_observation::AcceptFault::Listening) => {
+            value = 1;
+            0
+        }
+        None => get_option(&mut value, &mut size),
+    };
+    if result != 0 {
         #[cfg(test)]
-        prepare_observation::record(
-            observer,
-            site,
-            if name == nix::libc::SO_TYPE {
-                prepare_observation::Check::SocketTypeCall
-            } else {
-                prepare_observation::Check::AcceptConnCall
-            },
-            prepare_observation::Class::Syscall,
-            io::Error::last_os_error().raw_os_error(),
-        );
+        {
+            let (class, errno) = match injected {
+                Some(prepare_observation::AcceptFault::Errno(errno)) => {
+                    (prepare_observation::Class::SyntheticSyscall, Some(errno))
+                }
+                _ => (
+                    prepare_observation::Class::Syscall,
+                    io::Error::last_os_error().raw_os_error(),
+                ),
+            };
+            prepare_observation::record(
+                observer,
+                site,
+                if name == nix::libc::SO_TYPE {
+                    prepare_observation::Check::SocketTypeCall
+                } else {
+                    prepare_observation::Check::AcceptConnCall
+                },
+                class,
+                errno,
+            );
+        }
         return Err(AdmissionError::Refused);
     }
     if size as usize != std::mem::size_of_val(&value) {
@@ -584,16 +636,46 @@ fn socket_option(
             } else {
                 prepare_observation::Check::AcceptConnLength
             },
-            prepare_observation::Class::Length,
+            if injected.is_some() {
+                prepare_observation::Class::SyntheticPredicate
+            } else {
+                prepare_observation::Class::Length
+            },
             None,
         );
         return Err(AdmissionError::Refused);
     }
     Ok(value)
 }
+enum ConnectedProof {
+    AcceptOption,
+    PeerAddress,
+}
+const CONNECTED_PROOF: ConnectedProof = if cfg!(target_os = "macos") {
+    ConnectedProof::PeerAddress
+} else {
+    ConnectedProof::AcceptOption
+};
 fn validate_socket_impl(
     fd: &OwnedFd,
     config: TrustedChannelConfig,
+    #[cfg(test)] site: prepare_observation::Site,
+    #[cfg(test)] observer: Option<&mut prepare_observation::Observer>,
+) -> Result<(), AdmissionError> {
+    validate_socket_with_proof(
+        fd,
+        config,
+        CONNECTED_PROOF,
+        #[cfg(test)]
+        site,
+        #[cfg(test)]
+        observer,
+    )
+}
+fn validate_socket_with_proof(
+    fd: &OwnedFd,
+    config: TrustedChannelConfig,
+    proof: ConnectedProof,
     #[cfg(test)] site: prepare_observation::Site,
     #[cfg(test)] mut observer: Option<&mut prepare_observation::Observer>,
 ) -> Result<(), AdmissionError> {
@@ -656,14 +738,18 @@ fn validate_socket_impl(
         );
         return Err(AdmissionError::Refused);
     }
-    if socket_option(
-        fd,
-        libc::SO_ACCEPTCONN,
-        #[cfg(test)]
-        site,
-        #[cfg(test)]
-        observer.as_deref_mut(),
-    )? != 0
+    // macOS proves connected/non-listening through mandatory getpeername below.
+    // XNU solisten rejects connected sockets; soconnectlock rejects listeners:
+    // https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/uipc_socket.c
+    if matches!(proof, ConnectedProof::AcceptOption)
+        && socket_option(
+            fd,
+            libc::SO_ACCEPTCONN,
+            #[cfg(test)]
+            site,
+            #[cfg(test)]
+            observer.as_deref_mut(),
+        )? != 0
     {
         #[cfg(test)]
         prepare_observation::record(
@@ -676,17 +762,41 @@ fn validate_socket_impl(
         return Err(AdmissionError::Refused);
     }
     let socket = stream(fd);
-    if let Err(error) = socket.peer_addr() {
+    let peer = socket.peer_addr();
+    #[cfg(test)]
+    let peer = if let Some(value) = observer.as_deref_mut() {
+        value.socket_probe.peer_calls += 1;
+        match value.socket_probe.peer_error {
+            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+            None => peer,
+        }
+    } else {
+        peer
+    };
+    #[cfg(test)]
+    let peer_class = if observer
+        .as_ref()
+        .is_some_and(|value| value.socket_probe.peer_error.is_some())
+    {
+        prepare_observation::Class::SyntheticSyscall
+    } else {
+        prepare_observation::Class::Io
+    };
+    if let Err(error) = peer {
         #[cfg(test)]
         prepare_observation::record(
             observer,
             site,
             prepare_observation::Check::PeerAddressCall,
-            prepare_observation::Class::Io,
+            peer_class,
             error.raw_os_error(),
         );
         drop(error);
         return Err(AdmissionError::Refused);
+    }
+    #[cfg(test)]
+    if let Some(value) = observer.as_deref_mut() {
+        value.socket_probe.uid_calls += 1;
     }
     let uid = match crate::control::peer_uid(fd) {
         Ok(uid) => uid,
