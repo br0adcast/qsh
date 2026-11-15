@@ -360,6 +360,9 @@ impl HostDispatchChannel {
         );
         (&*socket).write(bytes)
     }
+    pub(super) fn retire_local_ticket(&mut self, ticket: super::host_auth_contract::AuthReference) {
+        self.state.retire_local_ticket(ticket);
+    }
     pub(crate) fn retire(self, host: &mut HostState) -> Result<(), HostError> {
         host.retire_frontend(self.frontend)
     }
@@ -1053,7 +1056,7 @@ pub(crate) fn admit_channel(
 
 #[cfg(test)]
 #[path = "local_channel_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 /// Sealed launch-only transfer. The host expectation remains with its parent.
 pub(super) mod launch {
