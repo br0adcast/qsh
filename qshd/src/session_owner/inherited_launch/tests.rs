@@ -208,6 +208,17 @@ fn launch529_transferred_end_stays_charged() {
                     "pre-start polling preserves exact custody"
                 );
                 c.frontend.as_ref().unwrap().for_spawn().unwrap();
+                assert!(c.first_unknown.is_none());
+                let observed = c.observation();
+                let busy = c.remote.as_ref().unwrap().test_busy_observation();
+                assert_eq!(busy.local, local_channel::launch::ObservationAccess::Busy);
+                assert!(busy.live.is_none() && busy.uncertain.is_none());
+                assert_eq!(
+                    c.observation(),
+                    observed,
+                    "diagnostic access cannot change custody/debt"
+                );
+                assert_eq!(custody(&c), original);
             }
             assert_eq!(launches.in_use(), 1);
             assert_eq!(launches.budget.in_use(), 1);
@@ -353,8 +364,36 @@ fn launch529_lost_wait_and_uncertain_close_never_refund() {
         }
         assert_eq!(launches.poll(&handle), super::LaunchProgress::Unknown);
         assert_eq!(launches.in_use(), 1);
+        let first = launches.observation(&handle);
+        let event = first.first.unwrap();
+        assert_eq!(
+            event.origin,
+            if lost_wait {
+                super::observation::Origin::ModeledLostWait
+            } else {
+                super::observation::Origin::RemoteSettlement
+            }
+        );
+        assert!(
+            event.errno.is_none(),
+            "modeled wait/boolean close carries no actual errno"
+        );
+        if lost_wait {
+            assert!(!event.snapshot.eof);
+        }
+        assert!(first.current.unwrap().eof);
+        assert_eq!(
+            first.current.unwrap().debt_sample,
+            super::observation::DebtSample::NotObserved
+        );
+        assert!(first.current.unwrap().debt.is_none());
+        assert!(event.snapshot.debt.is_some());
+        assert!(!first.current.unwrap().kill_attempted);
+        assert_eq!(launches.budget.in_use(), 1);
         launches.cancel(&handle);
         assert_eq!(launches.poll(&handle), super::LaunchProgress::Unknown);
+        assert_eq!(launches.observation(&handle).first, first.first);
+        assert_eq!(launches.budget.in_use(), 1);
     }
 }
 #[test]
@@ -517,6 +556,12 @@ fn launch529_poisoned_registry_keeps_exact_capsule_and_debt() {
     }));
     assert_eq!(launches.poll(&handle), super::LaunchProgress::Unknown);
     assert_eq!(launches.in_use(), 1);
+    let report = launches.observation(&handle);
+    assert_eq!(
+        report.unavailable,
+        Some(super::observation::Origin::CapsulePoisoned)
+    );
+    assert!(report.first.is_none() && report.current.is_none());
     drop(capsule);
     drop(launches);
     assert!(
@@ -563,4 +608,143 @@ fn launch529_known_extra_local_copy_is_pending_not_unknown() {
     extra.close();
     assert_eq!(launches.poll(&handle), super::LaunchProgress::Settled);
     assert_eq!(launches.budget.in_use(), 0);
+}
+
+// Synthetic scalar fixtures exercise the same observer as native failures;
+// no syscall errno, child or terminal receipt is claimed by these controls.
+fn diagnostic_snapshot(status: Option<&std::process::ExitStatus>) -> super::observation::Snapshot {
+    super::observation::Snapshot {
+        export: super::ExportDisposition::Owned,
+        wait: super::WaitState::Pending,
+        status: super::observation::Status::capture(status),
+        eof: false,
+        cancelled: false,
+        started: true,
+        kill_attempted: false,
+        write_shutdown: false,
+        presence: [true; 9],
+        debt_sample: super::observation::DebtSample::NotObserved,
+        debt: None,
+    }
+}
+#[test]
+fn launch529_unknown_first_observation_is_sticky() {
+    use super::observation::{self as d, Event, Origin};
+    let mut first = None;
+    let initial = Event {
+        origin: Origin::SetupRead,
+        errno: Some(123),
+        snapshot: diagnostic_snapshot(None),
+    };
+    d::record(&mut first, initial);
+    use std::os::unix::process::ExitStatusExt;
+    let terminal = std::process::ExitStatus::from_raw(9 << 8);
+    let mut later = diagnostic_snapshot(Some(&terminal));
+    later.eof = true;
+    later.wait = super::WaitState::Terminal;
+    d::record(
+        &mut first,
+        Event {
+            origin: Origin::ChildWait,
+            errno: Some(456),
+            snapshot: later,
+        },
+    );
+    assert_eq!(
+        first.unwrap().origin,
+        Origin::SetupRead,
+        "first actual uncertainty is immutable"
+    );
+    assert_eq!(first.unwrap().errno, Some(123));
+    assert!(!first.unwrap().snapshot.eof);
+    assert_eq!(first.unwrap().snapshot.wait, super::WaitState::Pending);
+    assert!(later.eof);
+    assert_eq!(later.status.code, Some(9));
+    assert!(!first.unwrap().snapshot.status.present);
+    assert_eq!(first.unwrap().snapshot.status.code, None);
+}
+#[test]
+fn launch529_unknown_observation_preserves_optional_status() {
+    use super::observation::Status;
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        Status::capture(None),
+        Status {
+            present: false,
+            code: None,
+            signal: None
+        }
+    );
+    let exited = std::process::ExitStatus::from_raw(7 << 8);
+    assert_eq!(
+        Status::capture(Some(&exited)),
+        Status {
+            present: true,
+            code: Some(7),
+            signal: None
+        }
+    );
+    let signaled = std::process::ExitStatus::from_raw(nix::libc::SIGTERM);
+    assert_eq!(
+        Status::capture(Some(&signaled)),
+        Status {
+            present: true,
+            code: None,
+            signal: Some(nix::libc::SIGTERM)
+        }
+    );
+}
+#[test]
+fn launch529_unknown_observation_is_bounded_and_non_authoritative() {
+    use super::observation::{self as d, Event, Origin, Report, Subcase};
+    use local_channel::launch::{
+        DebtObservation, ObservationAccess as A, ObservationEnd as E, SettlementReason,
+    };
+    let mut snapshot = diagnostic_snapshot(None);
+    snapshot.debt_sample = d::DebtSample::Captured;
+    snapshot.debt = Some(DebtObservation {
+        local: A::Available,
+        live: Some(u32::MAX),
+        uncertain: Some(true),
+        settled: false,
+        ends: A::Available,
+        own: Some(E::Uncertain),
+        peer: Some(E::Uncertain),
+        budget: A::Available,
+        budget_present: true,
+        budget_nonzero: Some(true),
+        reason: Some(SettlementReason::Inconsistent),
+    });
+    let report = Report {
+        first: Some(Event {
+            origin: Origin::RemoteSettlement,
+            errno: Some(i32::MIN),
+            snapshot,
+        }),
+        current: Some(snapshot),
+        unavailable: None,
+    };
+    let saved = report;
+    let rendered = d::render(Subcase::RecordReservedPrefix, &report);
+    assert!(rendered.len() <= 2048);
+    assert!(rendered.contains("subcase=record_reserved_prefix"));
+    assert_eq!(report, saved, "observation cannot mutate custody state");
+    let fallback = d::render_capped(Subcase::RecordMagic, &report, 64);
+    assert!(
+        fallback.len() <= 64,
+        "oversize diagnostic must use fixed unavailable fallback"
+    );
+    assert!(fallback.contains("unavailable"));
+    for reason in [
+        Origin::RegistryMissing,
+        Origin::CapsulePoisoned,
+        Origin::CapsuleBusy,
+    ] {
+        let report = Report {
+            first: None,
+            current: None,
+            unavailable: Some(reason),
+        };
+        assert!(d::render(Subcase::Other, &report).len() <= 2048);
+    }
 }

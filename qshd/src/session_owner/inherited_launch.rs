@@ -30,6 +30,7 @@ enum SettlementBasis {
     NeverExportedLocalCloses,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 enum ExportDisposition {
     LocalOnly,
     InFlight,
@@ -103,6 +104,8 @@ struct Capsule {
     modeled_child: bool,
     #[cfg(test)]
     interrupt_setup_read: bool,
+    #[cfg(test)]
+    first_unknown: Option<observation::Event>,
 }
 impl Capsule {
     fn cancelled(&self) -> bool {
@@ -144,6 +147,11 @@ impl Capsule {
             if let Some(setup) = self.setup.as_ref() {
                 if let Ok(fd) = setup.fd() {
                     if unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_WR) } != 0 {
+                        #[cfg(test)]
+                        {
+                            let errno = io::Error::last_os_error().raw_os_error();
+                            self.observe_unknown(observation::Origin::SetupShutdown, errno);
+                        }
                         self.unknown = true;
                     }
                 }
@@ -208,6 +216,8 @@ impl Capsule {
                             self.retire();
                         }
                         Ok(_) => {
+                            #[cfg(test)]
+                            self.observe_unknown(observation::Origin::SetupUnexpectedData, None);
                             self.unknown = true;
                             self.retire();
                         }
@@ -216,7 +226,12 @@ impl Capsule {
                                 e.kind(),
                                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                             ) => {}
-                        Err(_) => {
+                        Err(_error) => {
+                            #[cfg(test)]
+                            self.observe_unknown(
+                                observation::Origin::SetupRead,
+                                _error.raw_os_error(),
+                            );
                             self.unknown = true;
                             self.retire();
                         }
@@ -234,7 +249,9 @@ impl Capsule {
                     }
                     Ok(None) => {}
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => {
+                    Err(_error) => {
+                        #[cfg(test)]
+                        self.observe_unknown(observation::Origin::ChildWait, _error.raw_os_error());
                         self.wait = WaitState::Unknown;
                         self.unknown = true;
                         self.retire();
@@ -277,7 +294,11 @@ impl Capsule {
                     return self.progress;
                 }
                 launch::SettlementStatus::Pending => {}
-                launch::SettlementStatus::Unknown => self.unknown = true,
+                launch::SettlementStatus::Unknown => {
+                    #[cfg(test)]
+                    self.observe_unknown(observation::Origin::RemoteSettlement, None);
+                    self.unknown = true;
+                }
             }
         }
         if self.unknown || self.wait == WaitState::Unknown {
@@ -403,6 +424,8 @@ impl FrontendLaunches {
             modeled_child: false,
             #[cfg(test)]
             interrupt_setup_read: false,
+            #[cfg(test)]
+            first_unknown: None,
         }));
         // Retain the physical capsule before any socketpair or duplicate allocation.
         self.slots.push(Arc::clone(&capsule));
@@ -612,6 +635,8 @@ impl Drop for FrontendLaunches {
                 Ok(c) => c,
                 Err(poison) => {
                     let mut c = poison.into_inner();
+                    #[cfg(test)]
+                    c.observe_unknown(observation::Origin::DropPoison, None);
                     c.unknown = true;
                     if c.wait == WaitState::Pending {
                         c.wait = WaitState::Unknown;
@@ -669,6 +694,9 @@ impl FrontendLaunches {
         let c = self.find(h).unwrap();
         let mut c = c.lock().unwrap();
         assert!(c.modeled_child && c.child.is_none());
+        if lost {
+            c.observe_unknown(observation::Origin::ModeledLostWait, None);
+        }
         c.wait = if lost {
             WaitState::Unknown
         } else {
@@ -716,5 +744,228 @@ impl FrontendLaunches {
         c.wait = WaitState::Terminal;
         c.poll();
         c.quarantine = None;
+    }
+}
+
+#[cfg(test)]
+impl Capsule {
+    fn observation(&self) -> observation::Snapshot {
+        let mut snapshot = self.observation_scalars();
+        if let Some(remote) = self.remote.as_ref() {
+            snapshot.debt = Some(remote.test_observation());
+            snapshot.debt_sample = observation::DebtSample::Captured;
+        }
+        snapshot
+    }
+    fn observation_scalars(&self) -> observation::Snapshot {
+        observation::Snapshot {
+            export: self.export,
+            wait: self.wait,
+            status: observation::Status::capture(self.status.as_ref()),
+            eof: self.eof,
+            cancelled: self.cancelled(),
+            started: self.started,
+            kill_attempted: self.kill_attempted,
+            write_shutdown: self.write_shutdown,
+            presence: [
+                self.child.is_some(),
+                self.host.is_some(),
+                self.admitted.is_some(),
+                self.frontend.is_some(),
+                self.setup.is_some(),
+                self.setup_child.is_some(),
+                self.duplicates[0].is_some(),
+                self.duplicates[1].is_some(),
+                self.remote.is_some(),
+            ],
+            // The standalone registry observer holds one added capsule guard:
+            // it deliberately takes no debt lock and never reuses first debt.
+            debt_sample: if self.remote.is_some() {
+                observation::DebtSample::NotObserved
+            } else {
+                observation::DebtSample::NoRemote
+            },
+            debt: None,
+        }
+    }
+    fn observe_unknown(&mut self, origin: observation::Origin, errno: Option<i32>) {
+        if self.first_unknown.is_none() {
+            let snapshot = self.observation();
+            observation::record(
+                &mut self.first_unknown,
+                observation::Event {
+                    origin,
+                    errno,
+                    snapshot,
+                },
+            );
+        }
+    }
+}
+#[cfg(test)]
+impl FrontendLaunches {
+    fn observation(&self, handle: &LaunchHandle) -> observation::Report {
+        use observation::{Origin, Report};
+        let mut unavailable = None;
+        for capsule in &self.slots {
+            match capsule.try_lock() {
+                Ok(c) if Arc::ptr_eq(&c.control, &handle.control) => {
+                    return Report {
+                        unavailable: None,
+                        first: c.first_unknown,
+                        current: Some(c.observation_scalars()),
+                    }
+                }
+                Ok(_) => {}
+                Err(std::sync::TryLockError::WouldBlock) => unavailable = Some(Origin::CapsuleBusy),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    unavailable = Some(Origin::CapsulePoisoned)
+                }
+            }
+        }
+        Report {
+            unavailable: Some(unavailable.unwrap_or(Origin::RegistryMissing)),
+            first: None,
+            current: None,
+        }
+    }
+}
+
+// This entire observer is absent from the daemon and has no cleanup authority.
+#[cfg(test)]
+mod observation {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Origin {
+        SetupShutdown,
+        SetupUnexpectedData,
+        SetupRead,
+        ChildWait,
+        RemoteSettlement,
+        ModeledLostWait,
+        RegistryMissing,
+        CapsulePoisoned,
+        CapsuleBusy,
+        DropPoison,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Status {
+        pub present: bool,
+        pub code: Option<i32>,
+        pub signal: Option<i32>,
+    }
+    impl Status {
+        pub fn capture(status: Option<&ExitStatus>) -> Self {
+            Self {
+                present: status.is_some(),
+                code: status.and_then(ExitStatus::code),
+                signal: status.and_then(ExitStatusExt::signal),
+            }
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum DebtSample {
+        Captured,
+        NotObserved,
+        NoRemote,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Snapshot {
+        pub export: ExportDisposition,
+        pub wait: WaitState,
+        pub status: Status,
+        pub eof: bool,
+        pub cancelled: bool,
+        pub started: bool,
+        pub kill_attempted: bool,
+        pub write_shutdown: bool,
+        // Fixed schema order: child, host, admitted, frontend, setup,
+        // setup_child, duplicate0, duplicate1, remote. No fd/id extraction.
+        pub presence: [bool; 9],
+        pub debt_sample: DebtSample,
+        pub debt: Option<launch::DebtObservation>,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Event {
+        pub origin: Origin,
+        pub errno: Option<i32>,
+        pub snapshot: Snapshot,
+    }
+    pub(super) fn record(first: &mut Option<Event>, event: Event) {
+        first.get_or_insert(event);
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Subcase {
+        Other,
+        RecordMagic,
+        RecordHostZero,
+        RecordChannelZero,
+        RecordChallengeZero,
+        RecordUid,
+        RecordFrontendRole,
+        RecordHostRole,
+        RecordMinVersion,
+        RecordMaxVersion,
+        RecordReservedPrefix,
+        RecordDeadlineZero,
+        RecordTailVersion,
+        RecordReservedTail,
+        SetupRegular,
+        SetupListener,
+        SetupAlias,
+        ExtraSetupBytes,
+        DirectMissingFds,
+        DirectExtraArgs,
+    }
+    impl Subcase {
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::Other => "other",
+                Self::RecordMagic => "record_magic",
+                Self::RecordHostZero => "record_host_zero",
+                Self::RecordChannelZero => "record_channel_zero",
+                Self::RecordChallengeZero => "record_challenge_zero",
+                Self::RecordUid => "record_uid",
+                Self::RecordFrontendRole => "record_frontend_role",
+                Self::RecordHostRole => "record_host_role",
+                Self::RecordMinVersion => "record_min_version",
+                Self::RecordMaxVersion => "record_max_version",
+                Self::RecordReservedPrefix => "record_reserved_prefix",
+                Self::RecordDeadlineZero => "record_deadline_zero",
+                Self::RecordTailVersion => "record_tail_version",
+                Self::RecordReservedTail => "record_reserved_tail",
+                Self::SetupRegular => "setup_regular",
+                Self::SetupListener => "setup_listener",
+                Self::SetupAlias => "setup_alias",
+                Self::ExtraSetupBytes => "extra_setup_bytes",
+                Self::DirectMissingFds => "direct_missing_fds",
+                Self::DirectExtraArgs => "direct_extra_args",
+            }
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Report {
+        pub unavailable: Option<Origin>,
+        pub first: Option<Event>,
+        pub current: Option<Snapshot>,
+    }
+    pub(super) fn render(case: Subcase, report: &Report) -> String {
+        render_capped(case, report, 2048)
+    }
+    pub(super) fn render_capped(case: Subcase, report: &Report, cap: usize) -> String {
+        // Only closed enums, optional bounded integers and booleans are rendered.
+        let rendered = format!(
+            "launch529_diag_v1 subcase={} first={:?} current={:?} unavailable={:?}",
+            case.label(),
+            report.first,
+            report.current,
+            report.unavailable
+        );
+        if rendered.len() <= cap.min(2048) {
+            rendered
+        } else {
+            "launch529_diag_v1 unavailable".into()
+        }
     }
 }

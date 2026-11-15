@@ -163,17 +163,40 @@ fn body_output(launches: &mut FrontendLaunches, handle: &LaunchHandle) {
     }
 }
 fn settled(launches: &mut FrontendLaunches, handle: &LaunchHandle, success: bool) {
+    settled_case(launches, handle, success, observation::Subcase::Other);
+}
+fn subcase(case: observation::Subcase) {
+    eprintln!("launch529_subcase_v1 label={}", case.label());
+}
+fn settled_case(
+    launches: &mut FrontendLaunches,
+    handle: &LaunchHandle,
+    success: bool,
+    case: observation::Subcase,
+) {
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
         let progress = launches.poll(handle);
         if progress == LaunchProgress::Settled {
             break;
         }
+        if progress == LaunchProgress::Unknown {
+            eprintln!(
+                "{}",
+                observation::render(case, &launches.observation(handle))
+            );
+        }
         assert_ne!(
             progress,
             LaunchProgress::Unknown,
             "unknown is not cleanup proof"
         );
+        if Instant::now() >= deadline {
+            eprintln!(
+                "{}",
+                observation::render(case, &launches.observation(handle))
+            );
+        }
         assert!(
             Instant::now() < deadline,
             "exact Child/EOF cleanup deadline"
@@ -359,7 +382,23 @@ fn launch529_eof_wait_and_extra_reference_order() {
 fn launch529_foreign_or_invalid_inheritance_refuses() {
     // Real foreign-UID refusal is separately required in the disposable root tier.
     config();
-    for offset in [0, 12, 28, 44, 76, 80, 81, 82, 84, 86, 88, 96, 104] {
+    use observation::Subcase as S;
+    for (offset, case) in [
+        (0, S::RecordMagic),
+        (12, S::RecordHostZero),
+        (28, S::RecordChannelZero),
+        (44, S::RecordChallengeZero),
+        (76, S::RecordUid),
+        (80, S::RecordFrontendRole),
+        (81, S::RecordHostRole),
+        (82, S::RecordMinVersion),
+        (84, S::RecordMaxVersion),
+        (86, S::RecordReservedPrefix),
+        (88, S::RecordDeadlineZero),
+        (96, S::RecordTailVersion),
+        (104, S::RecordReservedTail),
+    ] {
+        subcase(case);
         let mut launches = real();
         let handle = prepare(&mut launches);
         {
@@ -379,9 +418,14 @@ fn launch529_foreign_or_invalid_inheritance_refuses() {
             }
         }
         assert!(launches.start(&handle).is_err());
-        settled(&mut launches, &handle, false);
+        settled_case(&mut launches, &handle, false, case);
     }
-    for kind in ["regular", "listener", "alias"] {
+    for (kind, case) in [
+        ("regular", S::SetupRegular),
+        ("listener", S::SetupListener),
+        ("alias", S::SetupAlias),
+    ] {
+        subcase(case);
         let mut launches = real();
         let handle = prepare(&mut launches);
         let dir = tempfile::tempdir().unwrap();
@@ -404,8 +448,9 @@ fn launch529_foreign_or_invalid_inheritance_refuses() {
             }
         }
         assert!(launches.start(&handle).is_err());
-        settled(&mut launches, &handle, false);
+        settled_case(&mut launches, &handle, false, case);
     }
+    subcase(S::ExtraSetupBytes);
     let mut launches = real();
     let handle = prepare(&mut launches);
     launches.start(&handle).unwrap();
@@ -417,8 +462,12 @@ fn launch529_foreign_or_invalid_inheritance_refuses() {
             5
         );
     }
-    settled(&mut launches, &handle, false);
-    for args in [vec![MARKER.into()], vec![MARKER.into(), "extra".into()]] {
+    settled_case(&mut launches, &handle, false, S::ExtraSetupBytes);
+    for (args, case) in [
+        (vec![MARKER.into()], S::DirectMissingFds),
+        (vec![MARKER.into(), "extra".into()], S::DirectExtraArgs),
+    ] {
+        subcase(case);
         let output = direct(daemon(), args, true);
         assert!(!output.0.success());
     }

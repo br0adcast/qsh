@@ -677,6 +677,8 @@ pub(super) mod launch {
         index: usize,
         ledger: Arc<Mutex<LocalCloses>>,
         settled: bool,
+        #[cfg(test)]
+        unknown_reason: Option<SettlementReason>,
     }
     pub(in crate::session_owner) fn validate_config(
         config: TrustedChannelConfig,
@@ -722,6 +724,8 @@ pub(super) mod launch {
             index: expected.custody.index,
             ledger,
             settled: false,
+            #[cfg(test)]
+            unknown_reason: None,
         };
         Ok((prepared, remote))
     }
@@ -760,7 +764,105 @@ pub(super) mod launch {
         Settled,
         Unknown,
     }
+    // Read-only test evidence; unavailable locks never grant cleanup authority.
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum ObservationAccess {
+        Available,
+        Busy,
+        Poisoned,
+        Overflow,
+    }
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum ObservationEnd {
+        Live,
+        Closed,
+        Uncertain,
+    }
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum SettlementReason {
+        LocalPoison,
+        LocalUncertain,
+        EndsPoison,
+        PeerUncertain,
+        BudgetPoison,
+        Inconsistent,
+    }
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) struct DebtObservation {
+        pub local: ObservationAccess,
+        pub live: Option<u32>,
+        pub uncertain: Option<bool>,
+        pub settled: bool,
+        pub ends: ObservationAccess,
+        pub own: Option<ObservationEnd>,
+        pub peer: Option<ObservationEnd>,
+        pub budget: ObservationAccess,
+        pub budget_present: bool,
+        pub budget_nonzero: Option<bool>,
+        pub reason: Option<SettlementReason>,
+    }
     impl RemoteEndObligation {
+        #[cfg(test)]
+        pub(in crate::session_owner) fn test_observation(&self) -> DebtObservation {
+            use std::sync::TryLockError;
+            // Each diagnostic guard ends before the next try_lock. No poison
+            // recovery, waiting, fd access, settlement or authority is added.
+            let (local, live, uncertain) = {
+                match self.ledger.try_lock() {
+                    Ok(s) => match u32::try_from(s.live) {
+                        Ok(live) => (ObservationAccess::Available, Some(live), Some(s.uncertain)),
+                        Err(_) => (ObservationAccess::Overflow, None, None),
+                    },
+                    Err(TryLockError::WouldBlock) => (ObservationAccess::Busy, None, None),
+                    Err(TryLockError::Poisoned(_)) => (ObservationAccess::Poisoned, None, None),
+                }
+            };
+            let (ends, own, peer) = {
+                let end = |e| match e {
+                    EndState::Live => ObservationEnd::Live,
+                    EndState::Closed => ObservationEnd::Closed,
+                    EndState::Uncertain => ObservationEnd::Uncertain,
+                };
+                match self.pair.ends.try_lock() {
+                    Ok(s) => (
+                        ObservationAccess::Available,
+                        Some(end(s[self.index])),
+                        Some(end(s[1 - self.index])),
+                    ),
+                    Err(TryLockError::WouldBlock) => (ObservationAccess::Busy, None, None),
+                    Err(TryLockError::Poisoned(_)) => (ObservationAccess::Poisoned, None, None),
+                }
+            };
+            let (budget, budget_nonzero) = {
+                match self.pair.budget.try_lock() {
+                    Ok(s) => (ObservationAccess::Available, Some(s.used != 0)),
+                    Err(TryLockError::WouldBlock) => (ObservationAccess::Busy, None),
+                    Err(TryLockError::Poisoned(_)) => (ObservationAccess::Poisoned, None),
+                }
+            };
+            DebtObservation {
+                local,
+                live,
+                uncertain,
+                settled: self.settled,
+                ends,
+                own,
+                peer,
+                budget,
+                budget_present: true,
+                budget_nonzero,
+                reason: self.unknown_reason,
+            }
+        }
+        #[cfg(test)]
+        pub(in crate::session_owner) fn test_busy_observation(&self) -> DebtObservation {
+            let _guard = self.ledger.lock().unwrap();
+            self.test_observation()
+        }
         pub(in crate::session_owner) fn track(&self, fd: OwnedFd) -> LocalFd {
             LocalFd::track(fd, Arc::clone(&self.ledger))
         }
@@ -771,26 +873,46 @@ pub(super) mod launch {
             _receipt: crate::session_owner::inherited_launch::Settlement,
         ) -> SettlementStatus {
             let Ok(local) = self.ledger.lock() else {
+                #[cfg(test)]
+                self.unknown_reason
+                    .get_or_insert(SettlementReason::LocalPoison);
                 return SettlementStatus::Unknown;
             };
             if local.uncertain {
+                #[cfg(test)]
+                self.unknown_reason
+                    .get_or_insert(SettlementReason::LocalUncertain);
                 return SettlementStatus::Unknown;
             }
             if local.live != 0 {
                 return SettlementStatus::Pending;
             }
             let Ok(mut ends) = self.pair.ends.lock() else {
+                #[cfg(test)]
+                self.unknown_reason
+                    .get_or_insert(SettlementReason::EndsPoison);
                 return SettlementStatus::Unknown;
             };
             match ends[1 - self.index] {
                 EndState::Live => return SettlementStatus::Pending,
-                EndState::Uncertain => return SettlementStatus::Unknown,
+                EndState::Uncertain => {
+                    #[cfg(test)]
+                    self.unknown_reason
+                        .get_or_insert(SettlementReason::PeerUncertain);
+                    return SettlementStatus::Unknown;
+                }
                 EndState::Closed => {}
             }
             let Ok(mut budget) = self.pair.budget.lock() else {
+                #[cfg(test)]
+                self.unknown_reason
+                    .get_or_insert(SettlementReason::BudgetPoison);
                 return SettlementStatus::Unknown;
             };
             if ends[self.index] != EndState::Live || budget.used == 0 {
+                #[cfg(test)]
+                self.unknown_reason
+                    .get_or_insert(SettlementReason::Inconsistent);
                 return SettlementStatus::Unknown;
             }
             // Credit and the remote-end terminal fact commit under the original
