@@ -127,6 +127,8 @@ struct Diagnostic {
     observations: usize,
     cleanup_stops: usize,
     exit_code: usize,
+    screen_receipt_state: usize,
+    screen_receipt_code: usize,
     failure: bool,
     body_status: usize,
     body: DiagnosticLocation,
@@ -150,6 +152,25 @@ impl std::fmt::Debug for Diagnostic {
             )
             .field("child_location", &self.child)
             .field("elapsed_ms", &self.elapsed_ms)
+            .field(
+                "screen_receipt_state",
+                &match self.screen_receipt_state {
+                    0 => "unavailable",
+                    1 => "none",
+                    2 => "code",
+                    _ => "invalid",
+                },
+            )
+            .field(
+                "screen_receipt_code",
+                &(if self.screen_receipt_state == 2 {
+                    u32::try_from(self.screen_receipt_code)
+                        .ok()
+                        .map(|code| code as i32)
+                } else {
+                    None
+                }),
+            )
             .field("receipt", &(self.observations & 1 != 0))
             .field("exit_seen", &(self.observations & 2 != 0))
             .field(
@@ -175,13 +196,23 @@ impl std::fmt::Debug for Diagnostic {
 }
 impl Diagnostic {
     fn report_fields(self) -> String {
-        format!("mode={} phase={} assertion={} elapsed_ms={} observations={} cleanup_stops={} exit_code={} failure={} body_status={} body_source={} body_line={} body_column={} child_status={} child_source={} child_line={} child_column={}",
+        format!("mode={} phase={} assertion={} elapsed_ms={} observations={} cleanup_stops={} exit_code={} failure={} body_status={} body_source={} body_line={} body_column={} child_status={} child_source={} child_line={} child_column={} screen_receipt_state={} screen_receipt_code={}",
             self.mode, self.phase, self.assertion, self.elapsed_ms, self.observations, self.cleanup_stops, self.exit_code,
             usize::from(self.failure), self.body_status, self.body.source, self.body.line, self.body.column,
-            self.child_status, self.child.source, self.child.line, self.child.column)
+            self.child_status, self.child.source, self.child.line, self.child.column,
+            self.screen_receipt_state, self.screen_receipt_code)
     }
     fn from_fields(fields: &std::collections::BTreeMap<String, usize>) -> Self {
         let field = |name| fields.get(name).copied().unwrap_or(0);
+        let (screen_receipt_state, screen_receipt_code) = match (
+            fields.get("screen_receipt_state"),
+            fields.get("screen_receipt_code"),
+        ) {
+            (None, None) => (0, 0),
+            (Some(&state), Some(&0)) if matches!(state, 0 | 1 | 3) => (state, 0),
+            (Some(&2), Some(&code)) if u32::try_from(code).is_ok() => (2, code),
+            _ => (3, 0),
+        };
         Self {
             mode: field("mode"),
             phase: field("phase"),
@@ -190,6 +221,8 @@ impl Diagnostic {
             observations: field("observations"),
             cleanup_stops: field("cleanup_stops"),
             exit_code: field("exit_code"),
+            screen_receipt_state,
+            screen_receipt_code,
             failure: field("failure") != 0,
             body_status: field("body_status"),
             body: DiagnosticLocation {
@@ -216,6 +249,7 @@ impl Diagnostic {
 thread_local! {
     static DIAGNOSTIC: std::cell::Cell<Diagnostic> = const { std::cell::Cell::new(Diagnostic {
         mode: 0, phase: 0, assertion: 0, elapsed_ms: 0, observations: 0, cleanup_stops: 0, exit_code: 0,
+        screen_receipt_state: 0, screen_receipt_code: 0,
         failure: false, body_status: 0, body: DiagnosticLocation { source: 0, line: 0, column: 0 },
         child_status: 0, child: DiagnosticLocation { source: 0, line: 0, column: 0 },
     }) };
@@ -378,6 +412,23 @@ pub(crate) fn diagnostic_exit_code(code: Option<i32>) {
         })
     });
 }
+// A completed Screen cleanup receipt is separate from the helper exit-response bits.
+pub(crate) fn diagnostic_screen_receipt(code: Option<i32>) {
+    DIAGNOSTIC.with(|cell| {
+        let mut diagnostic = cell.get();
+        if diagnostic.failure {
+            return;
+        }
+        (
+            diagnostic.screen_receipt_state,
+            diagnostic.screen_receipt_code,
+        ) = match code {
+            None => (1, 0),
+            Some(code) => (2, code as u32 as usize),
+        };
+        cell.set(diagnostic);
+    });
+}
 // Cleanup updates cannot overwrite the phase/assertion that caused unwinding.
 // Bits identify fixture roles only: leader=1, member=2, monitor=4 are stops;
 // monitor=8 and leader=16 are consuming waits the fixture itself performed.
@@ -392,6 +443,31 @@ pub(crate) fn diagnostic_cleanup_stops(bits: usize) {
 fn write_report(path: impl AsRef<std::path::Path>, report: String) {
     assert!(report.len() <= REPORT_LIMIT, "bounded fixture report");
     std::fs::write(path, report).unwrap();
+}
+fn format_body_report(
+    body_success: bool,
+    expected_waits: usize,
+    body_counts: (usize, usize),
+    diagnostic: Diagnostic,
+) -> String {
+    format!(
+        "body_success={} expected_waits={expected_waits} body_adopted={} body_rescues={} no_children=1 {}",
+        usize::from(body_success), body_counts.0, body_counts.1, diagnostic.report_fields()
+    )
+}
+fn format_supervisor_report(
+    body_success: bool,
+    timed_out: bool,
+    expected_waits: usize,
+    body_counts: (usize, usize),
+    supervisor_counts: (usize, usize),
+    diagnostic: Diagnostic,
+) -> String {
+    format!(
+        "body_success={} timed_out={} expected_waits={expected_waits} body_adopted={} body_rescues={} supervisor_adopted={} supervisor_rescues={} no_children=1 {}",
+        usize::from(body_success), usize::from(timed_out), body_counts.0, body_counts.1,
+        supervisor_counts.0, supervisor_counts.1, diagnostic.report_fields()
+    )
 }
 
 #[derive(Debug)]
@@ -717,9 +793,10 @@ pub(crate) fn run_exact(test: &str, expected_waits: usize, body: impl FnOnce()) 
             diagnostic.cleanup_stops |= DIAGNOSTIC.get().cleanup_stops;
             let waits = EXPECTED_WAITS.load(Ordering::SeqCst);
             let success = result.is_ok() && waits == expected_waits && drain.adopted == 0;
-            write_report(std::env::var_os(REPORT).unwrap(), format!(
-                "body_success={} expected_waits={waits} body_adopted={} body_rescues={} no_children=1 {}",
-                usize::from(success), drain.adopted, drain.rescues, diagnostic.report_fields()));
+            write_report(
+                std::env::var_os(REPORT).unwrap(),
+                format_body_report(success, waits, (drain.adopted, drain.rescues), diagnostic),
+            );
             std::process::exit(if success { 0 } else { 101 });
         }
         Some("supervisor") => {
@@ -766,10 +843,20 @@ pub(crate) fn run_exact(test: &str, expected_waits: usize, body: impl FnOnce()) 
             let mut diagnostic = Diagnostic::from_fields(&fields);
             (diagnostic.child_status, diagnostic.child) =
                 read_child_location(&child_panic_path(&report));
-            write_report(report, format!(
-                "body_success={} timed_out={} expected_waits={} body_adopted={} body_rescues={} supervisor_adopted={} supervisor_rescues={} no_children=1 {}",
-                usize::from(body_ok), usize::from(status.is_none()), fields.get("expected_waits").copied().unwrap_or(0),
-                fields.get("body_adopted").copied().unwrap_or(0), fields.get("body_rescues").copied().unwrap_or(0), drain.adopted, drain.rescues, diagnostic.report_fields()));
+            write_report(
+                report,
+                format_supervisor_report(
+                    body_ok,
+                    status.is_none(),
+                    fields.get("expected_waits").copied().unwrap_or(0),
+                    (
+                        fields.get("body_adopted").copied().unwrap_or(0),
+                        fields.get("body_rescues").copied().unwrap_or(0),
+                    ),
+                    (drain.adopted, drain.rescues),
+                    diagnostic,
+                ),
+            );
             std::process::exit(if success { 0 } else { 101 });
         }
         Some(_) => panic!("unknown private borrowed fixture stage"),
@@ -802,6 +889,215 @@ pub(crate) fn run_exact(test: &str, expected_waits: usize, body: impl FnOnce()) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receipt_fields(diagnostic: Diagnostic) -> std::collections::BTreeMap<String, usize> {
+        parse_receipt_report(&diagnostic.report_fields())
+    }
+    fn parse_receipt_report(report: &str) -> std::collections::BTreeMap<String, usize> {
+        report
+            .split_whitespace()
+            .map(|field| {
+                let (key, value) = field.split_once('=').unwrap();
+                (key.to_string(), value.parse().unwrap())
+            })
+            .collect()
+    }
+    fn receipt_input(
+        state: Option<usize>,
+        code: Option<usize>,
+    ) -> std::collections::BTreeMap<String, usize> {
+        let mut fields = std::collections::BTreeMap::new();
+        if let Some(state) = state {
+            fields.insert("screen_receipt_state".into(), state);
+        }
+        if let Some(code) = code {
+            fields.insert("screen_receipt_code".into(), code);
+        }
+        fields
+    }
+
+    #[test]
+    fn screen_receipt_diagnostic_preserves_option_through_reports() {
+        diagnostic_mode(DiagnosticMode::Unspecified);
+        for (input, state, wire_code, label, observed) in [
+            (Some((2, 7)), 2, 7, "code", Some(7)),
+            (None, 0, 0, "unavailable", None),
+            (Some((1, 0)), 1, 0, "none", None),
+            (Some((2, 0)), 2, 0, "code", Some(0)),
+            (
+                Some((2, (-1i32) as u32 as usize)),
+                2,
+                (-1i32) as u32 as usize,
+                "code",
+                Some(-1),
+            ),
+            (
+                Some((2, i32::MIN as u32 as usize)),
+                2,
+                i32::MIN as u32 as usize,
+                "code",
+                Some(i32::MIN),
+            ),
+            (
+                Some((2, i32::MAX as u32 as usize)),
+                2,
+                i32::MAX as u32 as usize,
+                "code",
+                Some(i32::MAX),
+            ),
+        ] {
+            diagnostic_mode(DiagnosticMode::Unspecified);
+            if input.is_some() {
+                diagnostic_screen_receipt(observed);
+            }
+            let set = DIAGNOSTIC.get();
+            assert_eq!(
+                (set.screen_receipt_state, set.screen_receipt_code),
+                (state, wire_code)
+            );
+            let fields =
+                input.map_or_else(Default::default, |(s, c)| receipt_input(Some(s), Some(c)));
+            let mut diagnostic = Diagnostic::from_fields(&fields);
+            for hop in 0..2 {
+                assert_eq!(
+                    (
+                        diagnostic.screen_receipt_state,
+                        diagnostic.screen_receipt_code
+                    ),
+                    (state, wire_code)
+                );
+                let rendered = format!("{diagnostic:?}");
+                assert!(
+                    rendered.contains(&format!("screen_receipt_state: {label:?}")),
+                    "{rendered}"
+                );
+                assert!(
+                    rendered.contains(&format!("screen_receipt_code: {observed:?}")),
+                    "{rendered}"
+                );
+                let report = if hop == 0 {
+                    format_body_report(false, 0, (0, 0), diagnostic)
+                } else {
+                    format_supervisor_report(false, false, 0, (0, 0), (0, 0), diagnostic)
+                };
+                let forwarded = parse_receipt_report(&report);
+                assert_eq!(forwarded.get("screen_receipt_state"), Some(&state));
+                assert_eq!(forwarded.get("screen_receipt_code"), Some(&wire_code));
+                diagnostic = Diagnostic::from_fields(&forwarded);
+            }
+        }
+    }
+
+    #[test]
+    fn screen_receipt_diagnostic_rejects_partial_or_invalid_fields() {
+        diagnostic_mode(DiagnosticMode::Unspecified);
+        let missing = Diagnostic::from_fields(&Default::default());
+        assert_eq!(
+            (missing.screen_receipt_state, missing.screen_receipt_code),
+            (0, 0)
+        );
+        let mut invalid = vec![
+            receipt_input(Some(0), None),
+            receipt_input(Some(1), None),
+            receipt_input(Some(2), None),
+            receipt_input(Some(3), None),
+            receipt_input(None, Some(0)),
+            receipt_input(Some(4), Some(0)),
+            receipt_input(Some(usize::MAX), Some(0)),
+            receipt_input(Some(0), Some(1)),
+            receipt_input(Some(1), Some(1)),
+            receipt_input(Some(3), Some(1)),
+            receipt_input(Some(3), Some(0)),
+        ];
+        if let Ok(overflow) = usize::try_from(u64::from(u32::MAX) + 1) {
+            invalid.push(receipt_input(Some(2), Some(overflow)));
+        }
+        for mut fields in invalid {
+            fields.insert("failure".into(), 1);
+            let mut diagnostic = Diagnostic::from_fields(&fields);
+            for _ in 0..2 {
+                assert_eq!(
+                    (
+                        diagnostic.screen_receipt_state,
+                        diagnostic.screen_receipt_code
+                    ),
+                    (3, 0)
+                );
+                let forwarded = receipt_fields(diagnostic);
+                assert_eq!(forwarded.get("screen_receipt_state"), Some(&3));
+                assert_eq!(forwarded.get("screen_receipt_code"), Some(&0));
+                assert!(diagnostic.failure);
+                let rendered = format!("{diagnostic:?}");
+                assert!(
+                    rendered.contains("screen_receipt_state: \"invalid\""),
+                    "{rendered}"
+                );
+                assert!(rendered.contains("screen_receipt_code: None"), "{rendered}");
+                diagnostic = Diagnostic::from_fields(&forwarded);
+            }
+        }
+    }
+
+    #[test]
+    fn screen_receipt_diagnostic_freezes_with_first_failure() {
+        diagnostic_mode(DiagnosticMode::Unspecified);
+        let mut fields = receipt_input(Some(2), Some((-1i32) as u32 as usize));
+        fields.insert("observations".into(), 127);
+        fields.insert("exit_code".into(), 42);
+        DIAGNOSTIC.set(Diagnostic::from_fields(&fields));
+        diagnostic_phase(DiagnosticPhase::ScreenCleanup);
+        diagnostic_assertion(
+            DiagnosticAssertion::ScreenReceiptStatus,
+            Duration::from_millis(7),
+        );
+        let before = DIAGNOSTIC.get();
+        let legacy = (before.observations, before.exit_code, before.elapsed_ms);
+        for code in [None, Some(0), Some(-1)] {
+            diagnostic_screen_receipt(code);
+            let after = DIAGNOSTIC.get();
+            assert_eq!(
+                (after.observations, after.exit_code, after.elapsed_ms),
+                legacy
+            );
+        }
+        let mut diagnostic = DIAGNOSTIC.get();
+        diagnostic.record_failure(Some(DiagnosticLocation::from_source(
+            "screen_native_tests.rs",
+            689,
+            9,
+        )));
+        DIAGNOSTIC.set(diagnostic);
+        diagnostic_screen_receipt(Some(7));
+        diagnostic_screen_receipt(None);
+        diagnostic_phase(DiagnosticPhase::ScreenResize);
+        diagnostic_assertion(
+            DiagnosticAssertion::ScreenGeometry,
+            Duration::from_millis(90),
+        );
+        let retained = DIAGNOSTIC.get();
+        assert_eq!(
+            receipt_fields(retained).get("screen_receipt_state"),
+            Some(&2)
+        );
+        assert_eq!(
+            receipt_fields(retained).get("screen_receipt_code"),
+            Some(&((-1i32) as u32 as usize))
+        );
+        assert_eq!(retained.phase, DiagnosticPhase::ScreenCleanup as usize);
+        assert_eq!(
+            retained.assertion,
+            DiagnosticAssertion::ScreenReceiptStatus as usize
+        );
+        assert_eq!((retained.body.line, retained.body.column), (689, 9));
+        assert_eq!(
+            (
+                retained.observations,
+                retained.exit_code,
+                retained.elapsed_ms
+            ),
+            (127, 42, 7)
+        );
+    }
 
     #[test]
     fn screen_diagnostic_checkpoint_preserves_phase_and_failure_location() {
@@ -1032,6 +1328,7 @@ mod tests {
 
     #[test]
     fn maximum_report_fields_remain_bounded() {
+        diagnostic_mode(DiagnosticMode::Unspecified);
         diagnostic_observations(2);
         diagnostic_exit_code(Some(-1));
         let rendered = format!("{:?}", DIAGNOSTIC.get());
@@ -1053,15 +1350,66 @@ mod tests {
             ("child_source".into(), usize::MAX),
             ("child_line".into(), usize::MAX),
             ("child_column".into(), usize::MAX),
+            ("screen_receipt_state".into(), 2),
+            ("screen_receipt_code".into(), u32::MAX as usize),
         ]);
         let diagnostic = Diagnostic::from_fields(&fields);
-        let report = format!("{} {}", "9".repeat(512), diagnostic.report_fields());
-        assert!(report.len() <= REPORT_LIMIT);
         assert!(format!("{diagnostic:?}").contains("unknown"));
+        assert_eq!(
+            receipt_fields(diagnostic).keys().collect::<Vec<_>>(),
+            fields.keys().collect::<Vec<_>>()
+        );
         let dir = tempfile::tempdir().unwrap();
         let report_path = dir.path().join("bounded-report");
-        write_report(&report_path, report);
-        assert!(std::fs::metadata(&report_path).unwrap().len() <= REPORT_LIMIT as u64);
+        // Use the actual formatters so added fields cannot evade the bound.
+        // Counts are maximal; serialized booleans have the real maximum, 1.
+        for (report, envelope_keys) in [
+            (
+                format_body_report(true, usize::MAX, (usize::MAX, usize::MAX), diagnostic),
+                &[
+                    "body_success",
+                    "expected_waits",
+                    "body_adopted",
+                    "body_rescues",
+                    "no_children",
+                ][..],
+            ),
+            (
+                format_supervisor_report(
+                    true,
+                    true,
+                    usize::MAX,
+                    (usize::MAX, usize::MAX),
+                    (usize::MAX, usize::MAX),
+                    diagnostic,
+                ),
+                &[
+                    "body_success",
+                    "timed_out",
+                    "expected_waits",
+                    "body_adopted",
+                    "body_rescues",
+                    "supervisor_adopted",
+                    "supervisor_rescues",
+                    "no_children",
+                ][..],
+            ),
+        ] {
+            assert!(report.len() <= REPORT_LIMIT);
+            write_report(&report_path, report.clone());
+            assert!(std::fs::metadata(&report_path).unwrap().len() <= REPORT_LIMIT as u64);
+            let parsed = read_fields(&report_path);
+            let mut expected_keys: std::collections::BTreeSet<_> = fields.keys().cloned().collect();
+            expected_keys.extend(envelope_keys.iter().map(|key| key.to_string()));
+            assert_eq!(
+                parsed
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected_keys
+            );
+            assert_eq!(report.split_whitespace().count(), parsed.len());
+        }
         let oversized =
             std::panic::catch_unwind(|| write_report(&report_path, "x".repeat(REPORT_LIMIT + 1)));
         assert!(oversized.is_err());

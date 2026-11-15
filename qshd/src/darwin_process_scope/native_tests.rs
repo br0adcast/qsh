@@ -1018,6 +1018,7 @@ impl Drop for DescendantGuard {
 }
 #[test]
 fn darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins() {
+    use super::fixture_input_ordering::{release_after_input, write_fixture_input};
     use std::io::Read;
     let qualification = prepare().expect("production admission");
     let directory = tempfile::tempdir().unwrap();
@@ -1052,6 +1053,8 @@ fn darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins() {
     };
     let mut reader = master.try_clone_reader().unwrap();
     let writer = master.take_writer().unwrap();
+    let (accepted, input_receipt) = std::sync::mpsc::channel();
+    let deadline = Instant::now() + Duration::from_secs(15);
     let reading = std::thread::spawn(move || {
         let mut bytes = [0; 256];
         loop {
@@ -1064,14 +1067,17 @@ fn darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins() {
         }
     });
     let writing = std::thread::spawn(move || {
-        use std::io::Write;
         let mut writer = writer;
-        writer.write_all(b"fixture-input\n")
+        write_fixture_input(&mut writer, accepted)
     });
-    publish(&directory.path().join("controller-bound"));
     let mut wait = own_child(child, qualification);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // Confirm the actual master-side write before the silent actor can exit.
+        // The receipt does not claim actor consumption or discharge either join.
+        release_after_input(&input_receipt, deadline, || {
+            publish(&directory.path().join("controller-bound"));
+        })
+        .expect("actual PTY input receipt before actor release");
         loop {
             match wait.poll_exit() {
                 ChildStatus::Reaped { code } => {
@@ -1097,11 +1103,18 @@ fn darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins() {
     drop(master);
     let read_join = reading.join();
     let write_join = writing.join();
+    // Check both original worker outcomes even if the receipt/owner stage failed.
+    let read_check = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_join.expect("actual PTY EOF join");
+    }));
+    let write_check = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        write_join
+            .expect("actual writer join")
+            .expect("actual PTY write");
+    }));
     result.unwrap();
-    read_join.expect("actual PTY EOF join");
-    write_join
-        .expect("actual writer join")
-        .expect("actual PTY write");
+    read_check.unwrap();
+    write_check.unwrap();
 
     eprintln!("darwin223 silent_leader=first descendant_other_pgrp=true process_reap=normal reader_join=actual writer_join=actual rescue=false");
 }

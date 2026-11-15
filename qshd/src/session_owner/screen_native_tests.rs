@@ -666,6 +666,7 @@ async fn screen_body() {
     drop(receiver);
     let receipts = engine.close_session().await.unwrap();
     assert_eq!(receipts.len(), 1);
+    borrowed_scope::diagnostic_screen_receipt(receipts[0].code());
     checkpoint(Check::ScreenWorkerJoin);
     assert!(receipts[0].workers_joined());
     checkpoint(Check::ScreenControlJoin);

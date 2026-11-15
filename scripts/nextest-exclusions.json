@@ -178,6 +178,14 @@
       ],
       "reason": "Requires disposable-root self-exec children with real foreign effective UIDs",
       "owner": "CI container job: run_suite test ssh_known_hosts_authority_privilege"
+    },
+    {
+      "binary": "qshd",
+      "tests": [
+        "endpoint::tests::private_parent_foreign_owner_refused"
+      ],
+      "reason": "Requires disposable root foreign-owner endpoint fixture",
+      "owner": "CI container job: run_suite lib qshd"
     }
   ]
 }
