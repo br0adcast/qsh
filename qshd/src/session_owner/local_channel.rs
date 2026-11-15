@@ -29,6 +29,162 @@ impl From<io::Error> for AdmissionError {
         Self::Unavailable
     }
 }
+
+/// Invocation-owned test evidence; none of these scalars carries admission authority.
+#[cfg(test)]
+pub(super) mod prepare_observation {
+    use super::AdmissionError;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum Site {
+        ProvisionFrontend,
+        ProvisionHost,
+        SplitFrontend,
+        SetupParent,
+        SetupChild,
+        OtherPreparation,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum Check {
+        GetsocknameCall,
+        UnixFamily,
+        SocketTypeCall,
+        SocketTypeLength,
+        StreamType,
+        AcceptConnCall,
+        AcceptConnLength,
+        NotListening,
+        PeerAddressCall,
+        PeerUidCall,
+        AllowedPeer,
+        NonblockingCall,
+        PersonalCurrentIdentity,
+        PersonalPeerUidCall,
+        ExactPersonalPeer,
+        TransferRole,
+        MissingDescriptor,
+        MissingObservation,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum Class {
+        Syscall,
+        Io,
+        Length,
+        Predicate,
+        SyntheticSyscall,
+        SyntheticPredicate,
+        MissingObservation,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) struct Event {
+        pub site: Site,
+        pub check: Check,
+        pub class: Class,
+        pub errno: Option<i32>,
+    }
+    #[derive(Clone, Copy)]
+    pub(in crate::session_owner) enum FaultKind {
+        Syscall,
+        Predicate,
+    }
+    #[derive(Default)]
+    pub(in crate::session_owner) struct Observer {
+        pub first: Option<Event>,
+        pub fault: Option<(Site, FaultKind)>,
+        pub suppressed: bool,
+    }
+    impl Observer {
+        pub fn begin(&mut self) {
+            self.first = None;
+        }
+        pub fn end(&mut self) {
+            self.fault = None;
+        }
+        pub fn record(&mut self, event: Event) {
+            if !self.suppressed {
+                self.first.get_or_insert(event);
+            }
+        }
+        pub fn render(&self, error: AdmissionError) -> String {
+            let event = self.first.unwrap_or(Event {
+                site: Site::OtherPreparation,
+                check: Check::MissingObservation,
+                class: Class::MissingObservation,
+                errno: None,
+            });
+            let line = format!(
+                "launch529_prepare_v1 site={:?} check={:?} class={:?} errno={:?} error={error:?}",
+                event.site, event.check, event.class, event.errno
+            );
+            if line.len() <= 1024 {
+                line
+            } else {
+                "launch529_prepare_v1 detail=Unavailable".into()
+            }
+        }
+    }
+    pub(in crate::session_owner) fn record(
+        observer: Option<&mut Observer>,
+        site: Site,
+        check: Check,
+        class: Class,
+        errno: Option<i32>,
+    ) {
+        if let Some(observer) = observer {
+            observer.record(Event {
+                site,
+                check,
+                class,
+                errno,
+            });
+        }
+    }
+    pub(in crate::session_owner) fn failed(
+        observer: Option<&mut Observer>,
+        site: Site,
+        check: Check,
+        class: Class,
+        errno: Option<i32>,
+        actual_failed: bool,
+    ) -> bool {
+        let Some(observer) = observer else {
+            return actual_failed;
+        };
+        if actual_failed {
+            observer.record(Event {
+                site,
+                check,
+                class,
+                errno,
+            });
+            return true;
+        }
+        let injected = match observer.fault {
+            Some((wanted, FaultKind::Syscall))
+                if wanted == site && check == Check::GetsocknameCall =>
+            {
+                Some((Class::SyntheticSyscall, Some(123)))
+            }
+            Some((wanted, FaultKind::Predicate))
+                if wanted == site && check == Check::UnixFamily =>
+            {
+                Some((Class::SyntheticPredicate, None))
+            }
+            _ => None,
+        };
+        if let Some((class, errno)) = injected {
+            observer.fault = None;
+            observer.record(Event {
+                site,
+                check,
+                class,
+                errno,
+            });
+            return true;
+        }
+        false
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrustedChannelConfig {
     pub host: HostInstance,
@@ -285,6 +441,26 @@ pub(crate) fn provision_pair(
     config: TrustedChannelConfig,
     budget: &AdmissionBudget,
 ) -> Result<(ExpectedAdmission, ExpectedAdmission), AdmissionError> {
+    provision_pair_impl(
+        config,
+        budget,
+        #[cfg(test)]
+        None,
+    )
+}
+#[cfg(test)]
+pub(super) fn provision_pair_observed(
+    config: TrustedChannelConfig,
+    budget: &AdmissionBudget,
+    observer: &mut prepare_observation::Observer,
+) -> Result<(ExpectedAdmission, ExpectedAdmission), AdmissionError> {
+    provision_pair_impl(config, budget, Some(observer))
+}
+fn provision_pair_impl(
+    config: TrustedChannelConfig,
+    budget: &AdmissionBudget,
+    #[cfg(test)] mut observer: Option<&mut prepare_observation::Observer>,
+) -> Result<(ExpectedAdmission, ExpectedAdmission), AdmissionError> {
     let responder = match (config.owner, config.requester) {
         (None, OwnerRole::Frontend) | (Some(_), OwnerRole::Owner) => OwnerRole::Host,
         (Some(_), OwnerRole::Frontend) => OwnerRole::Owner,
@@ -334,8 +510,22 @@ pub(crate) fn provision_pair(
     let a = end(a.into(), 0, config.requester, responder);
     let b = end(b.into(), 1, responder, config.requester);
     // Both kernel credential observations precede any admission bytes.
-    validate_socket(a.custody.fd.as_ref().unwrap(), config)?;
-    validate_socket(b.custody.fd.as_ref().unwrap(), config)?;
+    validate_socket_impl(
+        a.custody.fd.as_ref().unwrap(),
+        config,
+        #[cfg(test)]
+        prepare_observation::Site::ProvisionFrontend,
+        #[cfg(test)]
+        observer.as_deref_mut(),
+    )?;
+    validate_socket_impl(
+        b.custody.fd.as_ref().unwrap(),
+        config,
+        #[cfg(test)]
+        prepare_observation::Site::ProvisionHost,
+        #[cfg(test)]
+        observer,
+    )?;
     Ok((a, b))
 }
 // This borrowing facade never owns the number or closes it. Custody is sole owner.
@@ -343,54 +533,212 @@ fn stream(fd: &OwnedFd) -> ManuallyDrop<UnixStream> {
     ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd.as_raw_fd()) })
 }
 fn validate_socket(fd: &OwnedFd, config: TrustedChannelConfig) -> Result<(), AdmissionError> {
+    validate_socket_impl(
+        fd,
+        config,
+        #[cfg(test)]
+        prepare_observation::Site::OtherPreparation,
+        #[cfg(test)]
+        None,
+    )
+}
+fn socket_option(
+    fd: &OwnedFd,
+    name: i32,
+    #[cfg(test)] site: prepare_observation::Site,
+    #[cfg(test)] observer: Option<&mut prepare_observation::Observer>,
+) -> Result<i32, AdmissionError> {
+    let mut value = 0i32;
+    let mut size = std::mem::size_of_val(&value) as nix::libc::socklen_t;
+    if unsafe {
+        nix::libc::getsockopt(
+            fd.as_raw_fd(),
+            nix::libc::SOL_SOCKET,
+            name,
+            (&mut value as *mut i32).cast(),
+            &mut size,
+        )
+    } != 0
+    {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            if name == nix::libc::SO_TYPE {
+                prepare_observation::Check::SocketTypeCall
+            } else {
+                prepare_observation::Check::AcceptConnCall
+            },
+            prepare_observation::Class::Syscall,
+            io::Error::last_os_error().raw_os_error(),
+        );
+        return Err(AdmissionError::Refused);
+    }
+    if size as usize != std::mem::size_of_val(&value) {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            if name == nix::libc::SO_TYPE {
+                prepare_observation::Check::SocketTypeLength
+            } else {
+                prepare_observation::Check::AcceptConnLength
+            },
+            prepare_observation::Class::Length,
+            None,
+        );
+        return Err(AdmissionError::Refused);
+    }
+    Ok(value)
+}
+fn validate_socket_impl(
+    fd: &OwnedFd,
+    config: TrustedChannelConfig,
+    #[cfg(test)] site: prepare_observation::Site,
+    #[cfg(test)] mut observer: Option<&mut prepare_observation::Observer>,
+) -> Result<(), AdmissionError> {
     use nix::libc;
     let raw = fd.as_raw_fd();
     let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of_val(&addr) as libc::socklen_t;
-    if unsafe {
+    let failed = unsafe {
         libc::getsockname(
             raw,
             (&mut addr as *mut libc::sockaddr_storage).cast(),
             &mut len,
         )
-    } != 0
-        || addr.ss_family as i32 != libc::AF_UNIX
-    {
+    } != 0;
+    #[cfg(test)]
+    let failed = prepare_observation::failed(
+        observer.as_deref_mut(),
+        site,
+        prepare_observation::Check::GetsocknameCall,
+        prepare_observation::Class::Syscall,
+        if failed {
+            io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        },
+        failed,
+    );
+    if failed {
         return Err(AdmissionError::Refused);
     }
-    let option = |name| -> Result<i32, AdmissionError> {
-        let mut value = 0i32;
-        let mut size = std::mem::size_of_val(&value) as libc::socklen_t;
-        if unsafe {
-            libc::getsockopt(
-                raw,
-                libc::SOL_SOCKET,
-                name,
-                (&mut value as *mut i32).cast(),
-                &mut size,
-            )
-        } != 0
-            || size as usize != std::mem::size_of_val(&value)
-        {
-            return Err(AdmissionError::Refused);
-        }
-        Ok(value)
-    };
-    if option(libc::SO_TYPE)? != libc::SOCK_STREAM || option(libc::SO_ACCEPTCONN)? != 0 {
+    let failed = addr.ss_family as i32 != libc::AF_UNIX;
+    #[cfg(test)]
+    let failed = prepare_observation::failed(
+        observer.as_deref_mut(),
+        site,
+        prepare_observation::Check::UnixFamily,
+        prepare_observation::Class::Predicate,
+        None,
+        failed,
+    );
+    if failed {
+        return Err(AdmissionError::Refused);
+    }
+    if socket_option(
+        fd,
+        libc::SO_TYPE,
+        #[cfg(test)]
+        site,
+        #[cfg(test)]
+        observer.as_deref_mut(),
+    )? != libc::SOCK_STREAM
+    {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            prepare_observation::Check::StreamType,
+            prepare_observation::Class::Predicate,
+            None,
+        );
+        return Err(AdmissionError::Refused);
+    }
+    if socket_option(
+        fd,
+        libc::SO_ACCEPTCONN,
+        #[cfg(test)]
+        site,
+        #[cfg(test)]
+        observer.as_deref_mut(),
+    )? != 0
+    {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            prepare_observation::Check::NotListening,
+            prepare_observation::Class::Predicate,
+            None,
+        );
         return Err(AdmissionError::Refused);
     }
     let socket = stream(fd);
-    socket.peer_addr().map_err(|_| AdmissionError::Refused)?;
-    let uid = crate::control::peer_uid(fd).map_err(|_| AdmissionError::Refused)?;
+    if let Err(error) = socket.peer_addr() {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            prepare_observation::Check::PeerAddressCall,
+            prepare_observation::Class::Io,
+            error.raw_os_error(),
+        );
+        drop(error);
+        return Err(AdmissionError::Refused);
+    }
+    let uid = match crate::control::peer_uid(fd) {
+        Ok(uid) => uid,
+        Err(error) => {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                site,
+                prepare_observation::Check::PeerUidCall,
+                prepare_observation::Class::Io,
+                error.raw_os_error(),
+            );
+            drop(error);
+            return Err(AdmissionError::Refused);
+        }
+    };
     let allowed = match config.mode {
         HostMode::Personal { canonical_uid } => uid == canonical_uid || uid == 0,
         HostMode::System => uid == config.system_uid,
     };
     if !allowed {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            prepare_observation::Check::AllowedPeer,
+            prepare_observation::Class::Predicate,
+            None,
+        );
         return Err(AdmissionError::Refused);
     }
-    socket.set_nonblocking(true)?;
+    if let Err(error) = socket.set_nonblocking(true) {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            prepare_observation::Check::NonblockingCall,
+            prepare_observation::Class::Io,
+            error.raw_os_error(),
+        );
+        return Err(error.into());
+    }
     Ok(())
+}
+#[cfg(test)]
+pub(super) fn validate_socket_observed(
+    fd: &OwnedFd,
+    config: TrustedChannelConfig,
+    site: prepare_observation::Site,
+    observer: &mut prepare_observation::Observer,
+) -> Result<(), AdmissionError> {
+    validate_socket_impl(fd, config, site, Some(observer))
 }
 fn before(deadline: Instant) -> Result<(), AdmissionError> {
     if Instant::now() >= deadline {
@@ -696,21 +1044,67 @@ pub(super) mod launch {
         Ok(())
     }
     pub(in crate::session_owner) fn split_frontend(
+        expected: ExpectedAdmission,
+    ) -> Result<(PreparedFrontendEnd, RemoteEndObligation), AdmissionError> {
+        split_frontend_impl(
+            expected,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(test)]
+    pub(in crate::session_owner) fn split_frontend_observed(
+        expected: ExpectedAdmission,
+        observer: &mut prepare_observation::Observer,
+    ) -> Result<(PreparedFrontendEnd, RemoteEndObligation), AdmissionError> {
+        split_frontend_impl(expected, Some(observer))
+    }
+    fn split_frontend_impl(
         mut expected: ExpectedAdmission,
+        #[cfg(test)] mut observer: Option<&mut prepare_observation::Observer>,
     ) -> Result<(PreparedFrontendEnd, RemoteEndObligation), AdmissionError> {
         validate_config(expected.config)?;
         if expected.local != OwnerRole::Frontend || expected.peer != OwnerRole::Host {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                prepare_observation::Site::SplitFrontend,
+                prepare_observation::Check::TransferRole,
+                prepare_observation::Class::Predicate,
+                None,
+            );
             return Err(AdmissionError::Refused);
         }
-        validate_personal_fd(
-            expected
-                .custody
-                .fd
-                .as_ref()
-                .ok_or(AdmissionError::Refused)?,
+        let Some(fd) = expected.custody.fd.as_ref() else {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                prepare_observation::Site::SplitFrontend,
+                prepare_observation::Check::MissingDescriptor,
+                prepare_observation::Class::Predicate,
+                None,
+            );
+            return Err(AdmissionError::Refused);
+        };
+        validate_personal_fd_impl(
+            fd,
             unsafe { libc::geteuid() },
+            #[cfg(test)]
+            prepare_observation::Site::SplitFrontend,
+            #[cfg(test)]
+            observer.as_deref_mut(),
         )?;
-        let fd = expected.custody.fd.take().ok_or(AdmissionError::Refused)?;
+        let Some(fd) = expected.custody.fd.take() else {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                prepare_observation::Site::SplitFrontend,
+                prepare_observation::Check::MissingDescriptor,
+                prepare_observation::Class::Predicate,
+                None,
+            );
+            return Err(AdmissionError::Refused);
+        };
         let ledger = Arc::new(Mutex::new(LocalCloses::default()));
         let prepared = PreparedFrontendEnd {
             fd: LocalFd::track(fd, Arc::clone(&ledger)),
@@ -927,10 +1321,42 @@ pub(super) mod launch {
         fd: &OwnedFd,
         uid: u32,
     ) -> Result<(), AdmissionError> {
+        validate_personal_fd_impl(
+            fd,
+            uid,
+            #[cfg(test)]
+            prepare_observation::Site::OtherPreparation,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(test)]
+    pub(in crate::session_owner) fn validate_personal_fd_observed(
+        fd: &OwnedFd,
+        uid: u32,
+        site: prepare_observation::Site,
+        observer: &mut prepare_observation::Observer,
+    ) -> Result<(), AdmissionError> {
+        validate_personal_fd_impl(fd, uid, site, Some(observer))
+    }
+    fn validate_personal_fd_impl(
+        fd: &OwnedFd,
+        uid: u32,
+        #[cfg(test)] site: prepare_observation::Site,
+        #[cfg(test)] mut observer: Option<&mut prepare_observation::Observer>,
+    ) -> Result<(), AdmissionError> {
         if uid == 0 || uid != unsafe { libc::geteuid() } {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                site,
+                prepare_observation::Check::PersonalCurrentIdentity,
+                prepare_observation::Class::Predicate,
+                None,
+            );
             return Err(AdmissionError::Refused);
         }
-        validate_socket(
+        validate_socket_impl(
             fd,
             TrustedChannelConfig {
                 host: HostInstance::new([1; 16]).unwrap(),
@@ -941,8 +1367,34 @@ pub(super) mod launch {
                 min_version: 1,
                 max_version: 1,
             },
+            #[cfg(test)]
+            site,
+            #[cfg(test)]
+            observer.as_deref_mut(),
         )?;
-        if crate::control::peer_uid(fd)? != uid {
+        let peer = match crate::control::peer_uid(fd) {
+            Ok(peer) => peer,
+            Err(error) => {
+                #[cfg(test)]
+                prepare_observation::record(
+                    observer,
+                    site,
+                    prepare_observation::Check::PersonalPeerUidCall,
+                    prepare_observation::Class::Io,
+                    error.raw_os_error(),
+                );
+                return Err(error.into());
+            }
+        };
+        if peer != uid {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                site,
+                prepare_observation::Check::ExactPersonalPeer,
+                prepare_observation::Class::Predicate,
+                None,
+            );
             return Err(AdmissionError::Refused);
         }
         Ok(())

@@ -152,6 +152,7 @@ fn launch529_frontend_transfer_cannot_restore_host_or_owner() {
 #[test]
 #[ignore = "ordinary nonroot owned-FD fixture; explicitly selected in maintained CI"]
 fn launch529_transferred_end_stays_charged() {
+    prepare_observation_sites();
     let budget = AdmissionBudget::new(1).unwrap();
     let (frontend, host) = local_channel::provision_pair(config(), &budget).unwrap();
     let (prepared, remote) = local_channel::launch::split_frontend(frontend).unwrap();
@@ -283,7 +284,10 @@ fn launch529_cancel_before_and_after_start_wins_late_admission() {
     let mut launches = super::FrontendLaunches::new(1).unwrap();
     let handle = launches
         .prepare(config(), Instant::now() + Duration::from_secs(1))
-        .unwrap();
+        .unwrap_or_else(|error| {
+            eprintln!("{}", launches.prepare_observer.render(error));
+            panic!("preparation failed: {error:?}");
+        });
     launches.cancel(&handle);
     assert!(
         !launches.test_publish(&handle),
@@ -957,4 +961,194 @@ fn reset_uncertainties_stay_charged() {
         let c = capsule.lock().unwrap();
         assert!(c.eof && c.unknown && !c.kill_attempted && c.status.is_none());
     }
+}
+
+#[test]
+fn launch529_prepare_observation_records_real_socket_refusal() {
+    use local_channel::prepare_observation::{Check, Class, Event, Observer, Site};
+    let file: std::os::fd::OwnedFd = tempfile::tempfile().unwrap().into();
+    let mut observed = Observer::default();
+    assert_eq!(
+        local_channel::validate_socket_observed(
+            &file,
+            config(),
+            Site::ProvisionFrontend,
+            &mut observed,
+        ),
+        Err(local_channel::AdmissionError::Refused)
+    );
+    assert_eq!(
+        observed.first,
+        Some(Event {
+            site: Site::ProvisionFrontend,
+            check: Check::GetsocknameCall,
+            class: Class::Syscall,
+            errno: Some(nix::libc::ENOTSOCK),
+        }),
+        "the actual failing socket call must carry its own errno"
+    );
+    let mut absent = Observer {
+        suppressed: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        local_channel::validate_socket_observed(
+            &file,
+            config(),
+            Site::ProvisionFrontend,
+            &mut absent,
+        ),
+        Err(local_channel::AdmissionError::Refused)
+    );
+    assert!(absent.first.is_none());
+    // The validator borrowed the real object and acquired no additional ownership.
+    let file = std::fs::File::from(file);
+    assert!(file.metadata().unwrap().is_file());
+}
+
+#[test]
+fn launch529_prepare_observation_is_first_and_invocation_owned() {
+    use local_channel::prepare_observation::{Observer, Site};
+    let file: std::os::fd::OwnedFd = tempfile::tempfile().unwrap().into();
+    let mut a = Observer::default();
+    let mut b = Observer::default();
+    for site in [Site::ProvisionFrontend, Site::ProvisionHost] {
+        assert_eq!(
+            local_channel::validate_socket_observed(&file, config(), site, &mut a),
+            Err(local_channel::AdmissionError::Refused)
+        );
+        assert_eq!(a.first.unwrap().site, Site::ProvisionFrontend);
+        assert!(
+            b.first.is_none(),
+            "a distinct invocation has no shared cache"
+        );
+    }
+    assert_eq!(
+        local_channel::validate_socket_observed(&file, config(), Site::SetupChild, &mut b),
+        Err(local_channel::AdmissionError::Refused)
+    );
+    assert_eq!(b.first.unwrap().site, Site::SetupChild);
+    assert_eq!(a.first.unwrap().site, Site::ProvisionFrontend);
+    a.begin();
+    assert!(a.first.is_none());
+    assert_eq!(
+        local_channel::validate_socket_observed(&file, config(), Site::SetupParent, &mut a),
+        Err(local_channel::AdmissionError::Refused)
+    );
+    assert_eq!(a.first.unwrap().site, Site::SetupParent);
+    assert_eq!(b.first.unwrap().site, Site::SetupChild);
+}
+
+#[test]
+fn launch529_prepare_observation_is_closed_and_bounded() {
+    use local_channel::prepare_observation::{Check, Class, Event, Observer, Site};
+    for errno in [None, Some(0), Some(i32::MIN), Some(i32::MAX)] {
+        for error in [
+            local_channel::AdmissionError::InvalidConfig,
+            local_channel::AdmissionError::Capacity,
+            local_channel::AdmissionError::Unavailable,
+            local_channel::AdmissionError::Refused,
+            local_channel::AdmissionError::Deadline,
+        ] {
+            let mut observer = Observer::default();
+            observer.record(Event {
+                site: Site::ProvisionFrontend,
+                check: Check::GetsocknameCall,
+                class: Class::SyntheticSyscall,
+                errno,
+            });
+            let before = observer.first;
+            let line = observer.render(error);
+            assert!(line.len() <= 1024);
+            assert!(line.contains(&format!("errno={errno:?}")));
+            assert!(line.contains(&format!("error={error:?}")));
+            assert_eq!(observer.first, before);
+            for forbidden in ["uid=", "gid=", "pid=", "fd=", "path=", "nonce=", "payload="] {
+                assert!(!line.contains(forbidden));
+            }
+        }
+    }
+    let missing = Observer::default().render(local_channel::AdmissionError::Refused);
+    assert!(missing.contains("check=MissingObservation"));
+    assert!(missing.contains("errno=None"));
+}
+
+// Only one actual socket-validation result is faulted. No OS child is created.
+fn prepare_observation_sites() {
+    use local_channel::prepare_observation::{Check, Class, FaultKind, Site};
+    for site in [
+        Site::ProvisionFrontend,
+        Site::ProvisionHost,
+        Site::SplitFrontend,
+        Site::SetupParent,
+        Site::SetupChild,
+    ] {
+        for kind in [FaultKind::Syscall, FaultKind::Predicate] {
+            for suppressed in [false, true] {
+                let mut launches = super::FrontendLaunches::new(1).unwrap();
+                launches.prepare_observer.fault = Some((site, kind));
+                launches.prepare_observer.suppressed = suppressed;
+                let result = launches.prepare(config(), Instant::now() + Duration::from_secs(60));
+                let error = match result {
+                    Err(error) => error,
+                    Ok(handle) => {
+                        launches.cancel(&handle);
+                        assert_eq!(launches.poll(&handle), super::LaunchProgress::Settled);
+                        panic!("faulted validation must preserve the refusal result");
+                    }
+                };
+                assert_eq!(error, local_channel::AdmissionError::Refused);
+                assert_eq!(launches.in_use(), 0);
+                assert_eq!(launches.budget.in_use(), 0);
+                assert!(launches.prepare_observer.fault.is_none());
+                if suppressed {
+                    assert!(launches.prepare_observer.first.is_none());
+                } else {
+                    let event = launches.prepare_observer.first.unwrap();
+                    assert_eq!(event.site, site);
+                    match kind {
+                        FaultKind::Syscall => {
+                            assert_eq!(event.check, Check::GetsocknameCall);
+                            assert_eq!(event.class, Class::SyntheticSyscall);
+                            assert_eq!(event.errno, Some(123));
+                        }
+                        FaultKind::Predicate => {
+                            assert_eq!(event.check, Check::UnixFamily);
+                            assert_eq!(event.class, Class::SyntheticPredicate);
+                            assert_eq!(event.errno, None);
+                        }
+                    }
+                }
+                let handle = launches
+                    .prepare(config(), Instant::now() + Duration::from_secs(60))
+                    .unwrap();
+                assert!(
+                    launches.prepare_observer.first.is_none(),
+                    "success resets detail"
+                );
+                assert_eq!(launches.in_use(), 1);
+                assert_eq!(launches.budget.in_use(), 1);
+                launches.cancel(&handle);
+                assert_eq!(launches.poll(&handle), super::LaunchProgress::Settled);
+                assert_eq!(launches.budget.in_use(), 0);
+            }
+        }
+    }
+    let mut launches = super::FrontendLaunches::new(1).unwrap();
+    launches.prepare_observer.fault = Some((Site::ProvisionFrontend, FaultKind::Syscall));
+    assert!(matches!(
+        launches.prepare(config(), Instant::now()),
+        Err(local_channel::AdmissionError::Deadline)
+    ));
+    assert!(launches.prepare_observer.first.is_none());
+    assert!(
+        launches.prepare_observer.fault.is_none(),
+        "unused faults end with the invocation"
+    );
+    let handle = launches
+        .prepare(config(), Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    assert!(launches.prepare_observer.first.is_none());
+    launches.cancel(&handle);
+    assert_eq!(launches.poll(&handle), super::LaunchProgress::Settled);
 }

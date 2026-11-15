@@ -342,6 +342,8 @@ pub(crate) struct FrontendLaunches {
     setup_failure_after_allocation: bool,
     #[cfg(test)]
     uncertain_preparation_close: bool,
+    #[cfg(test)]
+    prepare_observer: local_channel::prepare_observation::Observer,
 }
 impl FrontendLaunches {
     pub(crate) fn new(limit: usize) -> Result<Self, AdmissionError> {
@@ -368,6 +370,8 @@ impl FrontendLaunches {
             setup_failure_after_allocation: false,
             #[cfg(test)]
             uncertain_preparation_close: false,
+            #[cfg(test)]
+            prepare_observer: Default::default(),
         })
     }
     fn find(&self, handle: &LaunchHandle) -> Option<Arc<Mutex<Capsule>>> {
@@ -391,6 +395,18 @@ impl FrontendLaunches {
             .count()
     }
     pub(crate) fn prepare(
+        &mut self,
+        config: TrustedChannelConfig,
+        deadline: Instant,
+    ) -> Result<LaunchHandle, AdmissionError> {
+        #[cfg(test)]
+        self.prepare_observer.begin();
+        let result = self.prepare_inner(config, deadline);
+        #[cfg(test)]
+        self.prepare_observer.end();
+        result
+    }
+    fn prepare_inner(
         &mut self,
         config: TrustedChannelConfig,
         deadline: Instant,
@@ -450,9 +466,20 @@ impl FrontendLaunches {
         self.slots.push(Arc::clone(&capsule));
         let mut c = capsule.lock().map_err(|_| AdmissionError::Unavailable)?;
         let result = (|| {
+            #[cfg(not(test))]
             let (frontend, host) = local_channel::provision_pair(config, &self.budget)?;
+            #[cfg(test)]
+            let (frontend, host) = local_channel::provision_pair_observed(
+                config,
+                &self.budget,
+                &mut self.prepare_observer,
+            )?;
             c.host = Some(host);
+            #[cfg(not(test))]
             let (frontend, remote) = launch::split_frontend(frontend)?;
+            #[cfg(test)]
+            let (frontend, remote) =
+                launch::split_frontend_observed(frontend, &mut self.prepare_observer)?;
             c.remote = Some(remote);
             c.record = frontend.setup(c.deadline.absolute()).encode();
             c.frontend = Some(frontend);
@@ -469,12 +496,28 @@ impl FrontendLaunches {
             let remote = c.remote.as_ref().ok_or(AdmissionError::Refused)?;
             c.setup = Some(remote.track(parent.into()));
             c.setup_child = Some(c.remote.as_ref().unwrap().track(child.into()));
+            #[cfg(not(test))]
             launch::validate_personal_fd(c.setup.as_ref().unwrap().fd()?, unsafe {
                 libc::geteuid()
             })?;
+            #[cfg(test)]
+            launch::validate_personal_fd_observed(
+                c.setup.as_ref().unwrap().fd()?,
+                unsafe { libc::geteuid() },
+                local_channel::prepare_observation::Site::SetupParent,
+                &mut self.prepare_observer,
+            )?;
+            #[cfg(not(test))]
             launch::validate_personal_fd(c.setup_child.as_ref().unwrap().fd()?, unsafe {
                 libc::geteuid()
             })?;
+            #[cfg(test)]
+            launch::validate_personal_fd_observed(
+                c.setup_child.as_ref().unwrap().fd()?,
+                unsafe { libc::geteuid() },
+                local_channel::prepare_observation::Site::SetupChild,
+                &mut self.prepare_observer,
+            )?;
             #[cfg(test)]
             if self.setup_failure_after_allocation {
                 c.interrupt_setup_read = true;
