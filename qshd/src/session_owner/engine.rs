@@ -182,6 +182,9 @@ pub struct SessionOwnerEngine {
     executor: ChannelOpenExecutor,
     session: Arc<SessionOpenLedger>,
     retained: RetainedChannelSet,
+    /// Exact-reaper receipts already consumed by an unfinished close. They
+    /// outlive a cancelled or failed close future until one close returns them.
+    close_receipts: Vec<RetainedCleanup>,
     channels: BTreeMap<u8, OwnedChannel>,
     restart: tokio::sync::watch::Receiver<RestartSignal>,
     input_budget: SessionInputBudget,
@@ -221,6 +224,7 @@ impl SessionOwnerEngine {
             executor: ChannelOpenExecutor::new(spawner, registry.clone()),
             session,
             retained: RetainedChannelSet::new(registry),
+            close_receipts: Vec::new(),
             channels: BTreeMap::new(),
             restart,
             input_budget: SessionInputBudget::new(),
@@ -1577,6 +1581,10 @@ impl SessionOwnerEngine {
         Ok(())
     }
     /// Host-authorized explicit close. EOF/Drop of an attachment never calls it.
+    ///
+    /// Cancel-safe: receipts consumed from the exact reaper are kept by the
+    /// engine, so a retry after a cancelled or failed close returns each
+    /// cleanup exactly once, on the close that finally succeeds.
     pub async fn close_session(&mut self) -> Result<Vec<RetainedCleanup>, EngineError> {
         {
             let mut leases = self.leases.lock().map_err(|_| EngineError::Unavailable)?;
@@ -1614,9 +1622,12 @@ impl SessionOwnerEngine {
                 self.control_failed = true;
             }
         }
-        let mut completed = Vec::new();
+        // Capacity is reserved before waiting, so storing a consumed receipt
+        // cannot fail between the reaper handing it over and the next await.
+        self.close_receipts.reserve(self.retained.channels());
         while self.retained.channels() != 0 {
-            completed.push(self.retained.next_cleanup().await);
+            let done = self.retained.next_cleanup().await;
+            self.close_receipts.push(done);
         }
         self.retained
             .join_workers()
@@ -1657,7 +1668,7 @@ impl SessionOwnerEngine {
         if self.control_failed {
             return Err(EngineError::CleanupPending);
         }
-        Ok(completed)
+        Ok(std::mem::take(&mut self.close_receipts))
     }
 }
 impl Drop for SessionOwnerEngine {
