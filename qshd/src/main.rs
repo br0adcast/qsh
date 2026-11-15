@@ -183,6 +183,14 @@ fn main() -> Result<()> {
             "service staging options require checked transport-ensure"
         );
     }
+    // The inherited frontend must not consume or forward replacement custody.
+    // Service-stage refusal above remains ahead of every private entry.
+    if args.first().map(OsString::as_os_str) == Some(OsStr::new("__qshd-frontend-admission-v1")) {
+        std::env::remove_var(handover::HANDOVER_FD_ENV);
+        if let Some(result) = qshd::frontend_admission_entry(&args) {
+            return result.map_err(Into::into);
+        }
+    }
     #[cfg(target_os = "macos")]
     if let Some(result) = qshd::darwin_keeper_entry(&args) {
         return result.map_err(Into::into);
