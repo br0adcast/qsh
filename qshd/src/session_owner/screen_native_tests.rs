@@ -50,6 +50,7 @@ fn native_screen_child() {
     let mut command = Vec::new();
     let mut reply = Vec::new();
     let mut replies = 0;
+    let mut finish_ready = false;
     loop {
         let mut byte = [0];
         match input.read(&mut byte) {
@@ -122,7 +123,17 @@ fn native_screen_child() {
                     "\r\nSIZE529 cols={} rows={} replies={replies}\r",
                     size.ws_col, size.ws_row
                 );
+                assert_eq!((size.ws_col, size.ws_row, replies), (100, 30, 1));
+                finish_ready = true;
                 child_identity(3, &tty);
+            }
+            b"FINISH529" => {
+                assert!(finish_ready && reply.is_empty());
+                assert_eq!(
+                    replies, 1,
+                    "finish requires exactly one completed query reply"
+                );
+                break;
             }
             _ => panic!("unexpected bounded fixture command"),
         }
@@ -444,9 +455,12 @@ async fn screen_body() {
             owner_models: 0,
         },
     ));
+    let leader_observer =
+        crate::channel_backend::fixture_leader_observation::FixtureLeaderObserver::new(16);
     let spawner = Arc::new(
         crate::channel_backend::PtyChannelSpawner::new(ordinary)
-            .with_retained_screens(factory.clone()),
+            .with_retained_screens(factory.clone())
+            .with_fixture_leader_observer(leader_observer.clone()),
     );
     let (_, restart) = tokio::sync::watch::channel(RestartSignal::IDLE);
     let scope = ControlTaskScope::new(tokio::runtime::Handle::current());
@@ -663,9 +677,25 @@ async fn screen_body() {
     note(&format!("screen529 owner={} child={} parent={} tty={} kernel_tty={} group={} session={} start={} output_start={start} output_end={end} epochs=1,2 raw_history_gap=1 query_responses=1 native_resize=100x30 canonical_equal=1 continuation_equal=1 tail_range_retries={}",std::process::id(),identity.child,identity.parent,identity.tty,identity.kernel_tty,identity.group,identity.session,identity.start,TAIL_RETRIES.load(std::sync::atomic::Ordering::Relaxed)));
     phase(Phase::ScreenCleanup);
     checkpoint(Check::ScreenReceipts);
+    let finish = b"FINISH529\n";
+    let finish_offset = position.accepted;
+    engine
+        .user_input(&second, channel, epoch, finish_offset, finish)
+        .unwrap()
+        .accepted()
+        .await
+        .unwrap();
+    wait_committed(&engine, channel, finish_offset + finish.len() as u64).await;
+    leader_observer
+        .wait_for_terminal(Instant::now() + Duration::from_secs(10))
+        .await
+        .expect("owned Screen leader must voluntarily exit zero before close");
+    note("screen601 terminal_zero_before_close=1 prior_kill=0 prior_cleanup=0");
     drop(receiver);
     let receipts = engine.close_session().await.unwrap();
     assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].stream(), 16);
+    assert_eq!(receipts[0].instance(), channel);
     borrowed_scope::diagnostic_screen_receipt(receipts[0].code());
     checkpoint(Check::ScreenWorkerJoin);
     assert!(receipts[0].workers_joined());
