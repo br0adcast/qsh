@@ -29,6 +29,177 @@ impl From<io::Error> for AdmissionError {
         Self::Unavailable
     }
 }
+
+/// Invocation-owned test evidence; none of these scalars carries admission authority.
+#[cfg(test)]
+pub(super) mod prepare_observation {
+    use super::AdmissionError;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum Site {
+        ProvisionFrontend,
+        ProvisionHost,
+        SplitFrontend,
+        SetupParent,
+        SetupChild,
+        OtherPreparation,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum Check {
+        GetsocknameCall,
+        UnixFamily,
+        SocketTypeCall,
+        SocketTypeLength,
+        StreamType,
+        AcceptConnCall,
+        AcceptConnLength,
+        NotListening,
+        PeerAddressCall,
+        PeerUidCall,
+        AllowedPeer,
+        NonblockingCall,
+        PersonalCurrentIdentity,
+        PersonalPeerUidCall,
+        ExactPersonalPeer,
+        TransferRole,
+        MissingDescriptor,
+        MissingObservation,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum Class {
+        Syscall,
+        Io,
+        Length,
+        Predicate,
+        SyntheticSyscall,
+        SyntheticPredicate,
+        MissingObservation,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) struct Event {
+        pub site: Site,
+        pub check: Check,
+        pub class: Class,
+        pub errno: Option<i32>,
+    }
+    #[derive(Clone, Copy)]
+    pub(in crate::session_owner) enum FaultKind {
+        Syscall,
+        Predicate,
+    }
+    #[derive(Clone, Copy)]
+    pub(in crate::session_owner) enum AcceptFault {
+        Errno(i32),
+        Length,
+        Listening,
+    }
+    #[derive(Default)]
+    pub(in crate::session_owner) struct SocketProbe {
+        pub accept_fault: Option<AcceptFault>,
+        pub peer_error: Option<i32>,
+        pub accept_calls: usize,
+        pub peer_calls: usize,
+        pub uid_calls: usize,
+    }
+    #[derive(Default)]
+    pub(in crate::session_owner) struct Observer {
+        pub first: Option<Event>,
+        pub fault: Option<(Site, FaultKind)>,
+        pub suppressed: bool,
+        pub(in crate::session_owner) socket_probe: SocketProbe,
+    }
+    impl Observer {
+        pub fn begin(&mut self) {
+            self.first = None;
+        }
+        pub fn end(&mut self) {
+            self.fault = None;
+        }
+        pub fn record(&mut self, event: Event) {
+            if !self.suppressed {
+                self.first.get_or_insert(event);
+            }
+        }
+        pub fn render(&self, error: AdmissionError) -> String {
+            let event = self.first.unwrap_or(Event {
+                site: Site::OtherPreparation,
+                check: Check::MissingObservation,
+                class: Class::MissingObservation,
+                errno: None,
+            });
+            let line = format!(
+                "launch529_prepare_v1 site={:?} check={:?} class={:?} errno={:?} error={error:?}",
+                event.site, event.check, event.class, event.errno
+            );
+            if line.len() <= 1024 {
+                line
+            } else {
+                "launch529_prepare_v1 detail=Unavailable".into()
+            }
+        }
+    }
+    pub(in crate::session_owner) fn record(
+        observer: Option<&mut Observer>,
+        site: Site,
+        check: Check,
+        class: Class,
+        errno: Option<i32>,
+    ) {
+        if let Some(observer) = observer {
+            observer.record(Event {
+                site,
+                check,
+                class,
+                errno,
+            });
+        }
+    }
+    pub(in crate::session_owner) fn failed(
+        observer: Option<&mut Observer>,
+        site: Site,
+        check: Check,
+        class: Class,
+        errno: Option<i32>,
+        actual_failed: bool,
+    ) -> bool {
+        let Some(observer) = observer else {
+            return actual_failed;
+        };
+        if actual_failed {
+            observer.record(Event {
+                site,
+                check,
+                class,
+                errno,
+            });
+            return true;
+        }
+        let injected = match observer.fault {
+            Some((wanted, FaultKind::Syscall))
+                if wanted == site && check == Check::GetsocknameCall =>
+            {
+                Some((Class::SyntheticSyscall, Some(123)))
+            }
+            Some((wanted, FaultKind::Predicate))
+                if wanted == site && check == Check::UnixFamily =>
+            {
+                Some((Class::SyntheticPredicate, None))
+            }
+            _ => None,
+        };
+        if let Some((class, errno)) = injected {
+            observer.fault = None;
+            observer.record(Event {
+                site,
+                check,
+                class,
+                errno,
+            });
+            return true;
+        }
+        false
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrustedChannelConfig {
     pub host: HostInstance,
@@ -288,6 +459,26 @@ pub(crate) fn provision_pair(
     config: TrustedChannelConfig,
     budget: &AdmissionBudget,
 ) -> Result<(ExpectedAdmission, ExpectedAdmission), AdmissionError> {
+    provision_pair_impl(
+        config,
+        budget,
+        #[cfg(test)]
+        None,
+    )
+}
+#[cfg(test)]
+pub(super) fn provision_pair_observed(
+    config: TrustedChannelConfig,
+    budget: &AdmissionBudget,
+    observer: &mut prepare_observation::Observer,
+) -> Result<(ExpectedAdmission, ExpectedAdmission), AdmissionError> {
+    provision_pair_impl(config, budget, Some(observer))
+}
+fn provision_pair_impl(
+    config: TrustedChannelConfig,
+    budget: &AdmissionBudget,
+    #[cfg(test)] mut observer: Option<&mut prepare_observation::Observer>,
+) -> Result<(ExpectedAdmission, ExpectedAdmission), AdmissionError> {
     let responder = match (config.owner, config.requester) {
         (None, OwnerRole::Frontend) | (Some(_), OwnerRole::Owner) => OwnerRole::Host,
         (Some(_), OwnerRole::Frontend) => OwnerRole::Owner,
@@ -337,8 +528,22 @@ pub(crate) fn provision_pair(
     let a = end(a.into(), 0, config.requester, responder);
     let b = end(b.into(), 1, responder, config.requester);
     // Both kernel credential observations precede any admission bytes.
-    validate_socket(a.custody.fd.as_ref().unwrap(), config)?;
-    validate_socket(b.custody.fd.as_ref().unwrap(), config)?;
+    validate_socket_impl(
+        a.custody.fd.as_ref().unwrap(),
+        config,
+        #[cfg(test)]
+        prepare_observation::Site::ProvisionFrontend,
+        #[cfg(test)]
+        observer.as_deref_mut(),
+    )?;
+    validate_socket_impl(
+        b.custody.fd.as_ref().unwrap(),
+        config,
+        #[cfg(test)]
+        prepare_observation::Site::ProvisionHost,
+        #[cfg(test)]
+        observer,
+    )?;
     Ok((a, b))
 }
 // This borrowing facade never owns the number or closes it. Custody is sole owner.
@@ -346,54 +551,307 @@ fn stream(fd: &OwnedFd) -> ManuallyDrop<UnixStream> {
     ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd.as_raw_fd()) })
 }
 fn validate_socket(fd: &OwnedFd, config: TrustedChannelConfig) -> Result<(), AdmissionError> {
+    validate_socket_impl(
+        fd,
+        config,
+        #[cfg(test)]
+        prepare_observation::Site::OtherPreparation,
+        #[cfg(test)]
+        None,
+    )
+}
+fn socket_option(
+    fd: &OwnedFd,
+    name: i32,
+    #[cfg(test)] site: prepare_observation::Site,
+    #[cfg(test)] observer: Option<&mut prepare_observation::Observer>,
+) -> Result<i32, AdmissionError> {
+    let mut value = 0i32;
+    let mut size = std::mem::size_of_val(&value) as nix::libc::socklen_t;
+    #[cfg(test)]
+    let mut observer = observer;
+    #[cfg(test)]
+    let injected = if name == nix::libc::SO_ACCEPTCONN {
+        observer.as_deref_mut().and_then(|observer| {
+            observer.socket_probe.accept_calls += 1;
+            observer.socket_probe.accept_fault
+        })
+    } else {
+        None
+    };
+    let get_option = |value: &mut i32, size: &mut nix::libc::socklen_t| unsafe {
+        nix::libc::getsockopt(
+            fd.as_raw_fd(),
+            nix::libc::SOL_SOCKET,
+            name,
+            (value as *mut i32).cast(),
+            size,
+        )
+    };
+    #[cfg(not(test))]
+    let result = get_option(&mut value, &mut size);
+    #[cfg(test)]
+    let result = match injected {
+        Some(prepare_observation::AcceptFault::Errno(_)) => -1,
+        Some(prepare_observation::AcceptFault::Length) => {
+            size = 0;
+            0
+        }
+        Some(prepare_observation::AcceptFault::Listening) => {
+            value = 1;
+            0
+        }
+        None => get_option(&mut value, &mut size),
+    };
+    if result != 0 {
+        #[cfg(test)]
+        {
+            let (class, errno) = match injected {
+                Some(prepare_observation::AcceptFault::Errno(errno)) => {
+                    (prepare_observation::Class::SyntheticSyscall, Some(errno))
+                }
+                _ => (
+                    prepare_observation::Class::Syscall,
+                    io::Error::last_os_error().raw_os_error(),
+                ),
+            };
+            prepare_observation::record(
+                observer,
+                site,
+                if name == nix::libc::SO_TYPE {
+                    prepare_observation::Check::SocketTypeCall
+                } else {
+                    prepare_observation::Check::AcceptConnCall
+                },
+                class,
+                errno,
+            );
+        }
+        return Err(AdmissionError::Refused);
+    }
+    if size as usize != std::mem::size_of_val(&value) {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            if name == nix::libc::SO_TYPE {
+                prepare_observation::Check::SocketTypeLength
+            } else {
+                prepare_observation::Check::AcceptConnLength
+            },
+            if injected.is_some() {
+                prepare_observation::Class::SyntheticPredicate
+            } else {
+                prepare_observation::Class::Length
+            },
+            None,
+        );
+        return Err(AdmissionError::Refused);
+    }
+    Ok(value)
+}
+enum ConnectedProof {
+    AcceptOption,
+    PeerAddress,
+}
+const CONNECTED_PROOF: ConnectedProof = if cfg!(target_os = "macos") {
+    ConnectedProof::PeerAddress
+} else {
+    ConnectedProof::AcceptOption
+};
+fn validate_socket_impl(
+    fd: &OwnedFd,
+    config: TrustedChannelConfig,
+    #[cfg(test)] site: prepare_observation::Site,
+    #[cfg(test)] observer: Option<&mut prepare_observation::Observer>,
+) -> Result<(), AdmissionError> {
+    validate_socket_with_proof(
+        fd,
+        config,
+        CONNECTED_PROOF,
+        #[cfg(test)]
+        site,
+        #[cfg(test)]
+        observer,
+    )
+}
+fn validate_socket_with_proof(
+    fd: &OwnedFd,
+    config: TrustedChannelConfig,
+    proof: ConnectedProof,
+    #[cfg(test)] site: prepare_observation::Site,
+    #[cfg(test)] mut observer: Option<&mut prepare_observation::Observer>,
+) -> Result<(), AdmissionError> {
     use nix::libc;
     let raw = fd.as_raw_fd();
     let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of_val(&addr) as libc::socklen_t;
-    if unsafe {
+    let failed = unsafe {
         libc::getsockname(
             raw,
             (&mut addr as *mut libc::sockaddr_storage).cast(),
             &mut len,
         )
-    } != 0
-        || addr.ss_family as i32 != libc::AF_UNIX
-    {
+    } != 0;
+    #[cfg(test)]
+    let failed = prepare_observation::failed(
+        observer.as_deref_mut(),
+        site,
+        prepare_observation::Check::GetsocknameCall,
+        prepare_observation::Class::Syscall,
+        if failed {
+            io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        },
+        failed,
+    );
+    if failed {
         return Err(AdmissionError::Refused);
     }
-    let option = |name| -> Result<i32, AdmissionError> {
-        let mut value = 0i32;
-        let mut size = std::mem::size_of_val(&value) as libc::socklen_t;
-        if unsafe {
-            libc::getsockopt(
-                raw,
-                libc::SOL_SOCKET,
-                name,
-                (&mut value as *mut i32).cast(),
-                &mut size,
-            )
-        } != 0
-            || size as usize != std::mem::size_of_val(&value)
-        {
-            return Err(AdmissionError::Refused);
-        }
-        Ok(value)
-    };
-    if option(libc::SO_TYPE)? != libc::SOCK_STREAM || option(libc::SO_ACCEPTCONN)? != 0 {
+    let failed = addr.ss_family as i32 != libc::AF_UNIX;
+    #[cfg(test)]
+    let failed = prepare_observation::failed(
+        observer.as_deref_mut(),
+        site,
+        prepare_observation::Check::UnixFamily,
+        prepare_observation::Class::Predicate,
+        None,
+        failed,
+    );
+    if failed {
+        return Err(AdmissionError::Refused);
+    }
+    if socket_option(
+        fd,
+        libc::SO_TYPE,
+        #[cfg(test)]
+        site,
+        #[cfg(test)]
+        observer.as_deref_mut(),
+    )? != libc::SOCK_STREAM
+    {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            prepare_observation::Check::StreamType,
+            prepare_observation::Class::Predicate,
+            None,
+        );
+        return Err(AdmissionError::Refused);
+    }
+    // macOS proves connected/non-listening through mandatory getpeername below.
+    // XNU solisten rejects connected sockets; soconnectlock rejects listeners:
+    // https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/uipc_socket.c
+    if matches!(proof, ConnectedProof::AcceptOption)
+        && socket_option(
+            fd,
+            libc::SO_ACCEPTCONN,
+            #[cfg(test)]
+            site,
+            #[cfg(test)]
+            observer.as_deref_mut(),
+        )? != 0
+    {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            prepare_observation::Check::NotListening,
+            prepare_observation::Class::Predicate,
+            None,
+        );
         return Err(AdmissionError::Refused);
     }
     let socket = stream(fd);
-    socket.peer_addr().map_err(|_| AdmissionError::Refused)?;
-    let uid = crate::control::peer_uid(fd).map_err(|_| AdmissionError::Refused)?;
+    let peer = socket.peer_addr();
+    #[cfg(test)]
+    let peer = if let Some(value) = observer.as_deref_mut() {
+        value.socket_probe.peer_calls += 1;
+        match value.socket_probe.peer_error {
+            Some(errno) => Err(io::Error::from_raw_os_error(errno)),
+            None => peer,
+        }
+    } else {
+        peer
+    };
+    #[cfg(test)]
+    let peer_class = if observer
+        .as_ref()
+        .is_some_and(|value| value.socket_probe.peer_error.is_some())
+    {
+        prepare_observation::Class::SyntheticSyscall
+    } else {
+        prepare_observation::Class::Io
+    };
+    if let Err(error) = peer {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            prepare_observation::Check::PeerAddressCall,
+            peer_class,
+            error.raw_os_error(),
+        );
+        drop(error);
+        return Err(AdmissionError::Refused);
+    }
+    #[cfg(test)]
+    if let Some(value) = observer.as_deref_mut() {
+        value.socket_probe.uid_calls += 1;
+    }
+    let uid = match crate::control::peer_uid(fd) {
+        Ok(uid) => uid,
+        Err(error) => {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                site,
+                prepare_observation::Check::PeerUidCall,
+                prepare_observation::Class::Io,
+                error.raw_os_error(),
+            );
+            drop(error);
+            return Err(AdmissionError::Refused);
+        }
+    };
     let allowed = match config.mode {
         HostMode::Personal { canonical_uid } => uid == canonical_uid || uid == 0,
         HostMode::System => uid == config.system_uid,
     };
     if !allowed {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            prepare_observation::Check::AllowedPeer,
+            prepare_observation::Class::Predicate,
+            None,
+        );
         return Err(AdmissionError::Refused);
     }
-    socket.set_nonblocking(true)?;
+    if let Err(error) = socket.set_nonblocking(true) {
+        #[cfg(test)]
+        prepare_observation::record(
+            observer,
+            site,
+            prepare_observation::Check::NonblockingCall,
+            prepare_observation::Class::Io,
+            error.raw_os_error(),
+        );
+        return Err(error.into());
+    }
     Ok(())
+}
+#[cfg(test)]
+pub(super) fn validate_socket_observed(
+    fd: &OwnedFd,
+    config: TrustedChannelConfig,
+    site: prepare_observation::Site,
+    observer: &mut prepare_observation::Observer,
+) -> Result<(), AdmissionError> {
+    validate_socket_impl(fd, config, site, Some(observer))
 }
 fn before(deadline: Instant) -> Result<(), AdmissionError> {
     if Instant::now() >= deadline {
@@ -599,3 +1057,555 @@ pub(crate) fn admit_channel(
 #[cfg(test)]
 #[path = "local_channel_tests.rs"]
 pub(super) mod tests;
+
+/// Sealed launch-only transfer. The host expectation remains with its parent.
+pub(super) mod launch {
+    use super::*;
+    use crate::session_owner::inherited_launch::record::SetupRecord;
+    use nix::libc;
+
+    #[derive(Default, Debug)]
+    struct LocalCloses {
+        live: usize,
+        uncertain: bool,
+    }
+    /// Tracks every new parent-owned copy; a failed close is never retried.
+    pub(in crate::session_owner) struct LocalFd {
+        fd: Option<OwnedFd>,
+        ledger: Arc<Mutex<LocalCloses>>,
+        closer: fn(RawFd) -> bool,
+    }
+    impl LocalFd {
+        pub(in crate::session_owner) fn fd(&self) -> Result<&OwnedFd, AdmissionError> {
+            self.fd.as_ref().ok_or(AdmissionError::Refused)
+        }
+        #[cfg(test)]
+        pub(in crate::session_owner) fn test_uncertain_close(&mut self) {
+            fn close_but_report_uncertain(raw: RawFd) -> bool {
+                let _ = close_once(raw);
+                false
+            }
+            self.closer = close_but_report_uncertain;
+        }
+        pub(in crate::session_owner) fn duplicate(&self) -> Result<Self, AdmissionError> {
+            let raw = unsafe { libc::fcntl(self.fd()?.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+            if raw < 0 {
+                return Err(AdmissionError::Unavailable);
+            }
+            Ok(Self::track(
+                unsafe { OwnedFd::from_raw_fd(raw) },
+                Arc::clone(&self.ledger),
+            ))
+        }
+        fn track(fd: OwnedFd, ledger: Arc<Mutex<LocalCloses>>) -> Self {
+            if let Ok(mut state) = ledger.lock() {
+                if let Some(next) = state.live.checked_add(1) {
+                    state.live = next;
+                } else {
+                    state.uncertain = true;
+                }
+            }
+            Self {
+                fd: Some(fd),
+                ledger,
+                closer: close_once,
+            }
+        }
+        pub(in crate::session_owner) fn close(&mut self) {
+            if let Some(fd) = self.fd.take() {
+                let confirmed = (self.closer)(fd.into_raw_fd());
+                if let Ok(mut state) = self.ledger.lock() {
+                    state.live = state.live.saturating_sub(1);
+                    state.uncertain |= !confirmed;
+                }
+            }
+        }
+    }
+    impl Drop for LocalFd {
+        fn drop(&mut self) {
+            self.close();
+        }
+    }
+    pub(in crate::session_owner) struct PreparedFrontendEnd {
+        pub(in crate::session_owner) fd: LocalFd,
+        host: HostInstance,
+        channel: [u8; 16],
+        challenge: [u8; 32],
+        uid: u32,
+    }
+    pub(in crate::session_owner) struct RemoteEndObligation {
+        pair: Arc<PairCharge>,
+        index: usize,
+        ledger: Arc<Mutex<LocalCloses>>,
+        settled: bool,
+        #[cfg(test)]
+        unknown_reason: Option<SettlementReason>,
+    }
+    pub(in crate::session_owner) fn validate_config(
+        config: TrustedChannelConfig,
+    ) -> Result<(), AdmissionError> {
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0
+            || config.mode != (HostMode::Personal { canonical_uid: uid })
+            || config.owner.is_some()
+            || config.requester != OwnerRole::Frontend
+            || config.min_version != 1
+            || config.max_version != 1
+        {
+            return Err(AdmissionError::InvalidConfig);
+        }
+        Ok(())
+    }
+    pub(in crate::session_owner) fn split_frontend(
+        expected: ExpectedAdmission,
+    ) -> Result<(PreparedFrontendEnd, RemoteEndObligation), AdmissionError> {
+        split_frontend_impl(
+            expected,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(test)]
+    pub(in crate::session_owner) fn split_frontend_observed(
+        expected: ExpectedAdmission,
+        observer: &mut prepare_observation::Observer,
+    ) -> Result<(PreparedFrontendEnd, RemoteEndObligation), AdmissionError> {
+        split_frontend_impl(expected, Some(observer))
+    }
+    fn split_frontend_impl(
+        mut expected: ExpectedAdmission,
+        #[cfg(test)] mut observer: Option<&mut prepare_observation::Observer>,
+    ) -> Result<(PreparedFrontendEnd, RemoteEndObligation), AdmissionError> {
+        validate_config(expected.config)?;
+        if expected.local != OwnerRole::Frontend || expected.peer != OwnerRole::Host {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                prepare_observation::Site::SplitFrontend,
+                prepare_observation::Check::TransferRole,
+                prepare_observation::Class::Predicate,
+                None,
+            );
+            return Err(AdmissionError::Refused);
+        }
+        let Some(fd) = expected.custody.fd.as_ref() else {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                prepare_observation::Site::SplitFrontend,
+                prepare_observation::Check::MissingDescriptor,
+                prepare_observation::Class::Predicate,
+                None,
+            );
+            return Err(AdmissionError::Refused);
+        };
+        validate_personal_fd_impl(
+            fd,
+            unsafe { libc::geteuid() },
+            #[cfg(test)]
+            prepare_observation::Site::SplitFrontend,
+            #[cfg(test)]
+            observer.as_deref_mut(),
+        )?;
+        let Some(fd) = expected.custody.fd.take() else {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                prepare_observation::Site::SplitFrontend,
+                prepare_observation::Check::MissingDescriptor,
+                prepare_observation::Class::Predicate,
+                None,
+            );
+            return Err(AdmissionError::Refused);
+        };
+        let ledger = Arc::new(Mutex::new(LocalCloses::default()));
+        let prepared = PreparedFrontendEnd {
+            fd: LocalFd::track(fd, Arc::clone(&ledger)),
+            host: expected.config.host,
+            channel: expected.channel,
+            challenge: expected.challenge,
+            uid: unsafe { libc::geteuid() },
+        };
+        let remote = RemoteEndObligation {
+            pair: Arc::clone(&expected.custody.pair),
+            index: expected.custody.index,
+            ledger,
+            settled: false,
+            #[cfg(test)]
+            unknown_reason: None,
+        };
+        Ok((prepared, remote))
+    }
+    impl PreparedFrontendEnd {
+        fn check_uid(&self, uid: u32) -> Result<(), AdmissionError> {
+            if uid == 0 || uid != self.uid {
+                return Err(AdmissionError::Refused);
+            }
+            Ok(())
+        }
+        pub(in crate::session_owner) fn for_spawn(&self) -> Result<(), AdmissionError> {
+            let uid = unsafe { libc::geteuid() };
+            self.check_uid(uid)?;
+            validate_personal_fd(self.fd.fd()?, uid)
+        }
+        #[cfg(test)]
+        pub(in crate::session_owner) fn test_check_uid(
+            &self,
+            uid: u32,
+        ) -> Result<(), AdmissionError> {
+            self.check_uid(uid)
+        }
+        pub(in crate::session_owner) fn setup(&self, deadline: u64) -> SetupRecord {
+            SetupRecord {
+                host: self.host,
+                channel: self.channel,
+                challenge: self.challenge,
+                uid: self.uid,
+                deadline,
+            }
+        }
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(in crate::session_owner) enum SettlementStatus {
+        Pending,
+        Settled,
+        Unknown,
+    }
+    // Read-only test evidence; unavailable locks never grant cleanup authority.
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum ObservationAccess {
+        Available,
+        Busy,
+        Poisoned,
+        Overflow,
+    }
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum ObservationEnd {
+        Live,
+        Closed,
+        Uncertain,
+    }
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) enum SettlementReason {
+        LocalPoison,
+        LocalUncertain,
+        EndsPoison,
+        PeerUncertain,
+        BudgetPoison,
+        Inconsistent,
+    }
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::session_owner) struct DebtObservation {
+        pub local: ObservationAccess,
+        pub live: Option<u32>,
+        pub uncertain: Option<bool>,
+        pub settled: bool,
+        pub ends: ObservationAccess,
+        pub own: Option<ObservationEnd>,
+        pub peer: Option<ObservationEnd>,
+        pub budget: ObservationAccess,
+        pub budget_present: bool,
+        pub budget_nonzero: Option<bool>,
+        pub reason: Option<SettlementReason>,
+    }
+    impl RemoteEndObligation {
+        #[cfg(test)]
+        pub(in crate::session_owner) fn test_observation(&self) -> DebtObservation {
+            use std::sync::TryLockError;
+            // Each diagnostic guard ends before the next try_lock. No poison
+            // recovery, waiting, fd access, settlement or authority is added.
+            let (local, live, uncertain) = {
+                match self.ledger.try_lock() {
+                    Ok(s) => match u32::try_from(s.live) {
+                        Ok(live) => (ObservationAccess::Available, Some(live), Some(s.uncertain)),
+                        Err(_) => (ObservationAccess::Overflow, None, None),
+                    },
+                    Err(TryLockError::WouldBlock) => (ObservationAccess::Busy, None, None),
+                    Err(TryLockError::Poisoned(_)) => (ObservationAccess::Poisoned, None, None),
+                }
+            };
+            let (ends, own, peer) = {
+                let end = |e| match e {
+                    EndState::Live => ObservationEnd::Live,
+                    EndState::Closed => ObservationEnd::Closed,
+                    EndState::Uncertain => ObservationEnd::Uncertain,
+                };
+                match self.pair.ends.try_lock() {
+                    Ok(s) => (
+                        ObservationAccess::Available,
+                        Some(end(s[self.index])),
+                        Some(end(s[1 - self.index])),
+                    ),
+                    Err(TryLockError::WouldBlock) => (ObservationAccess::Busy, None, None),
+                    Err(TryLockError::Poisoned(_)) => (ObservationAccess::Poisoned, None, None),
+                }
+            };
+            let (budget, budget_nonzero) = {
+                match self.pair.budget.try_lock() {
+                    Ok(s) => (ObservationAccess::Available, Some(s.used != 0)),
+                    Err(TryLockError::WouldBlock) => (ObservationAccess::Busy, None),
+                    Err(TryLockError::Poisoned(_)) => (ObservationAccess::Poisoned, None),
+                }
+            };
+            DebtObservation {
+                local,
+                live,
+                uncertain,
+                settled: self.settled,
+                ends,
+                own,
+                peer,
+                budget,
+                budget_present: true,
+                budget_nonzero,
+                reason: self.unknown_reason,
+            }
+        }
+        #[cfg(test)]
+        pub(in crate::session_owner) fn test_busy_observation(&self) -> DebtObservation {
+            let _guard = self.ledger.lock().unwrap();
+            self.test_observation()
+        }
+        pub(in crate::session_owner) fn track(&self, fd: OwnedFd) -> LocalFd {
+            LocalFd::track(fd, Arc::clone(&self.ledger))
+        }
+        /// Requires the retained capsule's sealed terminal/no-export receipt;
+        /// every known local copy must also have a confirmed close.
+        pub(in crate::session_owner) fn settle(
+            &mut self,
+            _receipt: crate::session_owner::inherited_launch::Settlement,
+        ) -> SettlementStatus {
+            let Ok(local) = self.ledger.lock() else {
+                #[cfg(test)]
+                self.unknown_reason
+                    .get_or_insert(SettlementReason::LocalPoison);
+                return SettlementStatus::Unknown;
+            };
+            if local.uncertain {
+                #[cfg(test)]
+                self.unknown_reason
+                    .get_or_insert(SettlementReason::LocalUncertain);
+                return SettlementStatus::Unknown;
+            }
+            if local.live != 0 {
+                return SettlementStatus::Pending;
+            }
+            let Ok(mut ends) = self.pair.ends.lock() else {
+                #[cfg(test)]
+                self.unknown_reason
+                    .get_or_insert(SettlementReason::EndsPoison);
+                return SettlementStatus::Unknown;
+            };
+            match ends[1 - self.index] {
+                EndState::Live => return SettlementStatus::Pending,
+                EndState::Uncertain => {
+                    #[cfg(test)]
+                    self.unknown_reason
+                        .get_or_insert(SettlementReason::PeerUncertain);
+                    return SettlementStatus::Unknown;
+                }
+                EndState::Closed => {}
+            }
+            let Ok(mut budget) = self.pair.budget.lock() else {
+                #[cfg(test)]
+                self.unknown_reason
+                    .get_or_insert(SettlementReason::BudgetPoison);
+                return SettlementStatus::Unknown;
+            };
+            if ends[self.index] != EndState::Live || budget.used == 0 {
+                #[cfg(test)]
+                self.unknown_reason
+                    .get_or_insert(SettlementReason::Inconsistent);
+                return SettlementStatus::Unknown;
+            }
+            // Credit and the remote-end terminal fact commit under the original
+            // local ledger locks; poison cannot silently discard the charge.
+            ends[self.index] = EndState::Closed;
+            budget.used -= 1;
+            self.settled = true;
+            SettlementStatus::Settled
+        }
+    }
+    pub(in crate::session_owner) fn validate_personal_fd(
+        fd: &OwnedFd,
+        uid: u32,
+    ) -> Result<(), AdmissionError> {
+        validate_personal_fd_impl(
+            fd,
+            uid,
+            #[cfg(test)]
+            prepare_observation::Site::OtherPreparation,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(test)]
+    pub(in crate::session_owner) fn validate_personal_fd_observed(
+        fd: &OwnedFd,
+        uid: u32,
+        site: prepare_observation::Site,
+        observer: &mut prepare_observation::Observer,
+    ) -> Result<(), AdmissionError> {
+        validate_personal_fd_impl(fd, uid, site, Some(observer))
+    }
+    fn validate_personal_fd_impl(
+        fd: &OwnedFd,
+        uid: u32,
+        #[cfg(test)] site: prepare_observation::Site,
+        #[cfg(test)] mut observer: Option<&mut prepare_observation::Observer>,
+    ) -> Result<(), AdmissionError> {
+        if uid == 0 || uid != unsafe { libc::geteuid() } {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                site,
+                prepare_observation::Check::PersonalCurrentIdentity,
+                prepare_observation::Class::Predicate,
+                None,
+            );
+            return Err(AdmissionError::Refused);
+        }
+        validate_socket_impl(
+            fd,
+            TrustedChannelConfig {
+                host: HostInstance::new([1; 16]).unwrap(),
+                owner: None,
+                requester: OwnerRole::Frontend,
+                mode: HostMode::Personal { canonical_uid: uid },
+                system_uid: uid,
+                min_version: 1,
+                max_version: 1,
+            },
+            #[cfg(test)]
+            site,
+            #[cfg(test)]
+            observer.as_deref_mut(),
+        )?;
+        let peer = match crate::control::peer_uid(fd) {
+            Ok(peer) => peer,
+            Err(error) => {
+                #[cfg(test)]
+                prepare_observation::record(
+                    observer,
+                    site,
+                    prepare_observation::Check::PersonalPeerUidCall,
+                    prepare_observation::Class::Io,
+                    error.raw_os_error(),
+                );
+                return Err(error.into());
+            }
+        };
+        if peer != uid {
+            #[cfg(test)]
+            prepare_observation::record(
+                observer,
+                site,
+                prepare_observation::Check::ExactPersonalPeer,
+                prepare_observation::Class::Predicate,
+                None,
+            );
+            return Err(AdmissionError::Refused);
+        }
+        Ok(())
+    }
+    pub(in crate::session_owner) fn read(fd: &OwnedFd, bytes: &mut [u8]) -> io::Result<usize> {
+        (&*stream(fd)).read(bytes)
+    }
+    pub(in crate::session_owner) fn write_setup(
+        fd: &OwnedFd,
+        bytes: &[u8; 112],
+        deadline: Instant,
+    ) -> Result<(), AdmissionError> {
+        let mut bytes = *bytes;
+        transfer(fd, &mut bytes, true, deadline)
+    }
+    pub(in crate::session_owner) fn read_setup(
+        fd: &OwnedFd,
+        bytes: &mut [u8],
+        deadline: Instant,
+    ) -> Result<(), AdmissionError> {
+        transfer(fd, bytes, false, deadline)
+    }
+    pub(in crate::session_owner) fn restore_frontend(
+        claimed: crate::session_owner::inherited_launch::child::ClaimedFrontend,
+    ) -> Result<ExpectedAdmission, AdmissionError> {
+        let (fd, record) = claimed.into_parts();
+        let config = TrustedChannelConfig {
+            host: record.host,
+            owner: None,
+            requester: OwnerRole::Frontend,
+            mode: HostMode::Personal {
+                canonical_uid: record.uid,
+            },
+            system_uid: record.uid,
+            min_version: 1,
+            max_version: 1,
+        };
+        validate_config(config)?;
+        validate_personal_fd(&fd, record.uid)?;
+        // This process owns one local end only. No parent Arc/ledger crosses exec.
+        let budget = Arc::new(Mutex::new(BudgetState {
+            limit: 1,
+            used: 1,
+            uncertain_ends: 0,
+        }));
+        let pair = Arc::new(PairCharge {
+            budget,
+            ends: Mutex::new([EndState::Live, EndState::Closed]),
+        });
+        Ok(ExpectedAdmission {
+            custody: Custody {
+                fd: Some(fd),
+                pair,
+                index: 0,
+                closer: close_once,
+            },
+            config,
+            local: OwnerRole::Frontend,
+            peer: OwnerRole::Host,
+            channel: record.channel,
+            challenge: record.challenge,
+        })
+    }
+    #[cfg(test)]
+    pub(in crate::session_owner) fn write_prefix(
+        fd: &OwnedFd,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), AdmissionError> {
+        let mut bytes = bytes.to_vec();
+        transfer(fd, &mut bytes, true, deadline)
+    }
+    #[cfg(test)]
+    pub(in crate::session_owner) fn test_evidence(channel: &mut AdmittedChannel) -> bool {
+        channel.take_frontend_evidence(channel.config.mode).is_ok()
+    }
+    #[cfg(test)]
+    pub(in crate::session_owner) fn test_write(fd: &OwnedFd, bytes: &[u8]) -> io::Result<usize> {
+        (&*stream(fd)).write(bytes)
+    }
+    #[cfg(test)]
+    impl RemoteEndObligation {
+        pub(in crate::session_owner) fn test_in_use(&self) -> usize {
+            self.pair
+                .budget
+                .lock()
+                .map(|state| state.used)
+                .unwrap_or(usize::MAX)
+        }
+        pub(in crate::session_owner) fn test_uncertain(&mut self) {
+            self.ledger.lock().unwrap().uncertain = true;
+        }
+    }
+    impl Drop for RemoteEndObligation {
+        fn drop(&mut self) {
+            if !self.settled {
+                self.pair.terminal(self.index, false);
+            }
+        }
+    }
+}
