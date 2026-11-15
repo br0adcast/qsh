@@ -25,6 +25,7 @@ import signal
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import tomllib
 from urllib.parse import unquote, urlsplit
@@ -198,14 +199,176 @@ CANCELLATION_SIGNALS = {signal.SIGINT, signal.SIGTERM}
 
 
 class OwnedCleanupError(RuntimeError):
-    def __init__(self, report):
+    def __init__(self, report, *, observer_custody=None):
         self.report = report
+        self.observer_custody = observer_custody
         super().__init__('owned cleanup: '+json.dumps(report, sort_keys=True))
 
 
 def cleanup_error(operation, error):
     return {'operation': operation, 'failure': type(error).__name__,
             'errno': getattr(error, 'errno', None), 'reason': str(error)[:1024]}
+
+
+class CensusObservation:
+    def __init__(self, report, custody=None):
+        self.report = report
+        self.custody = custody
+
+
+class ObserverSlotBusy(RuntimeError):
+    def __init__(self, custody):
+        self.custody = custody
+        super().__init__('previous census observer still has unresolved custody')
+
+
+class ObserverCustodian:
+    """One process-lifetime slot; reports/exceptions are never its only owner."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.active = None
+
+    def reserve(self):
+        with self._lock:
+            if self.active is not None:
+                raise ObserverSlotBusy(self.active)
+            self.active = ObserverCustody(self)
+            return self.active
+
+    def _release(self, custody):
+        with self._lock:
+            if self.active is not custody:
+                raise RuntimeError('observer custody slot identity mismatch')
+            self.active = None
+
+
+class ObserverCustody:
+    """Exclusive wait authority for one exact Popen, never a detached PID."""
+    def __init__(self, custodian):
+        self._custodian = custodian
+        self._lock = threading.Lock()
+        self.observer = None
+        self._pipes = ()
+        self._producing = True
+        self._close_attempted = False
+        self._close_failed = False
+        self.wait_authority = 'reserved'
+        self.status = None
+        self.kill_attempted = False
+        self.errors = []
+
+    def attach(self, observer):
+        with self._lock:
+            if self.observer is not None or self.wait_authority != 'reserved':
+                raise RuntimeError('observer already attached')
+            self.observer = observer
+            self._pipes = (observer.stdout, observer.stderr)
+            self.wait_authority = 'owned'
+
+    def _observe(self):
+        # Caller holds the capsule lock. Popen's wait/poll/kill can coerce
+        # ECHILD to success; only our exact consuming wait establishes status.
+        if self.wait_authority == 'consumed':
+            return self.status
+        if self.wait_authority != 'owned':
+            raise RuntimeError('observer wait authority is unavailable')
+        try:
+            if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+                raise RuntimeError('observer requires default SIGCHLD policy')
+            pid, status = os.waitpid(self.observer.pid, os.WNOHANG)
+            if pid == 0:
+                return None
+            if pid != self.observer.pid:
+                raise RuntimeError('observer wait returned an unexpected PID')
+            code = os.waitstatus_to_exitcode(status)
+        except BaseException as error:
+            self.wait_authority = 'lost'
+            self.errors.append(cleanup_error('observer-wait', error))
+            raise
+        self.status = code
+        self.wait_authority = 'consumed'
+        self.observer.returncode = code
+        return code
+
+    def wait(self, timeout):
+        # Same bounded POSIX role/cadence as Popen.wait(timeout), without its
+        # synthetic ECHILD success. Zero timeout makes exactly one observation.
+        cutoff = time.monotonic()+timeout
+        delay = .0005
+        while True:
+            with self._lock:
+                status = self._observe()
+            if status is not None:
+                return status
+            remaining = cutoff-time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self.observer.args, timeout)
+            delay = min(delay*2, .05, remaining)
+            time.sleep(delay)
+
+    def kill_once(self):
+        with self._lock:
+            if not self._producing or self.kill_attempted or self.wait_authority != 'owned':
+                return
+            if self._observe() is not None:
+                return
+            # Exclusive unreaped-child custody guards this syscall. Record the
+            # one attempt before signaling; never signal after lost/used status.
+            self.kill_attempted = True
+            try:
+                os.kill(self.observer.pid, signal.SIGKILL)
+            except BaseException as error:
+                self.errors.append(cleanup_error('observer-kill', error))
+                raise
+
+    def _pipes_closed(self):
+        return all(pipe.closed for pipe in self._pipes)
+
+    def _release_if_settled(self):
+        if (not self._producing and not self._close_failed and self._pipes_closed()
+                and self.wait_authority in ('reserved', 'consumed')):
+            self._custodian._release(self)
+
+    def finish_observation(self):
+        with self._lock:
+            if not self._producing:
+                return
+            if not self._close_attempted:
+                self._close_attempted = True
+                for pipe in self._pipes:
+                    try:
+                        pipe.close()
+                    except BaseException as error:
+                        self._close_failed = True
+                        self.errors.append(cleanup_error('observer-pipe-close', error))
+            self._producing = False
+            self._release_if_settled()
+
+    def reap_once(self):
+        # A bounded wait-only continuation, never another grace or signal.
+        with self._lock:
+            if self._producing or self.wait_authority != 'owned':
+                return
+            try:
+                self._observe()
+            except BaseException:
+                pass  # Scalar error and lost authority remain in the slot.
+            self._release_if_settled()
+
+    def snapshot(self):
+        with self._lock:
+            pipes_closed = self._pipes_closed()
+            state = ('active-producer' if self._producing else
+                     'lost' if self.wait_authority == 'lost' else
+                     'pipe-debt' if self._close_failed or not pipes_closed else
+                     'consumed' if self.wait_authority == 'consumed' else 'retained')
+            return dict(state=state, wait_authority=self.wait_authority,
+                        status=self.status, pipes_closed=pipes_closed,
+                        kill_attempted=self.kill_attempted,
+                        errors=[dict(error) for error in self.errors])
+
+
+_OBSERVER_CUSTODIAN = ObserverCustodian()
 
 
 def parse_zombie_group(output, leader):
@@ -231,13 +394,16 @@ def parse_zombie_group(output, leader):
     return len(seen)
 
 
-def observe_zombie_group(leader, cleanup_deadline):
+def observe_zombie_group(leader, cleanup_deadline, *, custodian=None):
     # Reserve observer kill/reap inside its one-second cap and leave the
     # remainder of the unchanged post-KILL deadline for the group leader.
     deadline = min(cleanup_deadline-0.1, time.monotonic()+1)
     read_deadline = deadline-0.1
     report = {'classification': 'unknown', 'rows': 0, 'observer_reaped': False,
               'status': None, 'stdout_bytes': 0, 'stderr_bytes': 0, 'errors': []}
+    custodian = _OBSERVER_CUSTODIAN if custodian is None else custodian
+    custody = None
+    reserved_here = False
     observer = None
     buffers = {'stdout': bytearray(), 'stderr': bytearray()}
     try:
@@ -245,12 +411,17 @@ def observe_zombie_group(leader, cleanup_deadline):
             raise ValueError('invalid owned group')
         if time.monotonic() >= read_deadline:
             raise TimeoutError('no group census budget remains')
+        custody = custodian.reserve()
+        reserved_here = True
+        if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+            raise RuntimeError('observer requires default SIGCHLD policy')
         environment = os.environ.copy()
         environment.update(LC_ALL='C', COMMAND_MODE='unix2003')
         observer = subprocess.Popen(
             ['/bin/ps', '-x', '-g', str(leader), '-o', 'pid=,pgid=,stat='],
             env=environment, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        custody.attach(observer)
         # The observer may inherit cleanup's deferred INT/TERM mask. It is
         # exclusively owned and is killed directly with SIGKILL on failure.
         with selectors.DefaultSelector() as selector:
@@ -270,37 +441,41 @@ def observe_zombie_group(leader, cleanup_deadline):
                     buffers[name].extend(data[:remaining_cap])
                     if len(data) > remaining_cap:
                         raise ValueError('group census '+name+' exceeds bound')
-        observer.wait(timeout=max(0, read_deadline-time.monotonic()))
-        report['status'] = observer.returncode
-        if observer.returncode != 0 or buffers['stderr']:
+        custody.wait(timeout=max(0, read_deadline-time.monotonic()))
+        report['status'] = custody.status
+        if custody.status != 0 or buffers['stderr']:
             raise ValueError('group census failed or wrote stderr')
         report['rows'] = parse_zombie_group(bytes(buffers['stdout']), leader)
         report['classification'] = 'zombie-only'
     except BaseException as error:
+        if isinstance(error, ObserverSlotBusy):
+            custody = error.custody
         report['errors'].append(cleanup_error('census', error))
     finally:
+        # A busy slot belongs to another observation; never touch its active
+        # producer or borrow its status as evidence for this target group.
         if observer is not None:
-            if observer.returncode is None:
+            try:
+                custody.kill_once()
+            except BaseException as error:
+                report['errors'].append(cleanup_error('observer-kill', error))
+            if custody.wait_authority == 'owned':
                 try:
-                    observer.kill()  # Only this unreaped direct observer PID.
-                except OSError as error:
-                    report['errors'].append(cleanup_error('observer-kill', error))
-                try:
-                    observer.wait(timeout=max(0, deadline-time.monotonic()))
+                    custody.wait(timeout=max(0, deadline-time.monotonic()))
                 except BaseException as error:
                     report['errors'].append(cleanup_error('observer-reap', error))
-            report['status'] = observer.returncode
-            report['observer_reaped'] = observer.returncode is not None
-            for pipe in (observer.stdout, observer.stderr):
-                try:
-                    pipe.close()
-                except BaseException as error:
-                    report['errors'].append(cleanup_error('observer-pipe-close', error))
+            custody.finish_observation()
+            snapshot = custody.snapshot()
+            report['status'] = snapshot['status']
+            report['observer_reaped'] = snapshot['wait_authority'] == 'consumed'
+            report['errors'].extend(dict(error) for error in snapshot['errors'])
+        elif reserved_here and custody.observer is None:
+            custody.finish_observation()
         report['stdout_bytes'] = len(buffers['stdout'])
         report['stderr_bytes'] = len(buffers['stderr'])
         if report['errors'] or not report['observer_reaped']:
             report['classification'] = 'unknown'
-    return report
+    return CensusObservation(report, custody if custodian.active is custody else None)
 
 
 def stop_owned(child, report=None):
@@ -312,6 +487,7 @@ def stop_owned(child, report=None):
                   leader_reaped=False, status=child.returncode, errors=[])
     if child.returncode is not None:
         raise OwnedCleanupError(report)
+    observer_custody = None
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, CANCELLATION_SIGNALS)
     try:
         try:
@@ -334,7 +510,9 @@ def stop_owned(child, report=None):
         except OSError as error:
             report['signals'].append(cleanup_error('KILL', error))
             if error.errno == errno.EPERM and platform.system() == 'Darwin':
-                report['census'] = observe_zombie_group(child.pid, deadline)
+                observation = observe_zombie_group(child.pid, deadline)
+                report['census'] = observation.report
+                observer_custody = observation.custody
                 if report['census']['classification'] == 'zombie-only':
                     report['outcome'] = 'observed-zombie-only'
         finally:
@@ -344,13 +522,19 @@ def stop_owned(child, report=None):
                 report['errors'].append(cleanup_error('leader-reap', error))
             report['status'] = child.returncode
             report['leader_reaped'] = child.returncode is not None
+            if observer_custody is not None:
+                try:
+                    observer_custody.reap_once()
+                except BaseException as error:
+                    report['errors'].append(cleanup_error('observer-continuation', error))
+                report['observer_cleanup'] = observer_custody.snapshot()
     finally:
         try:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous)
         except BaseException as error:
             report['errors'].append(cleanup_error('mask-restore', error))
     if report['outcome'] == 'unresolved' or not report['leader_reaped'] or report['errors']:
-        raise OwnedCleanupError(report)
+        raise OwnedCleanupError(report, observer_custody=observer_custody)
     return report
 
 
@@ -425,6 +609,9 @@ def stream_command(command, env, path, *, timeout=None, limit=MAX_COMMAND_OUTPUT
             try:
                 stop_owned(child, cleanup)
             except BaseException as cleanup_failure:
+                observer_custody = getattr(cleanup_failure, 'observer_custody', None)
+                if observer_custody is not None:
+                    primary.observer_custody = observer_custody
                 secondary.append(cleanup_failure)
                 cleanup.setdefault('outcome', 'unresolved')
                 cleanup.setdefault('errors', []).append(cleanup_error('cleanup', cleanup_failure))
