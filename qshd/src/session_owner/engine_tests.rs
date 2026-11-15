@@ -2972,13 +2972,15 @@ mod integrated {
             let _held = held;
             panic!("controlled fixture failure while channel 2 is held");
         }));
-        assert!(failure.is_err());
-        assert_eq!(
-            f.io.exit(17, |g| usize::from(g.held)),
-            0,
-            "unwinding left the exit gate held"
-        );
-        let done = bounded_close(&mut f).await;
+        // Record what the guard itself did before the independent fallback.
+        let released_by_guard = f.io.exit(17, |g| usize::from(g.held)) == 0;
+        // The fallback lets the actual reaper and joins finish even if the
+        // guard under test is broken; it cannot satisfy the check below.
+        f.io.release(17);
+        let closed = tokio::time::timeout(Duration::from_secs(5), f.engine.close_session()).await;
+        assert!(failure.is_err(), "controlled failure did not unwind");
+        assert!(released_by_guard, "unwinding left the exit gate held");
+        let done = closed.expect("close finished before deadline").unwrap();
         assert_eq!(
             receipt_facts(&done),
             [
