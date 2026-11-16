@@ -59,6 +59,9 @@ impl OwnerResourceClient {
             registration,
         }
     }
+    pub(super) fn same_registration(&self, other: &Self) -> bool {
+        self.registration == other.registration && self.same_host(other)
+    }
     pub(super) fn same_host(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.ledger, &other.ledger)
     }

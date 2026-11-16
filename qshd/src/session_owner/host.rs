@@ -13,6 +13,7 @@ use super::authorization_contract::{
     AttachGrant, AuthenticatedPrincipalRef, FrontendRegistration, GrantAuthority, GrantBinding,
     GrantLedger, LedgerInstance, PrincipalRegistration,
 };
+use super::host_engine::{LocalBinding, LocalLeasePhase};
 use super::host_resources::OwnerProvisioning;
 use super::resource_contract::HostResourceBinding;
 use super::resource_contract::{ResourceLedger, ResourceLimits};
@@ -29,6 +30,7 @@ pub(crate) enum HostError {
     Exhausted,
     Refused,
     ResourceDebt,
+    AlreadyAttached,
 }
 impl From<AuthorityError> for HostError {
     fn from(value: AuthorityError) -> Self {
@@ -103,6 +105,7 @@ struct CatalogEntry {
     phase: CatalogPhase,
     last_epoch: u64,
     cleanup_operation: Option<u64>,
+    local: Option<Arc<LocalBinding>>,
 }
 
 /// These capabilities deliberately have no production constructors in 3A1.
@@ -151,6 +154,8 @@ struct PendingGrant {
 #[derive(Debug)]
 pub(crate) struct AuthorizedAttachment {
     attachment: Attachment,
+    host: HostInstance,
+    local: Option<std::sync::Weak<LocalBinding>>,
 }
 impl AuthorizedAttachment {
     pub(crate) fn attachment(&self) -> Attachment {
@@ -180,6 +185,244 @@ pub(crate) struct HostState {
     last_now: u64,
 }
 impl HostState {
+    #[cfg(test)]
+    pub(super) fn frontend_for_generation_for_test(
+        &self,
+        generation: FrontendGeneration,
+    ) -> Option<FrontendAdmission> {
+        self.frontends
+            .iter()
+            .map(|(frontend, _)| *frontend)
+            .find(|frontend| frontend.generation() == generation)
+    }
+    #[cfg(test)]
+    pub(super) fn cleanup_operation_for_test(&self, locator: SessionLocator) -> Option<u64> {
+        self.catalog
+            .iter()
+            .find(|entry| entry.locator == locator)
+            .and_then(|entry| entry.cleanup_operation)
+    }
+    #[cfg(test)]
+    pub(super) fn resource_reservations_for_test(&self) -> usize {
+        self.resources.lock().unwrap().reservations()
+    }
+    pub(super) fn pin_local_engine(
+        &mut self,
+        provisioning: &OwnerProvisioning,
+        engine: &super::engine::SessionOwnerEngine,
+    ) -> Result<Arc<LocalBinding>, super::host_engine::LocalEngineError> {
+        use super::host_engine::LocalEngineError;
+        let binding = provisioning.binding();
+        if binding.host != self.instance {
+            return Err(LocalEngineError::Binding);
+        }
+        let entry = self
+            .catalog
+            .iter_mut()
+            .find(|entry| entry.locator == binding.locator)
+            .ok_or(LocalEngineError::Binding)?;
+        let registration = entry.resources.ok_or(LocalEngineError::Binding)?;
+        let expected =
+            super::resources::OwnerResourceClient::new(self.resources.clone(), registration);
+        if !expected.same_registration(&provisioning.client())
+            || !engine.matches_local_binding(
+                binding.locator,
+                &expected,
+                entry.account.uid(),
+                entry.account.name(),
+            )
+            || !matches!(entry.phase, CatalogPhase::NeverEstablished)
+            || entry.cleanup_operation.is_some()
+        {
+            return Err(LocalEngineError::Binding);
+        }
+        if entry.local.is_some() {
+            return Err(LocalEngineError::AlreadyBound);
+        }
+        let binding = Arc::new(LocalBinding {
+            identity: binding,
+            phase: Mutex::new(LocalLeasePhase::Detached),
+        });
+        entry.local = Some(binding.clone());
+        Ok(binding)
+    }
+    fn phase_available(phase: LocalLeasePhase) -> Result<(), HostError> {
+        match phase {
+            LocalLeasePhase::Detached => Ok(()),
+            LocalLeasePhase::Reserved(_)
+            | LocalLeasePhase::Attached(_)
+            | LocalLeasePhase::Fencing(_) => Err(HostError::AlreadyAttached),
+            _ => Err(HostError::Refused),
+        }
+    }
+    fn local_available(entry: &CatalogEntry) -> Result<(), HostError> {
+        if entry.cleanup_operation.is_some() {
+            return Err(HostError::Refused);
+        }
+        if let Some(local) = &entry.local {
+            Self::phase_available(*local.phase.lock().map_err(|_| HostError::Refused)?)?;
+        }
+        Ok(())
+    }
+    pub(super) fn validate_local_binding(
+        &self,
+        binding: &Arc<LocalBinding>,
+    ) -> Result<(), HostError> {
+        if binding.identity.host != self.instance
+            || !self.catalog.iter().any(|entry| {
+                entry.locator == binding.identity.locator
+                    && entry
+                        .local
+                        .as_ref()
+                        .is_some_and(|actual| Arc::ptr_eq(actual, binding))
+                    && !matches!(entry.phase, CatalogPhase::Completed { .. })
+            })
+        {
+            return Err(HostError::Refused);
+        }
+        Ok(())
+    }
+    pub(super) fn consume_local_authority(
+        &self,
+        binding: &Arc<LocalBinding>,
+        authorized: AuthorizedAttachment,
+    ) -> Result<Attachment, HostError> {
+        self.validate_local_binding(binding)?;
+        if authorized.host != self.instance
+            || authorized.attachment.locator != binding.identity.locator
+            || !authorized
+                .local
+                .and_then(|weak| weak.upgrade())
+                .is_some_and(|actual| Arc::ptr_eq(&actual, binding))
+            || *binding.phase.lock().map_err(|_| HostError::Refused)?
+                != LocalLeasePhase::Reserved(authorized.attachment)
+        {
+            return Err(HostError::Refused);
+        }
+        Ok(authorized.attachment)
+    }
+    fn retire_session_offers(&mut self, locator: SessionLocator) -> Result<(), HostError> {
+        let mut index = 0;
+        while index < self.offers.len() {
+            if self.offers[index].offer.binding.locator == locator {
+                self.grants
+                    .retire_principal(self.offers[index].authority.principal)
+                    .map_err(|_| HostError::Refused)?;
+                self.offers.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn establish_local_owner(
+        &mut self,
+        binding: &Arc<LocalBinding>,
+        proof: super::engine::LocalEstablishment,
+    ) -> Result<(), (HostError, super::engine::LocalEstablishment)> {
+        let result = (|| {
+            self.validate_local_binding(binding)?;
+            let entry = self
+                .catalog
+                .iter()
+                .find(|entry| entry.locator == binding.identity.locator)
+                .ok_or(HostError::Refused)?;
+            let client = super::resources::OwnerResourceClient::new(
+                self.resources.clone(),
+                entry.resources.ok_or(HostError::Refused)?,
+            );
+            if !proof.matches(binding, entry.locator, &client) {
+                return Err(HostError::Refused);
+            }
+            self.establish_owner(OwnerEstablished {
+                host: self.instance,
+                locator: binding.identity.locator,
+            })
+        })();
+        result.map_err(|error| (error, proof))
+    }
+    pub(super) fn complete_local_owner(
+        &mut self,
+        binding: &Arc<LocalBinding>,
+        intent: &CleanupIntent,
+        proof: super::engine::LocalCompletion,
+        now: u64,
+    ) -> Result<(), (HostError, super::engine::LocalCompletion)> {
+        let preflight = (|| {
+            self.validate_local_binding(binding)?;
+            let entry = self
+                .catalog
+                .iter()
+                .find(|entry| entry.locator == binding.identity.locator)
+                .ok_or(HostError::Refused)?;
+            let client = super::resources::OwnerResourceClient::new(
+                self.resources.clone(),
+                entry.resources.ok_or(HostError::Refused)?,
+            );
+            if intent.host != self.instance
+                || intent.locator != entry.locator
+                || entry.cleanup_operation != Some(intent.operation)
+                || *binding.phase.lock().map_err(|_| HostError::Refused)?
+                    != LocalLeasePhase::Closing
+                || !proof.matches(binding, entry.locator, &client)
+            {
+                return Err(HostError::Refused);
+            }
+            self.completion_preflight(
+                self.instance,
+                entry.locator,
+                intent.operation,
+                proof.facts(),
+                now,
+            )
+        })();
+        let index = match preflight {
+            Ok(index) => index,
+            Err(error) => return Err((error, proof)),
+        };
+        // The seal is consumed only after every fallible check/release. There
+        // is no setter or constructor accepting replacement public exit facts.
+        let converted = OwnerCompletion {
+            host: self.instance,
+            locator: binding.identity.locator,
+            operation: intent.operation,
+            facts: proof.into_facts(),
+        };
+        self.commit_completion(index, converted, now);
+        Ok(())
+    }
+    pub(super) fn complete_local_empty(
+        &mut self,
+        binding: &Arc<LocalBinding>,
+        proof: &super::engine::LocalEmptyCompletion,
+        now: u64,
+    ) -> Result<(), HostError> {
+        self.observe(now)?;
+        self.validate_local_binding(binding)?;
+        let index = self
+            .catalog
+            .iter()
+            .position(|entry| entry.locator == binding.identity.locator)
+            .ok_or(HostError::Refused)?;
+        let entry = &self.catalog[index];
+        let registration = entry.resources.ok_or(HostError::Refused)?;
+        let client =
+            super::resources::OwnerResourceClient::new(self.resources.clone(), registration);
+        if !matches!(entry.phase, CatalogPhase::NeverEstablished)
+            || *binding.phase.lock().map_err(|_| HostError::Refused)? != LocalLeasePhase::Closing
+            || !proof.matches(binding, entry.locator, &client)
+        {
+            return Err(HostError::Refused);
+        }
+        self.retire_session_offers(binding.identity.locator)?;
+        self.resources
+            .lock()
+            .map_err(|_| HostError::ResourceDebt)?
+            .retire_principal(registration)
+            .map_err(|_| HostError::ResourceDebt)?;
+        self.catalog.swap_remove(index);
+        Ok(())
+    }
     pub(crate) fn new(mode: HostMode, limits: HostLimits) -> Result<Self, HostError> {
         let instance = HostInstance::new(fresh_bytes()?).ok_or(HostError::Refused)?;
         let grant_scope = LedgerInstance::new(fresh_bytes()?).ok_or(HostError::Refused)?;
@@ -325,6 +568,7 @@ impl HostState {
             phase: CatalogPhase::NeverEstablished,
             last_epoch: 0,
             cleanup_operation: None,
+            local: None,
         });
         Ok((
             locator,
@@ -361,7 +605,7 @@ impl HostState {
     ) -> Result<PolicyIntent, HostError> {
         self.observe(now)?;
         self.retire_invalid_offers()?;
-        self.session_for_attempt(attempt, locator)?;
+        Self::local_available(self.session_for_attempt(attempt, locator)?)?;
         if self
             .offers
             .iter()
@@ -387,7 +631,7 @@ impl HostState {
         deadline: u64,
     ) -> Result<PolicyIntent, HostError> {
         self.observe(now)?;
-        self.session_for_attempt(attempt, binding.locator)?;
+        Self::local_available(self.session_for_attempt(attempt, binding.locator)?)?;
         if !self.offers.iter().any(|g| {
             g.attempt == attempt
                 && g.offer.grant == grant
@@ -419,6 +663,7 @@ impl HostState {
             PolicyResolution::Authenticated(attempt) => Ok(HostDecision::Authenticated(attempt)),
             PolicyResolution::Approved(policy) => {
                 let e = self.session_for_attempt(policy.attempt, policy.locator)?;
+                Self::local_available(e)?;
                 if e.account != policy.account {
                     return Err(HostError::Refused);
                 }
@@ -475,6 +720,15 @@ impl HostState {
                         Ok(HostDecision::GrantIssued(offer))
                     }
                     PolicyKind::ConsumeGrant => {
+                        let local = e.local.clone();
+                        let mut local_phase = local
+                            .as_ref()
+                            .map(|binding| binding.phase.lock())
+                            .transpose()
+                            .map_err(|_| HostError::Refused)?;
+                        if let Some(phase) = local_phase.as_ref() {
+                            Self::phase_available(**phase)?;
+                        }
                         let epoch = AttachEpoch::new(
                             e.last_epoch.checked_add(1).ok_or(HostError::Exhausted)?,
                         )
@@ -493,17 +747,22 @@ impl HostState {
                             .grants
                             .consume(g.authority, g.offer.grant, g.offer.binding, now, epoch)
                             .map_err(|_| HostError::Refused)?;
+                        self.catalog
+                            .iter_mut()
+                            .find(|entry| entry.locator == policy.locator)
+                            .ok_or(HostError::Refused)?
+                            .last_epoch = epoch.get();
+                        if let Some(phase) = local_phase.as_mut() {
+                            **phase = LocalLeasePhase::Reserved(attachment);
+                        }
                         let g = self.offers.swap_remove(i);
                         self.grants
                             .retire_principal(g.authority.principal)
                             .map_err(|_| HostError::Refused)?;
-                        self.catalog
-                            .iter_mut()
-                            .find(|e| e.locator == policy.locator)
-                            .ok_or(HostError::Refused)?
-                            .last_epoch = epoch.get();
                         Ok(HostDecision::GrantConsumed(AuthorizedAttachment {
                             attachment,
+                            host: self.instance,
+                            local: local.as_ref().map(Arc::downgrade),
                         }))
                     }
                     PolicyKind::Authenticate => Err(HostError::Refused),
@@ -538,6 +797,28 @@ impl HostState {
         self.authorization.cancel_attempt(attempt)?;
         self.retire_invalid_offers()
     }
+    fn invalidate_local_attachment(
+        entry: &CatalogEntry,
+        frontend: Option<FrontendGeneration>,
+    ) -> Result<(), HostError> {
+        if let Some(local) = &entry.local {
+            let mut phase = local.phase.lock().map_err(|_| HostError::Refused)?;
+            match *phase {
+                LocalLeasePhase::Reserved(attachment)
+                    if frontend.is_none_or(|generation| generation == attachment.frontend) =>
+                {
+                    *phase = LocalLeasePhase::Unknown;
+                }
+                LocalLeasePhase::Attached(attachment)
+                    if frontend.is_none_or(|generation| generation == attachment.frontend) =>
+                {
+                    *phase = LocalLeasePhase::Fencing(attachment);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn retire_frontend(&mut self, frontend: FrontendAdmission) -> Result<(), HostError> {
         let i = self
             .frontends
@@ -545,6 +826,9 @@ impl HostState {
             .position(|(f, _)| *f == frontend)
             .ok_or(HostError::Refused)?;
         self.authorization.retire_frontend(frontend)?;
+        for entry in &self.catalog {
+            Self::invalidate_local_attachment(entry, Some(frontend.generation()))?;
+        }
         // Retire grant principals before frontend removal; resource registrations
         // and session entries are independent from these transient lifetimes.
         self.retire_invalid_offers()?;
@@ -556,6 +840,13 @@ impl HostState {
     }
     pub(crate) fn revoke_account(&mut self, uid: u32) -> Result<(), HostError> {
         let revocation = self.authorization.revoke_account(uid);
+        for entry in self
+            .catalog
+            .iter()
+            .filter(|entry| entry.account.uid() == uid)
+        {
+            Self::invalidate_local_attachment(entry, None)?;
+        }
         self.retire_invalid_offers()?;
         revocation?;
         Ok(())
@@ -604,42 +895,63 @@ impl HostState {
         proof: OwnerCompletion,
         now: u64,
     ) -> Result<(), HostError> {
+        let index = self.completion_preflight(
+            proof.host,
+            proof.locator,
+            proof.operation,
+            &proof.facts,
+            now,
+        )?;
+        self.commit_completion(index, proof, now);
+        Ok(())
+    }
+    fn completion_preflight(
+        &mut self,
+        host: HostInstance,
+        locator: SessionLocator,
+        operation: u64,
+        facts: &[CompletedChannelFact],
+        now: u64,
+    ) -> Result<usize, HostError> {
         self.observe(now)?;
-        if proof.host != self.instance || proof.facts.len() > transport::channel::CHANNEL_IDENTITIES
-        {
+        if host != self.instance || facts.len() > transport::channel::CHANNEL_IDENTITIES {
             return Err(HostError::Refused);
         }
-        let e = self
+        let index = self
             .catalog
-            .iter_mut()
-            .find(|e| e.locator == proof.locator)
+            .iter()
+            .position(|entry| entry.locator == locator)
             .ok_or(HostError::Refused)?;
-        if !matches!(e.phase, CatalogPhase::Established)
-            || e.cleanup_operation != Some(proof.operation)
-            || proof.facts.iter().enumerate().any(|(i, f)| {
-                f.exit.attachment.locator != proof.locator
-                    || f.exit.channel != f.output.channel
-                    || f.input.validate().is_err()
-                    || proof.facts[..i]
+        let entry = &self.catalog[index];
+        if !matches!(entry.phase, CatalogPhase::Established)
+            || entry.cleanup_operation != Some(operation)
+            || facts.iter().enumerate().any(|(i, fact)| {
+                fact.exit.attachment.locator != locator
+                    || fact.exit.channel != fact.output.channel
+                    || fact.input.validate().is_err()
+                    || facts[..i]
                         .iter()
-                        .any(|old| old.exit.channel == f.exit.channel)
+                        .any(|old| old.exit.channel == fact.exit.channel)
             })
         {
             return Err(HostError::Refused);
         }
-        // A real owner completion is still not a resource refund: backing storage
-        // must already have its separately authenticated release evidence.
+        let registration = entry.resources.ok_or(HostError::Refused)?;
+        self.retire_session_offers(locator)?;
         self.resources
             .lock()
             .map_err(|_| HostError::ResourceDebt)?
-            .retire_principal(e.resources.ok_or(HostError::Refused)?)
+            .retire_principal(registration)
             .map_err(|_| HostError::ResourceDebt)?;
-        e.resources = None;
-        e.phase = CatalogPhase::Completed {
+        Ok(index)
+    }
+    fn commit_completion(&mut self, index: usize, proof: OwnerCompletion, now: u64) {
+        let entry = &mut self.catalog[index];
+        entry.resources = None;
+        entry.phase = CatalogPhase::Completed {
             at: now,
             facts: proof.facts,
         };
-        self.retire_invalid_offers()
     }
     pub(crate) fn completed_facts(
         &self,
@@ -680,7 +992,8 @@ impl HostState {
             let e = &self.catalog[i];
             let retire = match e.phase {
                 CatalogPhase::NeverEstablished
-                    if now.saturating_sub(e.created_at) >= NEVER_ESTABLISHED_GRACE_MS =>
+                    if e.local.is_none()
+                        && now.saturating_sub(e.created_at) >= NEVER_ESTABLISHED_GRACE_MS =>
                 {
                     if let Some(p) = e.resources {
                         self.resources
@@ -729,4 +1042,4 @@ mod tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "host_resource_tests.rs"]
-mod resource_tests;
+pub(super) mod resource_tests;

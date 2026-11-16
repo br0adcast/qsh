@@ -4,7 +4,7 @@ use crate::session_owner::authorization::{
     personal_authorization::{PersonalAdmission, PersonalAuthorization, PersonalDelivery},
 };
 use crate::session_owner::local_channel::{
-    admit_channel, provision_pair, AdmissionBudget, TrustedChannelConfig,
+    admit_channel, provision_pair, AdmissionBudget, AdmittedChannel, TrustedChannelConfig,
 };
 use crate::session_owner::owner_resource_contract::OwnerResourceRequest;
 use crate::session_owner::protocol::OwnerRole;
@@ -78,7 +78,7 @@ impl PersonalServer {
         key: &transport::handshake::Keypair,
         token: [u8; 16],
         start_kind: transport::StartKind,
-    ) {
+    ) -> (tokio::net::UdpSocket, Connection) {
         {
             let mut list = self.allowlist.lock().unwrap();
             if !list.contains(&key.public) {
@@ -125,18 +125,87 @@ impl PersonalServer {
         })
         .await
         .unwrap();
+        // Keep the owned client endpoint alive through manager drain. Dropping
+        // it first can make a late server datagram end the proof connection,
+        // legitimately scrubbing its key before the host's current-policy check.
+        (socket, client)
     }
 }
 
 async fn authenticated() -> (HostState, AuthenticationAttempt, PersonalAdmission) {
-    let uid = nix::unistd::geteuid().as_raw();
-    let mode = HostMode::Personal { canonical_uid: uid };
-    let bytes = ByteLimits {
+    let (host, attempt, lease, _, _, fixture) = authenticated_with_limits(ByteLimits {
         channel_bytes: 64,
         session_bytes: 96,
         account_bytes: 128,
         global_bytes: 256,
-    };
+    })
+    .await;
+    fixture.finish().await.unwrap();
+    (host, attempt, lease)
+}
+pub(in crate::session_owner) struct PersonalProofFixture {
+    server: Option<PersonalServer>,
+    probe: Option<(tokio::net::UdpSocket, Connection)>,
+    channels: Option<(AdmittedChannel, AdmittedChannel)>,
+    budget: AdmissionBudget,
+}
+impl PersonalProofFixture {
+    pub(in crate::session_owner) async fn finish(mut self) -> Result<(), &'static str> {
+        let server = self.server.take().ok_or("missing-server")?;
+        server.stop.request();
+        let mut task = server.task;
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await;
+        let result = match joined {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(_) => Err("proof-manager-join"),
+            Err(_) => {
+                task.abort();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+                Err("proof-manager-timeout")
+            }
+        };
+        self.probe.take();
+        self.channels.take();
+        if self.budget.in_use() != 0 {
+            return Err("proof-channel-budget");
+        }
+        result
+    }
+}
+impl Drop for PersonalProofFixture {
+    fn drop(&mut self) {
+        if let Some(server) = &self.server {
+            server.stop.request();
+            server.task.abort();
+        }
+        // This failure fallback is not a joined receipt; finish() is required.
+    }
+}
+pub(in crate::session_owner) struct PersonalProofObservation {
+    allowlist: transport::SharedAllowlist,
+    key: [u8; 32],
+}
+impl PersonalProofObservation {
+    pub(in crate::session_owner) fn key_is_listed(&self) -> bool {
+        self.allowlist.lock().unwrap().contains(&self.key)
+    }
+}
+/// Shares the maintained real Personal proof fixture with the host-engine
+/// transaction while preserving its default resource-fixture limits. The caller
+/// keeps the actual proof transport alive through current-policy checks, then
+/// explicitly joins it before reporting assertions.
+pub(in crate::session_owner) async fn authenticated_with_limits(
+    bytes: ByteLimits,
+) -> (
+    HostState,
+    AuthenticationAttempt,
+    PersonalAdmission,
+    PersonalAuthorization,
+    PersonalProofObservation,
+    PersonalProofFixture,
+) {
+    let uid = nix::unistd::geteuid().as_raw();
+    let mode = HostMode::Personal { canonical_uid: uid };
     let mut h = HostState::new(
         mode,
         HostLimits::new(
@@ -183,22 +252,24 @@ async fn authenticated() -> (HostState, AuthenticationAttempt, PersonalAdmission
         .reserve(h.begin_authentication(f, 0, 10000).unwrap(), 0)
         .unwrap();
     let server = PersonalServer::start(observer, list).await;
-    server
-        .prove(
-            &lease,
-            &transport::generate_keypair(),
-            [53; 16],
-            transport::StartKind::Cold,
-        )
+    let key = transport::generate_keypair();
+    let observation = PersonalProofObservation {
+        allowlist: server.allowlist.clone(),
+        key: key.public,
+    };
+    let probe = server
+        .prove(&lease, &key, [53; 16], transport::StartKind::Cold)
         .await;
     let HostDecision::Authenticated(attempt) = lease.try_authenticate(&mut h, 1).unwrap() else {
         panic!("real proof refused")
     };
-    server.stop.request();
-    server.task.await.unwrap().unwrap();
-    drop((frontend_channel, host_channel));
-    assert_eq!(budget.in_use(), 0);
-    (h, attempt, lease)
+    let fixture = PersonalProofFixture {
+        server: Some(server),
+        probe: Some(probe),
+        channels: Some((frontend_channel, host_channel)),
+        budget,
+    };
+    (h, attempt, lease, adapter, observation, fixture)
 }
 #[tokio::test]
 async fn resources529_real_admission_provisions_and_drop_does_not_refund() {
