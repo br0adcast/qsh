@@ -90,8 +90,16 @@ How a path selects lanes:
   - a file outside the crate includes one of its files;
   - a tripwire finds a platform surface: a `cfg` other than `test`, a `std`
     module outside the reviewed list, `Instant`, `SystemTime`, `unsafe`,
-    `extern`, `asm!`, `env!`, `file!` or an include.
+    `extern`, `asm!`, `env!`, `file!` or an include;
+  - a tripwire finds a path it cannot follow: an alias or bare use of `std`,
+    `core` or `alloc` (`use std as p`, `std::{self as p}`, `std::*`, a root
+    handed to a macro or call), a nested or computed `std::` path,
+    `macro_rules!`, or a `#[path]` other than a plain file name.
 
+  Tripwires read the code with its comments removed by a Rust lexer, so a
+  line such as `*out = …` stays code and `std /* */ :: fs` is still `std::fs`.
+  Doc comments count as code for platform names, because doctests compile them.
+  Source the lexer cannot follow revokes the boundary.
   Tripwires only revoke the boundary; membership is a reviewed policy change.
   The residual risk is platform-specific output volume or timing; Nightly and
   release qualification still run every lane.
@@ -127,7 +135,8 @@ jobs API names a pull request's head commit, while the checkout tests the
 synthetic merge; both are verified and recorded. The gate fails when:
 
 - a selected cell is missing, duplicated, not successful, or still unresolved
-  after five minutes;
+  after five minutes (a job listed as completed without a conclusion yet
+  counts as unresolved, not failed);
 - a job it does not know appears in its run;
 - a skipped job keeps a lane template that the lane needed;
 - the selection record is missing or names another source;

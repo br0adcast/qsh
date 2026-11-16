@@ -160,6 +160,11 @@ class Expectation:
         self.required = set(required)
 
 
+def settled(record):
+    """A completed record can briefly lack its conclusion; that is still pending."""
+    return record['status'] == 'completed' and record.get('conclusion') is not None
+
+
 def evaluate(groups, latest, history, attempt, own, required_admin, strict):
     """Return (failures, pending, cells) for one jobs snapshot.
 
@@ -198,13 +203,13 @@ def evaluate(groups, latest, history, attempt, own, required_admin, strict):
                 continue
             record = records[0] if records else None
             if lane in expected.required:
-                if record is None or record['status'] != 'completed':
+                if record is None or not settled(record):
                     pending.append(label + cell)
                     continue
                 if record.get('conclusion') != 'success':
                     failures.append('FAILED ' + label + cell + ' ' + str(record.get('conclusion')))
             elif record is not None:
-                if record['status'] != 'completed':
+                if not settled(record):
                     pending.append(label + cell)
                     continue
                 if record.get('conclusion') not in ('success', 'skipped'):
@@ -216,14 +221,16 @@ def evaluate(groups, latest, history, attempt, own, required_admin, strict):
             if len(records) > len(lanes):
                 failures.append('DUPLICATE_TEMPLATE ' + label + template.replace('\0', '…'))
             for record in records:
-                if record['status'] != 'completed' or record.get('conclusion') != 'skipped':
+                if record['status'] == 'completed' and record.get('conclusion') is None:
+                    pending.append(label + template.replace('\0', '…'))
+                elif record['status'] != 'completed' or record.get('conclusion') != 'skipped':
                     failures.append('TEMPLATE_NOT_SKIPPED ' + label + template.replace('\0', '…'))
         for key, (job, accept) in expected.admin.items():
             records = seen.get((prefix, key), [])
             if len(records) > 1:
                 failures.append('DUPLICATE ' + label + key)
             for record in records:
-                if record['status'] != 'completed':
+                if not settled(record):
                     pending.append(label + key)
                 elif record.get('conclusion') not in accept:
                     failures.append('ADMINISTRATIVE_FAILED ' + label + key.replace('\0', '…'))
@@ -231,7 +238,7 @@ def evaluate(groups, latest, history, attempt, own, required_admin, strict):
                 pending.append(label + key)
         for call in expected.calls:
             for record in seen.get((prefix, call), []):
-                if record['status'] != 'completed':
+                if not settled(record):
                     pending.append(label + call)
                 elif record.get('conclusion') != 'skipped':
                     failures.append('CALL_NOT_RUN ' + label + call + ' ' + str(record.get('conclusion')))

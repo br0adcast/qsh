@@ -273,7 +273,75 @@ def merged(base_ws, head_ws, attribute, name):
     return values
 
 
-RUST_COMMENT = re.compile(r'^\s*(//|/\*|\*)')
+LEX_START = re.compile(r'//|/\*|(?<![\w])(?:br|cr|r)#*"|"|\'')
+BLOCK_EDGE = re.compile(r'/\*|\*/')
+STRING_BODY = re.compile(r'(?:[^"\\]|\\.)*', re.S)
+CHAR_LITERAL = re.compile(r"'(?:\\(?:u\{[0-9A-Fa-f_]{1,8}\}|x[0-9A-Fa-f]{2}|.)|[^'\\\n])'", re.S)
+
+
+class LexError(ValueError):
+    """Rust text the lexer cannot follow; callers treat it as uncertain."""
+
+
+def rust_code(text, strings=True, docs=False):
+    """Replace Rust comments with a space, keeping every code line intact.
+
+    A line-prefix rule would drop executable lines such as `*out = value;`.
+    String, raw string and character literals are followed, so `//` or `/*`
+    inside a literal stays code. With `strings=False` literal contents are
+    blanked; with `docs=True` doc comments (`///`, `//!`, `/**`, `/*!`) stay as
+    code, because doctests compile them.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        found = LEX_START.search(text, i)
+        if found is None:
+            out.append(text[i:])
+            break
+        out.append(text[i:found.start()])
+        i = found.start()
+        token = found.group(0)
+        if token == '//':
+            end = text.find('\n', i)
+            end = n if end < 0 else end
+            doc = text.startswith(('///', '//!'), i) and not text.startswith('////', i)
+            out.append(text[i:end] if docs and doc else ' ')
+            i = end
+        elif token == '/*':
+            doc = text.startswith(('/**', '/*!'), i) and not text.startswith(('/**/', '/***'), i)
+            depth, j = 1, i + 2
+            while depth:
+                step = BLOCK_EDGE.search(text, j)
+                if step is None:
+                    raise LexError('unterminated block comment')
+                depth += 1 if step.group(0) == '/*' else -1
+                j = step.end()
+            out.append(text[i:j] if docs and doc else ' ' + '\n' * text.count('\n', i, j))
+            i = j
+        elif token.endswith('"') and token != '"':
+            close = '"' + token[token.index('#'):-1] if '#' in token else '"'
+            end = text.find(close, found.end())
+            if end < 0:
+                raise LexError('unterminated raw string')
+            body = text[found.end():end]
+            out.append(token + (body if strings else '\n' * body.count('\n')) + close)
+            i = end + len(close)
+        elif token == '"':
+            end = STRING_BODY.match(text, i + 1)
+            if end is None or end.end() >= n:
+                raise LexError('unterminated string')
+            body = end.group(0)
+            out.append('"' + (body if strings else '\n' * body.count('\n')) + '"')
+            i = end.end() + 1
+        else:
+            char = CHAR_LITERAL.match(text, i)
+            if char is None:
+                out.append("'")  # a lifetime or label
+                i += 1
+            else:
+                out.append(char.group(0) if strings else "' '")
+                i = char.end()
+    return ''.join(out)
 INCLUDE = re.compile(r'\b(include|include_str|include_bytes)!\s*\(\s*("(?:[^"\\]|\\.)*")?')
 GLOB_TOKEN = re.compile(r'(?:\.\./)*(?:scripts|packaging)/[^\s\'"`)\]]*')
 
@@ -316,7 +384,10 @@ class Corpus:
             if text is None:
                 continue
             if path.endswith('.rs'):
-                text = '\n'.join(line for line in text.splitlines() if not RUST_COMMENT.match(line))
+                try:
+                    text = rust_code(text)
+                except LexError:
+                    pass  # keep the whole text: more mentions, never fewer
             self.texts[path] = text
         self.globs = {path: globs(text) for path, text in self.texts.items()}
         self.basenames = {}
@@ -611,23 +682,71 @@ class Selector:
         return {lane: sorted(reasons) for lane, reasons in sorted(self.reasons.items())}
 
 
+ROOTS = ('std', 'core', 'alloc')
+PATH_ATTRIBUTE = re.compile(r'#\s*!?\s*\[\s*path\s*=\s*"([^"]*)"\s*\]')
+
+
 def tripwire(text, allowed_std):
-    code = '\n'.join(line for line in text.splitlines() if not RUST_COMMENT.match(line))
-    for item in re.finditer(r'\bcfg(?:_attr)?!?\s*\(', code):
+    """True unless the source visibly stays inside the reviewed pure subset.
+
+    Lexical and conservative: anything this cannot classify revokes the
+    boundary. Platform API names are found after comments are removed and
+    whitespace around `::` is collapsed, and any aliasing or computed path of
+    `std`, `core` or `alloc` revokes rather than being followed.
+    """
+    try:
+        literal = rust_code(text, docs=True)
+        documented = rust_code(text, strings=False, docs=True)
+        plain = rust_code(text, strings=False)
+    except LexError:
+        return True
+    for target in PATH_ATTRIBUTE.findall(literal):
+        if not re.fullmatch(r'[A-Za-z0-9_]+\.rs', target):
+            return True
+    if re.search(r'#\s*!?\s*\[\s*path\b', documented) and not PATH_ATTRIBUTE.search(literal):
+        return True
+    documented, plain = (re.sub(r'\s*::\s*', '::', code) for code in (documented, plain))
+    for item in re.finditer(r'\bcfg(?:_attr)?!?\s*\(', documented):
         depth, index = 1, item.end()
-        while index < len(code) and depth:
-            depth += {'(': 1, ')': -1}.get(code[index], 0)
+        while index < len(documented) and depth:
+            depth += {'(': 1, ')': -1}.get(documented[index], 0)
             index += 1
-        predicate = re.sub(r'\s+', '', code[item.end():index - 1])
+        predicate = re.sub(r'\s+', '', documented[item.end():index - 1])
         if 'cfg_attr' in item.group(0) or predicate not in ('test', 'not(test)'):
             return True
-    if re.search(r'\b(Instant|SystemTime|unsafe|extern)\b|#\s*!?\s*\[\s*link|\b(?:global_)?asm!'
-                 r'|\b(?:env|option_env|file|include|include_str|include_bytes)!', code):
+    if re.search(r'\b(Instant|SystemTime|unsafe|extern|macro_rules)\b|#\s*!?\s*\[\s*link'
+                 r'|\b(?:global_)?asm!|\b(?:env|option_env|file|include|include_str|include_bytes)!', documented):
         return True
-    for root in ('std', 'core', 'alloc'):
-        for item in re.finditer(r'\b' + root + r'::(\{[^}]*\}|[A-Za-z_]\w*)', code):
-            segment = item.group(1)
-            names = re.findall(r'(?:^|[{,])\s*([A-Za-z_]\w*)', segment) if segment.startswith('{') else [segment]
+    # Doctests compile doc comments, so explicit paths count there too. Bare
+    # roots and aliases are judged on code alone, where prose cannot appear.
+    return root_paths(documented, allowed_std, bare=False) or root_paths(plain, allowed_std, bare=True)
+
+
+def root_paths(code, allowed_std, bare):
+    for root in ROOTS:
+        for item in re.finditer(r'(?<![\w$.])' + root + r'(?!\w)', code):
+            rest = code[item.end():]
+            if not rest.startswith('::'):
+                if not bare:
+                    continue
+                if root == 'core' and re.match(r'\s*(\.|=(?!=)|;|:(?!:))', rest):
+                    continue  # a local value named `core`: `core.feed(…)`, `let mut core = …`
+                return True  # `use std as p;`, a bare root, or one handed to a macro or call
+            group = re.match(r'::\{([^{}]*)\}', rest)
+            if group:
+                names = []
+                for part in group.group(1).split(','):
+                    if not part.strip():
+                        continue
+                    head = re.match(r'\s*([A-Za-z_]\w*)', part)
+                    if head is None or head.group(1) in ('self', 'super', 'crate'):
+                        return True
+                    names.append(head.group(1))
+            else:
+                head = re.match(r'::([A-Za-z_]\w*)', rest)
+                if head is None:
+                    return True  # `std::*`, `std::$segment`, nested groups
+                names = [head.group(1)]
             if any(name not in allowed_std for name in names):
                 return True
     return False

@@ -130,11 +130,27 @@ class SelectionTests(unittest.TestCase):
                         '\n#[cfg(target_os = "macos")]\nfn mac() {}\n',
                         '\nuse std::{fs, mem};\n',
                         '\nconst X: &str = env!("HOME");\n',
-                        '\nextern "C" { fn abs(x: i32) -> i32; }\n'):
+                        '\nextern "C" { fn abs(x: i32) -> i32; }\n',
+                        # Review 6928857783: aliased, spaced and dereference forms.
+                        '\nuse std as platform;\npub fn a() -> bool { platform::fs::metadata("x").is_ok() }\n',
+                        '\npub fn b() -> bool { std /* comment */ :: fs :: metadata("x").is_ok() }\n',
+                        '\npub fn c(result: &mut bool) {\n    *result = std::fs::metadata("x").is_ok();\n}\n',
+                        '\nuse std::*;\n',
+                        '\nuse std::{self as p};\n',
+                        '\nmacro_rules! m { ($r:ident) => { $r::fs::read("x") } }\n',
+                        '\n#[path = "../../../cli/src/tty.rs"]\nmod borrowed;\n',
+                        '\n/// ```\n/// std::fs::read("x").unwrap();\n/// ```\npub fn d() {}\n',
+                        '\nconst U: &str = "http://x"; pub fn e() -> bool { std::fs::metadata("x").is_ok() }\n'):
             with self.subTest(planted=planted):
                 lanes = self.lanes(edits=[('crates/render/src/sgr.rs', append(planted))])
                 self.assertEqual(lanes, DEPENDENT)
                 self.assertIn('REVOKED_TRIPWIRE', ' '.join(r for v in self.last.reasons.values() for r in v))
+
+    def test_pure_code_with_dereferences_and_literals_keeps_the_boundary(self):
+        planted = ('\npub fn keep(out: &mut usize, v: &[u8]) {\n    *out = std::mem::size_of_val(v);\n'
+                   '    let _ = ("std::fs // not code", \'"\', r#"/* std::fs */"#);\n}\n'
+                   '// std::fs in a comment\n/* use std::fs; */\n')
+        self.assertEqual(self.lanes(edits=[('crates/render/src/sgr.rs', append(planted))]), BOUNDARY)
 
     def test_removing_forbid_unsafe_revokes_the_boundary(self):
         lanes = self.lanes(edits=[('crates/render/src/lib.rs',
@@ -389,12 +405,27 @@ class TripwireTests(unittest.TestCase):
         self.assertFalse(select.tripwire('use std::mem;\n#[cfg(test)]\nmod t {}\n#[cfg(not(test))]\nfn f() {}\n',
                                          allowed))
         self.assertFalse(select.tripwire('#![forbid(unsafe_code)]\n// std::fs in a comment\n', allowed))
+        for source in ('let mut core = T::new();\ncore.feed(b"x");\nlet f = core.frame();\n',
+                       '#[path = "renderer_tests.rs"]\nmod tests;\n', "fn f<'a>(x: &'a str) -> &'a str { x }",
+                       "let c = '\\''; let s = \"std::fs\";", '//! The renderer\'s core property\n'):
+            with self.subTest(source=source):
+                self.assertFalse(select.tripwire(source, allowed))
         for source in ('use std::io::Write;', 'use std::{mem, process};', 'let t = SystemTime::now();',
                        '#[cfg_attr(test, derive(Debug))]', '#[cfg(unix)]', 'if cfg!(windows) {}',
                        'unsafe { }', 'core::arch::asm!("nop");', 'include_bytes!("x")',
-                       'option_env!("X")', 'file!()', '#[link(name = "c")]'):
+                       'option_env!("X")', 'file!()', '#[link(name = "c")]',
+                       'use std as p;', 'std /* c */ :: fs :: read("x");', '*out = std::fs::read("x");',
+                       'use std::*;', 'use std::{self as p};', 'use std::{fs::{File}};', 'g(core);',
+                       'm!(alloc);', '#[path = "../x.rs"] mod x;', '/// std::fs::read("x");',
+                       'let s = "/*"; std::fs::read("x");', "let q = '\"'; std::fs::read(\"x\"); let r = '\"';",
+                       '/* unterminated', '"unterminated'):
             with self.subTest(source=source):
                 self.assertTrue(select.tripwire(source, allowed))
+
+    def test_rust_code_keeps_executable_lines_and_literals(self):
+        source = 'a /* x /* y */ z */ b // c\n*p = "//x";\nlet q = \'"\'; // d\n'
+        self.assertEqual(select.rust_code(source), 'a   b  \n*p = "//x";\nlet q = \'"\';  \n')
+        self.assertEqual(select.rust_code(source, strings=False), 'a   b  \n*p = "";\nlet q = \' \';  \n')
 
 
 if __name__ == '__main__':

@@ -237,6 +237,31 @@ class PullRequestGateTests(GateHarness):
         result = gate.Gate('ci', env, api, sleep=lambda seconds: None, source=(S, [B, H])).run()
         self.assertEqual(result['result'], 'PASS', result['failures'])
 
+    def test_completed_record_without_a_conclusion_is_still_pending(self):
+        # GitHub can list a job as completed before its conclusion is visible.
+        lanes = {'check', 'container'}
+        unsettled = {'container': {'status': 'completed', 'conclusion': None}}
+        snapshots = [self.pr_jobs(lanes, unsettled), self.pr_jobs(lanes)]
+        state = {'n': 0}
+
+        def latest():
+            state['n'] += 1
+            return snapshots[0] if state['n'] == 1 else snapshots[1]
+        env = dict(self.env, QSH_GATE_RECORD=self.record(lanes), QSH_GATE_NEEDS=self.needs(lanes),
+                   QSH_GATE_VISIBILITY_SECONDS='60')
+        api = FakeApi(self.run_payload(), latest, history=lambda: snapshots[1])
+        result = gate.Gate('ci', env, api, sleep=lambda seconds: None, source=(S, [B, H])).run()
+        self.assertEqual(result['result'], 'PASS', result['failures'])
+        self.assertGreater(state['n'], 1)
+        # A conclusion that never appears stays unresolved, never a pass.
+        env = dict(env, QSH_GATE_VISIBILITY_SECONDS='0')
+        stuck = self.pr_jobs(lanes, unsettled)
+        result = gate.Gate('ci', env, FakeApi(self.run_payload(), stuck), sleep=lambda seconds: None,
+                           source=(S, [B, H])).run()
+        self.assertEqual(result['result'], 'FAIL')
+        self.assertIn('UNRESOLVED container', result['failures'])
+        self.assertFalse(any(f.startswith('FAILED container') for f in result['failures']))
+
     def test_pagination_reads_every_page_and_refuses_truncation(self):
         lanes = {'check', 'container'}
         jobs = self.pr_jobs(lanes)
