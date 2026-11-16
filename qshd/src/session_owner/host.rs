@@ -106,6 +106,7 @@ struct CatalogEntry {
     last_epoch: u64,
     cleanup_operation: Option<u64>,
     local: Option<Arc<LocalBinding>>,
+    final_status: Option<super::status_contract::OwnerStatus>,
 }
 
 /// These capabilities deliberately have no production constructors in 3A1.
@@ -208,6 +209,9 @@ pub(crate) struct HostState {
     frontend_debt: Vec<FrontendObligation>,
     catalog: Vec<CatalogEntry>,
     status_revision: Option<u64>,
+    pub(super) status_resident_build: Option<super::status_contract::BuildIdentity>,
+    pub(super) status_serving: Option<super::host_status::ServingObservation>,
+    pub(super) status_snapshot: Option<super::host_status::StatusSnapshot>,
     offers: Vec<PendingGrant>,
     grants: GrantLedger,
     resources: Arc<Mutex<ResourceLedger>>,
@@ -381,7 +385,7 @@ impl HostState {
         intent: &CleanupIntent,
         proof: super::engine::LocalCompletion,
         now: u64,
-    ) -> Result<(), (HostError, super::engine::LocalCompletion)> {
+    ) -> Result<(), Box<(HostError, super::engine::LocalCompletion)>> {
         let preflight = (|| {
             self.validate_local_binding(binding)?;
             let entry = self
@@ -412,8 +416,22 @@ impl HostState {
         })();
         let index = match preflight {
             Ok(index) => index,
-            Err(error) => return Err((error, proof)),
+            Err(error) => return Err(Box::new((error, proof))),
         };
+        self.catalog[index].final_status =
+            proof.final_status().and_then(|(build, total_channels)| {
+                Some(super::status_contract::OwnerStatus {
+                    locator: binding.identity.locator,
+                    build,
+                    ipc: super::status_contract::IpcRange::new(
+                        super::protocol::OWNER_VERSION,
+                        super::protocol::OWNER_VERSION,
+                    )
+                    .ok()?,
+                    active_channels: 0,
+                    total_channels,
+                })
+            });
         // The seal is consumed only after every fallible check/release. There
         // is no setter or constructor accepting replacement public exit facts.
         let converted = OwnerCompletion {
@@ -493,6 +511,9 @@ impl HostState {
             frontend_debt: Vec::new(),
             catalog: Vec::new(),
             status_revision: Some(0),
+            status_resident_build: None,
+            status_serving: None,
+            status_snapshot: None,
             offers: Vec::new(),
             grants,
             resources: Arc::new(Mutex::new(resources)),
@@ -562,7 +583,10 @@ impl HostState {
             return Err(HostError::Refused);
         }
         // This admission latch precedes every allocation and fallible custody operation.
-        self.stopping = true;
+        if !self.stopping {
+            self.stopping = true;
+            self.note_status_mutation();
+        }
         let operation = match self.stop_operation {
             Some(operation) => operation,
             None => {
@@ -662,11 +686,39 @@ impl HostState {
                 })
         })
     }
+    #[cfg(test)]
+    pub(super) fn status_capacity_for_test(&mut self, capacity: usize) {
+        self.limits.sessions = capacity;
+    }
+    #[cfg(test)]
+    pub(super) fn exhaust_status_revision_for_test(&mut self) {
+        self.status_revision = Some(u64::MAX);
+    }
     pub(super) fn status_revision(&self) -> Option<u64> {
         self.status_revision
     }
     pub(super) fn note_status_mutation(&mut self) {
+        self.status_snapshot = None;
         self.status_revision = self.status_revision.and_then(|v| v.checked_add(1));
+    }
+    pub(super) fn status_catalog_roster(
+        &self,
+    ) -> Result<Vec<super::host_status::StatusCatalogRow>, super::host_status::StatusError> {
+        use super::host_status::{StatusCatalogRow, StatusError};
+        if self.catalog.len() > self.limits.sessions {
+            return Err(StatusError::Unavailable);
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(self.catalog.len())
+            .map_err(|_| StatusError::Unavailable)?;
+        for entry in &self.catalog {
+            rows.push(StatusCatalogRow {
+                binding: entry.local.clone().ok_or(StatusError::Unavailable)?,
+                completed: matches!(entry.phase, CatalogPhase::Completed { .. }),
+                final_status: entry.final_status.clone(),
+            });
+        }
+        Ok(rows)
     }
     pub(super) fn supervision_roster_complete(
         &self,
@@ -788,6 +840,7 @@ impl HostState {
                     frontend,
                     capsule: None,
                 });
+                self.note_status_mutation();
                 Ok(frontend)
             }
             Err(_) => {
@@ -869,6 +922,7 @@ impl HostState {
             last_epoch: 0,
             cleanup_operation: None,
             local: None,
+            final_status: None,
         });
         self.note_status_mutation();
         Ok((
@@ -957,6 +1011,7 @@ impl HostState {
         result: PolicyResult,
         now: u64,
     ) -> Result<HostDecision, HostError> {
+        self.note_status_mutation();
         self.ensure_running()?;
         self.observe(now)?;
         let resolution = self.authorization.resolve(result, now);
@@ -1147,6 +1202,7 @@ impl HostState {
         if self.frontends[index].retirement == FrontendRetirement::Active {
             self.authorization.retire_frontend(frontend)?;
             self.frontends[index].retirement = FrontendRetirement::AuthorityRetired;
+            self.status_frontend_lost(frontend);
         }
         for entry in &self.catalog {
             Self::invalidate_local_attachment(entry, Some(frontend.generation()))?;
@@ -1167,6 +1223,7 @@ impl HostState {
     }
     pub(crate) fn revoke_account(&mut self, uid: u32) -> Result<(), HostError> {
         let revocation = self.authorization.revoke_account(uid);
+        self.note_status_mutation();
         for entry in self
             .catalog
             .iter()

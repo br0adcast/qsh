@@ -62,3 +62,6 @@ pub(crate) mod host_replacement;
 
 #[allow(dead_code)] // Dormant inherited supervision; no service route is activated.
 pub(crate) mod supervisor;
+
+#[allow(dead_code)] // No actual serving/listener receipt producer is activated.
+pub(crate) mod host_status;

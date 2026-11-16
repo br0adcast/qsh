@@ -1243,6 +1243,10 @@ async fn supervisor529_replacement_fenced_requires_prepared_and_actual_complete_
         "replacement fencing is not owner destruction"
     );
     drop(fixture.consumer);
+    supervisor.owners[fixture.index]
+        .close(&mut h, 100)
+        .await
+        .unwrap();
 }
 #[tokio::test]
 async fn supervisor529_replacement_omitted_actual_owner_refuses_before_fencing() {
@@ -1250,7 +1254,7 @@ async fn supervisor529_replacement_omitted_actual_owner_refuses_before_fencing()
     let mut supervisor = HostSupervisor::new(&mut h).unwrap();
     let handle = frontend(&mut supervisor, &mut h);
     let fixture = program(&mut supervisor, &mut h, &handle).await;
-    let (omitted, _pair, _lease, _client, _restart) =
+    let (mut omitted, pair, _lease, _client, _restart) =
         unused_open_fixture(&mut h, supervisor.test_registration(&handle), false);
     let guard = h
         .begin_replacement(
@@ -1275,6 +1279,12 @@ async fn supervisor529_replacement_omitted_actual_owner_refuses_before_fencing()
         Some(crate::session_owner::status_contract::ReplacementStatus::Prepared)
     );
     drop(fixture.consumer);
+    omitted.release_unstarted_admitted(pair).unwrap();
+    omitted.close(&mut h, 100).await.unwrap();
+    supervisor.owners[fixture.index]
+        .close(&mut h, 101)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1334,6 +1344,10 @@ async fn supervisor529_replacement_cancelled_fence_resumes_exact_writer_without_
         Some(crate::session_owner::status_contract::ReplacementStatus::Fenced)
     );
     drop(fixture.consumer);
+    supervisor.owners[fixture.index]
+        .close(&mut h, 100)
+        .await
+        .unwrap();
 }
 #[tokio::test]
 async fn supervisor529_replacement_equal_roster_aba_invalidates_captured_operation() {
@@ -1368,4 +1382,8 @@ async fn supervisor529_replacement_equal_roster_aba_invalidates_captured_operati
     );
     assert_eq!(fixture.control.kills(16), 0);
     drop(fixture.consumer);
+    supervisor.owners[fixture.index]
+        .close(&mut h, 100)
+        .await
+        .unwrap();
 }

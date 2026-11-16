@@ -279,12 +279,17 @@ impl LocalEstablishment {
     }
 }
 pub(super) struct LocalCompletion {
+    build: Option<super::status_contract::BuildIdentity>,
+    total_channels: Option<u16>,
     binding: Weak<super::host_engine::LocalBinding>,
     locator: SessionLocator,
     client: OwnerResourceClient,
     facts: Vec<super::host::CompletedChannelFact>,
 }
 impl LocalCompletion {
+    pub(super) fn final_status(&self) -> Option<(super::status_contract::BuildIdentity, u16)> {
+        Some((self.build.clone()?, self.total_channels?))
+    }
     pub(super) fn matches(
         &self,
         binding: &Arc<super::host_engine::LocalBinding>,
@@ -327,15 +332,18 @@ pub struct SessionOwnerEngine {
     control_failed: bool,
     ever_established: bool,
     local_binding: Option<Weak<super::host_engine::LocalBinding>>,
+    local_build: Option<super::status_contract::BuildIdentity>,
     local_establishment: Option<LocalEstablishment>,
     local_completion: Option<LocalCompletion>,
     close_facts: Option<Vec<super::host::CompletedChannelFact>>,
+    close_total_channels: Option<u16>,
     cleanup_complete: bool,
     facts_captured: bool,
 }
 impl SessionOwnerEngine {
     pub(super) fn bind_local_binding(&mut self, binding: &Arc<super::host_engine::LocalBinding>) {
         self.local_binding = Some(Arc::downgrade(binding));
+        self.local_build = super::host_status::resident_build_identity().ok();
     }
     pub(super) fn take_local_establishment(&mut self) -> Option<LocalEstablishment> {
         self.local_establishment.take()
@@ -404,9 +412,11 @@ impl SessionOwnerEngine {
             control_failed: false,
             ever_established: false,
             local_binding: None,
+            local_build: None,
             local_establishment: None,
             local_completion: None,
             close_facts: None,
+            close_total_channels: None,
             cleanup_complete: false,
             facts_captured: false,
         })
@@ -639,6 +649,39 @@ impl SessionOwnerEngine {
             shared: self.leases.clone(),
             attachment: frontend.attachment,
             tickets,
+        })
+    }
+    pub(super) fn status_observation(
+        &self,
+    ) -> Result<super::status_contract::OwnerStatus, super::host_status::StatusError> {
+        use super::host_status::StatusError;
+        // All live true predicates become false irreversibly unless mutable
+        // installation changes the engine revision. Failed or unobserved live
+        // channels are unavailable, never an invented zero active count.
+        if self.control_failed
+            || self
+                .control_ticket
+                .as_ref()
+                .is_some_and(|ticket| !ticket.healthy())
+            || self.channels.values().any(|channel| {
+                !channel.installed
+                    || !self.retained.catalog_active(channel.instance)
+                    || !channel.writer.can_catalog()
+            })
+        {
+            return Err(StatusError::Unavailable);
+        }
+        let count = u8::try_from(self.channels.len()).map_err(|_| StatusError::Unavailable)?;
+        Ok(super::status_contract::OwnerStatus {
+            locator: self.locator,
+            build: self.local_build.clone().ok_or(StatusError::Unavailable)?,
+            ipc: super::status_contract::IpcRange::new(
+                super::protocol::OWNER_VERSION,
+                super::protocol::OWNER_VERSION,
+            )
+            .map_err(|_| StatusError::Unavailable)?,
+            active_channels: count,
+            total_channels: u16::from(count),
         })
     }
     pub fn catalog_available(&self) -> bool {
@@ -2072,6 +2115,10 @@ impl SessionOwnerEngine {
                     },
                 });
             }
+            // Accepted identities include exact failed-before-install slots,
+            // which deliberately have no fabricated installed-child exit fact.
+            // Retain this independent count across cancellation/map destruction.
+            self.close_total_channels = u16::try_from(self.channels.len()).ok();
             self.close_facts = Some(facts);
             self.facts_captured = true;
         }
@@ -2112,6 +2159,8 @@ impl SessionOwnerEngine {
         if self.ever_established {
             if let Some(binding) = &self.local_binding {
                 self.local_completion = Some(LocalCompletion {
+                    build: self.local_build.clone(),
+                    total_channels: self.close_total_channels,
                     binding: binding.clone(),
                     locator: self.locator,
                     client: self.resources.clone(),

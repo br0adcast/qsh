@@ -89,6 +89,11 @@ impl From<EngineError> for LocalEngineError {
     }
 }
 impl LocalOwnerEngine {
+    pub(super) fn status_observation(
+        &self,
+    ) -> Result<super::status_contract::OwnerStatus, super::host_status::StatusError> {
+        self.engine.status_observation()
+    }
     pub(super) fn status_revision(&self) -> Option<u64> {
         self.revision
     }
@@ -433,9 +438,10 @@ impl LocalOwnerEngine {
             self.frontend.take();
             self.fence.take();
             let proof = self.completion.take().ok_or(EngineError::CleanupPending)?;
-            if let Err((error, proof)) =
+            if let Err(failure) =
                 host.complete_local_owner(&self.binding, self.cleanup.as_ref().unwrap(), proof, now)
             {
+                let (error, proof) = *failure;
                 self.completion = Some(proof);
                 return Err(error.into());
             }

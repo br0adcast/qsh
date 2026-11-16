@@ -114,6 +114,17 @@ pub(crate) struct HostSupervisor {
     replacement_fencing: Option<ReplacementFencing>,
 }
 impl HostSupervisor {
+    pub(crate) fn status_page(
+        &self,
+        host: &mut HostState,
+        requester: FrontendAdmission,
+        cursor: Option<super::status_contract::StatusCursor>,
+    ) -> Result<super::status_contract::StatusPage, super::host_status::StatusError> {
+        self.current(host)
+            .map_err(|_| super::host_status::StatusError::Refused)?;
+        let owners: Vec<_> = self.owners.iter().collect();
+        host.status_page(requester, cursor, &owners)
+    }
     fn validate_fencing(&self, host: &HostState) -> Result<(), SupervisionError> {
         self.current(host)?;
         let progress = self
