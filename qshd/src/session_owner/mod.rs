@@ -53,3 +53,6 @@ mod host_endpoint_tests;
 
 #[allow(dead_code)] // Dormant inherited-launch parcel; no production caller.
 pub(crate) mod inherited_launch;
+
+#[allow(dead_code)] // Dormant local host-to-engine adapter; no production route.
+pub(crate) mod host_engine;

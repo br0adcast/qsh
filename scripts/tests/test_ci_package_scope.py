@@ -635,6 +635,80 @@ class PackageScopeTests(unittest.TestCase):
                 else:
                     self.assertNotEqual(result.returncode, 0, result.stderr)
 
+    def test_exact_cli_fixture_alone_and_with_core_admits_pr_and_push(self):
+        cli = 'cli/src/climb_bootstrap_tests.rs'
+        for event in ('pull_request', 'push'):
+            for paths in ([cli], [cli, 'qshd/src/session_owner/host_engine_tests.rs']):
+                with self.subTest(event=event, paths=paths):
+                    self.assertEqual(self.decision(paths, event_name=event), 'false')
+
+    def test_exact_cli_fixture_policy_amendment_preserves_main_contract(self):
+        cli = 'cli/src/climb_bootstrap_tests.rs'
+        prior = self.source
+        for current, previous in (
+            ("                           'scripts/tests/test_qshd_library_receipt.py',\n"
+             "                           'cli/src/climb_bootstrap_tests.rs'}",
+             "                           'scripts/tests/test_qshd_library_receipt.py'}"),
+            ("                              'scripts/tests/test_qshd_library_receipt.py',\n"
+             "                              'cli/src/climb_bootstrap_tests.rs'}:",
+             "                              'scripts/tests/test_qshd_library_receipt.py'}:"),
+        ):
+            self.assertEqual(prior.count(current), 1)
+            prior = prior.replace(current, previous, 1)
+        for event in ('pull_request', 'push'):
+            with self.subTest(event=event):
+                fixture = GitFixture()
+                self.addCleanup(fixture.close)
+                fixture.write('.github/workflows/ci.yml', prior)
+                fixture.write('scripts/tests/test_ci_package_scope.py')
+                base = fixture.commit()
+                fixture.write('.github/workflows/ci.yml', self.source)
+                fixture.write('scripts/tests/test_ci_package_scope.py', '# changed policy control\n')
+                fixture.write(cli)
+                fixture.write('qshd/src/session_owner/host_engine_tests.rs')
+                head = fixture.commit()
+                result, fields = fixture.execute(actual_helper(self.source), base, head,
+                                                event_name=event)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(fields.get('required'), 'false')
+                self.assertIn(' reason=PROTECTED_POLICY_AND_CORE\n', result.stdout)
+
+    def test_exact_cli_fixture_keeps_neighbor_package_dependency_and_unknown_required(self):
+        cli = 'cli/src/climb_bootstrap_tests.rs'
+        for event in ('pull_request', 'push'):
+            for other in ('cli/src/climb.rs', 'cli/src/neighbor_tests.rs',
+                          'packaging/selinux/new-input', 'cli/Cargo.toml',
+                          'scripts/check-selinux-consumer-rpm.py', 'unknown/new-input'):
+                with self.subTest(event=event, other=other):
+                    self.assertEqual(self.decision([cli, other], event_name=event), 'true')
+                    self.assertEqual(self.policy_decision(extra=[cli, other],
+                                                         event_name=event), 'true')
+
+    def test_exact_cli_fixture_missing_renamed_and_nonregular_entries_require_native(self):
+        cli = 'cli/src/climb_bootstrap_tests.rs'
+        for event in ('pull_request', 'push'):
+            for mutation in ('delete', 'rename', 'executable', 'symlink', 'empty', 'invalid-utf8'):
+                with self.subTest(event=event, mutation=mutation):
+                    fixture, base, _ = self.fixture([], initial=[cli])
+                    path = fixture.root / cli
+                    if mutation in ('delete', 'rename', 'symlink'):
+                        path.unlink()
+                    if mutation == 'rename':
+                        fixture.write('qshd/moved-fixture.rs')
+                    elif mutation == 'executable':
+                        path.chmod(0o755)
+                    elif mutation == 'symlink':
+                        path.symlink_to('neighbor_tests.rs')
+                    elif mutation == 'empty':
+                        path.write_text('')
+                    elif mutation == 'invalid-utf8':
+                        path.write_bytes(bytes([255]))
+                    head = fixture.commit()
+                    result, fields = fixture.execute(actual_helper(self.source), base, head,
+                                                    event_name=event)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(fields.get('required'), 'true')
+
     def test_nonpackage_pr_omits_native(self):
         self.assertEqual(self.decision(['qshd/src/session_owner/engine.rs']), 'false')
 

@@ -2042,11 +2042,13 @@ jobs:
                            'scripts/tests/test_native_verifier_paths.py',
                            'scripts/tests/test_released_peer_acceptance.py',
                            'scripts/tests/test_no_silent_skips.py',
-                           'scripts/tests/test_qshd_library_receipt.py'}
+                           'scripts/tests/test_qshd_library_receipt.py',
+                           'cli/src/climb_bootstrap_tests.rs'}
 
               def core_path(path):
                   if path in {'scripts/tests/test_no_silent_skips.py',
-                              'scripts/tests/test_qshd_library_receipt.py'}:
+                              'scripts/tests/test_qshd_library_receipt.py',
+                              'cli/src/climb_bootstrap_tests.rs'}:
                       workflow_file(head, path)
                   return path.startswith(('crates/', 'qshd/')) or path in unrelated
 

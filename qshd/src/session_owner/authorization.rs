@@ -76,6 +76,9 @@ pub(super) struct CanonicalAccount {
     name: String,
 }
 impl CanonicalAccount {
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
     pub(super) fn uid(&self) -> u32 {
         self.uid
     }

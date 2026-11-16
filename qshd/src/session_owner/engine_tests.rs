@@ -113,7 +113,7 @@ fn no_screen_reader_reserves_exact_slice_and_stops_at_full_credit() {
     worker.join().unwrap();
 }
 
-mod integrated {
+pub(in crate::session_owner) mod integrated {
     use super::*;
     use crate::session_owner::{
         authorization_contract::*, recovery_runtime::NoScreenConsumer, resource_contract::*,
@@ -158,7 +158,8 @@ mod integrated {
     #[derive(Default)]
     struct ExitGate {
         held: bool,
-        code: Option<i32>,
+        // Unconfigured defaults to zero; Some(None) is an actual unknown wait status.
+        code: Option<Option<i32>>,
         kills: usize,
         reaps: usize,
         held_polls: usize,
@@ -167,7 +168,7 @@ mod integrated {
         fn gate(&self, stream: u8, code: i32, held: bool) {
             let mut exits = self.exits.lock().unwrap();
             let gate = exits.entry(stream).or_default();
-            gate.code = Some(code);
+            gate.code = Some(Some(code));
             gate.held = held;
         }
         /// Infallible, so it can run while a test failure is unwinding.
@@ -281,7 +282,7 @@ mod integrated {
             if killed && gate.held {
                 gate.held_polls += 1;
             }
-            (killed && !gate.held).then_some(gate.code.or(Some(0)))
+            (killed && !gate.held).then_some(gate.code.unwrap_or(Some(0)))
         }
     }
     impl ChannelWait for Wait {
@@ -405,6 +406,184 @@ mod integrated {
         fn now(&self) -> u64 {
             0
         }
+    }
+    /// Reuses the maintained inert channel implementation with actual host
+    /// provisioning. No native child, PTY or second resource ledger is created.
+    pub(in crate::session_owner) fn host_fixture(
+        locator: SessionLocator,
+        client: OwnerResourceClient,
+    ) -> (
+        SessionOwnerEngine,
+        tokio::sync::watch::Sender<RestartSignal>,
+    ) {
+        let (engine, sender, _) = make_host_fixture(locator, client, None, None);
+        (engine, sender)
+    }
+    pub(in crate::session_owner) fn host_screen_fixture(
+        locator: SessionLocator,
+        client: OwnerResourceClient,
+        context: ScreenControlContext,
+    ) -> (
+        SessionOwnerEngine,
+        tokio::sync::watch::Sender<RestartSignal>,
+    ) {
+        let (engine, sender, _) = make_host_fixture(locator, client, Some(context), None);
+        (engine, sender)
+    }
+    pub(in crate::session_owner) fn host_screen_fixture_controlled(
+        locator: SessionLocator,
+        client: OwnerResourceClient,
+        context: ScreenControlContext,
+    ) -> (
+        SessionOwnerEngine,
+        tokio::sync::watch::Sender<RestartSignal>,
+        HostFixtureControl,
+    ) {
+        make_host_fixture(locator, client, Some(context), None)
+    }
+    #[cfg(target_os = "linux")]
+    pub(in crate::session_owner) fn host_fixture_for_principal(
+        locator: SessionLocator,
+        client: OwnerResourceClient,
+        principal: Principal,
+    ) -> (
+        SessionOwnerEngine,
+        tokio::sync::watch::Sender<RestartSignal>,
+    ) {
+        let (engine, sender, _) = make_host_fixture(locator, client, None, Some(principal));
+        (engine, sender)
+    }
+    pub(in crate::session_owner) struct HostFixtureControl(Arc<Io>);
+    impl HostFixtureControl {
+        pub(in crate::session_owner) fn hold_reads(&self) {
+            self.0
+                .reader_held
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        pub(in crate::session_owner) fn release_reads(&self) {
+            let _state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.0
+                .reader_held
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.0.changed.notify_all();
+        }
+        pub(in crate::session_owner) fn hold_writes(&self) {
+            self.0.held.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        pub(in crate::session_owner) fn write_entered(&self) -> bool {
+            self.0.entered.load(std::sync::atomic::Ordering::SeqCst) != 0
+        }
+        pub(in crate::session_owner) fn release_writes(&self) {
+            let _state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.0
+                .held
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.0.changed.notify_all();
+        }
+        pub(in crate::session_owner) fn gate_exit(
+            &self,
+            stream: u8,
+            code: Option<i32>,
+            held: bool,
+        ) {
+            let mut exits = self.0.exits.lock().unwrap();
+            let gate = exits.entry(stream).or_default();
+            gate.code = Some(code);
+            gate.held = held;
+        }
+        pub(in crate::session_owner) fn release_exit(&self, stream: u8) {
+            self.0.release(stream);
+        }
+        pub(in crate::session_owner) fn reaps(&self, stream: u8) -> usize {
+            self.0.exit(stream, |gate| gate.reaps)
+        }
+        pub(in crate::session_owner) fn held_exit_polls(&self, stream: u8) -> usize {
+            self.0.exit(stream, |gate| gate.held_polls)
+        }
+        pub(in crate::session_owner) fn kills(&self, stream: u8) -> usize {
+            self.0.exit(stream, |gate| gate.kills)
+        }
+        pub(in crate::session_owner) fn resize_calls(&self) -> usize {
+            self.0
+                .resize_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+        pub(in crate::session_owner) fn written(&self) -> Vec<u8> {
+            self.0.state.lock().unwrap().1.clone()
+        }
+    }
+    impl Drop for HostFixtureControl {
+        fn drop(&mut self) {
+            self.release_reads();
+            self.release_writes();
+            for gate in self
+                .0
+                .exits
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values_mut()
+            {
+                gate.held = false;
+            }
+            self.0.changed.notify_all();
+        }
+    }
+    pub(in crate::session_owner) fn host_fixture_controlled(
+        locator: SessionLocator,
+        client: OwnerResourceClient,
+    ) -> (
+        SessionOwnerEngine,
+        tokio::sync::watch::Sender<RestartSignal>,
+        HostFixtureControl,
+    ) {
+        make_host_fixture(locator, client, None, None)
+    }
+    fn make_host_fixture(
+        locator: SessionLocator,
+        client: OwnerResourceClient,
+        context: Option<ScreenControlContext>,
+        principal: Option<Principal>,
+    ) -> (
+        SessionOwnerEngine,
+        tokio::sync::watch::Sender<RestartSignal>,
+        HostFixtureControl,
+    ) {
+        let io = Arc::new(Io::default());
+        let screens = context
+            .as_ref()
+            .map(|_| Arc::new(crate::session_owner::screen_owner::RetainedScreenFactory::new()));
+        let spawner = Arc::new(Spawner {
+            registry: ChannelOpenRegistry::new(OpenLimits::default()),
+            io: io.clone(),
+            screens: screens.clone(),
+        });
+        let (sender, restart) = tokio::sync::watch::channel(RestartSignal::IDLE);
+        let engine = SessionOwnerEngine::new(
+            locator,
+            principal.unwrap_or_else(|| Principal {
+                uid: 1000,
+                name: "fixture-account".into(),
+                identity: "inert host engine fixture".into(),
+                incarnation: 0,
+            }),
+            [73; 16],
+            spawner,
+            client,
+            Arc::new(Clock),
+            restart,
+        )
+        .unwrap();
+        let engine = match (screens, context) {
+            (Some(factory), Some(context)) => engine
+                .with_screen_factory(factory)
+                .with_screen_control(context),
+            _ => engine,
+        };
+        (engine, sender, HostFixtureControl(io))
     }
     struct Fixture {
         engine: SessionOwnerEngine,
@@ -2917,6 +3096,224 @@ mod integrated {
             .collect();
         facts.sort_by_key(|r| r.0.get());
         facts
+    }
+    #[tokio::test]
+    async fn recovery_credit_from_another_registration_on_the_same_ledger_cannot_authorize_this_engine(
+    ) {
+        let (mut fixture, frontend) = Fixture::new();
+        let principal = AuthenticatedPrincipalRef::new([109; 16]).unwrap();
+        let registration = fixture
+            .ledger
+            .lock()
+            .unwrap()
+            .register_fresh_principal(principal, 2000)
+            .unwrap();
+        let client = OwnerResourceClient::new(fixture.ledger.clone(), registration);
+        let reservation = Reservation {
+            id: fixture
+                .ledger
+                .lock()
+                .unwrap()
+                .next_reservation_id()
+                .unwrap(),
+            principal,
+            locator: locator(),
+            channel: ChannelInstance::new(1).unwrap(),
+            kind: ReservationKind::SnapshotTransfer,
+            bytes: 81921,
+            screen_charge: None,
+        };
+        let allowance =
+            TransferAllowance::admit(client, reservation, RequestId::new(71).unwrap(), 0).unwrap();
+        let result = fixture.engine.catalog(&frontend, allowance);
+        let refused = matches!(
+            result,
+            Err(EngineError::Resource(OwnerProtocolError::Binding))
+        );
+        drop(result);
+        fixture.engine.close_session().await.unwrap();
+        assert!(
+            refused,
+            "a same-ledger foreign owner's credit substituted for this registration"
+        );
+        assert_eq!(fixture.ledger.lock().unwrap().reservations(), 0);
+    }
+    #[test]
+    fn failed_actual_opening_join_stays_unknown_on_every_close_retry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        struct Release(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap_or_else(|error| error.into_inner()) = true;
+                self.0 .1.notify_all();
+            }
+        }
+        let held = Release(release.clone());
+        let (entered, observed) = std::sync::mpsc::channel();
+        let occupant = runtime.spawn_blocking(move || {
+            entered.send(()).unwrap();
+            let mut ready = release.0.lock().unwrap();
+            while !*ready {
+                ready = release.1.wait(ready).unwrap();
+            }
+        });
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        runtime.block_on(async {
+            use std::future::Future;
+            use std::task::{Context, Waker};
+            let (mut fixture, frontend) = Fixture::new();
+            let channel = ChannelInstance::new(1).unwrap();
+            let history = fixture.reserve(channel, ReservationKind::OutputHistory, 4096);
+            let control = fixture.reserve(channel, ReservationKind::ControlQueue, 131072);
+            let pending = {
+                let opening = fixture.engine.open(
+                    &frontend,
+                    OpenRequest {
+                        stream: 16,
+                        kind: ChannelKind::Shell,
+                        cols: 80,
+                        rows: 24,
+                        screen: false,
+                        command: Vec::new(),
+                    },
+                    None,
+                    OwnerChannelResources {
+                        history,
+                        control,
+                        cleanup: RequestId::new(history.id.get()).unwrap(),
+                        read_buffer_bytes: 128,
+                        input_epoch: InputEpoch::new([110; 16]).unwrap(),
+                    },
+                );
+                tokio::pin!(opening);
+                opening
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            };
+            let worker = fixture.engine.channels[&16]
+                .opening_worker
+                .as_ref()
+                .unwrap();
+            worker.abort(); // This actual queued task never entered the owned spawner.
+            drop(held);
+            let occupant_joined = tokio::time::timeout(Duration::from_secs(5), occupant).await;
+            let first =
+                tokio::time::timeout(Duration::from_secs(5), fixture.engine.close_session()).await;
+            let second =
+                tokio::time::timeout(Duration::from_secs(5), fixture.engine.close_session()).await;
+            assert!(occupant_joined.unwrap().is_ok());
+            assert!(pending);
+            assert!(matches!(first.unwrap(), Err(EngineError::CleanupPending)));
+            assert!(
+                matches!(second.unwrap(), Err(EngineError::CleanupPending)),
+                "failed opening join became absence-as-success"
+            );
+            assert_eq!(
+                fixture
+                    .io
+                    .spawn_entered
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert_eq!(
+                fixture.ledger.lock().unwrap().reservations(),
+                2,
+                "failed join refunded unknown debt"
+            );
+            assert!(fixture.engine.take_local_completion().is_none());
+        });
+    }
+    #[tokio::test]
+    async fn cancelled_close_retains_the_actual_pending_opening_join() {
+        use std::future::Future;
+        use std::sync::atomic::Ordering;
+        use std::task::{Context, Poll, Waker};
+        struct HeldSpawn(Arc<Io>);
+        impl Drop for HeldSpawn {
+            fn drop(&mut self) {
+                let _state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+                self.0.spawn_hold.store(false, Ordering::SeqCst);
+                self.0.changed.notify_all();
+            }
+        }
+        let (mut f, front) = Fixture::new();
+        let channel = ChannelInstance::new(1).unwrap();
+        let history = f.reserve(channel, ReservationKind::OutputHistory, 4096);
+        let control = f.reserve(channel, ReservationKind::ControlQueue, 131072);
+        let io = f.io.clone();
+        io.spawn_hold.store(true, Ordering::SeqCst);
+        let held = HeldSpawn(io.clone());
+        {
+            let open = f.engine.open(
+                &front,
+                OpenRequest {
+                    stream: 16,
+                    kind: ChannelKind::Shell,
+                    cols: 80,
+                    rows: 24,
+                    screen: false,
+                    command: Vec::new(),
+                },
+                None,
+                OwnerChannelResources {
+                    history,
+                    control,
+                    cleanup: RequestId::new(history.id.get()).unwrap(),
+                    read_buffer_bytes: 128,
+                    input_epoch: InputEpoch::new([1; 16]).unwrap(),
+                },
+            );
+            tokio::pin!(open);
+            tokio::select! {
+                result = &mut open => panic!("held open completed: {result:?}"),
+                _ = wait(|| io.spawn_entered.load(Ordering::SeqCst) == 1) => {}
+            }
+        }
+        let before = f.ledger.lock().unwrap().reservations();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let close = f.engine.close_session();
+            tokio::pin!(close);
+            assert!(close.as_mut().poll(&mut cx).is_pending());
+        }
+        // Capture the guard's own result before fallback releases the backend.
+        let retry_pending = {
+            let retry = f.engine.close_session();
+            tokio::pin!(retry);
+            matches!(retry.as_mut().poll(&mut cx), Poll::Pending)
+        };
+        let still_charged = f.ledger.lock().unwrap().reservations() == before;
+        drop(held);
+        let cleanup = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match f.engine.close_session().await {
+                    Ok(done) => break done,
+                    Err(EngineError::CleanupPending) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected fallback cleanup: {error:?}"),
+                }
+            }
+        })
+        .await;
+        assert!(
+            cleanup.is_ok(),
+            "owned opening task did not finish after release"
+        );
+        assert!(
+            retry_pending,
+            "cancelled close discarded its only actual opening join"
+        );
+        assert!(still_charged, "pending opening join refunded backing");
+        assert!(
+            cleanup.unwrap().is_empty(),
+            "uninstalled open fabricated a retained exit"
+        );
+        assert_eq!(f.ledger.lock().unwrap().reservations(), 0);
     }
     #[tokio::test]
     async fn cancelled_close_keeps_completed_receipt_and_retry_returns_both_once() {

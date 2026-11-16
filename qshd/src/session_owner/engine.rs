@@ -6,7 +6,7 @@ use super::protocol::OwnerProtocolError;
 use super::recovery_runtime::{
     ConsumedRecovery, RecoveryError, RecoveryProducer, TransferAllowance,
 };
-use super::resource_contract::{Reservation, ReservationKind, ReservationReceipt};
+use super::resource_contract::{Reservation, ReservationKind};
 use super::resources::{AdmittedReservation, OwnerResourceClient, StorageCharge};
 use super::screen_control::{ControlTicket, ScreenControlContext};
 pub use super::writer::{InputSubmission, WriterError};
@@ -87,6 +87,11 @@ pub struct SessionFence {
 }
 impl SessionFence {
     pub async fn completed(self) -> Result<Vec<(ChannelInstance, InputPosition)>, EngineError> {
+        self.wait_completed().await
+    }
+    pub(super) async fn wait_completed(
+        &self,
+    ) -> Result<Vec<(ChannelInstance, InputPosition)>, EngineError> {
         let mut positions = Vec::with_capacity(MAX_CHANNELS);
         for (writer, ticket) in self.tickets.iter().flatten() {
             let position = writer
@@ -126,7 +131,7 @@ impl OwnerRecovery {
     }
     pub fn accept_consumed(&mut self, consumed: ConsumedRecovery) -> Result<(), EngineError> {
         let (completion, id, recovery, attachment, channel, host) = consumed.take();
-        if !self._allowance.same_host(&host) {
+        if !self._allowance.matches_client(&host) {
             return Err(EngineError::Resource(OwnerProtocolError::Binding));
         }
         if attachment != self.catalog.attachment() {
@@ -152,6 +157,60 @@ impl OwnerRecovery {
     }
 }
 
+/// Host-minted reservations consumed once by the retained open pipeline.
+pub(crate) struct AdmittedOwnerChannelResources {
+    history: AdmittedReservation,
+    control: AdmittedReservation,
+    read_buffer_bytes: usize,
+    input_epoch: InputEpoch,
+}
+impl AdmittedOwnerChannelResources {
+    pub(crate) fn new(
+        history: AdmittedReservation,
+        control: AdmittedReservation,
+        read_buffer_bytes: usize,
+        input_epoch: InputEpoch,
+    ) -> Self {
+        Self {
+            history,
+            control,
+            read_buffer_bytes,
+            input_epoch,
+        }
+    }
+}
+/// Exclusive tokens which have not reached any backing or worker. Cancellation
+/// before transfer can release this proved-unused custody, never a live channel.
+struct UnstartedAdmittedOpen {
+    client: OwnerResourceClient,
+    tokens: Option<(AdmittedReservation, AdmittedReservation)>,
+}
+impl UnstartedAdmittedOpen {
+    fn new(
+        client: OwnerResourceClient,
+        history: AdmittedReservation,
+        control: AdmittedReservation,
+    ) -> Self {
+        Self {
+            client,
+            tokens: Some((history, control)),
+        }
+    }
+    fn take(mut self) -> (AdmittedReservation, AdmittedReservation) {
+        self.tokens.take().unwrap()
+    }
+}
+impl Drop for UnstartedAdmittedOpen {
+    fn drop(&mut self) {
+        if let Some((history, control)) = self.tokens.take() {
+            for token in [history, control] {
+                let cleanup = token.cleanup();
+                let charge = StorageCharge::owned(self.client.clone(), token, cleanup);
+                charge.allow_release();
+            }
+        }
+    }
+}
 pub struct OwnerChannelResources {
     pub history: Reservation,
     pub control: Reservation,
@@ -162,7 +221,7 @@ pub struct OwnerChannelResources {
 struct OwnedChannel {
     instance: ChannelInstance,
     output: Arc<SharedOutput>,
-    admitted: AdmittedReservation,
+    admitted: Arc<StorageCharge>,
     writer: Arc<WriterShared>,
     request: OpenRequest,
     cleanup: RequestId,
@@ -170,7 +229,72 @@ struct OwnedChannel {
     custody: OpenCustody,
     opening_worker: Option<tokio::task::JoinHandle<()>>,
     installed: bool,
+    opening_failed: bool,
     last_resize: Option<(Attachment, u64)>,
+}
+pub(super) struct LocalEmptyCompletion {
+    binding: Weak<super::host_engine::LocalBinding>,
+    locator: SessionLocator,
+    client: OwnerResourceClient,
+}
+impl LocalEmptyCompletion {
+    pub(super) fn matches(
+        &self,
+        binding: &Arc<super::host_engine::LocalBinding>,
+        locator: SessionLocator,
+        client: &OwnerResourceClient,
+    ) -> bool {
+        self.binding
+            .upgrade()
+            .is_some_and(|actual| Arc::ptr_eq(&actual, binding))
+            && self.locator == locator
+            && self.client.same_registration(client)
+    }
+}
+pub(super) struct LocalEstablishment {
+    binding: Weak<super::host_engine::LocalBinding>,
+    locator: SessionLocator,
+    client: OwnerResourceClient,
+}
+impl LocalEstablishment {
+    pub(super) fn matches(
+        &self,
+        binding: &Arc<super::host_engine::LocalBinding>,
+        locator: SessionLocator,
+        client: &OwnerResourceClient,
+    ) -> bool {
+        self.binding
+            .upgrade()
+            .is_some_and(|actual| Arc::ptr_eq(&actual, binding))
+            && self.locator == locator
+            && self.client.same_registration(client)
+    }
+}
+pub(super) struct LocalCompletion {
+    binding: Weak<super::host_engine::LocalBinding>,
+    locator: SessionLocator,
+    client: OwnerResourceClient,
+    facts: Vec<super::host::CompletedChannelFact>,
+}
+impl LocalCompletion {
+    pub(super) fn matches(
+        &self,
+        binding: &Arc<super::host_engine::LocalBinding>,
+        locator: SessionLocator,
+        client: &OwnerResourceClient,
+    ) -> bool {
+        self.binding
+            .upgrade()
+            .is_some_and(|actual| Arc::ptr_eq(&actual, binding))
+            && self.locator == locator
+            && self.client.same_registration(client)
+    }
+    pub(super) fn into_facts(self) -> Vec<super::host::CompletedChannelFact> {
+        self.facts
+    }
+    pub(super) fn facts(&self) -> &[super::host::CompletedChannelFact] {
+        &self.facts
+    }
 }
 pub struct SessionOwnerEngine {
     locator: SessionLocator,
@@ -193,8 +317,45 @@ pub struct SessionOwnerEngine {
     control_ticket: Option<ControlTicket>,
     control_joined: bool,
     control_failed: bool,
+    ever_established: bool,
+    local_binding: Option<Weak<super::host_engine::LocalBinding>>,
+    local_establishment: Option<LocalEstablishment>,
+    local_completion: Option<LocalCompletion>,
+    close_facts: Option<Vec<super::host::CompletedChannelFact>>,
+    cleanup_complete: bool,
+    facts_captured: bool,
 }
 impl SessionOwnerEngine {
+    pub(super) fn bind_local_binding(&mut self, binding: &Arc<super::host_engine::LocalBinding>) {
+        self.local_binding = Some(Arc::downgrade(binding));
+    }
+    pub(super) fn take_local_establishment(&mut self) -> Option<LocalEstablishment> {
+        self.local_establishment.take()
+    }
+    pub(super) fn take_local_completion(&mut self) -> Option<LocalCompletion> {
+        self.local_completion.take()
+    }
+    pub(super) fn locally_established(&self) -> bool {
+        self.ever_established
+    }
+    pub(super) fn matches_local_binding(
+        &self,
+        locator: SessionLocator,
+        client: &OwnerResourceClient,
+        uid: u32,
+        name: &str,
+    ) -> bool {
+        self.leases
+            .lock()
+            .is_ok_and(|lease| !lease.closed && lease.current.is_none())
+            && self.channels.is_empty()
+            && self.control_ticket.is_none()
+            && self.local_binding.is_none()
+            && self.locator == locator
+            && self.resources.same_registration(client)
+            && self.principal.uid == uid
+            && self.principal.name == name
+    }
     pub fn new(
         locator: SessionLocator,
         principal: Principal,
@@ -233,6 +394,13 @@ impl SessionOwnerEngine {
             control_ticket: None,
             control_joined: false,
             control_failed: false,
+            ever_established: false,
+            local_binding: None,
+            local_establishment: None,
+            local_completion: None,
+            close_facts: None,
+            cleanup_complete: false,
+            facts_captured: false,
         })
     }
     pub fn with_screen_factory(
@@ -246,6 +414,12 @@ impl SessionOwnerEngine {
         self.screen_control = Some(context);
         self
     }
+    #[cfg(test)]
+    pub(super) fn control_identity_for_test(&self) -> Option<usize> {
+        self.control_ticket
+            .as_ref()
+            .map(|ticket| ticket.identity_for_test())
+    }
     pub fn control_joined(&self) -> bool {
         self.control_joined
     }
@@ -257,7 +431,7 @@ impl SessionOwnerEngine {
         supplied: OwnerChannelResources,
         lease: super::screen_owner::HostScreenLease,
     ) -> Result<ChannelInstance, EngineError> {
-        self.validate(frontend)?;
+        drop(self.attachment_admission(frontend)?);
         let size = terminal_size::TerminalSize::new(request.cols, request.rows)
             .map_err(|_| EngineError::InvalidRequest)?;
         if !request.screen
@@ -272,32 +446,14 @@ impl SessionOwnerEngine {
         {
             return Err(EngineError::Unavailable);
         }
-        if self.control_ticket.is_none() {
-            let ticket = match self
-                .screen_control
-                .as_ref()
-                .unwrap()
-                .start(
-                    self.resources.clone(),
-                    self.locator,
-                    supplied.history.channel,
-                )
-                .await
-            {
-                Ok(ticket) => ticket,
-                Err(_) => {
-                    self.control_failed = true;
-                    return Err(EngineError::Unavailable);
-                }
-            };
-            self.control_ticket = Some(ticket);
-        }
-        self.open_impl(frontend, request, term, supplied, Some(lease))
+        self.ensure_screen_control(frontend, supplied.history.channel)
+            .await?;
+        self.open_impl(frontend, request, term, supplied, Some(lease), None)
             .await
     }
     /// The host must already have authenticated and authorized this exact lease.
     /// This local seam is not a frontend decoder or a grant issuer.
-    pub fn attach_trusted(
+    pub(super) fn attach_trusted(
         &mut self,
         attachment: Attachment,
     ) -> Result<FrontendAttachment, EngineError> {
@@ -342,6 +498,12 @@ impl SessionOwnerEngine {
         if self.control_failed || self.control_ticket.as_ref().is_some_and(|t| !t.healthy()) {
             return Err(EngineError::Unavailable);
         }
+        self.attachment_admission(frontend)
+    }
+    fn attachment_admission(
+        &self,
+        frontend: &FrontendAttachment,
+    ) -> Result<std::sync::MutexGuard<'_, LeaseState>, EngineError> {
         if !Arc::ptr_eq(&frontend.shared, &self.leases) {
             return Err(EngineError::StaleAttachment);
         }
@@ -491,6 +653,17 @@ impl SessionOwnerEngine {
             })
     }
     #[cfg(test)]
+    pub(super) fn consumed_close_receipts_for_test(&self) -> usize {
+        self.close_receipts.len()
+    }
+    #[cfg(test)]
+    pub(super) fn writer_identity_for_test(&self, channel: ChannelInstance) -> Option<usize> {
+        self.channels
+            .values()
+            .find(|owned| owned.instance == channel)
+            .map(|owned| Arc::as_ptr(&owned.writer) as usize)
+    }
+    #[cfg(test)]
     pub(super) fn output_bounds_for_test(&self, channel: ChannelInstance) -> (u64, u64) {
         let owned = self
             .channels
@@ -530,7 +703,7 @@ impl SessionOwnerEngine {
         allowance: TransferAllowance,
     ) -> Result<OwnerRecovery, EngineError> {
         let mut leases = self.admission(frontend)?;
-        if !allowance.same_host(&self.resources) {
+        if !allowance.matches_client(&self.resources) {
             return Err(EngineError::Resource(OwnerProtocolError::Binding));
         }
         if !allowance.matches_locator(frontend.attachment) || !self.barriers_settled() {
@@ -626,7 +799,7 @@ impl SessionOwnerEngine {
         allowance: TransferAllowance,
     ) -> Result<RecoveryProducer, EngineError> {
         let mut leases = self.admission(frontend)?;
-        if !allowance.same_host(&self.resources) {
+        if !allowance.matches_client(&self.resources) {
             return Err(EngineError::Resource(OwnerProtocolError::Binding));
         }
         if request.attachment != frontend.attachment
@@ -984,6 +1157,109 @@ impl SessionOwnerEngine {
     pub fn locator(&self) -> SessionLocator {
         self.locator
     }
+    async fn ensure_screen_control(
+        &mut self,
+        frontend: &FrontendAttachment,
+        anchor: ChannelInstance,
+    ) -> Result<(), EngineError> {
+        drop(self.attachment_admission(frontend)?);
+        if self.control_failed {
+            return Err(EngineError::Unavailable);
+        }
+        if self.control_ticket.is_none() {
+            let ticket = self
+                .screen_control
+                .as_mut()
+                .ok_or(EngineError::Unavailable)?
+                .begin_start(self.resources.clone(), self.locator, anchor)
+                .map_err(|_| EngineError::Unavailable)?;
+            // Store the exact ticket synchronously before readiness can suspend.
+            self.control_ticket = Some(ticket);
+        }
+        if self.control_ticket.as_ref().unwrap().ready().await.is_err() {
+            self.control_failed = true;
+            return Err(EngineError::Unavailable);
+        }
+        self.validate(frontend)
+    }
+    pub(crate) async fn open_screen_admitted(
+        &mut self,
+        frontend: &FrontendAttachment,
+        request: OpenRequest,
+        term: Option<String>,
+        supplied: AdmittedOwnerChannelResources,
+        lease: super::screen_owner::HostScreenLease,
+    ) -> Result<ChannelInstance, EngineError> {
+        drop(self.attachment_admission(frontend)?);
+        let (raw, history, control) = self.validate_admitted_open(supplied)?;
+        let size = terminal_size::TerminalSize::new(request.cols, request.rows)
+            .map_err(|_| EngineError::InvalidRequest)?;
+        if !request.screen
+            || self.screen_factory.is_none()
+            || self.screen_control.is_none()
+            || !lease.matches(&self.resources, self.locator, raw.history.channel, size)
+        {
+            return Err(EngineError::Unavailable);
+        }
+        let unstarted = UnstartedAdmittedOpen::new(self.resources.clone(), history, control);
+        self.ensure_screen_control(frontend, raw.history.channel)
+            .await?;
+        self.open_impl(frontend, request, term, raw, Some(lease), Some(unstarted))
+            .await
+    }
+    pub(crate) async fn open_admitted(
+        &mut self,
+        frontend: &FrontendAttachment,
+        request: OpenRequest,
+        term: Option<String>,
+        supplied: AdmittedOwnerChannelResources,
+    ) -> Result<ChannelInstance, EngineError> {
+        self.validate(frontend)?;
+        let (raw, history, control) = self.validate_admitted_open(supplied)?;
+        let unstarted = UnstartedAdmittedOpen::new(self.resources.clone(), history, control);
+        self.open_impl(frontend, request, term, raw, None, Some(unstarted))
+            .await
+    }
+    fn validate_admitted_open(
+        &self,
+        supplied: AdmittedOwnerChannelResources,
+    ) -> Result<
+        (
+            OwnerChannelResources,
+            AdmittedReservation,
+            AdmittedReservation,
+        ),
+        EngineError,
+    > {
+        self.resources.validate_admitted(&supplied.history, None)?;
+        self.resources.validate_admitted(&supplied.control, None)?;
+        let history = supplied.history.reservation();
+        let control = supplied.control.reservation();
+        if supplied.history.cleanup() != supplied.control.cleanup()
+            || history.kind != ReservationKind::OutputHistory
+            || control.kind != ReservationKind::ControlQueue
+            || history.locator != self.locator
+            || control.locator != self.locator
+            || history.channel != control.channel
+            || history.id == control.id
+            || history.screen_charge.is_some()
+            || control.screen_charge.is_some()
+            || supplied.read_buffer_bytes == 0
+            || supplied.read_buffer_bytes > 16_384
+            || history.bytes <= supplied.read_buffer_bytes as u64
+            || control.bytes < (65_536 + CONTROL_METADATA) as u64
+        {
+            return Err(EngineError::InvalidRequest);
+        }
+        let raw = OwnerChannelResources {
+            history: supplied.history.reservation(),
+            control: supplied.control.reservation(),
+            cleanup: supplied.history.cleanup(),
+            read_buffer_bytes: supplied.read_buffer_bytes,
+            input_epoch: supplied.input_epoch,
+        };
+        Ok((raw, supplied.history, supplied.control))
+    }
     pub async fn open(
         &mut self,
         frontend: &FrontendAttachment,
@@ -991,7 +1267,7 @@ impl SessionOwnerEngine {
         term: Option<String>,
         supplied: OwnerChannelResources,
     ) -> Result<ChannelInstance, EngineError> {
-        self.open_impl(frontend, request, term, supplied, None)
+        self.open_impl(frontend, request, term, supplied, None, None)
             .await
     }
     async fn open_impl(
@@ -1001,6 +1277,7 @@ impl SessionOwnerEngine {
         term: Option<String>,
         supplied: OwnerChannelResources,
         model_lease: Option<super::screen_owner::HostScreenLease>,
+        admitted: Option<UnstartedAdmittedOpen>,
     ) -> Result<ChannelInstance, EngineError> {
         self.validate(frontend)?;
         if request.screen != model_lease.is_some() {
@@ -1043,7 +1320,11 @@ impl SessionOwnerEngine {
             }
         }
         // Payload and response/control state have independent preallocated slots.
-        let metadata = std::mem::size_of::<OwnedChannel>()
+        let metadata = 2
+            * (std::mem::size_of::<StorageCharge>() + 2 * std::mem::size_of::<usize>())
+            + std::mem::size_of::<super::host::CompletedChannelFact>()
+            + std::mem::size_of::<(Arc<StorageCharge>, Arc<WriterShared>)>()
+            + std::mem::size_of::<OwnedChannel>()
             + std::mem::size_of::<WriterShared>()
             + std::mem::size_of::<LeaseState>()
             + std::mem::size_of::<SessionFence>()
@@ -1083,13 +1364,23 @@ impl SessionOwnerEngine {
             .filter(|v| *v > 0)
             .ok_or(EngineError::InvalidRequest)?;
         // Host requests occur outside custody/lease locks, before any read backing.
-        let history = self.resources.reserve(supplied.history, supplied.cleanup)?;
-        let control = match self.resources.reserve(supplied.control, supplied.cleanup) {
-            Ok(v) => v,
-            Err(e) => {
-                self.release_storage(&history, supplied.cleanup)?;
-                return Err(e.into());
-            }
+        let (history, control) = if let Some(unstarted) = admitted {
+            let (history, control) = unstarted.take();
+            (
+                StorageCharge::new(self.resources.clone(), history, supplied.cleanup),
+                control,
+            )
+        } else {
+            let history = self.resources.reserve(supplied.history, supplied.cleanup)?;
+            let history = StorageCharge::new(self.resources.clone(), history, supplied.cleanup);
+            let control = match self.resources.reserve(supplied.control, supplied.cleanup) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.release_storage(&history, supplied.cleanup)?;
+                    return Err(e.into());
+                }
+            };
+            (history, control)
         };
         let control_charge = StorageCharge::new(self.resources.clone(), control, supplied.cleanup);
         let (writing, worker) = match WriterShared::new(
@@ -1246,6 +1537,7 @@ impl SessionOwnerEngine {
                     custody,
                     opening_worker: None,
                     installed: false,
+                    opening_failed: false,
                     last_resize: None,
                 },
             );
@@ -1352,6 +1644,16 @@ impl SessionOwnerEngine {
         self.validate(frontend)?;
         if !self.retained.ready_to_publish(instance) {
             return Err(EngineError::Opening);
+        }
+        if !self.ever_established {
+            if let Some(binding) = &self.local_binding {
+                self.local_establishment = Some(LocalEstablishment {
+                    binding: binding.clone(),
+                    locator: self.locator,
+                    client: self.resources.clone(),
+                });
+            }
+            self.ever_established = true;
         }
         Ok(instance)
     }
@@ -1565,20 +1867,27 @@ impl SessionOwnerEngine {
     }
     fn release_storage(
         &self,
-        admitted: &AdmittedReservation,
+        charge: &Arc<StorageCharge>,
         cleanup: RequestId,
     ) -> Result<(), EngineError> {
-        let r = admitted.reservation();
-        self.resources.release(
-            admitted,
-            ReservationReceipt {
-                id: cleanup,
-                reservation: r.id,
-                locator: r.locator,
-                channel: r.channel,
-            },
-        )?;
+        if charge.admitted().cleanup() != cleanup {
+            return Err(EngineError::Resource(OwnerProtocolError::Binding));
+        }
+        // Every caller first destroys its actual output/read backing or proves
+        // allocation never escaped. The final charge reference performs release.
+        charge.allow_release();
         Ok(())
+    }
+    pub(super) async fn close_local_empty(&mut self) -> Result<LocalEmptyCompletion, EngineError> {
+        if self.ever_established {
+            return Err(EngineError::Unavailable);
+        }
+        self.close_session().await?;
+        Ok(LocalEmptyCompletion {
+            binding: self.local_binding.clone().ok_or(EngineError::Unavailable)?,
+            locator: self.locator,
+            client: self.resources.clone(),
+        })
     }
     /// Host-authorized explicit close. EOF/Drop of an attachment never calls it.
     ///
@@ -1586,6 +1895,9 @@ impl SessionOwnerEngine {
     /// engine, so a retry after a cancelled or failed close returns each
     /// cleanup exactly once, on the close that finally succeeds.
     pub async fn close_session(&mut self) -> Result<Vec<RetainedCleanup>, EngineError> {
+        if self.cleanup_complete {
+            return Ok(std::mem::take(&mut self.close_receipts));
+        }
         {
             let mut leases = self.leases.lock().map_err(|_| EngineError::Unavailable)?;
             leases.closed = true;
@@ -1634,8 +1946,16 @@ impl SessionOwnerEngine {
             .await
             .map_err(|_| EngineError::CleanupPending)?;
         for owned in self.channels.values_mut() {
-            if let Some(worker) = owned.opening_worker.take() {
-                worker.await.map_err(|_| EngineError::CleanupPending)?;
+            if owned.opening_failed {
+                return Err(EngineError::CleanupPending);
+            }
+            if let Some(worker) = owned.opening_worker.as_mut() {
+                let result = worker.await;
+                owned.opening_failed = result.is_err();
+                owned.opening_worker.take();
+                if owned.opening_failed {
+                    return Err(EngineError::CleanupPending);
+                }
             }
             if !owned.installed
                 && !matches!(owned.custody.retry_cleanup(), CleanupStatus::Confirmed(_))
@@ -1643,31 +1963,113 @@ impl SessionOwnerEngine {
                 return Err(EngineError::CleanupPending);
             }
         }
+        // Validate release correlations and capture actual final facts while
+        // their writer/output owners still exist. No removed state implies proof.
+        if self.channels.len() > MAX_CHANNELS {
+            return Err(EngineError::Unavailable);
+        }
+        if !self.facts_captured {
+            let attachment = self
+                .leases
+                .lock()
+                .map_err(|_| EngineError::Unavailable)?
+                .current;
+            let mut facts = Vec::new();
+            facts
+                .try_reserve_exact(self.channels.len())
+                .map_err(|_| EngineError::Unavailable)?;
+            for owned in self.channels.values() {
+                let admitted = owned.admitted.admitted();
+                if admitted.cleanup() != owned.cleanup
+                    || admitted.reservation().channel != owned.instance
+                    || admitted.reservation().locator != self.locator
+                {
+                    return Err(EngineError::Resource(OwnerProtocolError::Binding));
+                }
+                if !owned.installed {
+                    continue;
+                }
+                let receipt = self
+                    .close_receipts
+                    .iter()
+                    .find(|receipt| receipt.instance() == owned.instance)
+                    .filter(|receipt| receipt.workers_joined())
+                    .ok_or(EngineError::CleanupPending)?;
+                let output = owned
+                    .output
+                    .state
+                    .lock()
+                    .map_err(|_| EngineError::Unavailable)?;
+                let offset = checked_end(output.start, output.bytes.len())
+                    .map_err(|_| EngineError::Unavailable)?;
+                let input = owned.writer.position();
+                input.validate().map_err(|_| EngineError::Unavailable)?;
+                facts.push(super::host::CompletedChannelFact {
+                    exit: ExitReceipt {
+                        attachment: attachment.ok_or(EngineError::Unavailable)?,
+                        channel: owned.instance,
+                        receipt_id: owned.cleanup,
+                        fact: receipt
+                            .code()
+                            .map_or(ExitFact::StatusUnavailable, |status| ExitFact::Reaped {
+                                status,
+                            }),
+                    },
+                    input,
+                    output: OutputCursor {
+                        channel: owned.instance,
+                        offset,
+                    },
+                });
+            }
+            self.close_facts = Some(facts);
+            self.facts_captured = true;
+        }
+        if self.close_facts.is_none() {
+            return Err(EngineError::CleanupPending);
+        }
         {
             let mut leases = self.leases.lock().map_err(|_| EngineError::Unavailable)?;
             drop(std::mem::take(&mut leases.writers));
         }
-        // No reader, writer or spawning worker retains backing at this point.
+        // Keep final charge references on the bounded stack until every map
+        // node/request/output backing is gone, including iterator spare backing.
+        let mut release: [Option<(Arc<StorageCharge>, Arc<WriterShared>)>; MAX_CHANNELS] =
+            std::array::from_fn(|_| None);
         let channels = std::mem::take(&mut self.channels);
-        for (_, owned) in channels {
+        for (slot, (_, owned)) in release.iter_mut().zip(channels) {
             let OwnedChannel {
                 output,
                 admitted,
                 writer,
                 request,
-                cleanup,
                 ..
             } = owned;
             drop(output);
             drop(request);
+            *slot = Some((admitted, writer));
+        }
+        for (admitted, writer) in release.into_iter().flatten() {
             writer.allow_release();
             drop(writer);
-            self.release_storage(&admitted, cleanup)?;
+            admitted.allow_release();
         }
         self.control_ticket.take();
+        self.screen_control.take();
         if self.control_failed {
             return Err(EngineError::CleanupPending);
         }
+        if self.ever_established {
+            if let Some(binding) = &self.local_binding {
+                self.local_completion = Some(LocalCompletion {
+                    binding: binding.clone(),
+                    locator: self.locator,
+                    client: self.resources.clone(),
+                    facts: self.close_facts.take().ok_or(EngineError::CleanupPending)?,
+                });
+            }
+        }
+        self.cleanup_complete = true;
         Ok(std::mem::take(&mut self.close_receipts))
     }
 }
@@ -1709,4 +2111,4 @@ impl Drop for SessionOwnerEngine {
 
 #[cfg(test)]
 #[path = "engine_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -1,7 +1,7 @@
 //! Explicit caller-owned timer-task custody for retained Screen engines.
 use super::{
     resource_contract::{Reservation, ReservationKind},
-    resources::{OwnerResourceClient, StorageCharge},
+    resources::{AdmittedReservation, OwnerResourceClient, StorageCharge},
 };
 use std::{
     future::Future,
@@ -121,17 +121,45 @@ pub struct ScreenControlContext {
     scope: ControlTaskScope,
     reservation: Reservation,
     cleanup: RequestId,
+    prepared: Option<(OwnerResourceClient, Arc<StorageCharge>)>,
+    started: bool,
 }
 impl ScreenControlContext {
+    #[cfg_attr(not(test), allow(dead_code))] // Dormant host-admitted seam; no production route.
+    pub(crate) fn admit_reserved(
+        scope: ControlTaskScope,
+        client: OwnerResourceClient,
+        admitted: AdmittedReservation,
+    ) -> Result<Self, Box<(ControlError, AdmittedReservation)>> {
+        let reservation = admitted.reservation();
+        if client.validate_admitted(&admitted, None).is_err()
+            || reservation.kind != ReservationKind::ControlQueue
+            || reservation.bytes < 65_536
+            || reservation.screen_charge.is_some()
+        {
+            return Err(Box::new((ControlError::Resource, admitted)));
+        }
+        let cleanup = admitted.cleanup();
+        let charge = StorageCharge::new(client.clone(), admitted, cleanup);
+        Ok(Self {
+            scope,
+            reservation,
+            cleanup,
+            prepared: Some((client, charge)),
+            started: false,
+        })
+    }
     pub fn new(scope: ControlTaskScope, reservation: Reservation, cleanup: RequestId) -> Self {
         Self {
             scope,
             reservation,
             cleanup,
+            prepared: None,
+            started: false,
         }
     }
-    pub(super) async fn start(
-        &self,
+    pub(super) fn begin_start(
+        &mut self,
         client: OwnerResourceClient,
         locator: SessionLocator,
         anchor: ChannelInstance,
@@ -141,13 +169,21 @@ impl ScreenControlContext {
         // bounded by16KiB for this small fixed future on the qualified target.
         // Both old/new maximum registry vectors plus the fixed channel slots,
         // Arc headers and wake state are included before any scheduler allocation.
-        let inventory = std::mem::size_of::<ControlState>()
+        let inventory = std::mem::size_of::<ScreenControlContext>()
+            + std::mem::size_of::<StorageCharge>()
+            + 2 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<ControlState>()
             + std::mem::size_of::<Registration>()
             + 2 * MAX_CHANNELS * std::mem::size_of::<Arc<Registration>>()
             + MAX_CHANNELS * (std::mem::size_of::<super::output::SharedOutput>() + 64)
             + 16_384
             + 4096;
-        if inventory > 65_536
+        if self.started
+            || inventory > 65_536
+            || self
+                .prepared
+                .as_ref()
+                .is_some_and(|(owner, _)| !owner.same_registration(&client))
             || r.kind != ReservationKind::ControlQueue
             || r.bytes < 65_536
             || r.principal != client.principal()
@@ -156,10 +192,15 @@ impl ScreenControlContext {
         {
             return Err(ControlError::Unavailable);
         }
-        let admitted = client
-            .reserve(r, self.cleanup)
-            .map_err(|_| ControlError::Resource)?;
-        let charge = StorageCharge::new(client, admitted, self.cleanup);
+        let charge = if let Some((_, charge)) = self.prepared.take() {
+            charge
+        } else {
+            let admitted = client
+                .reserve(r, self.cleanup)
+                .map_err(|_| ControlError::Resource)?;
+            StorageCharge::new(client, admitted, self.cleanup)
+        };
+        self.started = true;
         let state = Arc::new(ControlState {
             slots: Mutex::new(std::array::from_fn(|_| None)),
             notify: Notify::new(),
@@ -199,22 +240,28 @@ impl ScreenControlContext {
             entry.join.lock().unwrap_or_else(|e| e.into_inner()).handle =
                 Some(self.scope.inner.runtime.spawn(future));
         }
-        let ticket = ControlTicket {
+        Ok(ControlTicket {
             scope: self.scope.clone(),
             entry,
-        };
-        let ready_state = ticket.entry.state.clone();
-        loop {
-            let notified = ready_state.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if ticket.entry.state.phase.load(Ordering::Acquire) == 1 {
-                return Ok(ticket);
-            }
-            tokio::select! {
-                _=notified=>{},
-                _=ticket.join()=>{return Err(ControlError::Failed);}
-            }
+        })
+    }
+    #[cfg(test)]
+    pub(super) async fn start(
+        &mut self,
+        client: OwnerResourceClient,
+        locator: SessionLocator,
+        anchor: ChannelInstance,
+    ) -> Result<ControlTicket, ControlError> {
+        let ticket = self.begin_start(client, locator, anchor)?;
+        ticket.ready().await?;
+        Ok(ticket)
+    }
+}
+impl Drop for ScreenControlContext {
+    fn drop(&mut self) {
+        if let Some((_, charge)) = &self.prepared {
+            // This custody slot has never been transferred to a registration.
+            charge.allow_release();
         }
     }
 }
@@ -223,6 +270,24 @@ pub(super) struct ControlTicket {
     entry: Arc<Registration>,
 }
 impl ControlTicket {
+    #[cfg(test)]
+    pub(super) fn identity_for_test(&self) -> usize {
+        Arc::as_ptr(&self.entry) as usize
+    }
+    pub(super) async fn ready(&self) -> Result<(), ControlError> {
+        loop {
+            let notified = self.entry.state.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.healthy() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = notified => {},
+                _ = self.join() => return Err(ControlError::Failed),
+            }
+        }
+    }
     pub(super) fn healthy(&self) -> bool {
         self.entry.state.phase.load(Ordering::Acquire) == 1
             && !self.entry.state.stopping.load(Ordering::Acquire)
