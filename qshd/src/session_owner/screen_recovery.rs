@@ -2,7 +2,7 @@
 use super::{
     recovery_runtime::{ChargedRecoveryChunk, ConsumedRecovery, RecoveryError, TransferAllowance},
     resource_contract::{Reservation, ReservationKind, ScreenCharge},
-    resources::{OwnerResourceClient, StorageCharge},
+    resources::{AdmittedReservation, OwnerResourceClient, StorageCharge},
 };
 use crate::screen_budget::{ScreenBudget, ScreenEnvelope, ScreenLease};
 use std::sync::{Arc, Mutex, Weak};
@@ -44,6 +44,65 @@ pub struct ScreenRecoveryAllowance {
     requirements: ScreenRecoveryRequirements,
 }
 impl ScreenRecoveryAllowance {
+    #[cfg_attr(not(test), allow(dead_code))] // Dormant host-admitted seam; no production route.
+    pub(crate) fn admit_reserved(
+        client: OwnerResourceClient,
+        transfer: AdmittedReservation,
+        scratch: AdmittedReservation,
+        requirements: ScreenRecoveryRequirements,
+    ) -> Result<Self, Box<(RecoveryError, AdmittedReservation, AdmittedReservation)>> {
+        let validated = (|| {
+            client
+                .validate_admitted(&transfer, None)
+                .map_err(RecoveryError::Resource)?;
+            client
+                .validate_admitted(&scratch, None)
+                .map_err(RecoveryError::Resource)?;
+            let retained = requirements
+                .max_bytes
+                .checked_mul(2)
+                .ok_or(RecoveryError::Invalid)?;
+            let required_peak = requirements
+                .max_bytes
+                .checked_mul(4)
+                .and_then(|n| n.checked_add(2 * 1_052_672 + 1_048_576 + 16384 + 65536))
+                .ok_or(RecoveryError::Invalid)?;
+            let bytes = transfer.reservation();
+            let model = scratch.reservation();
+            if transfer.cleanup() != scratch.cleanup()
+                || bytes.locator != model.locator
+                || bytes.channel != model.channel
+                || model.kind != ReservationKind::ScreenModel
+                || model.bytes != 0
+                || model.screen_charge != Some(requirements.scratch)
+                || requirements.scratch.models != 0
+                || requirements.transfer_bytes < required_peak
+            {
+                return Err(RecoveryError::Invalid);
+            }
+            TransferAllowance::validate_reserved(
+                &client,
+                &transfer,
+                retained,
+                requirements.transfer_bytes,
+            )?;
+            Ok(retained)
+        })();
+        let retained = match validated {
+            Ok(retained) => retained,
+            Err(error) => return Err(Box::new((error, transfer, scratch))),
+        };
+        // Every fallible check precedes either transfer of this exact pair.
+        let cleanup = scratch.cleanup();
+        let transfer = TransferAllowance::from_reserved(client.clone(), transfer, retained);
+        let scratch = StorageCharge::new(client, scratch, cleanup);
+        scratch.allow_release();
+        Ok(Self {
+            transfer,
+            scratch,
+            requirements,
+        })
+    }
     pub fn admit(
         client: OwnerResourceClient,
         bytes: Reservation,
@@ -86,7 +145,7 @@ impl ScreenRecoveryAllowance {
         quote: ScreenRecoveryRequirements,
     ) -> bool {
         self.requirements == quote
-            && self.transfer.same_host(client)
+            && self.transfer.matches_client(client)
             && self.transfer.matches(request.attachment, request.channel)
     }
 }
@@ -112,7 +171,7 @@ impl ScreenEvidence {
         geometry: GeometryRecord,
         geometry_start: u64,
     ) -> bool {
-        if !self.host.same_host(client) {
+        if !self.host.same_registration(client) {
             return false;
         }
         let Some(state) = self.state.upgrade() else {

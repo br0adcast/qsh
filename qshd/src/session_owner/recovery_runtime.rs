@@ -2,7 +2,7 @@
 //! This is not a wire endpoint, terminal parser, or authentication adapter.
 use super::protocol::OwnerProtocolError;
 use super::resource_contract::{Reservation, ReservationKind};
-use super::resources::{OwnerResourceClient, StorageCharge};
+use super::resources::{AdmittedReservation, OwnerResourceClient, StorageCharge};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -34,6 +34,63 @@ pub struct TransferAllowance {
     pub(super) charge: Arc<StorageCharge>,
 }
 impl TransferAllowance {
+    #[cfg_attr(not(test), allow(dead_code))] // Dormant host-admitted seam; no production route.
+    pub(crate) fn admit_reserved(
+        client: OwnerResourceClient,
+        admitted: AdmittedReservation,
+        retained: usize,
+    ) -> Result<Self, Box<(RecoveryError, AdmittedReservation)>> {
+        let required = retained
+            .max(1)
+            .checked_add(CHUNK_BYTES)
+            .and_then(|n| n.checked_add(METADATA_BYTES));
+        let result = required
+            .ok_or(RecoveryError::Unavailable)
+            .and_then(|peak| Self::validate_reserved(&client, &admitted, retained, peak));
+        if let Err(error) = result {
+            return Err(Box::new((error, admitted)));
+        }
+        Ok(Self::from_reserved(client, admitted, retained))
+    }
+    #[cfg_attr(not(test), allow(dead_code))] // Dormant host-admitted seam; no production route.
+    pub(super) fn validate_reserved(
+        client: &OwnerResourceClient,
+        admitted: &AdmittedReservation,
+        retained: usize,
+        peak: usize,
+    ) -> Result<(), RecoveryError> {
+        client
+            .validate_admitted(admitted, None)
+            .map_err(RecoveryError::Resource)?;
+        let reservation = admitted.reservation();
+        if reservation.kind != ReservationKind::SnapshotTransfer
+            || reservation.screen_charge.is_some()
+            || retained > peak
+            || reservation.bytes < u64::try_from(peak).map_err(|_| RecoveryError::Unavailable)?
+        {
+            return Err(RecoveryError::Unavailable);
+        }
+        Ok(())
+    }
+    #[cfg_attr(not(test), allow(dead_code))] // Dormant host-admitted seam; no production route.
+    pub(super) fn from_reserved(
+        client: OwnerResourceClient,
+        admitted: AdmittedReservation,
+        retained: usize,
+    ) -> Self {
+        let reservation = admitted.reservation();
+        let cleanup = admitted.cleanup();
+        let charge = StorageCharge::new(client.clone(), admitted, cleanup);
+        // Existing producers, chunks, consumers and evidence keep exact charge
+        // references until their actual allocation backing has been destroyed.
+        charge.allow_release();
+        Self {
+            client,
+            reservation,
+            retained,
+            charge,
+        }
+    }
     pub fn admit(
         client: OwnerResourceClient,
         reservation: Reservation,
@@ -92,8 +149,8 @@ impl TransferAllowance {
     pub(super) fn matches(&self, attachment: Attachment, channel: ChannelInstance) -> bool {
         self.reservation.locator == attachment.locator && self.reservation.channel == channel
     }
-    pub(super) fn same_host(&self, client: &OwnerResourceClient) -> bool {
-        self.client.same_host(client)
+    pub(super) fn matches_client(&self, client: &OwnerResourceClient) -> bool {
+        self.client.same_registration(client)
     }
     pub(super) fn matches_locator(&self, attachment: Attachment) -> bool {
         self.reservation.locator == attachment.locator

@@ -172,7 +172,7 @@ async fn screen_control_explicit_scope_observes_actual_join_and_metadata_lifetim
         bytes: 65536,
         screen_charge: None,
     };
-    let context = ScreenControlContext::new(scope.clone(), r, RequestId::new(1).unwrap());
+    let mut context = ScreenControlContext::new(scope.clone(), r, RequestId::new(1).unwrap());
     let ticket = context.start(client, r.locator, r.channel).await.unwrap();
     assert!(ticket.healthy());
     assert_eq!(scope.registered(), 1);
@@ -256,7 +256,7 @@ async fn screen_control_concurrent_scope_drain_wakes_every_actual_join_waiter() 
     use crate::session_owner::screen_control::*;
     let (client, ledger) = setup();
     let scope = ControlTaskScope::new(tokio::runtime::Handle::current());
-    let context = control_context(&client, scope.clone());
+    let mut context = control_context(&client, scope.clone());
     let locator = SessionLocator {
         session: RetainedSessionId::new([82; 16]).unwrap(),
         owner: OwnerInstance::new([82; 16]).unwrap(),
@@ -290,7 +290,7 @@ fn screen_control_disabled_timer_startup_is_contained_and_keeps_unknown_debt() {
             .build()
             .unwrap();
         let scope = ControlTaskScope::new(runtime.handle().clone());
-        let context = control_context(&client, scope.clone());
+        let mut context = control_context(&client, scope.clone());
         let locator = SessionLocator {
             session: RetainedSessionId::new([82; 16]).unwrap(),
             owner: OwnerInstance::new([82; 16]).unwrap(),
@@ -346,7 +346,7 @@ async fn screen_control_fair_deadlines_coalesce_wakes_and_idle_has_no_periodic_p
     }
     let (client, ledger) = setup();
     let scope = ControlTaskScope::new(tokio::runtime::Handle::current());
-    let context = control_context(&client, scope.clone());
+    let mut context = control_context(&client, scope.clone());
     let locator = SessionLocator {
         session: RetainedSessionId::new([82; 16]).unwrap(),
         owner: OwnerInstance::new([82; 16]).unwrap(),
