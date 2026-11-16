@@ -183,6 +183,7 @@ pub(crate) struct HostState {
     resources: Arc<Mutex<ResourceLedger>>,
     last_cleanup: u64,
     last_now: u64,
+    pub(super) replacement: Option<Arc<Mutex<super::host_replacement::ReplacementSlot>>>,
 }
 impl HostState {
     #[cfg(test)]
@@ -454,7 +455,19 @@ impl HostState {
             resources: Arc::new(Mutex::new(resources)),
             last_cleanup: 0,
             last_now: 0,
+            replacement: None,
         })
+    }
+    #[cfg(test)]
+    pub(super) fn retire_frontend_authority_for_test(&mut self, frontend: FrontendAdmission) {
+        self.authorization.retire_frontend(frontend).unwrap();
+    }
+    pub(super) fn frontend_is_current(&self, frontend: FrontendAdmission) -> bool {
+        self.authorization.frontend_is_current(frontend)
+            && self
+                .frontends
+                .iter()
+                .any(|(current, _)| *current == frontend)
     }
     pub(crate) fn instance(&self) -> HostInstance {
         self.instance

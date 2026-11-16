@@ -56,3 +56,6 @@ pub(crate) mod inherited_launch;
 
 #[allow(dead_code)] // Dormant local host-to-engine adapter; no production route.
 pub(crate) mod host_engine;
+
+#[allow(dead_code)] // Dormant host transaction exclusion; no activation route.
+pub(crate) mod host_replacement;
