@@ -3022,13 +3022,32 @@ class ShortRuntimeAllocationTests(unittest.TestCase):
 
 
 class WorkflowSplitTests(unittest.TestCase):
+    @staticmethod
+    def job(text, name):
+        lines = text.splitlines()
+        if lines.count('  ' + name + ':') != 1:
+            raise AssertionError('expected one workflow job: ' + name)
+        start = lines.index('  ' + name + ':') + 1
+        end = next((i for i in range(start, len(lines))
+                    if lines[i].startswith('  ') and not lines[i].startswith('   ')
+                    and lines[i].strip() and not lines[i].lstrip().startswith('#')), len(lines))
+        return '\n'.join(lines[start:end]) + '\n'
+
     def test_both_native_service_lanes_prepare_before_bounded_direct_execution(self):
-        for path, platform in [('.github/workflows/native-crypto.yml', 'Intel Darwin'),
-                               ('.github/workflows/ci.yml', 'Darwin')]:
+        for path, job, platform in [('.github/workflows/native-crypto.yml', 'darwin-legacy-service-intel', 'Intel Darwin'),
+                                    ('.github/workflows/ci.yml', 'macos', 'Darwin')]:
             with self.subTest(path=path):
-                text = (SCRIPT.parents[1] / path).read_text()
+                workflow = (SCRIPT.parents[1] / path).read_text()
+                text = self.job(workflow, job)
                 prepare_name = 'Prepare native ' + platform + ' legacy account-service restart artifacts'
                 execute_name = 'Native ' + platform + ' legacy account-service restart acceptance'
+                report_name = 'Report native ' + platform + ' legacy-service bundle lifecycle'
+                for name in (prepare_name, execute_name, report_name):
+                    self.assertEqual(text.count('      - name: ' + name + '\n'), 1)
+                if platform == 'Intel Darwin':
+                    owner = self.job(workflow, 'darwin-owner-intel')
+                    for name in (prepare_name, execute_name, report_name):
+                        self.assertNotIn('      - name: ' + name + '\n', owner)
                 start = text.index('      - name: ' + prepare_name)
                 middle = text.index('      - name: ' + execute_name, start)
                 end = text.index('      - name:', middle + 20)
@@ -3046,3 +3065,4 @@ class WorkflowSplitTests(unittest.TestCase):
                 self.assertEqual(exports(preparation), exports(execution))
                 self.assertIn('timeout-minutes: 45', text)
                 self.assertIn('if: always()', text[end:end + 300])
+                self.assertTrue(text[end:].startswith('      - name: ' + report_name + '\n'))

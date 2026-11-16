@@ -1,6 +1,7 @@
 """Controls for ordinary nextest reporting; no workspace tests are launched."""
 import importlib.util
 import json
+import hashlib
 import re
 import shlex
 import os
@@ -261,6 +262,60 @@ class ReportTests(unittest.TestCase):
                          f"not ((binary_id(={binary}) & test(={name})))")
         workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
         self.assertIn("--require " + name, workflow)
+
+    def test_inherited_launch_root_case_has_one_exact_disposable_owner(self):
+        name = 'session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup'
+        expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
+        key = ("qshd", name)
+        self.assertEqual(len(expected), 76)
+        self.assertEqual([entry for entry in expected if entry[1] == name], [key])
+        self.assertEqual(expected[key]["owner"], "CI container job: run_suite lib qshd")
+        self.assertIn("binary_id(=qshd)", self.module.exclusion_filter({key: expected[key]}))
+        self.assertIn(f"test(={name})", self.module.exclusion_filter({key: expected[key]}))
+        workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
+        self.assertEqual(workflow.count("--require " + name), 1)
+
+    def test_composed_manifest_preserves_exact_main_union_and_rejects_aliases(self):
+        manifest = SCRIPTS / 'nextest-exclusions.json'
+        expected = self.module.load_exclusions(manifest)
+        encoded = json.dumps(sorted(expected), separators=(',', ':')).encode()
+        self.assertEqual(hashlib.sha256(encoded).hexdigest(), 'd59bff07e64e3b6eff2a0f1dcb1b7c734be7b323aa5cdcbc8bf18d517c96988d')
+        self.assertEqual(len(expected), 76)
+        launch = 'session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup'
+        raw = json.loads(manifest.read_text())
+        group = next(group for group in raw['exclusions'] if launch in group['tests'])
+        duplicate = json.loads(json.dumps(raw))
+        duplicate['exclusions'].append(group)
+        fixture = Path(self.temp.name) / 'duplicate-manifest.json'
+        fixture.write_text(json.dumps(duplicate))
+        with self.assertRaises(ValueError): self.module.load_exclusions(fixture)
+        alias = json.loads(json.dumps(raw))
+        next(group for group in alias['exclusions'] if launch in group['tests'])['binary'] = 'qshd::wrong_owner_alias'
+        fixture.write_text(json.dumps(alias))
+        aliased = self.module.load_exclusions(fixture)
+        self.assertEqual(len(aliased), 76, 'same-cardinality alias must not pass identity checks')
+        selected = {key: value for key, value in aliased.items() if key[1] in (launch, ROOT_ENDPOINT_TEST)}
+        with self.assertRaises(ValueError):
+            self.check([(launch, 'skipped', self.module.FILTER_REASON),
+                        (ROOT_ENDPOINT_TEST, 'skipped', self.module.FILTER_REASON), ('ordinary', 'pass', '')], selected)
+
+    def test_composed_root_requirements_are_filtered_once_in_ordinary_reports(self):
+        launch = 'session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup'
+        expected = self.module.load_exclusions(SCRIPTS / 'nextest-exclusions.json')
+        selected = {('qshd', name): expected[('qshd', name)] for name in (launch, ROOT_ENDPOINT_TEST)}
+        valid = [(name, 'skipped', self.module.FILTER_REASON) for name in (launch, ROOT_ENDPOINT_TEST)] + [('ordinary', 'pass', '')]
+        result = self.check(valid, selected)
+        self.assertEqual(result[0], 1)
+        self.assertEqual(set(result[1]), set(selected))
+        self.assertEqual(result[2], [])
+        for name in (launch, ROOT_ENDPOINT_TEST):
+            other = ROOT_ENDPOINT_TEST if name == launch else launch
+            for state in ('missing', 'pass', 'ignored', 'runtime-skip'):
+                cases = [(other, 'skipped', self.module.FILTER_REASON), ('ordinary', 'pass', '')]
+                if state == 'pass': cases.append((name, 'pass', ''))
+                elif state == 'ignored': cases.append((name, 'skipped', self.module.IGNORE_REASON))
+                elif state == 'runtime-skip': cases.append((name, 'stdout', 'SKIPPED synthetic root outcome'))
+                with self.subTest(name=name, state=state), self.assertRaises(ValueError): self.check(cases, selected)
 
     def test_expected_exclusions_are_distinct_from_executed_tests(self):
         result = self.check([("tests::root", "skipped", self.module.FILTER_REASON),

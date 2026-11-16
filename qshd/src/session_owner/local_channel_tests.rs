@@ -924,3 +924,250 @@ fn frontendio529_host_and_owner_endpoints_transfer_no_bytes() {
         }
     }
 }
+
+fn proof_observer() -> prepare_observation::Observer {
+    let mut observer = prepare_observation::Observer::default();
+    observer.socket_probe.accept_fault = Some(prepare_observation::AcceptFault::Errno(
+        nix::libc::ENOPROTOOPT,
+    ));
+    observer
+}
+fn check_proof(
+    fd: &OwnedFd,
+    proof: ConnectedProof,
+    cfg: TrustedChannelConfig,
+    observer: &mut prepare_observation::Observer,
+) -> Result<(), AdmissionError> {
+    validate_socket_with_proof(
+        fd,
+        cfg,
+        proof,
+        prepare_observation::Site::OtherPreparation,
+        Some(observer),
+    )
+}
+#[test]
+fn admission529_connected_peer_proof_avoids_unsupported_option() {
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let fd: OwnedFd = socket.into();
+    let mut observer = proof_observer();
+    assert_eq!(
+        check_proof(
+            &fd,
+            ConnectedProof::PeerAddress,
+            config(None, OwnerRole::Frontend),
+            &mut observer
+        ),
+        Ok(()),
+        "a real connected stream must not request the unsupported option"
+    );
+    assert_eq!(observer.socket_probe.accept_calls, 0);
+    assert_eq!(observer.socket_probe.peer_calls, 1);
+    assert_eq!(observer.socket_probe.uid_calls, 1);
+    assert_eq!(observer.first, None);
+    assert_ne!(
+        unsafe { nix::libc::fcntl(fd.as_raw_fd(), nix::libc::F_GETFL) } & nix::libc::O_NONBLOCK,
+        0
+    );
+}
+#[test]
+fn admission529_connected_peer_proof_refuses_real_nonpeers() {
+    use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
+    use prepare_observation::{Check, Class};
+    use std::os::unix::net::{UnixDatagram, UnixListener};
+    let dir = tempfile::tempdir().unwrap();
+    let (pipe, _pipe_peer) = nix::unistd::pipe().unwrap();
+    let (datagram, _datagram_peer) = UnixDatagram::pair().unwrap();
+    let listener = UnixListener::bind(dir.path().join("proof.sock")).unwrap();
+    let cases: Vec<(OwnedFd, Check, usize)> = vec![
+        (
+            tempfile::tempfile().unwrap().into(),
+            Check::GetsocknameCall,
+            0,
+        ),
+        (pipe, Check::GetsocknameCall, 0),
+        (datagram.into(), Check::StreamType, 0),
+        (listener.into(), Check::PeerAddressCall, 1),
+        (
+            socket(
+                AddressFamily::Unix,
+                SockType::Stream,
+                SockFlag::empty(),
+                None,
+            )
+            .unwrap(),
+            Check::PeerAddressCall,
+            1,
+        ),
+        (
+            socket(
+                AddressFamily::Inet,
+                SockType::Stream,
+                SockFlag::empty(),
+                None,
+            )
+            .unwrap(),
+            Check::UnixFamily,
+            0,
+        ),
+    ];
+    for (fd, check, peer_calls) in cases {
+        let mut observer = proof_observer();
+        assert_eq!(
+            check_proof(
+                &fd,
+                ConnectedProof::PeerAddress,
+                config(None, OwnerRole::Frontend),
+                &mut observer
+            ),
+            Err(AdmissionError::Refused)
+        );
+        let event = observer.first.unwrap();
+        assert_eq!(event.check, check);
+        assert_eq!(observer.socket_probe.accept_calls, 0);
+        assert_eq!(observer.socket_probe.peer_calls, peer_calls);
+        assert_eq!(observer.socket_probe.uid_calls, 0);
+        if check == Check::PeerAddressCall {
+            assert_eq!(event.class, Class::Io);
+            assert!(
+                event.errno.is_some(),
+                "actual getpeername failure retains its errno"
+            );
+        }
+    }
+}
+fn supported_test_proofs() -> impl IntoIterator<Item = ConnectedProof> {
+    #[cfg(target_os = "macos")]
+    {
+        [ConnectedProof::PeerAddress]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        [ConnectedProof::PeerAddress, ConnectedProof::AcceptOption]
+    }
+}
+#[test]
+fn admission529_connected_peer_proof_preserves_peer_identity_refusals() {
+    use prepare_observation::{Check, Class};
+    for proof in supported_test_proofs() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd: OwnedFd = socket.into();
+        let mut observer = prepare_observation::Observer::default();
+        observer.socket_probe.peer_error = Some(nix::libc::ENOTCONN);
+        assert_eq!(
+            check_proof(&fd, proof, config(None, OwnerRole::Frontend), &mut observer),
+            Err(AdmissionError::Refused)
+        );
+        let event = observer.first.unwrap();
+        assert_eq!(event.check, Check::PeerAddressCall);
+        assert_eq!(event.class, Class::SyntheticSyscall);
+        assert_eq!(event.errno, Some(nix::libc::ENOTCONN));
+        assert_eq!(observer.socket_probe.peer_calls, 1);
+        assert_eq!(observer.socket_probe.uid_calls, 0);
+    }
+    for proof in supported_test_proofs() {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd: OwnedFd = socket.into();
+        let mut cfg = config(None, OwnerRole::Frontend);
+        cfg.mode = HostMode::System;
+        cfg.system_uid = nix::unistd::geteuid().as_raw().wrapping_add(1);
+        let mut observer = prepare_observation::Observer::default();
+        assert_eq!(
+            check_proof(&fd, proof, cfg, &mut observer),
+            Err(AdmissionError::Refused)
+        );
+        assert_eq!(observer.first.unwrap().check, Check::AllowedPeer);
+        assert_eq!(observer.socket_probe.peer_calls, 1);
+        assert_eq!(observer.socket_probe.uid_calls, 1);
+        assert_eq!(
+            unsafe { nix::libc::fcntl(fd.as_raw_fd(), nix::libc::F_GETFL) } & nix::libc::O_NONBLOCK,
+            0
+        );
+    }
+}
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn admission529_explicit_option_proof_never_accepts_option_errors() {
+    use prepare_observation::{AcceptFault, Check, Class};
+    let cases = [
+        (
+            AcceptFault::Errno(nix::libc::ENOPROTOOPT),
+            Check::AcceptConnCall,
+            Class::SyntheticSyscall,
+        ),
+        (
+            AcceptFault::Errno(nix::libc::EOPNOTSUPP),
+            Check::AcceptConnCall,
+            Class::SyntheticSyscall,
+        ),
+        (
+            AcceptFault::Length,
+            Check::AcceptConnLength,
+            Class::SyntheticPredicate,
+        ),
+        (
+            AcceptFault::Listening,
+            Check::NotListening,
+            Class::Predicate,
+        ),
+    ];
+    for (fault, check, class) in cases {
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let fd: OwnedFd = socket.into();
+        let mut observer = prepare_observation::Observer::default();
+        observer.socket_probe.accept_fault = Some(fault);
+        assert_eq!(
+            check_proof(
+                &fd,
+                ConnectedProof::AcceptOption,
+                config(None, OwnerRole::Frontend),
+                &mut observer
+            ),
+            Err(AdmissionError::Refused)
+        );
+        let event = observer.first.unwrap();
+        assert_eq!(event.check, check);
+        assert_eq!(event.class, class);
+        assert_eq!(observer.socket_probe.accept_calls, 1);
+        assert_eq!(observer.socket_probe.peer_calls, 0);
+        assert_eq!(observer.socket_probe.uid_calls, 0);
+    }
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let fd: OwnedFd = socket.into();
+    let mut observer = prepare_observation::Observer::default();
+    assert_eq!(
+        check_proof(
+            &fd,
+            ConnectedProof::AcceptOption,
+            config(None, OwnerRole::Frontend),
+            &mut observer
+        ),
+        Ok(())
+    );
+    assert_eq!(observer.socket_probe.accept_calls, 1);
+    assert_eq!(observer.socket_probe.peer_calls, 1);
+    assert_eq!(observer.socket_probe.uid_calls, 1);
+    assert_eq!(observer.first, None);
+}
+
+/// Test-only prefill of this fixture's real nonblocking socket output. The
+/// bytes are explicitly drained as fixture occupancy before QSHH decoding;
+/// they are not a successful mock response or a resource-cleanup receipt.
+pub(crate) fn fill_dispatch_output(channel: &mut HostDispatchChannel) -> usize {
+    let socket = stream(channel.channel.custody.fd.as_ref().unwrap());
+    let mut peer = &*socket;
+    let bytes = [0xa5; 4096];
+    let mut filled = 0;
+    loop {
+        assert!(
+            filled < 8 * 1024 * 1024,
+            "fixture socket output must be bounded"
+        );
+        match peer.write(&bytes) {
+            Ok(0) => panic!("unexpected zero fixture write"),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return filled,
+            Err(e) => panic!("prefilling fixture socket: {e}"),
+        }
+    }
+}

@@ -6805,32 +6805,140 @@ pub(crate) mod tests {
         h.stop();
     }
 
-    /// The exec target is the account's shell FROM PASSWD -- a uniquely
-    /// named link so only IT can be what ran -- and `/bin/sh` when passwd
+    // Validate the account-shell fixture's observations independently of the
+    // system's env implementation and its handling of a renamed argv[0].
+    fn account_shell607_witness_matches(output: &str, expected_shell: &str) -> bool {
+        let expected = [
+            format!("EXECUTED={expected_shell}"),
+            format!("SHELL={expected_shell}"),
+        ];
+        output.lines().eq(expected.iter().map(String::as_str))
+    }
+
+    #[test]
+    fn shell607_witness_accepts_exact_records_and_pty_line_endings() {
+        for output in [
+            "EXECUTED=/private/selected-shell\nSHELL=/private/selected-shell\n",
+            "EXECUTED=/private/selected-shell\r\nSHELL=/private/selected-shell\r\n",
+        ] {
+            assert!(account_shell607_witness_matches(
+                output,
+                "/private/selected-shell"
+            ));
+        }
+    }
+
+    #[test]
+    fn shell607_witness_rejects_counterfeit_execution_or_shell() {
+        for (case, output) in [
+            (
+                "correct environment with wrong executable",
+                "EXECUTED=/private/other-shell\nSHELL=/private/selected-shell\n",
+            ),
+            (
+                "correct executable with wrong environment",
+                "EXECUTED=/private/selected-shell\nSHELL=/private/other-shell\n",
+            ),
+            (
+                "selected path is only a prefix",
+                "EXECUTED=/private/selected-shell-extra\nSHELL=/private/selected-shell-extra\n",
+            ),
+        ] {
+            assert!(
+                !account_shell607_witness_matches(output, "/private/selected-shell"),
+                "{case} must not prove the selected shell executed"
+            );
+        }
+    }
+
+    #[test]
+    fn shell607_witness_rejects_missing_duplicate_or_malformed_records() {
+        for (case, output) in [
+            ("missing execution", "SHELL=/private/selected-shell\n"),
+            ("missing environment", "EXECUTED=/private/selected-shell\n"),
+            (
+                "duplicate execution",
+                "EXECUTED=/private/selected-shell\nEXECUTED=/private/selected-shell\nSHELL=/private/selected-shell\n",
+            ),
+            (
+                "duplicate environment",
+                "EXECUTED=/private/selected-shell\nSHELL=/private/selected-shell\nSHELL=/private/selected-shell\n",
+            ),
+            (
+                "unexpected record",
+                "EXECUTED=/private/selected-shell\nSHELL=/private/selected-shell\nEXTRA=unexpected\n",
+            ),
+            (
+                "unexpected blank line",
+                "EXECUTED=/private/selected-shell\n\nSHELL=/private/selected-shell\n",
+            ),
+            (
+                "leading whitespace",
+                "EXECUTED=/private/selected-shell\n SHELL=/private/selected-shell\n",
+            ),
+            (
+                "trailing whitespace",
+                "EXECUTED=/private/selected-shell\nSHELL=/private/selected-shell \n",
+            ),
+            ("empty output", ""),
+        ] {
+            assert!(
+                !account_shell607_witness_matches(output, "/private/selected-shell"),
+                "{case} must not prove the selected shell executed"
+            );
+        }
+    }
+
+    /// The exec target is the account's shell FROM PASSWD -- a private
+    /// executable that reports its own path -- and `/bin/sh` when passwd
     /// leaves it empty, never the helper's own `$SHELL`.
     #[test]
     fn the_exec_target_is_the_accounts_shell_from_passwd() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
         let me = super::account::lookup(&my_login()).expect("this account resolves");
 
-        // A uniquely named link to `/usr/bin/env` as the shell: a login
-        // shell execs it directly, and `env` -- ignoring its argv0 -- prints
-        // the environment, in which SHELL is what the helper set from passwd:
-        // the link itself, nothing else on the machine has that name.
+        // The script observes its own target path independently of SHELL.
+        // A shebang interpreter supplies the script's $0; separate tests
+        // above retain the native executable's login-argv0 contract.
         let dir = tempfile::tempdir().expect("tempdir");
-        let (renamed_env, _) = uniquely_named(dir.path(), "e", "/usr/bin/env");
+        let selected_shell = dir.path().join("selected-shell");
+        std::fs::write(
+            &selected_shell,
+            "#!/bin/sh\nprintf 'EXECUTED=%s\\nSHELL=%s\\n' \"$0\" \"$SHELL\"\n",
+        )
+        .expect("write the private account-shell executable");
+        std::fs::set_permissions(&selected_shell, std::fs::Permissions::from_mode(0o700))
+            .expect("make the private account-shell executable runnable");
         let account = Account {
-            shell: renamed_env.clone(),
+            shell: selected_shell.clone(),
             ..me.clone()
         };
         let h = helper_for(account.clone(), test_config(), UNPRIVILEGED);
-        let out = output_of(&h, &open_shell(1, &account));
-        assert!(
-            out.contains(&format!("SHELL={}", renamed_env.display())),
-            "the shell channel must exec the account's shell ({}) and set SHELL to it, got \
-             {out:?}",
-            renamed_env.display()
-        );
-        h.stop();
+        let primary = catch_unwind(AssertUnwindSafe(|| {
+            let out = output_of(&h, &open_shell(1, &account));
+            assert!(
+                account_shell607_witness_matches(
+                    &out,
+                    selected_shell.to_str().expect("the fixture path is UTF-8")
+                ),
+                "the shell channel must execute the account's shell ({}) and set SHELL to it, \
+                 with exactly one record of each observation, got {out:?}",
+                selected_shell.display()
+            );
+        }));
+        let cleanup = catch_unwind(AssertUnwindSafe(|| h.stop()));
+        match (primary, cleanup) {
+            (Err(primary), cleanup) => {
+                if cleanup.is_err() {
+                    eprintln!("the selected-shell fixture's bounded cleanup also failed");
+                }
+                resume_unwind(primary)
+            }
+            (Ok(()), Err(cleanup)) => resume_unwind(cleanup),
+            (Ok(()), Ok(())) => {}
+        }
 
         // An empty passwd shell falls back to `/bin/sh`: ask the resulting
         // shell for `$SHELL` through a command channel.
@@ -6839,15 +6947,27 @@ pub(crate) mod tests {
             ..me
         };
         let h = helper_for(account.clone(), test_config(), UNPRIVILEGED);
-        let out = output_of(
-            &h,
-            &open_for(2, &account, "printf 'SHELL=%s\\n' \"$SHELL\""),
-        );
-        assert!(
-            out.contains("SHELL=/bin/sh"),
-            "an empty passwd shell must fall back to /bin/sh, got {out:?}"
-        );
-        h.stop();
+        let primary = catch_unwind(AssertUnwindSafe(|| {
+            let out = output_of(
+                &h,
+                &open_for(2, &account, "printf 'SHELL=%s\\n' \"$SHELL\""),
+            );
+            assert!(
+                out.contains("SHELL=/bin/sh"),
+                "an empty passwd shell must fall back to /bin/sh, got {out:?}"
+            );
+        }));
+        let cleanup = catch_unwind(AssertUnwindSafe(|| h.stop()));
+        match (primary, cleanup) {
+            (Err(primary), cleanup) => {
+                if cleanup.is_err() {
+                    eprintln!("the empty-shell fixture's bounded cleanup also failed");
+                }
+                resume_unwind(primary)
+            }
+            (Ok(()), Err(cleanup)) => resume_unwind(cleanup),
+            (Ok(()), Ok(())) => {}
+        }
     }
 
     /// A channel whose program exits on its own is reported exactly once,
@@ -17193,6 +17313,94 @@ pub(crate) mod tests {
         h.stop();
     }
 
+    fn tty608_terminal_witness(output: &str, exit_code: i32) -> Option<&str> {
+        if exit_code != 0 {
+            return None;
+        }
+        let mut lines = output
+            .strip_suffix('\n')?
+            .split('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line));
+        if lines.next()? != "QSH_TTY_BEGIN" {
+            return None;
+        }
+        let terminal = lines.next()?;
+        if lines.next()? != "QSH_TTY_END"
+            || lines.next().is_some()
+            || !terminal.starts_with("/dev/")
+            || terminal.len() == "/dev/".len()
+            || terminal.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some(terminal)
+    }
+
+    #[test]
+    fn tty608_terminal_witness_requires_one_complete_exact_frame() {
+        let lf = "QSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END\n";
+        let crlf = "QSH_TTY_BEGIN\r\n/dev/pts/1\r\nQSH_TTY_END\r\n";
+        for framed in [lf, crlf] {
+            assert_eq!(tty608_terminal_witness(framed, 0), Some("/dev/pts/1"));
+            for exit_code in [1, -1, 127] {
+                assert_eq!(tty608_terminal_witness(framed, exit_code), None);
+            }
+        }
+        for malformed in [
+            "/dev/pts/1END\r\n",
+            "QSH_TTY_OTHER_BEGIN\n/dev/pts/1\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_OTHER_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END",
+            "QSH_TTY_BEGIN\n\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\nnot a tty\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\n/dev/pts/2\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\0extra\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\rextra\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\textra\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\u{1b}\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\u{7f}\nQSH_TTY_END\n",
+            "error\nQSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END\nextra\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END\nQSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END\n",
+        ] {
+            assert_eq!(
+                tty608_terminal_witness(malformed, 0),
+                None,
+                "malformed terminal witness accepted: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tty608_terminal_witness_does_not_repair_a_contaminated_or_wrong_value() {
+        let old_output = "/dev/pts/1END\r\n";
+        let old_expected = old_output
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("/dev/"));
+        assert_eq!(old_expected, Some("/dev/pts/1END"));
+        assert_eq!(tty608_terminal_witness(old_output, 0), None);
+
+        for (framed, value) in [
+            ("QSH_TTY_BEGIN\n/dev/pts/2\nQSH_TTY_END\n", "/dev/pts/2"),
+            (
+                "QSH_TTY_BEGIN\n/dev/pts/1END\nQSH_TTY_END\n",
+                "/dev/pts/1END",
+            ),
+            ("QSH_TTY_BEGIN\n/dev/pts/1 \nQSH_TTY_END\n", "/dev/pts/1 "),
+        ] {
+            let other = tty608_terminal_witness(framed, 0).unwrap();
+            assert_eq!(other, value);
+            assert_ne!(
+                format!("account|service|{other}|203.0.113.7"),
+                "account|service|/dev/pts/1|203.0.113.7",
+                "a different valid terminal must not become the PAM record's terminal"
+            );
+        }
+    }
+
     /// The modules see who is logging in, on what, and from where: the
     /// account's name, the service the daemon was configured for, the
     /// terminal the helper opened for the login's first channel, and the
@@ -17230,39 +17438,60 @@ pub(crate) mod tests {
         );
 
         let h = helper_with_pam_confdir(dir.path(), "qshd-test-items");
-        // The terminal of the FIRST channel is the session's, so this one
-        // has to be read back from the channel itself -- the helper names
-        // it, and nothing else here knows it.
-        let (opened, fd) = open_command_with_fd(&h.channels, 1, my_uid(), h.login, "tty; echo END");
-        assert!(
-            matches!(opened, Response::Opened { id: 1 }),
-            "got {opened:?}"
-        );
-        let seen = read_until_or_timeout(&mut std::fs::File::from(fd.expect("terminal")), "END");
-        let tty = seen
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("/dev/"))
-            .unwrap_or_else(|| panic!("the shell must name its own terminal, got {seen:?}"))
-            .to_string();
-
-        wait_until_exists(&items, TEST_RECV_TIMEOUT);
-        let recorded = recorded_lines(&items);
-
-        assert_eq!(
-            recorded.first().map(String::as_str),
-            Some(
-                format!(
-                    "{me}|qshd-test-items|{tty}|{rhost}",
-                    me = h.me,
-                    rhost = "203.0.113.7"
+        let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The first channel's terminal is the session's. Capture the
+            // utility's value, then own both record boundaries independently
+            // of any trailing newline it supplied. The value is never a format.
+            let command =
+                r#"terminal=$(tty) && printf 'QSH_TTY_BEGIN\n%s\nQSH_TTY_END\n' "$terminal""#;
+            let (opened, fd) = open_command_with_fd(&h.channels, 1, my_uid(), h.login, command);
+            assert!(
+                matches!(opened, Response::Opened { id: 1 }),
+                "got {opened:?}"
+            );
+            let mut master = std::fs::File::from(fd.expect("terminal"));
+            let seen = read_to_end_within(&mut master).unwrap_or_else(|partial| {
+                let observed: String = partial.chars().take(512).collect();
+                panic!("terminal witness must reach its end before deadline, got {observed:?}")
+            });
+            let exit_code = wait_for_exited(&h.channels, 1);
+            drop(master);
+            let tty = tty608_terminal_witness(&seen, exit_code).unwrap_or_else(|| {
+                let observed: String = seen.chars().take(512).collect();
+                panic!(
+                    "successful terminal witness must be one complete frame; exit={exit_code}, \
+                     got {observed:?}"
                 )
-                .as_str()
-            ),
-            "the account, the service, the login's terminal and the address it logged in from \
-             must all reach the modules: {recorded:?}"
-        );
-        h.stop();
+            });
+
+            wait_until_exists(&items, TEST_RECV_TIMEOUT);
+            let recorded = recorded_lines(&items);
+            assert_eq!(
+                recorded.first().map(String::as_str),
+                Some(
+                    format!(
+                        "{me}|qshd-test-items|{tty}|{rhost}",
+                        me = h.me,
+                        rhost = "203.0.113.7"
+                    )
+                    .as_str()
+                ),
+                "the account, the service, the login's terminal and the address it logged in from \
+                 must all reach the modules: {recorded:?}"
+            );
+        }));
+        // The primary assertion cannot bypass the existing bounded helper
+        // cleanup. Its terminal descriptor has already dropped on either path.
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || h.stop()));
+        if let Err(failure) = primary {
+            if cleanup.is_err() {
+                eprintln!("terminal witness cleanup also failed after the primary assertion");
+            }
+            std::panic::resume_unwind(failure);
+        }
+        if let Err(failure) = cleanup {
+            std::panic::resume_unwind(failure);
+        }
     }
 
     /// The array handed to `execve` carries each environment name ONCE.

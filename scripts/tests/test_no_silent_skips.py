@@ -61,7 +61,7 @@ def library_gate():
 
 
 def synthetic_log(required, *, missing=None, renamed=None, ignored=None,
-                  failed=None, body_count=102, filtered=0):
+                  failed=None, body_count=119, filtered=0):
     """Well-counted synthetic outcomes isolate each gate's refusal condition."""
     outcomes = []
     for name in required:
@@ -72,7 +72,7 @@ def synthetic_log(required, *, missing=None, renamed=None, ignored=None,
         status = "ignored" if name == ignored else "FAILED" if name == failed else "ok"
         outcomes.append((name, status))
     # A required ignored wrapper replaces one synthetic ignored body, so the
-    # total remains 102: rejection cannot depend only on a count mismatch.
+    # total remains 119: rejection cannot depend only on a count mismatch.
     bodies = body_count - sum(status == "ignored" for _, status in outcomes)
     outcomes.extend((f"synthetic_parser_body_{i}", "ignored") for i in range(bodies))
     passed = sum(status == "ok" for _, status in outcomes)
@@ -107,7 +107,7 @@ class NoSilentSkipsControls(unittest.TestCase):
                        XDG_CACHE_HOME=directory, TMPDIR=directory, HISTFILE="/dev/null")
             env.pop("SSH_AUTH_SOCK", None)
             env.pop("SSH_AGENT_PID", None)
-            args = ["sh", str(ROOT / "scripts/no-silent-skips.sh"), str(path), "--ignored", "102"]
+            args = ["sh", str(ROOT / "scripts/no-silent-skips.sh"), str(path), "--ignored", "119"]
             for name in required:
                 args.extend(["--require", name])
             args.extend(ALLOWED)
@@ -117,12 +117,12 @@ class NoSilentSkipsControls(unittest.TestCase):
 
     def test_workflow_requires_exact_reviewed_union(self):
         ignored, required, allowed = library_gate()
-        self.assertEqual(ignored, 102)
+        self.assertEqual(ignored, 119)
         actual = [name for name in required if name.startswith(C1_PREFIX)]
         self.assertCountEqual(actual, C1_REQUIRED)
         self.assertEqual(len(actual), 17)
         self.assertEqual(tuple(allowed), ALLOWED)
-        self.assertIn("python3 -B -m unittest discover -s scripts/tests -p 'test_no_silent_skips.py'",
+        self.assertIn("python3 -I -B scripts/tests/test_no_silent_skips.py -v",
                       (ROOT / ".github/workflows/ci.yml").read_text())
 
     def test_complete_nonzero_union_passes(self):
@@ -130,27 +130,27 @@ class NoSilentSkipsControls(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_each_missing_wrapper_refuses(self):
-        for name in C1_REQUIRED:
+        for name in self.required:
             with self.subTest(wrapper=name):
                 self.assertNotEqual(self.check_log(synthetic_log(self.required, missing=name)).returncode, 0)
 
     def test_each_renamed_wrapper_refuses(self):
-        for name in C1_REQUIRED:
+        for name in self.required:
             with self.subTest(wrapper=name):
                 self.assertNotEqual(self.check_log(synthetic_log(self.required, renamed=name)).returncode, 0)
 
     def test_each_ignored_wrapper_refuses_with_correct_total(self):
-        for name in C1_REQUIRED:
+        for name in self.required:
             with self.subTest(wrapper=name):
                 self.assertNotEqual(self.check_log(synthetic_log(self.required, ignored=name)).returncode, 0)
 
     def test_each_failed_wrapper_refuses(self):
-        for name in C1_REQUIRED:
+        for name in self.required:
             with self.subTest(wrapper=name):
                 self.assertNotEqual(self.check_log(synthetic_log(self.required, failed=name)).returncode, 0)
 
     def test_wrong_ignored_count_refuses(self):
-        for count in (101, 103):
+        for count in (85, 101, 102, 118, 120):
             self.assertNotEqual(self.check_log(synthetic_log(self.required, body_count=count)).returncode, 0)
 
     def test_zero_passed_refuses_without_requiring_a_wrapper(self):
@@ -165,4 +165,7 @@ class NoSilentSkipsControls(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    suite = unittest.defaultTestLoader.loadTestsFromModule(__import__(__name__))
+    count = suite.countTestCases()
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    raise SystemExit(0 if count > 0 and result.wasSuccessful() and not result.skipped else 1)
