@@ -1,78 +1,10 @@
 name: Native crypto prerequisite
 run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'pty-eof-build' && format('PTY EOF build · {0} · {1}', github.ref_name, github.sha) || github.event_name == 'workflow_dispatch' && inputs.mode == 'pty-eof-control' && format('PTY EOF control · {0} · {1}', github.ref_name, github.sha) || '' }}
 
+# CI selects these lanes per change and calls this workflow (#609); Release
+# and Nightly call it with every lane. Its own PR and main triggers are gone
+# so orchestration never runs it twice.
 on:
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'qshd/**'
-      - 'crates/logging/**'
-      - 'crates/transport/**'
-      - 'crates/terminal-size/**'
-      - 'crates/terminal/**'
-      - 'vendor/vte/**'
-      - 'vendor/alacritty_terminal/**'
-      - '.github/workflows/ci.yml'
-      - 'cli/Cargo.toml'
-      - 'cli/tests/mixed_versions.rs'
-      - 'crates/daemon-bootstrap-protocol/**'
-      - 'scripts/released-peer-acceptance.py'
-      - 'scripts/tests/test_released_peer_acceptance.py'
-      - 'packaging/build-server-packages.sh'
-      - 'packaging/acceptance.sh'
-      - 'scripts/check-pam-linkage.sh'
-      - 'crates/sshauth/**'
-      - 'crates/release-auth/**'
-      - 'crates/ssh/src/crypto_worker.rs'
-      - 'scripts/*openssl*'
-      - 'scripts/openssl/**'
-      - 'scripts/tests/test_build_openssl.py'
-      - 'scripts/check-native-verifier-paths.py'
-      - 'scripts/tests/test_native_verifier_paths.py'
-      - '.github/workflows/native-crypto.yml'
-      - '.github/workflows/release.yml'
-      - 'packaging/Dockerfile.build-*'
-      - 'packaging/bootstrap/**'
-      - 'packaging/rpm-tool/**'
-      - 'scripts/tests/test_rpm_tool.py'
-      - 'scripts/tests/test_bootstrap_tools.py'
-  push:
-    branches: [main]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'qshd/**'
-      - 'crates/logging/**'
-      - 'crates/transport/**'
-      - 'crates/terminal-size/**'
-      - 'crates/terminal/**'
-      - 'vendor/vte/**'
-      - 'vendor/alacritty_terminal/**'
-      - '.github/workflows/ci.yml'
-      - 'cli/Cargo.toml'
-      - 'cli/tests/mixed_versions.rs'
-      - 'crates/daemon-bootstrap-protocol/**'
-      - 'scripts/released-peer-acceptance.py'
-      - 'scripts/tests/test_released_peer_acceptance.py'
-      - 'packaging/build-server-packages.sh'
-      - 'packaging/acceptance.sh'
-      - 'scripts/check-pam-linkage.sh'
-      - 'crates/sshauth/**'
-      - 'crates/release-auth/**'
-      - 'crates/ssh/src/crypto_worker.rs'
-      - 'scripts/*openssl*'
-      - 'scripts/openssl/**'
-      - 'scripts/tests/test_build_openssl.py'
-      - 'scripts/check-native-verifier-paths.py'
-      - 'scripts/tests/test_native_verifier_paths.py'
-      - '.github/workflows/native-crypto.yml'
-      - '.github/workflows/release.yml'
-      - 'packaging/Dockerfile.build-*'
-      - 'packaging/bootstrap/**'
-      - 'packaging/rpm-tool/**'
-      - 'scripts/tests/test_rpm_tool.py'
-      - 'scripts/tests/test_bootstrap_tools.py'
   workflow_dispatch:
     inputs:
       mode:
@@ -81,12 +13,21 @@ on:
         required: true
         default: qualification
         options: [qualification, pty-eof-build, pty-eof-control]
+      lanes:
+        description: Canonical JSON array of native lanes; [] selects none
+        type: string
+        required: false
+        default: '["floors","intel-legacy","intel-owner","portable"]'
   workflow_call:
     inputs:
       mode:
         type: string
         required: false
         default: qualification
+      lanes:
+        type: string
+        required: false
+        default: '["floors","intel-legacy","intel-owner","portable"]'
 
 permissions:
   contents: read
@@ -98,7 +39,7 @@ env:
 
 jobs:
   portable:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) && contains(fromJSON(inputs.lanes), 'portable') }}
     name: Native ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -269,7 +210,7 @@ jobs:
   # Ownership gets its own budget; measured crypto/product prerequisites used
   # almost 31 minutes of the shared 35-minute Intel job before owner compilation.
   darwin-owner-intel:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) && contains(fromJSON(inputs.lanes), 'intel-owner') }}
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
@@ -619,7 +560,7 @@ jobs:
 
   # Legacy preparation and acceptance retain a separate same-runner budget.
   darwin-legacy-service-intel:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) && contains(fromJSON(inputs.lanes), 'intel-legacy') }}
     name: ${{ matrix.name }}
     strategy:
       fail-fast: false
@@ -822,7 +763,7 @@ jobs:
           PY_STATE
 
   system-floors:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) && contains(fromJSON(inputs.lanes), 'floors') }}
     name: Native system floor (${{ matrix.format }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -886,6 +827,32 @@ jobs:
                 fi
               done
             '
+
+  # Omitted input means the documented default: every lane. A supplied value
+  # must be the canonical sorted array of known lanes; [] selects none.
+  lanes:
+    name: Validate native lanes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Refuse non-canonical lane selections
+        env:
+          QSH_NATIVE_LANES: ${{ inputs.lanes }}
+        run: |
+          python3 -I -B - <<'PY_LANES'
+          import json
+          import os
+          known = ('floors', 'intel-legacy', 'intel-owner', 'portable')
+          raw = os.environ['QSH_NATIVE_LANES']
+          try:
+              lanes = json.loads(raw)
+          except ValueError:
+              raise SystemExit('native lanes refused: not JSON')
+          if (type(lanes) is not list or any(type(lane) is not str or lane not in known for lane in lanes)
+                  or json.dumps(sorted(set(lanes)), separators=(',', ':')) != raw):
+              raise SystemExit('native lanes refused: not the canonical array')
+          print('native lanes: ' + (', '.join(lanes) if lanes else 'none'))
+          PY_LANES
 
   dispatch-mode:
     name: Validate manual mode

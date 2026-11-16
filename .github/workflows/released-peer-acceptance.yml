@@ -1,28 +1,9 @@
 name: Released-peer acceptance
 
+# CI selects this gate for the reviewed released-peer paths and calls it
+# (#609, scripts/ci-selection.json "peer_paths"); Release and Nightly call it
+# for every candidate. It has no trigger of its own besides a manual run.
 on:
-  # Qualify changes to this gate before merge without repeating it on every patch.
-  pull_request:
-    paths:
-      - '.github/workflows/released-peer-acceptance.yml'
-      - '.github/workflows/release.yml'
-      - 'scripts/released-peer-acceptance.py'
-      - 'scripts/tests/test_released_peer_acceptance.py'
-      - 'cli/tests/mixed_versions.rs'
-      - 'qshd/tests/mixed_versions.rs'
-      - 'crates/daemon-bootstrap-protocol/**'
-      - 'crates/bringup/src/**'
-      - 'qshd/src/main.rs'
-      - 'qshd/src/control.rs'
-      - 'qshd/src/control/**'
-      - 'qshd/src/transport_daemon.rs'
-      - 'qshd/src/destructive_restart.rs'
-      - 'qshd/src/modern_restart.rs'
-      - 'qshd/src/service_restart.rs'
-      - 'qshd/src/control_service_tests.rs'
-      - 'cli/src/ssh_step.rs'
-      - 'cli/src/busy_daemon.rs'
-      - 'cli/src/climb.rs'
   workflow_dispatch:
   workflow_call:
 

@@ -154,10 +154,20 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(len(set(peer.CASES)), len(peer.CASES))
 
     def test_pull_request_changes_run_the_real_gate_without_every_patch(self):
+        # CI selects and calls this gate per change (#609); the former PR path
+        # list lives in the selection policy. Every listed path must still
+        # select the real eight-case gate, by its reviewed path, by the gate
+        # job reading it, or by the full selection of a workflow change.
         workflow = (SCRIPT.parents[1] / '.github/workflows/released-peer-acceptance.yml').read_text()
-        trigger = re.search(r'^  pull_request:\n    paths:\n((?:      - .*\n)+)', workflow, re.MULTILINE)
-        self.assertIsNotNone(trigger, 'PR acceptance changes must execute the actual eight-case gate')
-        paths = [ast.literal_eval(line.strip()[2:]) for line in trigger.group(1).splitlines()]
+        self.assertNotIn('  pull_request:', workflow.split('\npermissions:', 1)[0])
+        policy = json.loads((SCRIPT.parents[1] / 'scripts/ci-selection.json').read_text())
+        job = workflow.split('\n  released-peers:\n', 1)[1]
+        paths = policy['peer_paths']
+
+        def selected(path):
+            return (any(fnmatch.fnmatchcase(path, pattern.replace('/**', '/*')) for pattern in paths)
+                    or path in job or path.rsplit('/', 1)[-1] in job
+                    or any(path.startswith(pattern[:-2]) for pattern in policy['full'] if pattern.endswith('/**')))
         for changed in ('.github/workflows/released-peer-acceptance.yml',
                         '.github/workflows/release.yml',
                         'scripts/released-peer-acceptance.py',
@@ -170,12 +180,13 @@ class AcceptanceTests(unittest.TestCase):
                         'qshd/src/modern_restart.rs', 'qshd/src/service_restart.rs',
                         'qshd/src/control_service_tests.rs', 'cli/src/ssh_step.rs',
                         'cli/src/busy_daemon.rs', 'cli/src/climb.rs'):
-            self.assertTrue(any(fnmatch.fnmatchcase(changed, pattern) for pattern in paths), changed)
-        self.assertFalse(any(fnmatch.fnmatchcase('README.md', pattern) for pattern in paths))
+            self.assertTrue(selected(changed), changed)
+        self.assertFalse(selected('README.md'))
         self.assertIn('ref: ${{ github.sha }}', workflow)
         self.assertIn('python3 scripts/released-peer-acceptance.py --evidence', workflow)
         release = (SCRIPT.parents[1] / '.github/workflows/release.yml').read_text()
-        self.assertRegex(release, r'needs: \[release, ordinary-ci, released-peer-acceptance, release-verifier\]')
+        self.assertRegex(release, r'needs: \[release, ordinary-ci, released-peer-acceptance, release-verifier,'
+                                  r' release-qualification\]')
 
 
 class LibtestRecordTests(unittest.TestCase):

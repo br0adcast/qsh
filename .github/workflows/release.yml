@@ -28,11 +28,16 @@ permissions:
 jobs:
   # Tags must qualify the exact source, not a nearby main or PR merge commit.
   # Branch package runs do not publish or repeat the full ordinary suite.
+  # This workflow runs the native, released-peer and fuzz workflows itself;
+  # the called CI must be told so, and its gate reads the jobs API (#609).
   ordinary-ci:
     if: github.ref_type == 'tag'
     uses: ./.github/workflows/ci.yml
+    with:
+      caller-runs: native peers fuzz
     permissions:
       contents: read
+      actions: read
 
   # Focused published-peer checks run for candidate packages and gate publication.
   released-peer-acceptance:
@@ -44,6 +49,46 @@ jobs:
   # Product builds below link this same verified native source statically.
   native-crypto:
     uses: ./.github/workflows/native-crypto.yml
+
+  # Fuzz smoke of the exact tag source, part of its full qualification.
+  fuzz:
+    if: github.ref_type == 'tag'
+    uses: ./.github/workflows/fuzz.yml
+    permissions:
+      contents: read
+
+  # Every expected cell of every lane, by the jobs API, for this exact
+  # candidate: no nearby nightly or main evidence stands in for it (#609).
+  # A called workflow's success can hide a skipped cell; this cannot. If a
+  # caller already failed, this is skipped and `publish` is blocked alike.
+  release-qualification:
+    name: Release qualification
+    if: github.ref_type == 'tag'
+    needs: [ordinary-ci, native-crypto, released-peer-acceptance, fuzz]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Account for every cell of the full qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QSH_GATE_NEEDS: ${{ toJSON(needs) }}
+          QSH_GATE_RECORD: ${{ needs.ordinary-ci.outputs.record }}
+          QSH_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: python3 -I -B scripts/ci-gate.py release --output "$RUNNER_TEMP/qualification.json"
+      - name: Retain the qualification record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification.json
+          if-no-files-found: error
 
   linux:
     strategy:
@@ -696,7 +741,7 @@ jobs:
   # verifier accepts, and uploads the fourteen release files.
   publish:
     if: github.ref_type == 'tag' && github.repository == 'br0adcast/qsh'
-    needs: [release, ordinary-ci, released-peer-acceptance, release-verifier]
+    needs: [release, ordinary-ci, released-peer-acceptance, release-verifier, release-qualification]
     runs-on: ubuntu-latest
     # Its required reviewer approves each publication before any step runs.
     # The tagged commit supplies this file, so the tag ruleset, not this

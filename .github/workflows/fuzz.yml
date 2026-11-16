@@ -1,43 +1,16 @@
 name: Fuzz smoke
 
+# CI selects this smoke when a change reaches the fuzz crate's closure and
+# calls it (#609); Release and Nightly call it for every candidate.
 on:
-  pull_request:
-    paths:
-      - "fuzz/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "vendor/**"
-      - "crates/transport/**"
-      - "crates/sshauth/**"
-      - "crates/terminal/**"
-      - "crates/terminal-size/**"
-      - "scripts/build-openssl.sh"
-      - "scripts/build_openssl.py"
-      - "scripts/openssl/**"
-      - ".github/workflows/fuzz.yml"
-  push:
-    branches: [main]
-    paths:
-      - "fuzz/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "vendor/**"
-      - "crates/transport/**"
-      - "crates/sshauth/**"
-      - "crates/terminal/**"
-      - "crates/terminal-size/**"
-      - "scripts/build-openssl.sh"
-      - "scripts/build_openssl.py"
-      - "scripts/openssl/**"
-      - ".github/workflows/fuzz.yml"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+# No concurrency group: a called run would share it with its caller and
+# cancel that run. The caller's own group governs a called smoke.
 
 env:
   CARGO_TERM_COLOR: always

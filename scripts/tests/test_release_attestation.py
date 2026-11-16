@@ -645,7 +645,8 @@ class WorkflowTests(unittest.TestCase):
     def test_publish_gates_dependencies_and_concurrency(self):
         body = self.jobs['publish']
         self.assertIn("    if: github.ref_type == 'tag' && github.repository == 'br0adcast/qsh'\n", body)
-        self.assertIn('    needs: [release, ordinary-ci, released-peer-acceptance, release-verifier]\n', body)
+        self.assertIn('    needs: [release, ordinary-ci, released-peer-acceptance, release-verifier,'
+                      ' release-qualification]\n', body)
         self.assertIn('    concurrency:\n      group: qsh-release-${{ github.ref }}\n'
                       '      cancel-in-progress: false\n', body)
         self.assertNotRegex(self.text, r'always\(\)|continue-on-error')
@@ -660,11 +661,19 @@ class WorkflowTests(unittest.TestCase):
         body = self.jobs['publish']
         self.assertIn('\n    environment: release\n', body)
         self.assertIn('      actions: read\n', body)
+        # The CI and release qualification gates read the jobs API (#609);
+        # read-only, with no environment, and nothing else may.
+        gates = {'ordinary-ci': '    permissions:\n      contents: read\n      actions: read\n',
+                 'release-qualification': '    permissions:\n      contents: read\n      actions: read\n'}
         for job, other in self.jobs.items():
             if job != 'publish':
                 with self.subTest(job=job):
                     self.assertNotIn('environment:', other)
-                    self.assertNotIn('actions: read', other)
+                    if job in gates:
+                        self.assertIn(gates[job], other)
+                        self.assertEqual(other.count('actions: read'), 1)
+                    else:
+                        self.assertNotIn('actions: read', other)
         check = self.step('publish', 'Require the release authority settings')
         self.assertIn('python3 scripts/check-release-settings.py --repo "$GITHUB_REPOSITORY"', check)
         self.assertIn('GH_TOKEN: ${{ github.token }}', check)

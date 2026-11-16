@@ -1066,11 +1066,12 @@ raise SystemExit('unexpected fixture mode')
         # a GitHub execution. Read the callee default rather than inventing one.
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
         called = native.split('  workflow_call:\n', 1)[1].split('\npermissions:', 1)[0]
-        fields = dict(line.strip().split(': ', 1) for line in called.splitlines()
+        mode = called.split('      mode:\n', 1)[1].split('\n      lanes:', 1)[0]
+        fields = dict(line.strip().split(': ', 1) for line in mode.splitlines()
                       if line.startswith('        ') and ': ' in line)
         release = (ROOT / '.github/workflows/release.yml').read_text()
         self.assertIn('  workflow_dispatch:\n\nenv:', release)
-        caller = release.split('  native-crypto:\n', 1)[1].split('\n  linux:', 1)[0]
+        caller = release.split('  native-crypto:\n', 1)[1].split('\n\n', 1)[0]
         self.assertEqual(caller.strip(), 'uses: ./.github/workflows/native-crypto.yml')
         validator = self.body('native-crypto.yml', 'dispatch-mode', 'Refuse unknown manual modes')
         with self.fixture('x86_64-unknown-linux-musl') as (work, env):
@@ -1081,8 +1082,11 @@ raise SystemExit('unexpected fixture mode')
             self.assertEqual((calls, records), ([], []))
         self.assertIn('    inputs:\n      mode:\n', called)
         self.assertEqual(fields, {'type': 'string', 'required': 'false', 'default': 'qualification'})
-        self.assertEqual(self.job('native-crypto.yml', 'darwin-legacy-service-intel').splitlines()[0],
-                         self.job('native-crypto.yml', 'darwin-owner-intel').splitlines()[0])
+        # The same mode guard; only the selected lane name differs (#609).
+        self.assertEqual(self.job('native-crypto.yml', 'darwin-legacy-service-intel').splitlines()[0]
+                         .replace("'intel-legacy'", "'<lane>'"),
+                         self.job('native-crypto.yml', 'darwin-owner-intel').splitlines()[0]
+                         .replace("'intel-owner'", "'<lane>'"))
 
     def test_native_manual_mode_contract(self):
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
@@ -1100,11 +1104,15 @@ raise SystemExit('unexpected fixture mode')
                 self.assertEqual((work / 'completed').exists(), accepted)
                 self.assertEqual((calls, records), ([], []))
         selection = "github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')"
+        # Each qualification job also needs its lane in the canonical lane array (#609).
+        lanes = {'portable': 'portable', 'darwin-owner-intel': 'intel-owner',
+                 'darwin-legacy-service-intel': 'intel-legacy', 'system-floors': 'floors'}
         for job in ('portable', 'darwin-owner-intel', 'darwin-legacy-service-intel',
                     'system-floors', 'pty-eof-diagnostic'):
             condition = native.split('  ' + job + ':\n', 1)[1].splitlines()
             condition = next(line for line in condition if line.startswith('    if:'))
-            expected = selection if job == 'pty-eof-diagnostic' else '!(' + selection + ')'
+            expected = selection if job == 'pty-eof-diagnostic' else (
+                '!(' + selection + ") && contains(fromJSON(inputs.lanes), '" + lanes[job] + "')")
             self.assertEqual(condition, '    if: ${{ ' + expected + ' }}')
         dispatch = native.split('  dispatch-mode:\n', 1)[1].split('  pty-eof-diagnostic:', 1)[0]
         self.assertIn("    if: github.event_name == 'workflow_dispatch'\n", dispatch)
@@ -1129,16 +1137,23 @@ raise SystemExit('unexpected fixture mode')
         self.assertEqual(re.findall(pairs, portable), list(self.TARGETS))
         self.assertEqual(re.findall(pairs, diagnostic), list(self.TARGETS[2:]))
         selection = "github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')"
+        lanes = {'portable': 'portable', 'darwin-owner-intel': 'intel-owner',
+                 'darwin-legacy-service-intel': 'intel-legacy', 'system-floors': 'floors'}
         for job in ('portable', 'darwin-owner-intel', 'darwin-legacy-service-intel', 'system-floors'):
             beginning = native.split('  ' + job + ':\n', 1)[1].split('\n', 1)[0]
-            self.assertEqual(beginning, "    if: ${{ !(" + selection + ") }}")
+            self.assertEqual(beginning, "    if: ${{ !(" + selection + ") && contains(fromJSON(inputs.lanes), '"
+                             + lanes[job] + "') }}")
         self.assertIn("    if: ${{ " + selection + " }}", diagnostic)
         self.assertIn('options: [qualification, pty-eof-build, pty-eof-control]', native)
         self.assertIn('ref: ${{ github.sha }}', diagnostic)
         self.assertIn('scripts/qualify-pty-eof-control.py "$PTY_EOF_MODE" "$NATIVE_TARGET"', diagnostic)
         for forbidden in ('--include-ignored', 'native_tests::', 'keeper_tests::', 'keeper_integration_tests::', 'upload-artifact'):
             self.assertNotIn(forbidden, diagnostic)
-        self.assertEqual(native.count("      - 'cli/Cargo.toml'"), 2)
+        # CI now calls this workflow per change (#609): a client manifest
+        # change selects every native lane, as the former path triggers did.
+        policy = json.loads((ROOT / 'scripts/ci-selection.json').read_text())
+        self.assertIn('**/Cargo.toml', policy['full'])
+        self.assertNotIn('  pull_request:', native.split('\npermissions:', 1)[0])
         helper = self.body('native-crypto.yml', 'portable', 'Qualify offline release authentication')
         self.assertIn('-p test_native_verifier_paths.py', helper)
         self.assertIn('scripts/check-native-verifier-paths.py', helper)

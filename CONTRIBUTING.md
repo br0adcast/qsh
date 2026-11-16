@@ -149,6 +149,9 @@ this section.**
   [its source verification and qualification procedure](docs/native-crypto.md).
 - Changes to GitHub Actions follow
   [the revision review and validation procedure](docs/actions-maintenance.md).
+- Pull request CI runs the lanes your change can reach; `CI gate` is the result.
+  [CI lane selection](docs/actions-maintenance.md#ci-lane-selection) explains
+  the rules and how to request the full matrix for a branch.
 - A change to how `qshd` uses Linux-PAM (`qshd/src/helper/pam.rs`, the
   `system` feature) keeps `scripts/check-pam-linkage.sh` passing; its header
   says what it checks, and when only `--featureless-only` applies.
