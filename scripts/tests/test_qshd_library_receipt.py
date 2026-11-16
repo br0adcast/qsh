@@ -25,6 +25,10 @@ BASELINE_POLICY = M_POLICY.replace('--ignored 85', '--ignored 102').replace(
     '            drop_worker_privileges_refuses_without_root',
     '            --require ' + ROOT_LAUNCH + ' ' + chr(92) + '\n' +
     '            drop_worker_privileges_refuses_without_root')
+# Add the seventeen exact reviewed System wrappers after host policy.
+SYSTEM_POLICY = '            --require helper::server::tests::system_dispatch::authdispatch529_system_cancel_submitted_retains_real_child_until_wait \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_cancel_unsubmitted_cleans_only_exact_nonce \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_cap_before_spend_cleans_exact_remaining_nonce \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_close_loses_sink_without_releasing_real_child \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_coalesced_requests_keep_ordered_replies \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_current_policy_rejects_other_real_seam \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_deadline_and_partial_input_expire_inert \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_eof_retires_real_admitted_frontend \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_eof_submitted_drops_sink_not_physical_custody \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_forged_signature_and_unlisted_key_refuse \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_full_sink_stale_real_result_cannot_approve_twin \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_global_nonce_saturation_is_shared \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_host_pending_capacity_is_global \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_late_real_verdict_after_deadline_is_not_applied \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_real_signed_proof_and_current_revocation \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_replay_and_cross_seam_do_not_touch_other_ticket \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_wrong_method_report_and_host_refuse \\\n'
+BASELINE_POLICY = BASELINE_POLICY.replace('--ignored 102', '--ignored 119').replace(
+    '            --require process_scope::', SYSTEM_POLICY + '            --require process_scope::')
 PORTABLE_LAUNCH = ('session_owner::inherited_launch::tests::launch529_cancel_before_and_after_start_wins_late_admission', 'session_owner::inherited_launch::tests::launch529_deadline_is_absolute_across_partial_setup', 'session_owner::inherited_launch::tests::launch529_foreign_handle_cannot_cancel_or_settle', 'session_owner::inherited_launch::tests::launch529_frontend_transfer_cannot_restore_host_or_owner', 'session_owner::inherited_launch::tests::launch529_handle_drop_keeps_physical_custody', 'session_owner::inherited_launch::tests::launch529_known_extra_local_copy_is_pending_not_unknown', 'session_owner::inherited_launch::tests::launch529_known_prefix_deadline_does_not_refresh_final_bytes', 'session_owner::inherited_launch::tests::launch529_lost_wait_and_uncertain_close_never_refund', 'session_owner::inherited_launch::tests::launch529_poisoned_registry_keeps_exact_capsule_and_debt', 'session_owner::inherited_launch::tests::launch529_prefix_stall_and_dribble_retire_without_reply', 'session_owner::inherited_launch::tests::launch529_private_marker_routing_is_exact', 'session_owner::inherited_launch::tests::launch529_record_exact_shape_and_binding', 'session_owner::inherited_launch::tests::launch529_record_rejects_every_unsupported_field', 'session_owner::inherited_launch::tests::launch529_registry_drop_quarantines_unsettled_debt', 'session_owner::inherited_launch::tests::launch529_setup_sockets_refuse_stall_extra_cancel_and_invalid_types', 'session_owner::inherited_launch::tests::launch529_transferred_end_stays_charged', 'session_owner::inherited_launch::tests::launch529_wait_and_eof_are_independent_receipts')
 NATIVE_LAUNCH = ('session_owner::inherited_launch::native_tests::launch529_eof_wait_and_extra_reference_order', 'session_owner::inherited_launch::native_tests::launch529_exec_admits_only_the_designated_frontend', 'session_owner::inherited_launch::native_tests::launch529_exec_failure_and_cancel_keep_exact_custody', 'session_owner::inherited_launch::native_tests::launch529_foreign_or_invalid_inheritance_refuses')
 
@@ -85,7 +89,7 @@ class Fixture:
         self.compiler = 'rustc 1.98.1 (48a229cea 2026-09-01)\nrelease: 1.98.1\n'
         self.image = [{'Id': 'sha256:' + '1' * 64,
                        'RepoDigests': ['ubuntu@sha256:' + '2' * 64]}]
-        self.policy = ['--ignored', '102', '--require', 'fixture_required', 'ordinary_only']
+        self.policy = ['--ignored', '119', '--require', 'fixture_required', 'ordinary_only']
         self.calls = []
         self.failure = None
         self.sync()
@@ -339,6 +343,19 @@ class LibraryReceiptTests(unittest.TestCase):
                 fx.sync()
                 self.refused(fx)
 
+    def test_receipt_requires_reconciled_system_policy(self):
+        self.success(self.fixture())
+        for optimize in (0, 2):
+            for prefix in (['--ignored', '85'], ['--ignored', '101'], ['--ignored', '102'], ['--ignored', '118'], ['--ignored', '120'], [], ['--wrong', '119']):
+                with self.subTest(prefix=prefix, optimize=optimize):
+                    fx = self.fixture()
+                    fx.policy = [*prefix, '--require', CANARY, CANARY]
+                    status, out, err = fx.invoke(optimize=optimize)
+                    self.assertEqual((status, out, err), (1, '', 'qshd_library_receipt_error library-policy\n'))
+                    self.assertFalse(fx.prior.exists())
+                    for private in (CANARY, str(fx.root), str(fx.runtime)):
+                        self.assertNotIn(private, out + err)
+
     def test_endpoint_foreign_owner_requirement_rejects_missing_renamed_ignored_or_failed(self):
         name = 'endpoint::tests::private_parent_foreign_owner_refused'
         script = WORKFLOW.resolve().parents[2] / 'scripts/no-silent-skips.sh'
@@ -368,14 +385,14 @@ class LibraryReceiptTests(unittest.TestCase):
     def test_composed_root_policy_requires_every_exact_outcome(self):
         # Literal main50e5 + sole Launch root contract, not workflow-derived.
         required = re.findall(r'--require (\S+)', BASELINE_POLICY)
-        self.assertEqual(len(required), 26)
+        self.assertEqual(len(required), 43)
         self.assertIn('endpoint::tests::private_parent_foreign_owner_refused', required)
         self.assertIn(ROOT_LAUNCH, required)
         allowances = ['drop_worker_privileges_refuses_without_root',
                       'own_capability_sets_parses_and_reports_none_for_an_ordinary_process',
                       'an_undeliverable_signal_is_reported_to_the_helper',
                       'a_rotation_that_cannot_rename_is_reported_and_bounds_file_growth']
-        policy = ['--ignored', '102'] + [part for name in required for part in ('--require', name)] + allowances
+        policy = ['--ignored', '119'] + [part for name in required for part in ('--require', name)] + allowances
         script = WORKFLOW.resolve().parents[2] / 'scripts/no-silent-skips.sh'
         for target in ('endpoint::tests::private_parent_foreign_owner_refused', ROOT_LAUNCH):
             for state in ('ok', 'missing', 'renamed', 'ignored', 'FAILED'):
@@ -385,13 +402,13 @@ class LibraryReceiptTests(unittest.TestCase):
                     elif state != 'ok': outcomes = [(name + '_wrong' if name == target and state == 'renamed' else name,
                                                    state if name == target and state != 'renamed' else status) for name, status in outcomes]
                     ignored = sum(status == 'ignored' for _, status in outcomes)
-                    outcomes += [(f'synthetic_ignored_{i}', 'ignored') for i in range(102 - ignored)]
+                    outcomes += [(f'synthetic_ignored_{i}', 'ignored') for i in range(119 - ignored)]
                     passed = sum(status == 'ok' for _, status in outcomes)
                     failed = sum(status == 'FAILED' for _, status in outcomes)
                     result = 'FAILED' if failed else 'ok'
                     log = '\n'.join([*(f'test {name} ... {status}' for name, status in outcomes),
                                      *(f'SKIPPED {name}: synthetic allowed control' for name in allowances),
-                                     f'test result: {result}. {passed} passed; {failed} failed; 102 ignored; '
+                                     f'test result: {result}. {passed} passed; {failed} failed; 119 ignored; '
                                      '0 measured; 0 filtered out; finished in 0.00s', ''])
                     path = Path(directory) / 'synthetic.log'
                     path.write_text(log)
@@ -403,7 +420,7 @@ class LibraryReceiptTests(unittest.TestCase):
         step = workflow.split('      - name: Run the root-gated suites, one binary per fresh container\n', 1)[1]
         self.assertIn(BASELINE_DOCKER, step)
         self.assertIn(BASELINE_POLICY, step)
-        self.assertEqual(BASELINE_POLICY.count('--require '), 26)
+        self.assertEqual(BASELINE_POLICY.count('--require '), 43)
         self.assertIn(BASELINE_BUILD, workflow)
         before = step.index('qshd_library_receipt before "$bin" "$@"')
         run = step.index(BASELINE_DOCKER)
@@ -419,9 +436,9 @@ class LibraryReceiptTests(unittest.TestCase):
 
     def test_launch_policy_is_exact_and_rejects_stale_cardinality(self):
         self.assertEqual(M_POLICY.count('--require '), 25)
-        self.assertEqual(BASELINE_POLICY.count('--require '), 26)
+        self.assertEqual(BASELINE_POLICY.count('--require '), 43)
         self.assertIn('--require ' + ROOT_LAUNCH, BASELINE_POLICY)
-        for count in ('85', '101', '103'):
+        for count in ('85', '101', '102', '118', '120'):
             fx = self.fixture()
             fx.policy[1] = count
             self.refused(fx)

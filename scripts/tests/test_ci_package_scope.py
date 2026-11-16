@@ -27,6 +27,7 @@ NATIVE_STEP = 'Native package fixture controls'
 ORIGINAL_CONTROLS = (
     'sh -n scripts/install.sh',
     "python3 -B -m unittest discover -s scripts/tests -p 'test_client_install_bootstrap.py'",
+    "python3 -I -B scripts/tests/test_no_silent_skips.py -v",
     "python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'",
     "python3 -m unittest discover -s scripts/tests -p 'test_release_version.py'",
     "python3 -m unittest discover -s scripts/tests -p 'test_rust_version.py'",
@@ -78,6 +79,9 @@ ORIGINAL_CONTROLS = (
     "QSH_TEST_NEXTEST=cargo-nextest python3 -m unittest discover -s scripts/tests -p 'test_nextest_report.py'",
 )
 
+
+SYSTEM_OLD_ROOT = '          run_suite lib qshd --ignored 102 \\\n            --require helper::server::tests::host_policy::host529_policy_bad_bounds_wrong_nonce_and_shared_child_cap_refuse_before_fork \\\n            --require helper::server::tests::host_policy::host529_policy_cancelled_consumer_and_deadline_retain_real_child_until_wait \\\n            --require helper::server::tests::host_policy::host529_policy_current_account_and_root_restrictions_are_rechecked \\\n            --require helper::server::tests::host_policy::host529_policy_forged_signature_and_wrong_key_refuse \\\n            --require helper::server::tests::host_policy::host529_policy_key_revocation_between_issue_and_consume_is_current \\\n            --require helper::server::tests::host_policy::host529_policy_late_real_verdict_after_cancel_or_revocation_cannot_grant \\\n            --require helper::server::tests::host_policy::host529_policy_nonce_cannot_be_redirected_to_legacy_login \\\n            --require helper::server::tests::host_policy::host529_policy_nonce_replay_expiry_shared_capacity_and_recovery \\\n            --require helper::server::tests::host_policy::host529_policy_real_auth_and_two_policy_checks_do_not_create_logins \\\n            --require helper::server::tests::host_policy::host529_policy_verdict_before_reap_lost_consumer_stays_charged \\\n            --require process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session \\\n            --require control::peer_tests::control_peer_root_client_rejects_foreign_server \\\n            --require control::peer_tests::control_peer_foreign_client_rejects_root_server \\\n            --require transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \\\n            --require transport_daemon::peer_tests::control_peer_foreign_server_rejects_root_client \\\n            --require serve::tests::the_system_flag_is_accepted_and_moves_the_host_key \\\n            --require helper::monitor::tests::pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks \\\n            --require helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks \\\n            --require log::tests::path_diagnostics_relative_preparation_rotates_after_detach_cwd_change \\\n            --require log::tests::path_diagnostics_foreground_failure_warns_once_and_survives_in_status \\\n            --require helper::server::tests::worker_parent::worker508_pre_stage_stop_is_retained_without_publication \\\n            --require helper::server::tests::worker_parent::worker508_init_failure_before_stage_acceptance_settles \\\n            --require helper::server::tests::worker_parent::worker508_post_stage_unread_stop_settles_failed \\\n            --require helper::server::tests::worker_parent::worker508_terminal_before_pending_send_suppresses_stop \\\n            --require endpoint::tests::private_parent_foreign_owner_refused \\\n            --require session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup \\\n            drop_worker_privileges_refuses_without_root \\\n            own_capability_sets_parses_and_reports_none_for_an_ordinary_process \\\n            an_undeliverable_signal_is_reported_to_the_helper \\\n            a_rotation_that_cannot_rename_is_reported_and_bounds_file_growth\n'
+SYSTEM_NEW_ROOT = '          run_suite lib qshd --ignored 119 \\\n            --require helper::server::tests::host_policy::host529_policy_bad_bounds_wrong_nonce_and_shared_child_cap_refuse_before_fork \\\n            --require helper::server::tests::host_policy::host529_policy_cancelled_consumer_and_deadline_retain_real_child_until_wait \\\n            --require helper::server::tests::host_policy::host529_policy_current_account_and_root_restrictions_are_rechecked \\\n            --require helper::server::tests::host_policy::host529_policy_forged_signature_and_wrong_key_refuse \\\n            --require helper::server::tests::host_policy::host529_policy_key_revocation_between_issue_and_consume_is_current \\\n            --require helper::server::tests::host_policy::host529_policy_late_real_verdict_after_cancel_or_revocation_cannot_grant \\\n            --require helper::server::tests::host_policy::host529_policy_nonce_cannot_be_redirected_to_legacy_login \\\n            --require helper::server::tests::host_policy::host529_policy_nonce_replay_expiry_shared_capacity_and_recovery \\\n            --require helper::server::tests::host_policy::host529_policy_real_auth_and_two_policy_checks_do_not_create_logins \\\n            --require helper::server::tests::host_policy::host529_policy_verdict_before_reap_lost_consumer_stays_charged \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_cancel_submitted_retains_real_child_until_wait \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_cancel_unsubmitted_cleans_only_exact_nonce \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_cap_before_spend_cleans_exact_remaining_nonce \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_close_loses_sink_without_releasing_real_child \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_coalesced_requests_keep_ordered_replies \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_current_policy_rejects_other_real_seam \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_deadline_and_partial_input_expire_inert \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_eof_retires_real_admitted_frontend \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_eof_submitted_drops_sink_not_physical_custody \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_forged_signature_and_unlisted_key_refuse \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_full_sink_stale_real_result_cannot_approve_twin \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_global_nonce_saturation_is_shared \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_host_pending_capacity_is_global \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_late_real_verdict_after_deadline_is_not_applied \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_real_signed_proof_and_current_revocation \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_replay_and_cross_seam_do_not_touch_other_ticket \\\n            --require helper::server::tests::system_dispatch::authdispatch529_system_wrong_method_report_and_host_refuse \\\n            --require process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session \\\n            --require control::peer_tests::control_peer_root_client_rejects_foreign_server \\\n            --require control::peer_tests::control_peer_foreign_client_rejects_root_server \\\n            --require transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client \\\n            --require transport_daemon::peer_tests::control_peer_foreign_server_rejects_root_client \\\n            --require serve::tests::the_system_flag_is_accepted_and_moves_the_host_key \\\n            --require helper::monitor::tests::pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks \\\n            --require helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks \\\n            --require log::tests::path_diagnostics_relative_preparation_rotates_after_detach_cwd_change \\\n            --require log::tests::path_diagnostics_foreground_failure_warns_once_and_survives_in_status \\\n            --require helper::server::tests::worker_parent::worker508_pre_stage_stop_is_retained_without_publication \\\n            --require helper::server::tests::worker_parent::worker508_init_failure_before_stage_acceptance_settles \\\n            --require helper::server::tests::worker_parent::worker508_post_stage_unread_stop_settles_failed \\\n            --require helper::server::tests::worker_parent::worker508_terminal_before_pending_send_suppresses_stop \\\n            --require endpoint::tests::private_parent_foreign_owner_refused \\\n            --require session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup \\\n            drop_worker_privileges_refuses_without_root \\\n            own_capability_sets_parses_and_reports_none_for_an_ordinary_process \\\n            an_undeliverable_signal_is_reported_to_the_helper \\\n            a_rotation_that_cannot_rename_is_reported_and_bounds_file_growth\n'
 
 def check_job(source):
     matches = list(re.finditer(r'(?m)^  check:\n', source))
@@ -270,6 +274,103 @@ class PackageScopeTests(unittest.TestCase):
         if expected_reason is not None:
             self.assertIn(' reason=' + expected_reason + '\n', result.stdout)
         return fields['required']
+
+    def system_baseline(self):
+        source = self.source
+        pairs = (
+            (SYSTEM_NEW_ROOT, SYSTEM_OLD_ROOT),
+            ("              require(policy[:2] == ['--ignored', '119'], 'library-policy')\n",
+             "              require(policy[:2] == ['--ignored', '102'], 'library-policy')\n"),
+            ('          # `--ignored 119` is the exact compiled system-library ignored count:\n'
+             '          # Plus seventeen isolated System bridge bodies, each required through its wrapper.\n',
+             '          # `--ignored 102` is the exact compiled system-library ignored count:\n'),
+            ('          python3 -I -B scripts/tests/test_no_silent_skips.py -v\n', ''),
+        )
+        for current, prior in pairs:
+            # These literals also occur inside the actual helper as escaped source.
+            self.assertEqual(source.count(current), 1)
+            source = source.replace(current, prior, 1)
+        return source
+
+    def system_decision(self, changed=None, *, reverse=False, event='pull_request', extra=(), remove=None):
+        fixture = GitFixture()
+        self.addCleanup(fixture.close)
+        fixture.write('.github/workflows/ci.yml', self.source if reverse else self.system_baseline())
+        for path in ('scripts/tests/test_ci_package_scope.py', 'scripts/tests/test_no_silent_skips.py',
+                     'scripts/tests/test_qshd_library_receipt.py'):
+            fixture.write(path)
+        base = fixture.commit()
+        fixture.write('.github/workflows/ci.yml', self.system_baseline() if reverse else changed or self.source)
+        for path in ('qshd/src/helper/local_auth_dispatch.rs', 'qshd/src/helper/local_auth_dispatch_tests.rs',
+                     'qshd/src/helper/server.rs', 'scripts/tests/test_no_silent_skips.py',
+                     'scripts/tests/test_qshd_library_receipt.py', *extra):
+            fixture.write(path, '# changed authored fixture\n')
+        if remove:
+            (fixture.root / remove).unlink()
+        head = fixture.commit()
+        result, fields = fixture.execute(actual_helper(self.source), base, head, event_name=event)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return fields.get('required')
+
+    def test_exact_system_transition_admits_pr_and_push_with_current_core_paths(self):
+        for event in ('pull_request', 'push'):
+            for extra in ((), ('crates/transport/src/lib.rs',), ('.github/workflows/native-crypto.yml',)):
+                with self.subTest(event=event, extra=extra):
+                    self.assertEqual(self.system_decision(event=event, extra=extra), 'false')
+
+    def test_system_transition_refuses_downgrade_package_dependency_unknown_and_deleted_controls(self):
+        self.assertEqual(self.system_decision(reverse=True), 'true')
+        for path in ('packaging/selinux/new-input', 'qshd/Cargo.toml', 'scripts/unclassified.py'):
+            self.assertEqual(self.system_decision(extra=(path,)), 'true')
+        for path in ('scripts/tests/test_no_silent_skips.py', 'scripts/tests/test_qshd_library_receipt.py',
+                     'scripts/tests/test_ci_package_scope.py'):
+            self.assertEqual(self.system_decision(remove=path), 'true')
+
+    def test_system_transition_rejects_every_changed_requirement_and_allowance(self):
+        for line in SYSTEM_NEW_ROOT.splitlines(True)[1:]:
+            with self.subTest(obligation=line.strip()):
+                self.assertEqual(self.system_decision(changed=self.source.replace(line, '', 1)), 'true')
+        first = SYSTEM_NEW_ROOT.splitlines(True)[1]
+        self.assertEqual(self.system_decision(changed=self.source.replace(first, first + first, 1)), 'true')
+        lines = SYSTEM_NEW_ROOT.splitlines(True)
+        swapped = ''.join([lines[0], lines[2], lines[1], *lines[3:]])
+        self.assertEqual(self.system_decision(changed=self.source.replace(SYSTEM_NEW_ROOT, swapped)), 'true')
+
+    def test_system_transition_rejects_changed_prefix_count_comment_and_command(self):
+        mutations = [self.source.replace('run_suite lib qshd --ignored 119', 'run_suite lib qshd --ignored ' + count)
+                     for count in ('85', '102', '118', '120')]
+        mutations += [self.source.replace("              require(policy[:2] == ['--ignored', '119']",
+                                          "              require(policy[:2] == ['--ignored', '118']"),
+                      self.source.replace('# `--ignored 119`', '# `--ignored 118`')]
+        command = '          python3 -I -B scripts/tests/test_no_silent_skips.py -v\n'
+        mutations += [self.source.replace(command, ''), self.source.replace(command, command * 2),
+                      self.source.replace(command, command.replace(' -I', '')),
+                      self.source.replace(command, '').replace('          sh -n scripts/install.sh\n',
+                                                                command + '          sh -n scripts/install.sh\n')]
+        mutations += list(self.protected_workflow_mutations().values())
+        for i, changed in enumerate(mutations):
+            with self.subTest(mutation=i):
+                self.assertNotEqual(changed, self.source)
+                self.assertEqual(self.system_decision(changed=changed), 'true')
+
+    def test_no_skip_module_runner_refuses_empty_skipped_failed_and_accepts_positive(self):
+        module = (ROOT / 'scripts/tests/test_no_silent_skips.py').read_text()
+        marker = 'if __name__ == "__main__":\n'
+        self.assertEqual(module.count(marker), 1)
+        runner = module.split(marker)[1]
+        for state, body in [('empty', ''), ('skip', '@unittest.skip("inert")\n'),
+                            ('fail', ''), ('pass', '')]:
+            with self.subTest(state=state), tempfile.TemporaryDirectory(prefix='qsh-noskip-runner-') as temp:
+                path = Path(temp) / 'fixture.py'
+                fixture = 'import unittest\n'
+                if state != 'empty':
+                    fixture += 'class Fixture(unittest.TestCase):\n'
+                    if body: fixture += '    ' + body
+                    fixture += '    def test_case(self): ' + ('self.fail("inert")' if state == 'fail' else 'pass') + '\n'
+                path.write_text(fixture + marker + runner)
+                result = subprocess.run(['/usr/bin/python3', '-I', '-B', str(path)],
+                                        text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode == 0, state == 'pass', result.stderr)
 
     def test_initial_policy_only_delta_requires_protected_contract(self):
         self.assertEqual(self.policy_decision(old=True), 'false')
