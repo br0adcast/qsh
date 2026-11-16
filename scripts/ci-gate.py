@@ -203,14 +203,12 @@ def evaluate(groups, latest, history, attempt, own, required_admin, strict):
                     continue
                 if record.get('conclusion') != 'success':
                     failures.append('FAILED ' + label + cell + ' ' + str(record.get('conclusion')))
-                    continue
             elif record is not None:
                 if record['status'] != 'completed':
                     pending.append(label + cell)
                     continue
                 if record.get('conclusion') not in ('success', 'skipped'):
                     failures.append('NOT_REQUIRED_BUT_FAILED ' + label + cell)
-                    continue
             if record is not None:
                 cells.append(cell_record(lane, label + cell, record, history))
         for template, lanes in expected.templates.items():

@@ -315,6 +315,11 @@ class RerunTests(GateHarness):
         api = FakeApi(self.run_payload(attempt=2), second, history=first + second)
         result = gate.Gate('ci', env, api, sleep=lambda s: None, source=(S, [B, H])).run()
         self.assertIn('FAILED container failure', result['failures'])
+        # The failed cell stays in the record with the attempt that executed it.
+        cells = {cell['name']: cell for cell in result['cells']}
+        self.assertEqual((cells['container']['conclusion'], cells['container']['retained'],
+                          cells['container']['executed_in_attempt']), ('failure', False, 2))
+        self.assertEqual((cells['check']['retained'], cells['check']['executed_in_attempt']), (True, 1))
 
     def test_rerun_with_retained_successes_passes_and_reports_them(self):
         lanes = {'check', 'container'}
