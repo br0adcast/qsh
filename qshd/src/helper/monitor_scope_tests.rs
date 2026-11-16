@@ -15,10 +15,11 @@ fn helper39_monitor_joins_sibling_jobs_before_receipt_and_pam_close() {
 fn monitor_sibling_jobs_body() {
     use super::super::protocol::CleanupKind;
     use crate::test_support::borrowed_scope::{
-        diagnostic_assertion as checkpoint, diagnostic_cleanup_stops, diagnostic_exit_code,
-        diagnostic_mode, diagnostic_observations, diagnostic_phase as phase,
-        owned_children_absent, DiagnosticAssertion as Check, DiagnosticMode as Mode,
-        DiagnosticPhase as Phase,
+        diagnostic_add_observations, diagnostic_assertion as checkpoint,
+        diagnostic_capture_locations, diagnostic_cleanup_stops, diagnostic_exit_code,
+        diagnostic_member_adoption, diagnostic_mode, diagnostic_observations,
+        diagnostic_phase as phase, owned_children_absent, DiagnosticAssertion as Check,
+        DiagnosticMode as Mode, DiagnosticPhase as Phase,
     };
     use nix::libc;
     use std::io::Read;
@@ -108,6 +109,7 @@ fn monitor_sibling_jobs_body() {
         helper: Option<TestHelper>,
         jobs: Option<Jobs>,
         master: Option<OwnedFd>,
+        closed: std::path::PathBuf,
         joined: bool,
         // Every fixture stop or product-owned wait, as `cleanup_stops` bits.
         interventions: usize,
@@ -122,7 +124,10 @@ fn monitor_sibling_jobs_body() {
         }
         fn finish(&mut self) -> bool {
             // Observe fixture intervention before it can conceal an earlier
-            // product failure. Cleanup never overwrites the failing checkpoint.
+            // product failure. Cleanup never overwrites the failing checkpoint:
+            // after a first panic these checkpoints are ignored, so each one
+            // names the boundary only when cleanup itself is what failed.
+            checkpoint(Check::CleanupJobStops, Duration::ZERO);
             let stops = self.jobs.as_ref().map_or(0, |jobs| {
                 usize::from(!jobs.leader.exited()) | (usize::from(!jobs.member.exited()) << 1)
             });
@@ -143,19 +148,31 @@ fn monitor_sibling_jobs_body() {
                 drop(auth);
                 // Keep the fixture and every worker until actual completion.
                 // No timed join may detach a helper on a failing assertion.
+                checkpoint(Check::CleanupHelperJoin, Duration::ZERO);
                 self.joined = thread.join().is_ok();
+                // Recorded now, not after cleanup returns: a later cleanup
+                // failure must not leave these observations unrefreshed.
+                diagnostic_add_observations(
+                    (usize::from(self.closed.exists()) << 5) | (usize::from(self.joined) << 6),
+                );
                 drop(dir);
             }
             if let Some(jobs) = self.jobs.take() {
+                checkpoint(Check::CleanupMonitorStop, Duration::ZERO);
                 self.intervened(usize::from(!jobs.monitor.exited()) << 2);
                 jobs.monitor.stop();
                 // The helper thread is already joined: no competing product
                 // waiter can lose numeric-PID authority to fixture cleanup.
                 // The product waits both; a wait here is recorded at once, so
                 // a later cleanup panic cannot lose it.
+                checkpoint(Check::CleanupMonitorWait, Duration::ZERO);
                 self.intervened(usize::from(jobs.monitor.reap_if_child()) << 3);
+                checkpoint(Check::CleanupLeaderWait, Duration::ZERO);
                 self.intervened(usize::from(jobs.leader.reap_if_child()) << 4);
                 // The adopted member's wait is the fixture's own contract.
+                // First record, without consuming it, whether it is still ours.
+                diagnostic_member_adoption(jobs.member.0.as_fd());
+                checkpoint(Check::CleanupMemberWait, Duration::ZERO);
                 jobs.member.reap_adopted_member();
             }
             self.master = None;
@@ -168,6 +185,7 @@ fn monitor_sibling_jobs_body() {
         }
     }
 
+    diagnostic_capture_locations();
     // Fixture-only APIs are qualified before any helper or shell is created.
     // This does not establish or change the daemon's supported kernel floor.
     let self_pin = Pin::new(unsafe { libc::getpid() });
@@ -196,13 +214,19 @@ fn monitor_sibling_jobs_body() {
             helper: Some(helper_with_pam_confdir(dir.path(), "qshd-test-owned-scope")),
             jobs: None,
             master: None,
+            closed: closed.clone(),
             joined: false,
             interventions: 0,
         };
+        // A live leader blocks in `read`, never in `wait`: the scope kills the
+        // leader and then the member, and a leader still inside wait4 can
+        // consume the member's exit if the member dies before the leader runs
+        // again. The member's exact wait then belongs to nobody here (#612).
+        // In `read`, SIGKILL ends the leader without any wait.
         let ending = if mode == "leader-first" {
             "exit 0"
         } else {
-            "wait"
+            "IFS= read -r _"
         };
         // Bash builtin read supplies the barrier without spawning transient
         // sleeps: this fixture creates exactly one known sibling-PGID job.
