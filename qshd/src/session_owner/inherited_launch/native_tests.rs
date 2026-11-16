@@ -58,8 +58,9 @@ fn supervisor_handoff_and_stop() {
             body: false,
         })
         .unwrap();
+    let setup_deadline = Instant::now() + Duration::from_secs(10);
     let handle = supervisor
-        .prepare(&mut host, config, Instant::now() + Duration::from_secs(10))
+        .prepare(&mut host, config, setup_deadline)
         .unwrap();
     supervisor.start(&mut host, &handle).unwrap();
     let SupervisionProgress::AttachedChannel(frontend) =
@@ -69,13 +70,43 @@ fn supervisor_handoff_and_stop() {
     };
     assert!(host.frontend_is_current(frontend));
     assert_eq!(supervisor.in_use(), 1);
-    supervisor.begin_stop(&mut host).unwrap();
+    assert_eq!(host.frontend_obligations_for_test(), 1);
+    assert!(supervisor
+        .prepare(&mut host, config, setup_deadline)
+        .is_err());
+    // Reuse the same host only after its exact real Child/EOF/paired-close
+    // settlement, not merely after retiring logical frontend permission.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    drop(handle);
+    while supervisor.in_use() != 0 || host.frontend_obligations_for_test() != 0 {
+        supervisor.poll_frontends(&mut host).unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "exact first frontend settlement deadline"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert!(!host.frontend_is_current(frontend));
+    assert_eq!(supervisor.in_use(), 0);
+    assert_eq!(host.frontend_obligations_for_test(), 0);
+    let successor = supervisor
+        .prepare(&mut host, config, setup_deadline)
+        .unwrap();
+    supervisor.start(&mut host, &successor).unwrap();
+    let SupervisionProgress::AttachedChannel(next) =
+        supervisor.poll_frontend(&successor, &mut host).unwrap()
+    else {
+        panic!("same-host successor did not receive exact real admission")
+    };
+    assert_ne!(next, frontend);
+    assert!(host.frontend_is_current(next));
+    assert_eq!(supervisor.in_use(), 1);
+    supervisor.begin_stop(&mut host).unwrap();
+    assert!(!host.frontend_is_current(next));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(12);
     loop {
         match runtime.block_on(supervisor.finish_stop(&mut host, 0)) {
             Ok(()) => break,
