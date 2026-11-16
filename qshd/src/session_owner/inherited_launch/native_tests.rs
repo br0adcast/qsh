@@ -25,6 +25,73 @@ fn config() -> TrustedChannelConfig {
         max_version: 1,
     }
 }
+/// The maintained real case exercises the actual supervisor, not a modeled child.
+fn supervisor_handoff_and_stop() {
+    use crate::session_owner::host::{HostLimits, HostState};
+    use crate::session_owner::resource_contract::{ByteLimits, ResourceLimits, ScreenLimits};
+    use crate::session_owner::supervisor::{HostSupervisor, SupervisionError, SupervisionProgress};
+    let mut config = config();
+    let bytes = ByteLimits {
+        channel_bytes: 1 << 20,
+        session_bytes: 8 << 20,
+        account_bytes: 32 << 20,
+        global_bytes: 128 << 20,
+    };
+    let resources = ResourceLimits {
+        max_reservations: 128,
+        screen: ScreenLimits::from_existing(crate::screen_budget::BudgetLimits::default()).unwrap(),
+        snapshot_transfer: bytes,
+        control_queue: bytes,
+    };
+    let mut host = HostState::new(
+        config.mode,
+        HostLimits::new(resources, 1, 4, 4, 4, 100).unwrap(),
+    )
+    .unwrap();
+    config.host = host.instance();
+    let mut supervisor = HostSupervisor::new(&mut host).unwrap();
+    supervisor
+        .set_program_for_test(TestProgram {
+            executable: daemon(),
+            args: vec![MARKER.into()],
+            environment: vec![],
+            body: false,
+        })
+        .unwrap();
+    let handle = supervisor
+        .prepare(&mut host, config, Instant::now() + Duration::from_secs(10))
+        .unwrap();
+    supervisor.start(&mut host, &handle).unwrap();
+    let SupervisionProgress::AttachedChannel(frontend) =
+        supervisor.poll_frontend(&handle, &mut host).unwrap()
+    else {
+        panic!("actual inherited handoff did not admit its exact frontend")
+    };
+    assert!(host.frontend_is_current(frontend));
+    assert_eq!(supervisor.in_use(), 1);
+    supervisor.begin_stop(&mut host).unwrap();
+    assert!(!host.frontend_is_current(frontend));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        match runtime.block_on(supervisor.finish_stop(&mut host, 0)) {
+            Ok(()) => break,
+            Err(SupervisionError::CleanupPending) => {}
+            Err(error) => panic!("exact supervisor stop refused: {error:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "supervisor exact Child/EOF cleanup deadline"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(supervisor.in_use(), 0);
+    // A successor claim is possible only after actual debt/registration cleanup.
+    let _successor = HostSupervisor::new(&mut host).unwrap();
+}
 fn daemon() -> PathBuf {
     let path = PathBuf::from(
         std::env::var_os("QSH_TEST_QSHD").expect("CI supplies exact current Cargo daemon artifact"),
@@ -206,6 +273,9 @@ fn settled_case(
     }
     assert_eq!(launches.in_use(), 0);
     assert_eq!(launches.budget.in_use(), 0);
+    let observed = launches.observe(handle).unwrap();
+    assert_eq!(observed.progress(), LaunchProgress::Settled);
+    assert!(observed.eof(), "setup EOF is an actual launch observation");
     let capsule = launches.find(handle).unwrap();
     let c = capsule.lock().unwrap();
     assert!(
@@ -283,6 +353,7 @@ fn launch529_exec_admits_only_the_designated_frontend() {
     }
     launches.cancel(&handle);
     settled(&mut launches, &handle, true);
+    supervisor_handoff_and_stop();
     // Copied setup on another real pair cannot satisfy the retained original Host.
     let mut launches = real();
     let handle = prepare(&mut launches);

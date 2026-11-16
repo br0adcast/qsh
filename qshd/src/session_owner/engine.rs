@@ -165,6 +165,14 @@ pub(crate) struct AdmittedOwnerChannelResources {
     input_epoch: InputEpoch,
 }
 impl AdmittedOwnerChannelResources {
+    #[cfg(test)]
+    pub(super) fn descriptions(&self) -> (Reservation, Reservation) {
+        (self.history.reservation(), self.control.reservation())
+    }
+    #[cfg(test)]
+    pub(super) fn split_for_test(self) -> (AdmittedReservation, AdmittedReservation) {
+        (self.history, self.control)
+    }
     pub(crate) fn new(
         history: AdmittedReservation,
         control: AdmittedReservation,
@@ -1231,6 +1239,13 @@ impl SessionOwnerEngine {
         ),
         EngineError,
     > {
+        let raw = self.validate_admitted_open_borrowed(&supplied)?;
+        Ok((raw, supplied.history, supplied.control))
+    }
+    pub(super) fn validate_admitted_open_borrowed(
+        &self,
+        supplied: &AdmittedOwnerChannelResources,
+    ) -> Result<OwnerChannelResources, EngineError> {
         self.resources.validate_admitted(&supplied.history, None)?;
         self.resources.validate_admitted(&supplied.control, None)?;
         let history = supplied.history.reservation();
@@ -1251,14 +1266,49 @@ impl SessionOwnerEngine {
         {
             return Err(EngineError::InvalidRequest);
         }
-        let raw = OwnerChannelResources {
+        Ok(OwnerChannelResources {
             history: supplied.history.reservation(),
             control: supplied.control.reservation(),
             cleanup: supplied.history.cleanup(),
             read_buffer_bytes: supplied.read_buffer_bytes,
             input_epoch: supplied.input_epoch,
-        };
-        Ok((raw, supplied.history, supplied.control))
+        })
+    }
+    pub(super) fn release_unstarted_admitted(
+        &self,
+        supplied: AdmittedOwnerChannelResources,
+    ) -> Result<(), Box<(EngineError, AdmittedOwnerChannelResources)>> {
+        if let Err(error) = self.validate_admitted_open_borrowed(&supplied) {
+            return Err(Box::new((error, supplied)));
+        }
+        drop(UnstartedAdmittedOpen::new(
+            self.resources.clone(),
+            supplied.history,
+            supplied.control,
+        ));
+        Ok(())
+    }
+    pub(super) fn preflight_admitted_open(
+        &self,
+        frontend: &FrontendAttachment,
+        request: &OpenRequest,
+        supplied: &AdmittedOwnerChannelResources,
+        lease: Option<&super::screen_owner::HostScreenLease>,
+    ) -> Result<(), EngineError> {
+        self.validate(frontend)?;
+        let raw = self.validate_admitted_open_borrowed(supplied)?;
+        if let Some(lease) = lease {
+            let size = terminal_size::TerminalSize::new(request.cols, request.rows)
+                .map_err(|_| EngineError::InvalidRequest)?;
+            if !request.screen
+                || self.screen_factory.is_none()
+                || self.screen_control.is_none()
+                || !lease.matches(&self.resources, self.locator, raw.history.channel, size)
+            {
+                return Err(EngineError::Unavailable);
+            }
+        }
+        Ok(())
     }
     pub async fn open(
         &mut self,

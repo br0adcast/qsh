@@ -43,12 +43,104 @@ impl Drop for ReplacementGuard {
         }
     }
 }
+/// Exact operation identity; possession alone is not a completed fence.
+#[derive(Debug, Clone)]
+pub(super) struct ReplacementFenceScope {
+    slot: Arc<Mutex<ReplacementSlot>>,
+    host: HostInstance,
+    id: ReplacementId,
+}
 impl HostState {
+    #[cfg(test)]
+    pub(super) fn prepare_replacement_for_test(&mut self, guard: &ReplacementGuard) {
+        self.begin_replacement_work(guard).unwrap();
+        self.observe_replacement(ReplacementObservation {
+            slot: guard.slot.clone(),
+            fact: super::status_contract::ReplacementFact {
+                transaction: Some(guard.id),
+                status: super::status_contract::ReplacementStatus::Prepared,
+                serving: None,
+            },
+        })
+        .unwrap();
+    }
+    #[cfg(test)]
+    pub(super) fn replacement_status_for_test(
+        &self,
+    ) -> Option<super::status_contract::ReplacementStatus> {
+        self.replacement.as_ref()?.lock().ok()?.transaction.status()
+    }
+    pub(super) fn replacement_fence_scope(
+        &self,
+        guard: &ReplacementGuard,
+    ) -> Result<ReplacementFenceScope, ReplacementError> {
+        let scope = ReplacementFenceScope {
+            slot: guard.slot.clone(),
+            host: self.instance(),
+            id: guard.id,
+        };
+        self.validate_replacement_fence_scope(&scope)?;
+        Ok(scope)
+    }
+    pub(super) fn validate_replacement_fence_scope(
+        &self,
+        scope: &ReplacementFenceScope,
+    ) -> Result<(), ReplacementError> {
+        self.ensure_running()
+            .map_err(|_| ReplacementError::Refused)?;
+        if scope.host != self.instance() || !self.owns_replacement(&scope.slot) {
+            return Err(ReplacementError::Refused);
+        }
+        let slot = scope
+            .slot
+            .lock()
+            .map_err(|_| ReplacementError::Unavailable)?;
+        if slot.host != scope.host
+            || slot.transaction.id() != scope.id
+            || !self.frontend_is_current(slot.requester)
+            || slot.released
+            || slot.abandoned
+            || slot.physically_settled
+            || !slot.work_begun
+            || slot.transaction.status()
+                != Some(super::status_contract::ReplacementStatus::Prepared)
+        {
+            return Err(ReplacementError::Refused);
+        }
+        Ok(())
+    }
+    pub(super) fn record_replacement_fenced(
+        &mut self,
+        receipt: super::supervisor::ReplacementFencedReceipt,
+    ) -> Result<
+        (),
+        (
+            ReplacementError,
+            super::supervisor::ReplacementFencedReceipt,
+        ),
+    > {
+        if let Err(error) = self.validate_replacement_fence_scope(receipt.scope()) {
+            return Err((error, receipt));
+        }
+        let scope = receipt.scope();
+        let observation = ReplacementObservation {
+            slot: scope.slot.clone(),
+            fact: super::status_contract::ReplacementFact {
+                transaction: Some(scope.id),
+                status: super::status_contract::ReplacementStatus::Fenced,
+                serving: None,
+            },
+        };
+        self.observe_replacement(observation)
+            .map_err(|(error, _)| (error, receipt))
+    }
     pub(crate) fn begin_replacement(
         &mut self,
         requester: FrontendAdmission,
         candidate: FrontendIdentity,
     ) -> Result<ReplacementGuard, ReplacementError> {
+        self.ensure_running()
+            .map_err(|_| ReplacementError::Refused)?;
         if !self.frontend_is_current(requester) {
             return Err(ReplacementError::Refused);
         }
@@ -84,6 +176,8 @@ impl HostState {
         &mut self,
         guard: &ReplacementGuard,
     ) -> Result<(), ReplacementError> {
+        self.ensure_running()
+            .map_err(|_| ReplacementError::Refused)?;
         if !self.owns_replacement(&guard.slot) {
             return Err(ReplacementError::Refused);
         }
@@ -110,6 +204,8 @@ impl HostState {
         observation: ReplacementObservation,
     ) -> Result<(), (ReplacementError, ReplacementObservation)> {
         let result = (|| {
+            self.ensure_running()
+                .map_err(|_| ReplacementError::Refused)?;
             if !self.owns_replacement(&observation.slot) {
                 return Err(ReplacementError::Refused);
             }

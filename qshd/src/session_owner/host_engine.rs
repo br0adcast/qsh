@@ -13,6 +13,30 @@ pub(crate) enum LocalEngineError {
     Binding,
     AlreadyBound,
     AlreadyAttached,
+    OpenRefused(Box<RefusedOpenInputs>),
+}
+pub(crate) struct RefusedOpenInputs {
+    error: LocalEngineError,
+    supplied: super::engine::AdmittedOwnerChannelResources,
+    lease: Option<super::screen_owner::HostScreenLease>,
+}
+impl std::fmt::Debug for RefusedOpenInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefusedOpenInputs")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+impl RefusedOpenInputs {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        LocalEngineError,
+        super::engine::AdmittedOwnerChannelResources,
+        Option<super::screen_owner::HostScreenLease>,
+    ) {
+        (self.error, self.supplied, self.lease)
+    }
 }
 pub(crate) struct LocalEngineBindFailure {
     error: LocalEngineError,
@@ -40,6 +64,7 @@ pub(super) struct LocalBinding {
     pub(super) phase: Mutex<LocalLeasePhase>,
 }
 pub(crate) struct LocalOwnerEngine {
+    revision: Option<u64>,
     provisioning: OwnerProvisioning,
     engine: SessionOwnerEngine,
     frontend: Option<FrontendAttachment>,
@@ -64,6 +89,34 @@ impl From<EngineError> for LocalEngineError {
     }
 }
 impl LocalOwnerEngine {
+    pub(super) fn status_revision(&self) -> Option<u64> {
+        self.revision
+    }
+    fn note_status_mutation(&mut self) {
+        self.revision = self.revision.and_then(|v| v.checked_add(1));
+    }
+    pub(super) fn supervision_binding(&self) -> &Arc<LocalBinding> {
+        &self.binding
+    }
+    pub(super) fn supervision_attachment(&self) -> Option<Attachment> {
+        self.frontend.as_ref().map(FrontendAttachment::attachment)
+    }
+    pub(super) fn supervision_complete(&self) -> bool {
+        self.binding
+            .phase
+            .lock()
+            .is_ok_and(|phase| *phase == LocalLeasePhase::Complete)
+    }
+    #[cfg(test)]
+    pub(super) fn input_position_for_test(
+        &self,
+        channel: transport::channel_geometry::ChannelInstance,
+    ) -> Result<transport::session_resume::InputPosition, EngineError> {
+        self.engine.input_position(channel)
+    }
+    pub(super) fn catalog_available(&self) -> bool {
+        self.engine.catalog_available()
+    }
     pub(crate) fn provision_channel_resources(
         &self,
         host: &HostState,
@@ -159,6 +212,7 @@ impl LocalOwnerEngine {
         cols: u16,
         rows: u16,
     ) -> Result<transport::channel_geometry::GeometryRecord, LocalEngineError> {
+        self.note_status_mutation();
         self.frontend_for(attachment)?;
         Ok(self
             .engine
@@ -248,6 +302,21 @@ impl LocalOwnerEngine {
             }
         }
     }
+    pub(crate) fn release_unstarted_admitted(
+        &self,
+        supplied: super::engine::AdmittedOwnerChannelResources,
+    ) -> Result<(), Box<RefusedOpenInputs>> {
+        self.engine
+            .release_unstarted_admitted(supplied)
+            .map_err(|failure| {
+                let (error, supplied) = *failure;
+                Box::new(RefusedOpenInputs {
+                    error: error.into(),
+                    supplied,
+                    lease: None,
+                })
+            })
+    }
     pub(crate) async fn open_admitted(
         &mut self,
         host: &mut HostState,
@@ -255,8 +324,26 @@ impl LocalOwnerEngine {
         term: Option<String>,
         supplied: super::engine::AdmittedOwnerChannelResources,
     ) -> Result<transport::channel_geometry::ChannelInstance, LocalEngineError> {
-        host.validate_local_binding(&self.binding)?;
-        self.validate_current()?;
+        self.note_status_mutation();
+        let validated = (|| {
+            host.ensure_running()?;
+            host.validate_local_binding(&self.binding)?;
+            self.validate_current()?;
+            self.engine.preflight_admitted_open(
+                self.frontend.as_ref().unwrap(),
+                &request,
+                &supplied,
+                None,
+            )?;
+            Ok::<_, LocalEngineError>(())
+        })();
+        if let Err(error) = validated {
+            return Err(LocalEngineError::OpenRefused(Box::new(RefusedOpenInputs {
+                error,
+                supplied,
+                lease: None,
+            })));
+        }
         let channel = self
             .engine
             .open_admitted(self.frontend.as_ref().unwrap(), request, term, supplied)
@@ -272,8 +359,26 @@ impl LocalOwnerEngine {
         supplied: super::engine::AdmittedOwnerChannelResources,
         lease: super::screen_owner::HostScreenLease,
     ) -> Result<transport::channel_geometry::ChannelInstance, LocalEngineError> {
-        host.validate_local_binding(&self.binding)?;
-        self.validate_current()?;
+        self.note_status_mutation();
+        let validated = (|| {
+            host.ensure_running()?;
+            host.validate_local_binding(&self.binding)?;
+            self.validate_current()?;
+            self.engine.preflight_admitted_open(
+                self.frontend.as_ref().unwrap(),
+                &request,
+                &supplied,
+                Some(&lease),
+            )?;
+            Ok::<_, LocalEngineError>(())
+        })();
+        if let Err(error) = validated {
+            return Err(LocalEngineError::OpenRefused(Box::new(RefusedOpenInputs {
+                error,
+                supplied,
+                lease: Some(lease),
+            })));
+        }
         let channel = self
             .engine
             .open_screen_admitted(
@@ -292,6 +397,7 @@ impl LocalOwnerEngine {
         host: &mut HostState,
         now: u64,
     ) -> Result<(), LocalEngineError> {
+        self.note_status_mutation();
         if *self
             .binding
             .phase
@@ -360,6 +466,7 @@ impl LocalOwnerEngine {
         host: &mut HostState,
         authorized: AuthorizedAttachment,
     ) -> Result<Attachment, LocalEngineError> {
+        self.note_status_mutation();
         host.validate_local_binding(&self.binding)?;
         let attachment = host.consume_local_authority(&self.binding, authorized)?;
         if self.frontend.is_some() {
@@ -385,6 +492,7 @@ impl LocalOwnerEngine {
         Ok(attachment)
     }
     pub(crate) fn begin_detach(&mut self, host: &mut HostState) -> Result<(), LocalEngineError> {
+        self.note_status_mutation();
         host.validate_local_binding(&self.binding)?;
         let frontend = self.frontend.as_ref().ok_or(LocalEngineError::Binding)?;
         let attachment = frontend.attachment();
@@ -430,6 +538,9 @@ impl LocalOwnerEngine {
             .wait_completed()
             .await?;
         host.validate_local_binding(&self.binding)?;
+        // Pending wait retains the same fence; publish mutation with the actual
+        // synchronous detach commit, so cancellation does not invent a revision.
+        self.note_status_mutation();
         *self
             .binding
             .phase
@@ -469,6 +580,7 @@ impl HostState {
         };
         engine.bind_local_binding(&binding);
         Ok(LocalOwnerEngine {
+            revision: Some(0),
             provisioning,
             engine,
             frontend: None,

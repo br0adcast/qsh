@@ -59,3 +59,6 @@ pub(crate) mod host_engine;
 
 #[allow(dead_code)] // Dormant host transaction exclusion; no activation route.
 pub(crate) mod host_replacement;
+
+#[allow(dead_code)] // Dormant inherited supervision; no service route is activated.
+pub(crate) mod supervisor;
