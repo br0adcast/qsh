@@ -441,6 +441,7 @@ pub(in crate::session_owner) mod integrated {
     ) {
         make_host_fixture(locator, client, Some(context), None)
     }
+    #[cfg(target_os = "linux")]
     pub(in crate::session_owner) fn host_fixture_for_principal(
         locator: SessionLocator,
         client: OwnerResourceClient,
