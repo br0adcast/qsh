@@ -664,12 +664,13 @@ async fn host_engine_admitted_screen_open_uses_distinct_anchor_channel_and_model
     };
     let history = reserve(ReservationKind::OutputHistory, 4096, None, 3);
     let control = reserve(ReservationKind::ControlQueue, 512 * 1024, None, 3);
-    let (mut engine, _restart) =
-        crate::session_owner::engine::tests::integrated::host_screen_fixture(
+    let (mut engine, _restart, io) =
+        crate::session_owner::engine::tests::integrated::host_screen_fixture_controlled(
             locator,
             provisioning.client(),
             context,
         );
+    io.hold_reads();
     let front = engine
         .attach_trusted(Attachment {
             locator,
@@ -721,7 +722,16 @@ async fn host_engine_admitted_screen_open_uses_distinct_anchor_channel_and_model
                 Err(_) => panic!("real transfer credit refused"),
             }
         };
-        let mut transaction = engine.catalog(&front, transfer(0usize, 4)).unwrap();
+        let mut stale_transaction = engine.catalog(&front, transfer(0usize, 4)).unwrap();
+        assert_eq!(engine.output_bounds_for_test(channel).1, 0);
+        io.release_reads();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !engine.catalog_available() || engine.output_bounds_for_test(channel).1 != 14 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let mut consumer = ScreenConsumer::new(
             channel,
             [93; 16],
@@ -733,15 +743,32 @@ async fn host_engine_admitted_screen_open_uses_distinct_anchor_channel_and_model
             transfer(quote.max_bytes, 5),
         )
         .unwrap();
-        let bytes = reserve(
-            ReservationKind::SnapshotTransfer,
-            quote.transfer_bytes as u64,
-            None,
-            6,
+        let allowance = |serial| {
+            let bytes = reserve(
+                ReservationKind::SnapshotTransfer,
+                quote.transfer_bytes as u64,
+                None,
+                serial,
+            );
+            let scratch = reserve(ReservationKind::ScreenModel, 0, Some(quote.scratch), serial);
+            ScreenRecoveryAllowance::admit_reserved(provisioning.client(), bytes, scratch, quote)
+        };
+        let (stale_request, stale_evidence) = consumer.request(front.attachment());
+        let stale_refused = matches!(
+            engine.recover_screen(
+                &front,
+                &mut stale_transaction,
+                stale_request,
+                &stale_evidence,
+                RecoveryId::new([95; 16]).unwrap(),
+                RequestId::new(29).unwrap(),
+                allowance(6).unwrap_or_else(|_| panic!("stale recovery credit refused")),
+            ),
+            Err(crate::session_owner::engine::EngineError::Unavailable)
         );
-        let scratch = reserve(ReservationKind::ScreenModel, 0, Some(quote.scratch), 6);
-        let allowance =
-            ScreenRecoveryAllowance::admit_reserved(provisioning.client(), bytes, scratch, quote);
+        drop((stale_transaction, stale_evidence));
+        let mut transaction = engine.catalog(&front, transfer(0usize, 7)).unwrap();
+        let allowance = allowance(8);
         match allowance {
             Ok(allowance) => {
                 let (request, evidence) = consumer.request(front.attachment());
@@ -767,7 +794,7 @@ async fn host_engine_admitted_screen_open_uses_distinct_anchor_channel_and_model
                     .unwrap();
                 engine.finish_recovery(&front, transaction).unwrap();
                 drop((evidence, consumer));
-                true
+                stale_refused
             }
             Err(_) => false,
         }

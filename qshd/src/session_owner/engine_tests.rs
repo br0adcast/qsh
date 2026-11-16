@@ -455,6 +455,22 @@ pub(in crate::session_owner) mod integrated {
     }
     pub(in crate::session_owner) struct HostFixtureControl(Arc<Io>);
     impl HostFixtureControl {
+        pub(in crate::session_owner) fn hold_reads(&self) {
+            self.0
+                .reader_held
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        pub(in crate::session_owner) fn release_reads(&self) {
+            let _state = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.0
+                .reader_held
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.0.changed.notify_all();
+        }
         pub(in crate::session_owner) fn hold_writes(&self) {
             self.0.held.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -502,6 +518,7 @@ pub(in crate::session_owner) mod integrated {
     }
     impl Drop for HostFixtureControl {
         fn drop(&mut self) {
+            self.release_reads();
             self.release_writes();
             for gate in self
                 .0

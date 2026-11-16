@@ -657,6 +657,16 @@ struct SelectedFixture {
     _pty: (std::os::fd::OwnedFd, std::fs::File),
     data: bool,
 }
+fn distinct_later_port(initial: u16, selected: Option<u16>) -> u16 {
+    let mut port = initial;
+    loop {
+        port = port.wrapping_add(1).max(1);
+        if port != initial && Some(port) != selected {
+            return port;
+        }
+    }
+}
+
 fn selected_fixture(
     input: &[u8],
     reply: Vec<u8>,
@@ -768,7 +778,7 @@ fn selected_fixture(
     setup.args.no_password = false;
     *setup.session_key.lock().unwrap() = None;
     let mut later = setup.args.addresses[0].clone();
-    later.qsh_port += 1;
+    later.qsh_port = distinct_later_port(later.qsh_port, ready.map(|(port, _)| port));
     setup.args.addresses.push(later);
     let discoveries = Arc::new(Mutex::new(Vec::new()));
     setup.discovery = Arc::new(RecordedSilence(discoveries.clone(), ready));
@@ -1213,6 +1223,11 @@ fn selected_ready_authenticated_protocol_mismatch_stops_all_routes_and_joins_pro
     let _serial = crate::tty::SIGNAL_TESTS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let later = distinct_later_port(60022, Some(60023));
+    assert!(
+        later != 0 && later != 60022 && later != 60023,
+        "selected ready endpoint must remain distinct from the forbidden later route"
+    );
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let server = transport::generate_keypair();
     let fixture = selected_fixture(
