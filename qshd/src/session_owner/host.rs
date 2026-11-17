@@ -106,6 +106,7 @@ struct CatalogEntry {
     last_epoch: u64,
     cleanup_operation: Option<u64>,
     local: Option<Arc<LocalBinding>>,
+    final_status: Option<super::status_contract::OwnerStatus>,
 }
 
 /// These capabilities deliberately have no production constructors in 3A1.
@@ -169,20 +170,54 @@ pub(crate) enum HostDecision {
     GrantConsumed(AuthorizedAttachment),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontendRetirement {
+    Active,
+    AuthorityRetired,
+}
+#[derive(Debug)]
+struct HostFrontend {
+    admission: FrontendAdmission,
+    registration: FrontendRegistration,
+    retirement: FrontendRetirement,
+}
+#[derive(Debug)]
+struct FrontendObligation {
+    frontend: FrontendAdmission,
+    capsule: Option<super::inherited_launch::CapsuleIdentity>,
+}
+#[derive(Debug)]
+pub(super) struct SupervisionClaim {
+    host: HostInstance,
+    _identity: [u8; 16],
+}
 #[derive(Debug)]
 pub(crate) struct HostState {
     instance: HostInstance,
+    mode: HostMode,
+    stopping: bool,
+    supervision: Option<Arc<SupervisionClaim>>,
+    stop_operation: Option<u64>,
+    last_stop: u64,
+    #[cfg(test)]
+    fail_frontend_cleanup_once: Option<FrontendAdmission>,
     grant_scope: LedgerInstance,
     resource_scope: LedgerInstance,
     limits: HostLimits,
     authorization: AuthorizationState,
-    frontends: Vec<(FrontendAdmission, FrontendRegistration)>,
+    frontends: Vec<HostFrontend>,
+    frontend_debt: Vec<FrontendObligation>,
     catalog: Vec<CatalogEntry>,
+    status_revision: Option<u64>,
+    pub(super) status_resident_build: Option<super::status_contract::BuildIdentity>,
+    pub(super) status_serving: Option<super::host_status::ServingObservation>,
+    pub(super) status_snapshot: Option<super::host_status::StatusSnapshot>,
     offers: Vec<PendingGrant>,
     grants: GrantLedger,
     resources: Arc<Mutex<ResourceLedger>>,
     last_cleanup: u64,
     last_now: u64,
+    pub(super) replacement: Option<Arc<Mutex<super::host_replacement::ReplacementSlot>>>,
 }
 impl HostState {
     #[cfg(test)]
@@ -192,7 +227,7 @@ impl HostState {
     ) -> Option<FrontendAdmission> {
         self.frontends
             .iter()
-            .map(|(frontend, _)| *frontend)
+            .map(|record| record.admission)
             .find(|frontend| frontend.generation() == generation)
     }
     #[cfg(test)]
@@ -211,6 +246,7 @@ impl HostState {
         provisioning: &OwnerProvisioning,
         engine: &super::engine::SessionOwnerEngine,
     ) -> Result<Arc<LocalBinding>, super::host_engine::LocalEngineError> {
+        self.ensure_running()?;
         use super::host_engine::LocalEngineError;
         let binding = provisioning.binding();
         if binding.host != self.instance {
@@ -244,6 +280,7 @@ impl HostState {
             phase: Mutex::new(LocalLeasePhase::Detached),
         });
         entry.local = Some(binding.clone());
+        self.note_status_mutation();
         Ok(binding)
     }
     fn phase_available(phase: LocalLeasePhase) -> Result<(), HostError> {
@@ -287,6 +324,7 @@ impl HostState {
         binding: &Arc<LocalBinding>,
         authorized: AuthorizedAttachment,
     ) -> Result<Attachment, HostError> {
+        self.ensure_running()?;
         self.validate_local_binding(binding)?;
         if authorized.host != self.instance
             || authorized.attachment.locator != binding.identity.locator
@@ -347,7 +385,7 @@ impl HostState {
         intent: &CleanupIntent,
         proof: super::engine::LocalCompletion,
         now: u64,
-    ) -> Result<(), (HostError, super::engine::LocalCompletion)> {
+    ) -> Result<(), Box<(HostError, super::engine::LocalCompletion)>> {
         let preflight = (|| {
             self.validate_local_binding(binding)?;
             let entry = self
@@ -378,8 +416,22 @@ impl HostState {
         })();
         let index = match preflight {
             Ok(index) => index,
-            Err(error) => return Err((error, proof)),
+            Err(error) => return Err(Box::new((error, proof))),
         };
+        self.catalog[index].final_status =
+            proof.final_status().and_then(|(build, total_channels)| {
+                Some(super::status_contract::OwnerStatus {
+                    locator: binding.identity.locator,
+                    build,
+                    ipc: super::status_contract::IpcRange::new(
+                        super::protocol::OWNER_VERSION,
+                        super::protocol::OWNER_VERSION,
+                    )
+                    .ok()?,
+                    active_channels: 0,
+                    total_channels,
+                })
+            });
         // The seal is consumed only after every fallible check/release. There
         // is no setter or constructor accepting replacement public exit facts.
         let converted = OwnerCompletion {
@@ -421,6 +473,7 @@ impl HostState {
             .retire_principal(registration)
             .map_err(|_| HostError::ResourceDebt)?;
         self.catalog.swap_remove(index);
+        self.note_status_mutation();
         Ok(())
     }
     pub(crate) fn new(mode: HostMode, limits: HostLimits) -> Result<Self, HostError> {
@@ -443,18 +496,297 @@ impl HostState {
             .map_err(|_| HostError::Capacity)?;
         Ok(Self {
             instance,
+            mode,
+            stopping: false,
+            supervision: None,
+            stop_operation: None,
+            last_stop: 0,
+            #[cfg(test)]
+            fail_frontend_cleanup_once: None,
             grant_scope,
             resource_scope,
             limits,
             authorization,
             frontends: Vec::new(),
+            frontend_debt: Vec::new(),
             catalog: Vec::new(),
+            status_revision: Some(0),
+            status_resident_build: None,
+            status_serving: None,
+            status_snapshot: None,
             offers: Vec::new(),
             grants,
             resources: Arc::new(Mutex::new(resources)),
             last_cleanup: 0,
             last_now: 0,
+            replacement: None,
         })
+    }
+    #[cfg(test)]
+    pub(super) fn retire_frontend_authority_for_test(&mut self, frontend: FrontendAdmission) {
+        self.authorization.retire_frontend(frontend).unwrap();
+    }
+    #[cfg(test)]
+    pub(super) fn fail_frontend_cleanup_once_for_test(&mut self, frontend: FrontendAdmission) {
+        self.fail_frontend_cleanup_once = Some(frontend);
+    }
+    #[cfg(test)]
+    pub(super) fn frontend_obligations_for_test(&self) -> usize {
+        self.frontend_debt.len()
+    }
+    pub(super) fn frontend_retirement_pending(&self, frontend: FrontendAdmission) -> bool {
+        self.frontends
+            .iter()
+            .any(|record| record.admission == frontend)
+    }
+    pub(super) fn frontend_is_current(&self, frontend: FrontendAdmission) -> bool {
+        self.authorization.frontend_is_current(frontend)
+            && self.frontends.iter().any(|record| {
+                record.admission == frontend && record.retirement == FrontendRetirement::Active
+            })
+    }
+    pub(super) fn ensure_running(&self) -> Result<(), HostError> {
+        if self.stopping {
+            Err(HostError::Refused)
+        } else {
+            Ok(())
+        }
+    }
+    pub(super) fn claim_supervision(
+        &mut self,
+    ) -> Result<(Arc<SupervisionClaim>, HostMode, usize), HostError> {
+        if self.supervision.is_some() {
+            return Err(HostError::Refused);
+        }
+        let claim = Arc::new(SupervisionClaim {
+            host: self.instance,
+            _identity: fresh_bytes()?,
+        });
+        self.supervision = Some(claim.clone());
+        Ok((claim, self.mode, self.limits.frontends))
+    }
+    pub(super) fn supervision_is_unclaimed(&self) -> bool {
+        self.supervision.is_none()
+    }
+    pub(super) fn supervision_is_current(&self, claim: &Arc<SupervisionClaim>) -> bool {
+        claim.host == self.instance
+            && self
+                .supervision
+                .as_ref()
+                .is_some_and(|actual| Arc::ptr_eq(actual, claim))
+    }
+    pub(super) fn latch_supervisor_stop(
+        &mut self,
+        claim: &Arc<SupervisionClaim>,
+    ) -> Result<(u64, Vec<FrontendAdmission>), HostError> {
+        if !self.supervision_is_current(claim) {
+            return Err(HostError::Refused);
+        }
+        // This admission latch precedes every allocation and fallible custody operation.
+        if !self.stopping {
+            self.stopping = true;
+            self.note_status_mutation();
+        }
+        let operation = match self.stop_operation {
+            Some(operation) => operation,
+            None => {
+                self.last_stop = self.last_stop.checked_add(1).ok_or(HostError::Exhausted)?;
+                self.stop_operation = Some(self.last_stop);
+                self.last_stop
+            }
+        };
+        Ok((
+            operation,
+            self.frontends
+                .iter()
+                .map(|record| record.admission)
+                .collect(),
+        ))
+    }
+    pub(super) fn pin_frontend_custody(
+        &mut self,
+        capsule: &super::inherited_launch::CapsuleIdentity,
+    ) -> Result<(), HostError> {
+        if capsule.instance() != self.instance
+            || !self.supervision_is_current(capsule.claim())
+            || !self.frontend_is_current(capsule.frontend())
+        {
+            return Err(HostError::Refused);
+        }
+        let debt = self
+            .frontend_debt
+            .iter_mut()
+            .find(|debt| debt.frontend == capsule.frontend())
+            .ok_or(HostError::Refused)?;
+        if debt.capsule.is_some() {
+            return Err(HostError::Refused);
+        }
+        debt.capsule = Some(capsule.clone());
+        Ok(())
+    }
+    pub(super) fn settle_frontend_custody(
+        &mut self,
+        receipt: super::inherited_launch::FrontendSettlement,
+    ) -> Result<(), (HostError, super::inherited_launch::FrontendSettlement)> {
+        let result = (|| {
+            let identity = receipt.identity();
+            if identity.instance() != self.instance
+                || !self.supervision_is_current(identity.claim())
+                || self.frontend_is_current(identity.frontend())
+            {
+                return Err(HostError::Refused);
+            }
+            let index = self
+                .frontend_debt
+                .iter()
+                .position(|debt| {
+                    debt.frontend == identity.frontend()
+                        && debt
+                            .capsule
+                            .as_ref()
+                            .is_some_and(|actual| actual.same(identity))
+                })
+                .ok_or(HostError::Refused)?;
+            self.frontend_debt.swap_remove(index);
+            Ok(())
+        })();
+        result.map_err(|error| (error, receipt))
+    }
+    pub(super) fn supervision_is_stopping(&self) -> bool {
+        self.stopping
+    }
+    pub(super) fn frontend_fences_pending(&self, frontend: FrontendGeneration) -> bool {
+        self.catalog.iter().any(|entry| {
+            if matches!(entry.phase, CatalogPhase::Completed { .. }) {
+                return false;
+            }
+            let Some(binding) = &entry.local else {
+                return true;
+            };
+            let Ok(phase) = binding.phase.lock() else {
+                return true;
+            };
+            match *phase {
+                LocalLeasePhase::Reserved(attachment)
+                | LocalLeasePhase::Attached(attachment)
+                | LocalLeasePhase::Fencing(attachment) => attachment.frontend == frontend,
+                LocalLeasePhase::Closing | LocalLeasePhase::Unknown => true,
+                LocalLeasePhase::Detached | LocalLeasePhase::Complete => false,
+            }
+        })
+    }
+    pub(super) fn supervision_has_unknown_owner(&self) -> bool {
+        self.catalog.iter().any(|entry| {
+            !matches!(entry.phase, CatalogPhase::Completed { .. })
+                && entry.local.as_ref().is_some_and(|binding| {
+                    binding
+                        .phase
+                        .lock()
+                        .map_or(true, |phase| *phase == LocalLeasePhase::Unknown)
+                })
+        })
+    }
+    #[cfg(test)]
+    pub(super) fn status_capacity_for_test(&mut self, capacity: usize) {
+        self.limits.sessions = capacity;
+    }
+    #[cfg(test)]
+    pub(super) fn exhaust_status_revision_for_test(&mut self) {
+        self.status_revision = Some(u64::MAX);
+    }
+    pub(super) fn status_revision(&self) -> Option<u64> {
+        self.status_revision
+    }
+    pub(super) fn note_status_mutation(&mut self) {
+        self.status_snapshot = None;
+        self.status_revision = self.status_revision.and_then(|v| v.checked_add(1));
+    }
+    pub(super) fn status_catalog_roster(
+        &self,
+    ) -> Result<Vec<super::host_status::StatusCatalogRow>, super::host_status::StatusError> {
+        use super::host_status::{StatusCatalogRow, StatusError};
+        if self.catalog.len() > self.limits.sessions {
+            return Err(StatusError::Unavailable);
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(self.catalog.len())
+            .map_err(|_| StatusError::Unavailable)?;
+        for entry in &self.catalog {
+            rows.push(StatusCatalogRow {
+                binding: entry.local.clone().ok_or(StatusError::Unavailable)?,
+                completed: matches!(entry.phase, CatalogPhase::Completed { .. }),
+                final_status: entry.final_status.clone(),
+            });
+        }
+        Ok(rows)
+    }
+    pub(super) fn supervision_roster_complete(
+        &self,
+        owners: &[&super::host_engine::LocalOwnerEngine],
+    ) -> bool {
+        owners.len() <= self.limits.sessions
+            && owners.iter().enumerate().all(|(i, owner)| {
+                self.supervision_owner_known(owner.supervision_binding())
+                    && !owners[..i].iter().any(|other| {
+                        Arc::ptr_eq(other.supervision_binding(), owner.supervision_binding())
+                    })
+            })
+            && self.catalog.iter().all(|entry| {
+                if matches!(entry.phase, CatalogPhase::Completed { .. }) {
+                    return true;
+                }
+                entry.local.as_ref().is_some_and(|binding| {
+                    binding.phase.lock().is_ok_and(|phase| {
+                        matches!(
+                            *phase,
+                            LocalLeasePhase::Detached
+                                | LocalLeasePhase::Attached(_)
+                                | LocalLeasePhase::Fencing(_)
+                        )
+                    }) && owners
+                        .iter()
+                        .any(|owner| Arc::ptr_eq(owner.supervision_binding(), binding))
+                })
+            })
+    }
+    pub(super) fn supervision_owner_limit(&self) -> usize {
+        self.limits.sessions
+    }
+    pub(super) fn supervision_owner_known(&self, binding: &Arc<LocalBinding>) -> bool {
+        binding.identity.host == self.instance
+            && self.catalog.iter().any(|entry| {
+                entry.locator == binding.identity.locator
+                    && entry
+                        .local
+                        .as_ref()
+                        .is_some_and(|actual| Arc::ptr_eq(actual, binding))
+            })
+    }
+    pub(super) fn supervision_owners_settled(&self) -> bool {
+        self.catalog
+            .iter()
+            .all(|entry| matches!(entry.phase, CatalogPhase::Completed { .. }))
+            && self
+                .resources
+                .lock()
+                .is_ok_and(|ledger| ledger.reservations() == 0 && ledger.principals() == 0)
+    }
+    pub(super) fn complete_supervisor_stop(
+        &mut self,
+        receipt: super::supervisor::StopCompletion,
+    ) -> Result<(), HostError> {
+        if !self.supervision_is_current(receipt.claim())
+            || !self.stopping
+            || self.stop_operation != Some(receipt.operation())
+            || !self.frontends.is_empty()
+            || !self.frontend_debt.is_empty()
+            || !self.supervision_owners_settled()
+        {
+            return Err(HostError::Refused);
+        }
+        self.supervision = None;
+        self.stop_operation = None;
+        Ok(())
     }
     pub(crate) fn instance(&self) -> HostInstance {
         self.instance
@@ -486,10 +818,29 @@ impl HostState {
         &mut self,
         peer: AuthenticatedPeer,
     ) -> Result<FrontendAdmission, HostError> {
+        self.ensure_running()?;
+        if self.frontend_debt.len() >= self.limits.frontends {
+            return Err(HostError::Capacity);
+        }
+        self.frontends
+            .try_reserve(1)
+            .map_err(|_| HostError::Capacity)?;
+        self.frontend_debt
+            .try_reserve(1)
+            .map_err(|_| HostError::Capacity)?;
         let frontend = self.authorization.admit_frontend(peer)?;
         match self.grants.register_fresh_frontend(frontend.generation()) {
             Ok(registration) => {
-                self.frontends.push((frontend, registration));
+                self.frontends.push(HostFrontend {
+                    admission: frontend,
+                    registration,
+                    retirement: FrontendRetirement::Active,
+                });
+                self.frontend_debt.push(FrontendObligation {
+                    frontend,
+                    capsule: None,
+                });
+                self.note_status_mutation();
                 Ok(frontend)
             }
             Err(_) => {
@@ -504,6 +855,7 @@ impl HostState {
         now: u64,
         deadline: u64,
     ) -> Result<PolicyIntent, HostError> {
+        self.ensure_running()?;
         self.observe(now)?;
         Ok(self
             .authorization
@@ -522,6 +874,7 @@ impl HostState {
         attempt: AuthenticationAttempt,
         now: u64,
     ) -> Result<(SessionLocator, OwnerProvisioning), HostError> {
+        self.ensure_running()?;
         self.observe(now)?;
         let (account, _) = self.authorization.identity(attempt)?;
         if self.catalog.len() >= self.limits.sessions
@@ -569,7 +922,9 @@ impl HostState {
             last_epoch: 0,
             cleanup_operation: None,
             local: None,
+            final_status: None,
         });
+        self.note_status_mutation();
         Ok((
             locator,
             OwnerProvisioning::from_catalog(
@@ -603,6 +958,7 @@ impl HostState {
         now: u64,
         deadline: u64,
     ) -> Result<PolicyIntent, HostError> {
+        self.ensure_running()?;
         self.observe(now)?;
         self.retire_invalid_offers()?;
         Self::local_available(self.session_for_attempt(attempt, locator)?)?;
@@ -630,6 +986,7 @@ impl HostState {
         now: u64,
         deadline: u64,
     ) -> Result<PolicyIntent, HostError> {
+        self.ensure_running()?;
         self.observe(now)?;
         Self::local_available(self.session_for_attempt(attempt, binding.locator)?)?;
         if !self.offers.iter().any(|g| {
@@ -654,6 +1011,8 @@ impl HostState {
         result: PolicyResult,
         now: u64,
     ) -> Result<HostDecision, HostError> {
+        self.note_status_mutation();
+        self.ensure_running()?;
         self.observe(now)?;
         let resolution = self.authorization.resolve(result, now);
         // Refusal/current-account mismatch may retire an attempt. Invalidate all
@@ -687,8 +1046,11 @@ impl HostState {
                         let frontend = self
                             .frontends
                             .iter()
-                            .find(|(f, _)| *f == policy.frontend)
-                            .map(|(_, r)| *r)
+                            .find(|record| {
+                                record.admission == policy.frontend
+                                    && record.retirement == FrontendRetirement::Active
+                            })
+                            .map(|record| record.registration)
                             .ok_or(HostError::Refused)?;
                         let registration = self
                             .grants
@@ -820,26 +1182,48 @@ impl HostState {
         Ok(())
     }
     pub(crate) fn retire_frontend(&mut self, frontend: FrontendAdmission) -> Result<(), HostError> {
-        let i = self
+        let Some(index) = self
             .frontends
             .iter()
-            .position(|(f, _)| *f == frontend)
-            .ok_or(HostError::Refused)?;
-        self.authorization.retire_frontend(frontend)?;
+            .position(|record| record.admission == frontend)
+        else {
+            // A completed logical retirement can be retried while its exact
+            // physical obligation is still retained; this never refunds debt.
+            return if self
+                .frontend_debt
+                .iter()
+                .any(|debt| debt.frontend == frontend)
+            {
+                Ok(())
+            } else {
+                Err(HostError::Refused)
+            };
+        };
+        if self.frontends[index].retirement == FrontendRetirement::Active {
+            self.authorization.retire_frontend(frontend)?;
+            self.frontends[index].retirement = FrontendRetirement::AuthorityRetired;
+            self.status_frontend_lost(frontend);
+        }
         for entry in &self.catalog {
             Self::invalidate_local_attachment(entry, Some(frontend.generation()))?;
         }
-        // Retire grant principals before frontend removal; resource registrations
-        // and session entries are independent from these transient lifetimes.
+        #[cfg(test)]
+        if self.fail_frontend_cleanup_once == Some(frontend) {
+            self.fail_frontend_cleanup_once = None;
+            return Err(HostError::Refused);
+        }
+        // Keep the registration and progress until every remaining step commits.
+        // No retry restores authentication or re-mints grants/physical credit.
         self.retire_invalid_offers()?;
-        let (_, registration) = self.frontends.swap_remove(i);
         self.grants
-            .revoke_frontend(registration)
+            .revoke_frontend(self.frontends[index].registration)
             .map_err(|_| HostError::Refused)?;
+        self.frontends.swap_remove(index);
         Ok(())
     }
     pub(crate) fn revoke_account(&mut self, uid: u32) -> Result<(), HostError> {
         let revocation = self.authorization.revoke_account(uid);
+        self.note_status_mutation();
         for entry in self
             .catalog
             .iter()
@@ -864,6 +1248,7 @@ impl HostState {
             return Err(HostError::Refused);
         }
         e.phase = CatalogPhase::Established;
+        self.note_status_mutation();
         Ok(())
     }
     pub(crate) fn begin_owner_cleanup(
@@ -884,6 +1269,7 @@ impl HostState {
             .ok_or(HostError::Exhausted)?;
         e.cleanup_operation = Some(operation);
         self.last_cleanup = operation;
+        self.note_status_mutation();
         Ok(CleanupIntent {
             host: self.instance,
             locator,
@@ -952,6 +1338,7 @@ impl HostState {
             at: now,
             facts: proof.facts,
         };
+        self.note_status_mutation();
     }
     pub(crate) fn completed_facts(
         &self,
@@ -981,6 +1368,7 @@ impl HostState {
             .position(|e| e.locator == locator)
             .ok_or(HostError::Refused)?;
         self.catalog.swap_remove(i);
+        self.note_status_mutation();
         Ok(())
     }
     pub(crate) fn sweep(&mut self, now: u64) -> Result<(), HostError> {
@@ -1011,6 +1399,7 @@ impl HostState {
             };
             if retire {
                 self.catalog.swap_remove(i);
+                self.note_status_mutation();
             } else {
                 i += 1;
             }

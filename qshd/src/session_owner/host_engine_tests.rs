@@ -2545,7 +2545,8 @@ async fn host_engine_sealed_completion_refuses_foreign_host_owner_and_operation_
         foreign.complete_local_owner(&first.binding, first.cleanup.as_ref().unwrap(), proof, 22);
     let foreign_refused;
     match foreign_result {
-        Err((error, returned)) => {
+        Err(failure) => {
+            let (error, returned) = *failure;
             foreign_refused = error == HostError::Refused;
             proof = returned;
         }
@@ -2555,7 +2556,8 @@ async fn host_engine_sealed_completion_refuses_foreign_host_owner_and_operation_
         host.complete_local_owner(&first.binding, second.cleanup.as_ref().unwrap(), proof, 22);
     let operation_refused;
     match wrong_operation {
-        Err((error, returned)) => {
+        Err(failure) => {
+            let (error, returned) = *failure;
             operation_refused = error == HostError::Refused;
             proof = returned;
         }
@@ -2565,7 +2567,8 @@ async fn host_engine_sealed_completion_refuses_foreign_host_owner_and_operation_
         host.complete_local_owner(&second.binding, second.cleanup.as_ref().unwrap(), proof, 22);
     let owner_refused;
     match wrong_owner {
-        Err((error, returned)) => {
+        Err(failure) => {
+            let (error, returned) = *failure;
             owner_refused = error == HostError::Refused;
             proof = returned;
         }
@@ -3190,4 +3193,138 @@ async fn host_engine_revocation_and_late_old_auth_end_preserve_retained_child_an
         2
     );
     assert_eq!(host.resource_reservations_for_test(), 0);
+}
+
+#[tokio::test]
+async fn host_engine_status_stopped_screen_control_is_unavailable_without_host_mutation() {
+    use crate::session_owner::engine::AdmittedOwnerChannelResources;
+    use crate::session_owner::owner_resource_contract::OwnerResourceRequest;
+    use crate::session_owner::resource_contract::{ReservationKind, ScreenCharge};
+    use crate::session_owner::screen_control::{ControlTaskScope, ScreenControlContext};
+    use crate::session_owner::screen_owner::HostScreenLease;
+    use transport::channel::ChannelKind;
+    use transport::channel_geometry::ChannelInstance;
+    use transport::session_resume::*;
+    let (mut host, attempt) = catalog();
+    let (locator, provisioning) = host.create_session_provisioned(attempt, 2).unwrap();
+    let screen_channel = ChannelInstance::new(1).unwrap();
+    let size = terminal_size::TerminalSize::new(80, 24).unwrap();
+    let scope = ControlTaskScope::new(tokio::runtime::Handle::current());
+    let (context, lease, supplied) = {
+        let reserve = |kind, bytes, screen_charge, serial| {
+            provisioning
+                .reserve(
+                    OwnerResourceRequest {
+                        locator,
+                        channel: screen_channel,
+                        kind,
+                        bytes,
+                        screen_charge,
+                    },
+                    RequestId::new(serial).unwrap(),
+                )
+                .unwrap()
+        };
+        let context = match ScreenControlContext::admit_reserved(
+            scope.clone(),
+            provisioning.client(),
+            reserve(ReservationKind::ControlQueue, 65536, None, 220),
+        ) {
+            Ok(context) => context,
+            Err(_) => panic!("anchor refused"),
+        };
+        let slots = crate::screen_budget::ScreenEnvelope::new(size)
+            .charge()
+            .unwrap();
+        let lease = match HostScreenLease::admit_reserved(
+            provisioning.client(),
+            reserve(
+                ReservationKind::ScreenModel,
+                0,
+                Some(ScreenCharge {
+                    cells: slots.cells as u64,
+                    rows: slots.rows as u64,
+                    models: 1,
+                }),
+                221,
+            ),
+            size,
+        ) {
+            Ok(lease) => lease,
+            Err(_) => panic!("model refused"),
+        };
+        let supplied = AdmittedOwnerChannelResources::new(
+            reserve(ReservationKind::OutputHistory, 4096, None, 222),
+            reserve(ReservationKind::ControlQueue, 512 * 1024, None, 222),
+            128,
+            InputEpoch::new([122; 16]).unwrap(),
+        );
+        (context, lease, supplied)
+    };
+    let (engine, _restart, control) =
+        crate::session_owner::engine::tests::integrated::host_screen_fixture_controlled(
+            locator,
+            provisioning.client(),
+            context,
+        );
+    // Keep the real reader inside its backend so stopping Screen control
+    // cannot first terminate its worker and mask the missing ticket predicate.
+    control.hold_reads();
+    let mut bound = match host.bind_local_engine(provisioning, engine) {
+        Ok(bound) => bound,
+        Err(_) => panic!("binding refused"),
+    };
+    let authorized = authorize(&mut host, attempt, locator, 3);
+    let attachment = bound.attach(&mut host, authorized).unwrap();
+    let opened = bound
+        .open_screen_admitted(
+            &mut host,
+            OpenRequest {
+                stream: 16,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: true,
+                command: Vec::new(),
+            },
+            None,
+            supplied,
+            lease,
+        )
+        .await;
+    opened.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while bound.status_observation().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let requester = host
+        .frontend_for_generation_for_test(attachment.frontend)
+        .unwrap();
+    host.install_serving_for_test(requester);
+    host.status_page(requester, None, &[&bound]).unwrap();
+    let host_revision = host.status_revision();
+    let owner_revision = bound.status_revision();
+    scope.drain().await.unwrap();
+    let observed = bound.status_observation();
+    let page = host.status_page(requester, None, &[&bound]);
+    let unchanged =
+        host.status_revision() == host_revision && bound.status_revision() == owner_revision;
+    control.release_reads();
+    let cleanup = bound.close(&mut host, 100).await;
+    assert!(
+        unchanged,
+        "actual control stop did not call host/adapter mutation APIs"
+    );
+    assert_eq!(
+        observed,
+        Err(crate::session_owner::host_status::StatusError::Unavailable)
+    );
+    assert_eq!(
+        page,
+        Err(crate::session_owner::host_status::StatusError::Unavailable)
+    );
+    assert!(cleanup.is_ok());
 }
