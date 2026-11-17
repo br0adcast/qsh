@@ -157,6 +157,13 @@ impl LocalOwnerEngine {
         }
         Ok(frontend)
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn validate_attachment(
+        &self,
+        attachment: Attachment,
+    ) -> Result<(), LocalEngineError> {
+        self.frontend_for(attachment).map(|_| ())
+    }
     pub(crate) fn catalog(
         &self,
         attachment: Attachment,
