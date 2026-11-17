@@ -102,6 +102,197 @@ pub const CONTROL_GATE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The staged files' name prefix, next to the binary.
 pub(crate) const STAGED_PREFIX: &str = ".qshd-update-";
 
+/// How a replacement records its steps in the daemon log: `replacement
+/// step: <token>` as it reaches each one, and `replacement stopped: <token>`
+/// when it gives up short of a successful exec. The client that asked for
+/// the update was told `Restarting` before any of this, so the log is the
+/// only place that says how far an announced replacement got.
+pub(crate) const RESTART_STEP_LOG: &str = "replacement step: ";
+pub(crate) const RESTART_STOP_LOG: &str = "replacement stopped: ";
+
+/// The steps of [`StagedImage::restart`], in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestartStep {
+    Announced,
+    Joined,
+    JoinLate,
+    Drained,
+    DrainLate,
+    Fenced,
+    ControlGate,
+    Exec,
+}
+
+impl RestartStep {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 8] = [
+        Self::Announced,
+        Self::Joined,
+        Self::JoinLate,
+        Self::Drained,
+        Self::DrainLate,
+        Self::Fenced,
+        Self::ControlGate,
+        Self::Exec,
+    ];
+
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Announced => "announced",
+            Self::Joined => "joined",
+            Self::JoinLate => "join-late",
+            Self::Drained => "drained",
+            Self::DrainLate => "drain-late",
+            Self::Fenced => "fenced",
+            Self::ControlGate => "control-gate",
+            Self::Exec => "exec",
+        }
+    }
+}
+
+/// Why [`StagedImage::restart`] returned instead of replacing the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestartStop {
+    NoHandover,
+    Revoked,
+    CleanupPending,
+    FenceUnavailable,
+    IdentityExhausted,
+    CleanupUnproved,
+    ControlBusy,
+    ExecFailed,
+}
+
+impl RestartStop {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 8] = [
+        Self::NoHandover,
+        Self::Revoked,
+        Self::CleanupPending,
+        Self::FenceUnavailable,
+        Self::IdentityExhausted,
+        Self::CleanupUnproved,
+        Self::ControlBusy,
+        Self::ExecFailed,
+    ];
+
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::NoHandover => "no-handover",
+            Self::Revoked => "revoked",
+            Self::CleanupPending => "cleanup-pending",
+            Self::FenceUnavailable => "fence-unavailable",
+            Self::IdentityExhausted => "identity-exhausted",
+            Self::CleanupUnproved => "cleanup-unproved",
+            Self::ControlBusy => "control-busy",
+            Self::ExecFailed => "exec-failed",
+        }
+    }
+}
+
+/// The new image's first line once it runs ([`RESUMED_LOG`]), and its line
+/// when taking the handover fails ([`RESUME_FAILED_LOG`]).
+pub const RESUMED_LOG: &str = "resumed after an update";
+pub const RESUME_FAILED_LOG: &str = "transport-resume";
+
+fn restart_text(prefix: &str, token: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        format!("{prefix}{token}")
+    } else {
+        format!("{prefix}{token} -- {detail}")
+    }
+}
+
+/// One step line: the token, then what the step adds, if anything.
+fn restart_step(level: crate::log::Level, step: RestartStep, detail: &str) {
+    let text = restart_text(RESTART_STEP_LOG, step.token(), detail);
+    crate::log::record(level, "update", &text);
+}
+
+/// Logs why the replacement stopped and hands `result` back unchanged.
+fn restart_stopped(stop: RestartStop, result: UpdateResult) -> UpdateResult {
+    let detail = match &result {
+        UpdateResult::Rejected { detail, .. } => detail.as_str(),
+        _ => "",
+    };
+    let text = restart_text(RESTART_STOP_LOG, stop.token(), detail);
+    crate::log::warn("update", &text);
+    result
+}
+
+/// What a daemon log says about replacements, in closed values only: which
+/// steps were reached, the last one, the last stop, and whether a new image
+/// resumed or failed to. Nothing of a line beyond its token is kept.
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RestartLogFacts {
+    pub steps: Vec<&'static str>,
+    pub last_step: Option<&'static str>,
+    pub stopped: Option<&'static str>,
+    pub resumed: bool,
+    pub resume_failed: bool,
+    /// A replacement line whose token is none of the known ones.
+    pub unrecognized: bool,
+}
+
+#[cfg(test)]
+impl RestartLogFacts {
+    /// Reads `log` -- the daemon log's bytes, possibly cut anywhere -- line
+    /// by line. Only lines of the `update` component count.
+    pub(crate) fn parse(log: &[u8]) -> Self {
+        let mut facts = Self::default();
+        for line in log.split(|byte| *byte == b'\n') {
+            let Ok(line) = std::str::from_utf8(line) else {
+                continue;
+            };
+            let Some(text) = update_log_text(line) else {
+                continue;
+            };
+            if let Some(rest) = text.strip_prefix(RESTART_STEP_LOG) {
+                match RestartStep::ALL
+                    .into_iter()
+                    .find(|step| log_token(rest) == step.token())
+                {
+                    Some(step) => {
+                        if !facts.steps.contains(&step.token()) {
+                            facts.steps.push(step.token());
+                        }
+                        facts.last_step = Some(step.token());
+                    }
+                    None => facts.unrecognized = true,
+                }
+            } else if let Some(rest) = text.strip_prefix(RESTART_STOP_LOG) {
+                match RestartStop::ALL
+                    .into_iter()
+                    .find(|stop| log_token(rest) == stop.token())
+                {
+                    Some(stop) => facts.stopped = Some(stop.token()),
+                    None => facts.unrecognized = true,
+                }
+            } else if text.starts_with(RESUMED_LOG) {
+                facts.resumed = true;
+            } else if text.starts_with(RESUME_FAILED_LOG) {
+                facts.resume_failed = true;
+            }
+        }
+        facts
+    }
+}
+
+/// The message of one `update` log line, after its
+/// `<time> [<pid>] <level> update: ` header.
+#[cfg(test)]
+fn update_log_text(line: &str) -> Option<&str> {
+    let (_, after_pid) = line.split_once("] ")?;
+    let (_level, rest) = after_pid.split_once(' ')?;
+    rest.trim_start().strip_prefix("update: ")
+}
+
+#[cfg(test)]
+fn log_token(rest: &str) -> &str {
+    rest.split(' ').next().unwrap_or("")
+}
+
 /// Held for reading around every child the personal daemon spawns, and for
 /// writing through the exec window (see the module docs).
 static SPAWN_GATE: RwLock<()> = RwLock::new(());
@@ -919,28 +1110,31 @@ impl UpdateTransfer for StagedImage {
     /// else here: it sleeps, waits for locks and execs.
     fn restart(mut self: Box<Self>) -> UpdateResult {
         let Some(base) = self.handover.clone() else {
-            return UpdateResult::Rejected {
-                code: RejectCode::ExecFailed,
-                detail: "this daemon cannot hand itself over".to_string(),
-            };
+            return restart_stopped(
+                RestartStop::NoHandover,
+                UpdateResult::Rejected {
+                    code: RejectCode::ExecFailed,
+                    detail: "this daemon cannot hand itself over".to_string(),
+                },
+            );
         };
         // Closed already by the last count in `verify`, and kept closed to
         // the exec: no new session from here on (see the module docs).
         let Some(lease) = self.lease else {
-            return revoked_update();
+            return restart_stopped(RestartStop::Revoked, revoked_update());
         };
         {
             let Ok(state) = base.actions.state.lock() else {
-                return revoked_update();
+                return restart_stopped(RestartStop::Revoked, revoked_update());
             };
             if !state.owns_replacement(lease) {
-                return revoked_update();
+                return restart_stopped(RestartStop::Revoked, revoked_update());
             }
             base.admission.close();
             self.closed_admission = true;
         }
         if let Err(error) = self.cleanup_preflight() {
-            return error;
+            return restart_stopped(RestartStop::CleanupPending, error);
         }
         // Test only: inject a late arrival after the final favorable snapshot.
         #[cfg(test)]
@@ -952,18 +1146,21 @@ impl UpdateTransfer for StagedImage {
         }
         let (undo, restart) = {
             let Ok(state) = base.actions.state.lock() else {
-                return revoked_update();
+                return restart_stopped(RestartStop::Revoked, revoked_update());
             };
             if !state.owns_replacement(lease) {
-                return revoked_update();
+                return restart_stopped(RestartStop::Revoked, revoked_update());
             }
             let fence = match self.opens.begin_restart_fence() {
                 Ok(fence) => fence,
                 Err(_) => {
-                    return UpdateResult::Rejected {
-                        code: RejectCode::ExecFailed,
-                        detail: "channel opening could not be fenced".into(),
-                    }
+                    return restart_stopped(
+                        RestartStop::FenceUnavailable,
+                        UpdateResult::Rejected {
+                            code: RejectCode::ExecFailed,
+                            detail: "channel opening could not be fenced".into(),
+                        },
+                    )
                 }
             };
             let undo = UndoRestart {
@@ -979,13 +1176,17 @@ impl UpdateTransfer for StagedImage {
             match announced {
                 Ok(restart) => (undo, restart),
                 Err(_) => {
-                    return UpdateResult::Rejected {
-                        code: RejectCode::ExecFailed,
-                        detail: "restart identity exhausted".into(),
-                    }
+                    return restart_stopped(
+                        RestartStop::IdentityExhausted,
+                        UpdateResult::Rejected {
+                            code: RejectCode::ExecFailed,
+                            detail: "restart identity exhausted".into(),
+                        },
+                    )
                 }
             }
         };
+        restart_step(crate::log::Level::Info, RestartStep::Announced, "");
         // Only for the sessions to put `Restarting` on the wire: the
         // decision is made, and nobody is admitted meanwhile.
         std::thread::sleep(RESTART_GRACE);
@@ -994,25 +1195,31 @@ impl UpdateTransfer for StagedImage {
         // bound of its own; then every one that joined confirms, with the
         // whole drain budget: one stuck session must not use up the others'
         // time to reap.
-        if !self.restarts.wait_joined(restart, JOIN_TIMEOUT) {
-            crate::log::warn(
-                "update",
+        if self.restarts.wait_joined(restart, JOIN_TIMEOUT) {
+            restart_step(crate::log::Level::Info, RestartStep::Joined, "");
+        } else {
+            restart_step(
+                crate::log::Level::Warn,
+                RestartStep::JoinLate,
                 "not every session heard the restart in time; draining anyway",
             );
         }
         let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
         {
             let Ok(state) = base.actions.state.lock() else {
-                return revoked_update();
+                return restart_stopped(RestartStop::Revoked, revoked_update());
             };
             if !state.owns_replacement(lease) {
-                return revoked_update();
+                return restart_stopped(RestartStop::Revoked, revoked_update());
             }
             self.restarts.drain(restart);
         }
-        if !self.restarts.wait_drained_until(restart, drain_deadline) {
-            crate::log::warn(
-                "update",
+        if self.restarts.wait_drained_until(restart, drain_deadline) {
+            restart_step(crate::log::Level::Info, RestartStep::Drained, "");
+        } else {
+            restart_step(
+                crate::log::Level::Warn,
+                RestartStep::DrainLate,
                 &format!(
                     "not every session reaped its installed channels within {} s",
                     DRAIN_TIMEOUT.as_secs()
@@ -1024,11 +1231,15 @@ impl UpdateTransfer for StagedImage {
             .as_ref()
             .and_then(|fence| fence.wait_until(drain_deadline))
         else {
-            return UpdateResult::Rejected {
-                code: RejectCode::ExecFailed,
-                detail: "pending channel creation has not proved cleanup".into(),
-            };
+            return restart_stopped(
+                RestartStop::CleanupUnproved,
+                UpdateResult::Rejected {
+                    code: RejectCode::ExecFailed,
+                    detail: "pending channel creation has not proved cleanup".into(),
+                },
+            );
         };
+        restart_step(crate::log::Level::Info, RestartStep::Fenced, "");
         // No `ADD-CLIENT` between the allowlist snapshot and the exec: the
         // gate is taken here, after the drain -- a key added during the
         // drain is in the snapshot, and `STATUS` is answered throughout it
@@ -1036,24 +1247,28 @@ impl UpdateTransfer for StagedImage {
         // Bounded: a control client that never finishes must not keep the
         // daemon closed to every session.
         let Some(_control) = write_within(&base.control_gate, CONTROL_GATE_TIMEOUT) else {
-            let reason = format!(
-                "the control socket stayed busy for {} s",
-                CONTROL_GATE_TIMEOUT.as_secs()
+            return restart_stopped(
+                RestartStop::ControlBusy,
+                UpdateResult::Rejected {
+                    code: RejectCode::ControlBusy,
+                    detail: format!(
+                        "the control socket stayed busy for {} s",
+                        CONTROL_GATE_TIMEOUT.as_secs()
+                    ),
+                },
             );
-            crate::log::warn("update", &reason);
-            return UpdateResult::Rejected {
-                code: RejectCode::ControlBusy,
-                detail: reason,
-            };
         };
+        restart_step(crate::log::Level::Info, RestartStep::ControlGate, "");
         let reason = self.exec_with_handover(&base, &open_exec_permit);
         // Still here: the exec failed, and this daemon goes on as it was --
         // minus the channels it drained.
-        crate::log::warn("update", &reason);
-        UpdateResult::Rejected {
-            code: RejectCode::ExecFailed,
-            detail: reason,
-        }
+        restart_stopped(
+            RestartStop::ExecFailed,
+            UpdateResult::Rejected {
+                code: RejectCode::ExecFailed,
+                detail: reason,
+            },
+        )
     }
 }
 
@@ -1165,8 +1380,9 @@ impl StagedImage {
                 return format!("could not keep descriptor {fd} across exec: {e}");
             }
         }
-        crate::log::info(
-            "update",
+        restart_step(
+            crate::log::Level::Info,
+            RestartStep::Exec,
             &format!("replacing this process with build {}", self.offer.build),
         );
         let Some(lease) = self.lease else {
@@ -1344,6 +1560,7 @@ mod tests {
     include!("update_restart_bounds_tests.rs");
     include!("update_open_tests.rs");
     include!("update_scope_tests.rs");
+    include!("update_restart_log_tests.rs");
     use super::*;
     use crate::test_support::{fd_flags_lock, suppress_shell_history};
     use std::io::Read;
