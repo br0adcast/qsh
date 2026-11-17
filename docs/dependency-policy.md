@@ -90,6 +90,7 @@ exception. Remove obsolete entries rather than leaving broad ignores behind.
 | Exact finding | Rationale and required boundary | Follow-up/review |
 | --- | --- | --- |
 | RUSTSEC-2023-0071, rsa 0.10.0-rc.18, vulnerability | Local RSA preparation and signing use the qualified native backend without a RustCrypto private fallback, completed in #59/#121. Upstream formats/public verification and external signers remain separate boundaries. | #62; maintainer review by 2027-01-24 |
+| RUSTSEC-2026-0543, chrono 0.4.45, unmaintained | Transitive only: russh-sftp 3.0.1 uses chrono in `FileAttributes::from(&Metadata)` and `protocol::File::new`/`longname`, which the qsh SFTP upload (`RawSftpSession` init/open/write/close with explicit attributes) does not call; russh-util 0.52.0 depends on it only for wasm32. Not a vulnerability disposition; a new SFTP operation or callsite reopens it. | #618; maintainer review by 2027-02-17 |
 
 Review these entries on any related pin, callsite, startup-thread, native
 backend or advisory change, even before the date. Do not remove RSA support,
