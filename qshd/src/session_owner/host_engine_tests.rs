@@ -859,7 +859,7 @@ fn authorize(
     try_authorize(host, attempt, locator, now).unwrap()
 }
 
-async fn recover_bound_data(
+pub(in crate::session_owner) async fn recover_bound_data(
     bound: &LocalOwnerEngine,
     attachment: transport::session_resume::Attachment,
     channel: transport::channel_geometry::ChannelInstance,

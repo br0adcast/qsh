@@ -65,3 +65,7 @@ pub(crate) mod supervisor;
 
 #[allow(dead_code)] // No actual serving/listener receipt producer is activated.
 pub(crate) mod host_status;
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // Dormant checked Linux route; no process runtime is activated.
+pub(crate) mod linux;

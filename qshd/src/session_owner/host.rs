@@ -319,6 +319,32 @@ impl HostState {
         }
         Ok(())
     }
+    /// Admit a route using the current sealed account and actual catalog binding.
+    #[cfg(target_os = "linux")]
+    pub(super) fn authorize_linux_route(
+        &self,
+        binding: &Arc<LocalBinding>,
+        frontend: FrontendAdmission,
+        attempt: AuthenticationAttempt,
+        attachment: Attachment,
+    ) -> Result<HostMode, HostError> {
+        self.ensure_running()?;
+        self.validate_local_binding(binding)?;
+        let (account, actual_frontend) = self.authorization.identity(attempt)?;
+        if actual_frontend != frontend
+            || !self.frontend_is_current(frontend)
+            || attachment.frontend != frontend.generation()
+            || attachment.locator != binding.identity.locator
+            || !self.catalog.iter().any(|entry| {
+                entry.locator == attachment.locator
+                    && entry.account == *account
+                    && entry.cleanup_operation.is_none()
+            })
+        {
+            return Err(HostError::Refused);
+        }
+        Ok(self.mode)
+    }
     pub(super) fn consume_local_authority(
         &self,
         binding: &Arc<LocalBinding>,

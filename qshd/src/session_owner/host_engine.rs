@@ -59,7 +59,7 @@ pub(super) enum LocalLeasePhase {
     Complete,
 }
 #[derive(Debug)]
-pub(super) struct LocalBinding {
+pub(crate) struct LocalBinding {
     pub(super) identity: HostResourceBinding,
     pub(super) phase: Mutex<LocalLeasePhase>,
 }
@@ -157,6 +157,13 @@ impl LocalOwnerEngine {
         }
         Ok(frontend)
     }
+    #[cfg(target_os = "linux")]
+    pub(super) fn validate_attachment(
+        &self,
+        attachment: Attachment,
+    ) -> Result<(), LocalEngineError> {
+        self.frontend_for(attachment).map(|_| ())
+    }
     pub(crate) fn catalog(
         &self,
         attachment: Attachment,
@@ -236,6 +243,31 @@ impl LocalOwnerEngine {
             return Err(EngineError::StaleAttachment.into());
         }
         self.begin_detach(host)
+    }
+    /// Latch destruction before an asynchronous close can be cancelled unpolled.
+    /// This exact attachment loses writer authority immediately; only retained
+    /// host cleanup may advance Closing afterwards.
+    #[cfg(target_os = "linux")]
+    pub(super) fn begin_terminate(
+        &mut self,
+        host: &HostState,
+        attachment: Attachment,
+    ) -> Result<(), LocalEngineError> {
+        host.ensure_running()?;
+        host.validate_local_binding(&self.binding)?;
+        self.frontend_for(attachment)?;
+        let mut phase = self
+            .binding
+            .phase
+            .lock()
+            .map_err(|_| LocalEngineError::Binding)?;
+        if *phase != LocalLeasePhase::Attached(attachment) {
+            return Err(LocalEngineError::Binding);
+        }
+        *phase = LocalLeasePhase::Closing;
+        drop(phase);
+        self.note_status_mutation();
+        Ok(())
     }
     pub(crate) async fn close_from_frontend(
         &mut self,
@@ -604,4 +636,4 @@ impl HostState {
 }
 #[cfg(test)]
 #[path = "host_engine_tests.rs"]
-mod tests;
+pub(super) mod tests;
