@@ -27,6 +27,15 @@ pub(crate) struct LinuxOwnerRoute {
     frontend: FrontendAdmission,
     attempt: AuthenticationAttempt,
     attachment: Attachment,
+    operation: Operation,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Operation {
+    Ready,
+    Detaching,
+    Detached,
+    Terminating,
+    Terminated,
 }
 impl LinuxOwnerRoute {
     pub(crate) fn bind_personal(
@@ -47,7 +56,95 @@ impl LinuxOwnerRoute {
             frontend,
             attempt,
             attachment,
+            operation: Operation::Ready,
         })
+    }
+    fn destination(
+        &self,
+        host: &HostState,
+        owner: &LocalOwnerEngine,
+    ) -> Result<(), LinuxOwnerError> {
+        if host.instance() != self.binding.identity.host
+            || !Arc::ptr_eq(&self.binding, owner.supervision_binding())
+        {
+            return Err(LinuxOwnerError::Refused);
+        }
+        Ok(())
+    }
+    fn current(&self, host: &HostState, owner: &LocalOwnerEngine) -> Result<(), LinuxOwnerError> {
+        self.destination(host, owner)?;
+        host.authorize_linux_route(&self.binding, self.frontend, self.attempt, self.attachment)?;
+        owner.validate_attachment(self.attachment)?;
+        Ok(())
+    }
+    pub(crate) fn begin_detach(
+        &mut self,
+        host: &mut HostState,
+        owner: &mut LocalOwnerEngine,
+    ) -> Result<(), LinuxOwnerError> {
+        self.destination(host, owner)?;
+        if self.operation == Operation::Detaching {
+            return Ok(());
+        }
+        if self.operation != Operation::Ready {
+            return Err(LinuxOwnerError::Refused);
+        }
+        self.current(host, owner)?;
+        owner.frontend_lost(host, self.attachment)?;
+        self.operation = Operation::Detaching;
+        Ok(())
+    }
+    pub(crate) async fn finish_detach(
+        &mut self,
+        host: &mut HostState,
+        owner: &mut LocalOwnerEngine,
+    ) -> Result<(), LinuxOwnerError> {
+        self.destination(host, owner)?;
+        if self.operation == Operation::Detached {
+            return Ok(());
+        }
+        if self.operation != Operation::Detaching
+            || owner.supervision_attachment() != Some(self.attachment)
+        {
+            return Err(LinuxOwnerError::Refused);
+        }
+        owner.finish_detach(host).await?;
+        self.operation = Operation::Detached;
+        Ok(())
+    }
+    pub(crate) fn begin_terminate(
+        &mut self,
+        host: &mut HostState,
+        owner: &mut LocalOwnerEngine,
+    ) -> Result<(), LinuxOwnerError> {
+        self.destination(host, owner)?;
+        if self.operation == Operation::Terminating {
+            return Ok(());
+        }
+        if self.operation != Operation::Ready {
+            return Err(LinuxOwnerError::Refused);
+        }
+        self.current(host, owner)?;
+        owner.begin_terminate(host, self.attachment)?;
+        self.operation = Operation::Terminating;
+        Ok(())
+    }
+    pub(crate) async fn finish_terminate(
+        &mut self,
+        host: &mut HostState,
+        owner: &mut LocalOwnerEngine,
+        now: u64,
+    ) -> Result<(), LinuxOwnerError> {
+        self.destination(host, owner)?;
+        if self.operation == Operation::Terminated {
+            return Ok(());
+        }
+        if self.operation != Operation::Terminating {
+            return Err(LinuxOwnerError::Refused);
+        }
+        owner.close(host, now).await?;
+        self.operation = Operation::Terminated;
+        Ok(())
     }
 }
 #[cfg(test)]

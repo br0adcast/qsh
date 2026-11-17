@@ -175,3 +175,274 @@ fn linux529_route_refuses_foreign_host_attempt_frontend_owner_and_mode_without_m
         LinuxOwnerRoute::bind_personal(&system, &owner, frontend, attempt, attachment).is_err()
     );
 }
+
+#[test]
+fn linux529_route_rejects_equal_visible_but_foreign_binding() {
+    let (host, owner, frontend, attempt, attachment, _restart) = attached(PERSONAL);
+    let actual = owner.supervision_binding();
+    let forged = std::sync::Arc::new(crate::session_owner::host_engine::LocalBinding {
+        identity: actual.identity,
+        phase: std::sync::Mutex::new(
+            crate::session_owner::host_engine::LocalLeasePhase::Attached(attachment),
+        ),
+    });
+    assert!(host
+        .authorize_linux_route(&forged, frontend, attempt, attachment)
+        .is_err());
+    assert!(LinuxOwnerRoute::bind_personal(&host, &owner, frontend, attempt, attachment).is_ok());
+}
+
+#[tokio::test]
+async fn linux529_detach_finishes_after_auth_retirement_without_completion_and_cannot_close_successor(
+) {
+    let (mut host, mut owner, frontend, attempt, first, _restart) = attached(PERSONAL);
+    let mut route =
+        LinuxOwnerRoute::bind_personal(&host, &owner, frontend, attempt, first).unwrap();
+    let mut competing =
+        LinuxOwnerRoute::bind_personal(&host, &owner, frontend, attempt, first).unwrap();
+    route.begin_detach(&mut host, &mut owner).unwrap();
+    route.begin_detach(&mut host, &mut owner).unwrap();
+    assert!(route.begin_terminate(&mut host, &mut owner).is_err());
+    assert!(competing.begin_terminate(&mut host, &mut owner).is_err());
+    host.retire_frontend(frontend).unwrap();
+    route.finish_detach(&mut host, &mut owner).await.unwrap();
+    route.finish_detach(&mut host, &mut owner).await.unwrap();
+    assert_eq!(host.catalog_len(), 1);
+    assert!(!owner.supervision_complete());
+    let (fresh_frontend, fresh_attempt) =
+        authenticate(&mut host, PERSONAL, 1000, "fixture-account", 7);
+    let authorized = authorize(&mut host, fresh_attempt, first.locator, 9);
+    let second = owner.attach(&mut host, authorized).unwrap();
+    assert!(route.begin_terminate(&mut host, &mut owner).is_err());
+    assert!(competing.begin_terminate(&mut host, &mut owner).is_err());
+    assert!(owner
+        .close_from_frontend(&mut host, first, 14)
+        .await
+        .is_err());
+    assert!(
+        LinuxOwnerRoute::bind_personal(&host, &owner, fresh_frontend, fresh_attempt, second)
+            .is_ok()
+    );
+    assert_eq!(host.catalog_len(), 1);
+}
+
+#[tokio::test]
+async fn linux529_termination_latches_shared_exclusion_and_survives_requester_retirement() {
+    let (mut host, mut owner, frontend, attempt, attachment, _restart) = attached(PERSONAL);
+    let mut terminate =
+        LinuxOwnerRoute::bind_personal(&host, &owner, frontend, attempt, attachment).unwrap();
+    let mut competing =
+        LinuxOwnerRoute::bind_personal(&host, &owner, frontend, attempt, attachment).unwrap();
+    terminate.begin_terminate(&mut host, &mut owner).unwrap();
+    assert!(competing.begin_detach(&mut host, &mut owner).is_err());
+    assert!(competing.begin_terminate(&mut host, &mut owner).is_err());
+    assert!(terminate.begin_detach(&mut host, &mut owner).is_err());
+    host.retire_frontend(frontend).unwrap();
+    terminate
+        .finish_terminate(&mut host, &mut owner, 7)
+        .await
+        .unwrap();
+    terminate
+        .finish_terminate(&mut host, &mut owner, 8)
+        .await
+        .unwrap();
+    assert!(owner.supervision_complete());
+    assert_eq!(host.catalog_len(), 0);
+    assert!(terminate.begin_terminate(&mut host, &mut owner).is_err());
+}
+
+async fn controlled() -> (
+    HostState,
+    LocalOwnerEngine,
+    FrontendAdmission,
+    AuthenticationAttempt,
+    Attachment,
+    tokio::sync::watch::Sender<transport::channel_server::RestartSignal>,
+    crate::session_owner::engine::tests::integrated::HostFixtureControl,
+) {
+    use crate::session_owner::owner_resource_contract::OwnerResourceRequest;
+    use crate::session_owner::resource_contract::ReservationKind;
+    use transport::channel::{ChannelKind, OpenRequest};
+    use transport::channel_geometry::ChannelInstance;
+    use transport::session_resume::{InputEpoch, RequestId};
+    let mut host = host(PERSONAL);
+    let (frontend, attempt) = authenticate(&mut host, PERSONAL, 1000, "fixture-account", 0);
+    let (locator, provisioning) = host.create_session_provisioned(attempt, 2).unwrap();
+    let (engine, restart, control) =
+        crate::session_owner::engine::tests::integrated::host_fixture_controlled(
+            locator,
+            provisioning.client(),
+        );
+    let mut owner = host
+        .bind_local_engine(provisioning, engine)
+        .unwrap_or_else(|_| panic!("binding refused"));
+    let authorized = authorize(&mut host, attempt, locator, 3);
+    let attachment = owner.attach(&mut host, authorized).unwrap();
+    let channel = ChannelInstance::new(1).unwrap();
+    let request = |kind, bytes| OwnerResourceRequest {
+        locator,
+        channel,
+        kind,
+        bytes,
+        screen_charge: None,
+    };
+    let supplied = owner
+        .provision_channel_resources(
+            &host,
+            attachment,
+            (
+                request(ReservationKind::OutputHistory, 4096),
+                request(ReservationKind::ControlQueue, 131072),
+            ),
+            RequestId::new(50).unwrap(),
+            128,
+            InputEpoch::new([99; 16]).unwrap(),
+        )
+        .unwrap();
+    owner
+        .open_admitted(
+            &mut host,
+            OpenRequest {
+                stream: 16,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            },
+            None,
+            supplied,
+        )
+        .await
+        .unwrap();
+    (host, owner, frontend, attempt, attachment, restart, control)
+}
+
+#[tokio::test]
+async fn linux529_actual_partial_write_fence_survives_cancellation_and_stale_route_cannot_mutate_successor(
+) {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+    use transport::channel_geometry::{ChannelInstance, ResizeRequestId};
+    use transport::session_resume::InputEpoch;
+    let (mut host, mut owner, frontend, attempt, first, _restart, control) = controlled().await;
+    let channel = ChannelInstance::new(1).unwrap();
+    let epoch = InputEpoch::new([99; 16]).unwrap();
+    let mut route =
+        LinuxOwnerRoute::bind_personal(&host, &owner, frontend, attempt, first).unwrap();
+    let exercised = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let consumer = crate::session_owner::host_engine::tests::recover_bound_data(
+            &owner, first, channel, 60,
+        )
+        .await
+        .unwrap();
+        control.hold_writes();
+        owner
+            .user_input(first, channel, epoch, 0, b"abcd")
+            .unwrap()
+            .accepted()
+            .await
+            .unwrap();
+        while !control.write_entered() {
+            tokio::task::yield_now().await;
+        }
+        route.begin_detach(&mut host, &mut owner).unwrap();
+        let pending = {
+            let finish = route.finish_detach(&mut host, &mut owner);
+            tokio::pin!(finish);
+            finish
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        };
+        control.release_writes();
+        route.finish_detach(&mut host, &mut owner).await.unwrap();
+        assert!(pending);
+        assert_eq!(control.written(), b"ab");
+        assert!(!owner.supervision_complete());
+        assert!(host.resource_reservations_for_test() > 0);
+        assert!(owner.user_input(first, channel, epoch, 4, b"x").is_err());
+        assert!(owner
+            .resize(first, channel, ResizeRequestId::new(1).unwrap(), 90, 30)
+            .is_err());
+        let authorized = authorize(&mut host, attempt, first.locator, 8);
+        let second = owner.attach(&mut host, authorized).unwrap();
+        let fresh_consumer = crate::session_owner::host_engine::tests::recover_bound_data(
+            &owner, second, channel, 80,
+        )
+        .await
+        .unwrap();
+        assert!(route.begin_terminate(&mut host, &mut owner).is_err());
+        assert!(owner
+            .close_from_frontend(&mut host, first, 12)
+            .await
+            .is_err());
+        owner
+            .user_input(second, channel, epoch, 4, b"ef")
+            .unwrap()
+            .accepted()
+            .await
+            .unwrap();
+        owner.begin_detach(&mut host).unwrap();
+        owner.finish_detach(&mut host).await.unwrap();
+        drop((consumer, fresh_consumer));
+    })
+    .await;
+    control.release_writes();
+    owner.close(&mut host, 13).await.unwrap();
+    assert!(exercised.is_ok());
+    assert_eq!(host.resource_reservations_for_test(), 0);
+}
+
+#[tokio::test]
+async fn linux529_cancelled_termination_retains_exact_real_cleanup_and_foreign_destinations_untouched(
+) {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+    let (mut host, mut owner, frontend, attempt, attachment, _restart, control) =
+        controlled().await;
+    control.gate_exit(16, Some(3), true);
+    let mut route =
+        LinuxOwnerRoute::bind_personal(&host, &owner, frontend, attempt, attachment).unwrap();
+    route.begin_terminate(&mut host, &mut owner).unwrap();
+    let (mut foreign_host, mut foreign_owner, _, _, _, _foreign_restart) = attached(PERSONAL);
+    assert!(route
+        .finish_terminate(&mut foreign_host, &mut foreign_owner, 7)
+        .await
+        .is_err());
+    assert!(!foreign_owner.supervision_complete());
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let result = {
+                let close = route.finish_terminate(&mut host, &mut owner, 7);
+                tokio::pin!(close);
+                close.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            };
+            assert!(result.is_pending());
+            if control.held_exit_polls(16) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let operation = host.cleanup_operation_for_test(attachment.locator);
+    let charged = host.resource_reservations_for_test();
+    host.retire_frontend(frontend).unwrap();
+    control.release_exit(16);
+    let completed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        route.finish_terminate(&mut host, &mut owner, 8),
+    )
+    .await;
+    assert!(pending.is_ok());
+    assert!(operation.is_some());
+    assert!(charged > 0);
+    completed.unwrap().unwrap();
+    assert_eq!(control.reaps(16), 1);
+    assert_eq!(host.resource_reservations_for_test(), 0);
+    assert_eq!(
+        host.cleanup_operation_for_test(attachment.locator),
+        operation
+    );
+}
