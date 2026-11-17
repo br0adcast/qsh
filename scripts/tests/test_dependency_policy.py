@@ -73,7 +73,7 @@ class AdvisoryGateTests(unittest.TestCase):
                     self.gate.load_exceptions(path, self.today)
 
     def test_ignore_scope_requires_every_locked_version_to_match(self):
-        packages = [{'name': 'rsa', 'version': '0.10.0-rc.18'}]
+        packages = [{'name': 'rsa', 'version': '0.10.0-rc.18'}, {'name': 'chrono', 'version': '0.4.45'}]
         self.gate.validate_exception_versions(self.exceptions, packages)
         for changed in [packages[1:], packages + [{'name': 'rsa', 'version': '0.10.0-rc.19'}],
                         [dict(packages[0], version='0.10.0-rc.19')]]:
