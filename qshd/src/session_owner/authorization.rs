@@ -229,6 +229,9 @@ impl AuthorizationState {
         self.last_now = now;
         Ok(())
     }
+    pub(super) fn frontend_is_current(&self, frontend: FrontendAdmission) -> bool {
+        !self.sealed && self.frontends.contains(&frontend)
+    }
     pub(super) fn admit_frontend(
         &mut self,
         peer: AuthenticatedPeer,

@@ -74,6 +74,11 @@ enum WaitState {
     Unknown,
 }
 struct Capsule {
+    instance: transport::session_resume::HostInstance,
+    registration: Option<(
+        super::authorization::FrontendAdmission,
+        Arc<super::host::SupervisionClaim>,
+    )>,
     control: Arc<Control>,
     deadline: LaunchDeadline,
     progress: LaunchProgress,
@@ -352,6 +357,79 @@ impl Capsule {
     }
 }
 
+/// An exact capsule identity, not a serving or cleanup receipt.
+#[derive(Clone)]
+pub(super) struct CapsuleIdentity {
+    control: Arc<Control>,
+    instance: transport::session_resume::HostInstance,
+    frontend: super::authorization::FrontendAdmission,
+    claim: Arc<super::host::SupervisionClaim>,
+}
+impl std::fmt::Debug for CapsuleIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapsuleIdentity").finish_non_exhaustive()
+    }
+}
+impl CapsuleIdentity {
+    pub(super) fn frontend(&self) -> super::authorization::FrontendAdmission {
+        self.frontend
+    }
+    pub(super) fn instance(&self) -> transport::session_resume::HostInstance {
+        self.instance
+    }
+    pub(super) fn claim(&self) -> &Arc<super::host::SupervisionClaim> {
+        &self.claim
+    }
+    pub(super) fn same(&self, other: &Self) -> bool {
+        self.instance == other.instance
+            && self.frontend == other.frontend
+            && Arc::ptr_eq(&self.control, &other.control)
+            && Arc::ptr_eq(&self.claim, &other.claim)
+    }
+}
+/// Minted only from Capsule's actual settled physical state. It is not a frame.
+pub(super) struct FrontendSettlement {
+    identity: CapsuleIdentity,
+}
+impl FrontendSettlement {
+    pub(super) fn identity(&self) -> &CapsuleIdentity {
+        &self.identity
+    }
+}
+
+/// Immutable observations minted only while holding the actual retained Capsule.
+pub(super) struct LaunchObservation {
+    identity: Arc<Control>,
+    instance: transport::session_resume::HostInstance,
+    progress: LaunchProgress,
+    eof: bool,
+    terminal: bool,
+    lost: bool,
+    settlement: Option<FrontendSettlement>,
+}
+impl LaunchObservation {
+    pub(super) fn matches(&self, identity: &CapsuleIdentity) -> bool {
+        Arc::ptr_eq(&self.identity, &identity.control)
+    }
+    pub(super) fn instance(&self) -> transport::session_resume::HostInstance {
+        self.instance
+    }
+    pub(super) fn progress(&self) -> LaunchProgress {
+        self.progress
+    }
+    pub(super) fn eof(&self) -> bool {
+        self.eof
+    }
+    pub(super) fn terminal(&self) -> bool {
+        self.terminal
+    }
+    pub(super) fn lost(&self) -> bool {
+        self.lost
+    }
+    pub(super) fn take_settlement(&mut self) -> Option<FrontendSettlement> {
+        self.settlement.take()
+    }
+}
 pub(crate) struct FrontendLaunches {
     limit: usize,
     budget: AdmissionBudget,
@@ -451,6 +529,8 @@ impl FrontendLaunches {
             logical: AtomicU8::new(0),
         });
         let capsule = Arc::new(Mutex::new(Capsule {
+            instance: config.host,
+            registration: None,
             control: Arc::clone(&control),
             deadline,
             progress: LaunchProgress::Preparing,
@@ -709,6 +789,87 @@ impl FrontendLaunches {
             }
         }
     }
+    pub(super) fn take_host_dispatch(
+        &mut self,
+        handle: &LaunchHandle,
+        host: &mut super::host::HostState,
+        claim: &Arc<super::host::SupervisionClaim>,
+        mode: super::authorization::HostMode,
+        limit: usize,
+    ) -> Result<(super::local_channel::HostDispatchChannel, CapsuleIdentity), AdmissionError> {
+        if !host.supervision_is_current(claim)
+            || host.ensure_running().is_err()
+            || !(1..=super::protocol::MAX_OWNER_REQUESTS).contains(&limit)
+        {
+            return Err(AdmissionError::Refused);
+        }
+        let capsule = self.find(handle).ok_or(AdmissionError::Refused)?;
+        let mut c = capsule.lock().map_err(|_| AdmissionError::Unavailable)?;
+        // A duplicate or foreign handoff must not retire the existing capsule.
+        if c.instance != host.instance() || c.registration.is_some() {
+            return Err(AdmissionError::Refused);
+        }
+        if c.poll() != LaunchProgress::Admitted || c.cancelled() {
+            return Err(AdmissionError::Refused);
+        }
+        let admitted = c.admitted.take().ok_or(AdmissionError::Refused)?;
+        let dispatch = match admitted.into_host_dispatch(host, mode, limit) {
+            Ok(dispatch) => dispatch,
+            Err(_) => {
+                c.retire();
+                return Err(AdmissionError::Refused);
+            }
+        };
+        let frontend = dispatch.frontend();
+        c.registration = Some((frontend, claim.clone()));
+        let identity = CapsuleIdentity {
+            control: c.control.clone(),
+            instance: c.instance,
+            frontend,
+            claim: claim.clone(),
+        };
+        if host.pin_frontend_custody(&identity).is_err() {
+            let _ = host.retire_frontend(frontend);
+            drop(dispatch);
+            c.retire();
+            return Err(AdmissionError::Unavailable);
+        }
+        Ok((dispatch, identity))
+    }
+    pub(super) fn observe(
+        &mut self,
+        handle: &LaunchHandle,
+    ) -> Result<LaunchObservation, AdmissionError> {
+        let capsule = self.find(handle).ok_or(AdmissionError::Refused)?;
+        let mut c = capsule.lock().map_err(|_| AdmissionError::Unavailable)?;
+        let progress = c.poll();
+        let settlement = if progress == LaunchProgress::Settled {
+            c.registration
+                .as_ref()
+                .map(|(frontend, claim)| FrontendSettlement {
+                    identity: CapsuleIdentity {
+                        control: c.control.clone(),
+                        instance: c.instance,
+                        frontend: *frontend,
+                        claim: claim.clone(),
+                    },
+                })
+        } else {
+            None
+        };
+        Ok(LaunchObservation {
+            identity: c.control.clone(),
+            instance: c.instance,
+            progress,
+            settlement,
+            eof: c.eof,
+            terminal: c.wait == WaitState::Terminal,
+            lost: c.cancelled()
+                || c.eof
+                || matches!(c.wait, WaitState::Terminal | WaitState::Unknown)
+                || c.unknown,
+        })
+    }
     pub(crate) fn poll(&mut self, handle: &LaunchHandle) -> LaunchProgress {
         let Some(capsule) = self.find(handle) else {
             return LaunchProgress::Unknown;
@@ -756,7 +917,7 @@ fn qualify_sigchld() -> Result<(), AdmissionError> {
 }
 
 #[cfg(test)]
-struct TestProgram {
+pub(super) struct TestProgram {
     executable: std::path::PathBuf,
     args: Vec<std::ffi::OsString>,
     environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
@@ -765,6 +926,95 @@ struct TestProgram {
 
 #[cfg(test)]
 impl FrontendLaunches {
+    pub(super) fn set_program_for_test(
+        &mut self,
+        program: TestProgram,
+    ) -> Result<(), AdmissionError> {
+        if !self.slots.is_empty() {
+            return Err(AdmissionError::Refused);
+        }
+        self.program = Some(program);
+        Ok(())
+    }
+    /// No OS child or FD is created. This exercises only retained receipt ordering.
+    pub(super) fn model_capsule(
+        &mut self,
+        instance: transport::session_resume::HostInstance,
+    ) -> Result<LaunchHandle, AdmissionError> {
+        self.slots.retain(|slot| {
+            slot.lock()
+                .map(|c| c.progress != LaunchProgress::Settled)
+                .unwrap_or(true)
+        });
+        if self.slots.len() >= self.limit {
+            return Err(AdmissionError::Capacity);
+        }
+        let control = Arc::new(Control {
+            logical: AtomicU8::new(1),
+        });
+        let capsule = Arc::new(Mutex::new(Capsule {
+            instance,
+            registration: None,
+            control: control.clone(),
+            deadline: LaunchDeadline::new(Instant::now() + std::time::Duration::from_secs(10))?,
+            progress: LaunchProgress::Admitted,
+            started: true,
+            export: ExportDisposition::Owned,
+            setup_allocated: false,
+            host: None,
+            admitted: None,
+            frontend: None,
+            setup: None,
+            setup_child: None,
+            duplicates: [None, None],
+            remote: None,
+            record: [0; record::RECORD_LEN],
+            child: None,
+            status: None,
+            output: None,
+            errors: None,
+            wait: WaitState::Pending,
+            eof: false,
+            unknown: false,
+            kill_attempted: false,
+            write_shutdown: false,
+            quarantine: None,
+            modeled_child: true,
+            interrupt_setup_read: false,
+            setup_read_fault: None,
+            setup_shutdown_fault: None,
+            setup_shutdown_calls: 0,
+            first_unknown: None,
+            first_rejection: None,
+        }));
+        self.slots.push(capsule);
+        Ok(LaunchHandle { control })
+    }
+    pub(super) fn model_registration(
+        &mut self,
+        handle: &LaunchHandle,
+        frontend: super::authorization::FrontendAdmission,
+        claim: Arc<super::host::SupervisionClaim>,
+    ) -> CapsuleIdentity {
+        let capsule = self.find(handle).unwrap();
+        let mut c = capsule.lock().unwrap();
+        assert!(
+            c.modeled_child && c.child.is_none() && c.setup.is_none() && c.registration.is_none()
+        );
+        c.registration = Some((frontend, claim.clone()));
+        CapsuleIdentity {
+            control: c.control.clone(),
+            instance: c.instance,
+            frontend,
+            claim,
+        }
+    }
+    pub(super) fn model_eof(&mut self, handle: &LaunchHandle) {
+        let capsule = self.find(handle).unwrap();
+        let mut c = capsule.lock().unwrap();
+        assert!(c.modeled_child && c.child.is_none() && c.setup.is_none());
+        c.eof = true;
+    }
     fn test_expire(&mut self, h: &LaunchHandle) {
         let capsule = self.find(h).unwrap();
         let mut c = capsule.lock().unwrap();
@@ -782,7 +1032,7 @@ impl FrontendLaunches {
     fn test_publish(&mut self, h: &LaunchHandle) -> bool {
         self.find(h).unwrap().lock().unwrap().publish()
     }
-    fn test_wait(&mut self, h: &LaunchHandle, lost: bool) {
+    pub(super) fn test_wait(&mut self, h: &LaunchHandle, lost: bool) {
         let c = self.find(h).unwrap();
         let mut c = c.lock().unwrap();
         assert!(c.modeled_child && c.child.is_none());

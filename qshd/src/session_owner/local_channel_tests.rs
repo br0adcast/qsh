@@ -633,8 +633,10 @@ fn authdispatch529_drop_closes_owned_fd_without_refunding_host_registration() {
     for _ in 0..2 {
         let (peer, channel) = admitted(cfg, &budget);
         let dispatch = channel.into_host_dispatch(&mut host, mode, 2).unwrap();
-        retained.push(dispatch.frontend());
+        let frontend = dispatch.frontend();
+        retained.push(frontend);
         drop(dispatch);
+        assert!(host.frontend_is_current(frontend));
         let socket = stream(peer.custody.fd.as_ref().unwrap());
         assert_eq!((&*socket).read(&mut [0; 1]).unwrap(), 0);
         drop((socket, peer));
@@ -646,13 +648,16 @@ fn authdispatch529_drop_closes_owned_fd_without_refunding_host_registration() {
     assert_eq!(budget.in_use(), 0);
     for frontend in retained {
         host.retire_frontend(frontend).unwrap();
+        assert!(!host.frontend_is_current(frontend));
     }
     let (peer, channel) = admitted(cfg, &budget);
-    channel
-        .into_host_dispatch(&mut host, mode, 2)
-        .unwrap()
-        .retire(&mut host)
-        .unwrap();
+    // Logical retirement cannot settle unassociated export/child custody.
+    // Same-host capacity reuse is proved by the real inherited Capsule case.
+    assert_eq!(host.frontend_obligations_for_test(), 2);
+    assert!(matches!(
+        channel.into_host_dispatch(&mut host, mode, 2),
+        Err(crate::session_owner::host::HostError::Capacity)
+    ));
     drop(peer);
     assert_eq!(budget.in_use(), 0);
 }

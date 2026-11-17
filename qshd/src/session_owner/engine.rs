@@ -165,6 +165,14 @@ pub(crate) struct AdmittedOwnerChannelResources {
     input_epoch: InputEpoch,
 }
 impl AdmittedOwnerChannelResources {
+    #[cfg(test)]
+    pub(super) fn descriptions(&self) -> (Reservation, Reservation) {
+        (self.history.reservation(), self.control.reservation())
+    }
+    #[cfg(test)]
+    pub(super) fn split_for_test(self) -> (AdmittedReservation, AdmittedReservation) {
+        (self.history, self.control)
+    }
     pub(crate) fn new(
         history: AdmittedReservation,
         control: AdmittedReservation,
@@ -271,12 +279,17 @@ impl LocalEstablishment {
     }
 }
 pub(super) struct LocalCompletion {
+    build: Option<super::status_contract::BuildIdentity>,
+    total_channels: Option<u16>,
     binding: Weak<super::host_engine::LocalBinding>,
     locator: SessionLocator,
     client: OwnerResourceClient,
     facts: Vec<super::host::CompletedChannelFact>,
 }
 impl LocalCompletion {
+    pub(super) fn final_status(&self) -> Option<(super::status_contract::BuildIdentity, u16)> {
+        Some((self.build.clone()?, self.total_channels?))
+    }
     pub(super) fn matches(
         &self,
         binding: &Arc<super::host_engine::LocalBinding>,
@@ -319,15 +332,18 @@ pub struct SessionOwnerEngine {
     control_failed: bool,
     ever_established: bool,
     local_binding: Option<Weak<super::host_engine::LocalBinding>>,
+    local_build: Option<super::status_contract::BuildIdentity>,
     local_establishment: Option<LocalEstablishment>,
     local_completion: Option<LocalCompletion>,
     close_facts: Option<Vec<super::host::CompletedChannelFact>>,
+    close_total_channels: Option<u16>,
     cleanup_complete: bool,
     facts_captured: bool,
 }
 impl SessionOwnerEngine {
     pub(super) fn bind_local_binding(&mut self, binding: &Arc<super::host_engine::LocalBinding>) {
         self.local_binding = Some(Arc::downgrade(binding));
+        self.local_build = super::host_status::resident_build_identity().ok();
     }
     pub(super) fn take_local_establishment(&mut self) -> Option<LocalEstablishment> {
         self.local_establishment.take()
@@ -396,9 +412,11 @@ impl SessionOwnerEngine {
             control_failed: false,
             ever_established: false,
             local_binding: None,
+            local_build: None,
             local_establishment: None,
             local_completion: None,
             close_facts: None,
+            close_total_channels: None,
             cleanup_complete: false,
             facts_captured: false,
         })
@@ -631,6 +649,39 @@ impl SessionOwnerEngine {
             shared: self.leases.clone(),
             attachment: frontend.attachment,
             tickets,
+        })
+    }
+    pub(super) fn status_observation(
+        &self,
+    ) -> Result<super::status_contract::OwnerStatus, super::host_status::StatusError> {
+        use super::host_status::StatusError;
+        // All live true predicates become false irreversibly unless mutable
+        // installation changes the engine revision. Failed or unobserved live
+        // channels are unavailable, never an invented zero active count.
+        if self.control_failed
+            || self
+                .control_ticket
+                .as_ref()
+                .is_some_and(|ticket| !ticket.healthy())
+            || self.channels.values().any(|channel| {
+                !channel.installed
+                    || !self.retained.catalog_active(channel.instance)
+                    || !channel.writer.can_catalog()
+            })
+        {
+            return Err(StatusError::Unavailable);
+        }
+        let count = u8::try_from(self.channels.len()).map_err(|_| StatusError::Unavailable)?;
+        Ok(super::status_contract::OwnerStatus {
+            locator: self.locator,
+            build: self.local_build.clone().ok_or(StatusError::Unavailable)?,
+            ipc: super::status_contract::IpcRange::new(
+                super::protocol::OWNER_VERSION,
+                super::protocol::OWNER_VERSION,
+            )
+            .map_err(|_| StatusError::Unavailable)?,
+            active_channels: count,
+            total_channels: u16::from(count),
         })
     }
     pub fn catalog_available(&self) -> bool {
@@ -1231,6 +1282,13 @@ impl SessionOwnerEngine {
         ),
         EngineError,
     > {
+        let raw = self.validate_admitted_open_borrowed(&supplied)?;
+        Ok((raw, supplied.history, supplied.control))
+    }
+    pub(super) fn validate_admitted_open_borrowed(
+        &self,
+        supplied: &AdmittedOwnerChannelResources,
+    ) -> Result<OwnerChannelResources, EngineError> {
         self.resources.validate_admitted(&supplied.history, None)?;
         self.resources.validate_admitted(&supplied.control, None)?;
         let history = supplied.history.reservation();
@@ -1251,14 +1309,49 @@ impl SessionOwnerEngine {
         {
             return Err(EngineError::InvalidRequest);
         }
-        let raw = OwnerChannelResources {
+        Ok(OwnerChannelResources {
             history: supplied.history.reservation(),
             control: supplied.control.reservation(),
             cleanup: supplied.history.cleanup(),
             read_buffer_bytes: supplied.read_buffer_bytes,
             input_epoch: supplied.input_epoch,
-        };
-        Ok((raw, supplied.history, supplied.control))
+        })
+    }
+    pub(super) fn release_unstarted_admitted(
+        &self,
+        supplied: AdmittedOwnerChannelResources,
+    ) -> Result<(), Box<(EngineError, AdmittedOwnerChannelResources)>> {
+        if let Err(error) = self.validate_admitted_open_borrowed(&supplied) {
+            return Err(Box::new((error, supplied)));
+        }
+        drop(UnstartedAdmittedOpen::new(
+            self.resources.clone(),
+            supplied.history,
+            supplied.control,
+        ));
+        Ok(())
+    }
+    pub(super) fn preflight_admitted_open(
+        &self,
+        frontend: &FrontendAttachment,
+        request: &OpenRequest,
+        supplied: &AdmittedOwnerChannelResources,
+        lease: Option<&super::screen_owner::HostScreenLease>,
+    ) -> Result<(), EngineError> {
+        self.validate(frontend)?;
+        let raw = self.validate_admitted_open_borrowed(supplied)?;
+        if let Some(lease) = lease {
+            let size = terminal_size::TerminalSize::new(request.cols, request.rows)
+                .map_err(|_| EngineError::InvalidRequest)?;
+            if !request.screen
+                || self.screen_factory.is_none()
+                || self.screen_control.is_none()
+                || !lease.matches(&self.resources, self.locator, raw.history.channel, size)
+            {
+                return Err(EngineError::Unavailable);
+            }
+        }
+        Ok(())
     }
     pub async fn open(
         &mut self,
@@ -2022,6 +2115,10 @@ impl SessionOwnerEngine {
                     },
                 });
             }
+            // Accepted identities include exact failed-before-install slots,
+            // which deliberately have no fabricated installed-child exit fact.
+            // Retain this independent count across cancellation/map destruction.
+            self.close_total_channels = u16::try_from(self.channels.len()).ok();
             self.close_facts = Some(facts);
             self.facts_captured = true;
         }
@@ -2062,6 +2159,8 @@ impl SessionOwnerEngine {
         if self.ever_established {
             if let Some(binding) = &self.local_binding {
                 self.local_completion = Some(LocalCompletion {
+                    build: self.local_build.clone(),
+                    total_channels: self.close_total_channels,
                     binding: binding.clone(),
                     locator: self.locator,
                     client: self.resources.clone(),

@@ -147,6 +147,11 @@ pub(in crate::session_owner) mod integrated {
         spawn_hold: std::sync::atomic::AtomicBool,
         spawn_entered: std::sync::atomic::AtomicUsize,
         reader_held: std::sync::atomic::AtomicBool,
+        leader_unobserved: std::sync::atomic::AtomicBool,
+        writer_fail: std::sync::atomic::AtomicBool,
+        reader_finished: std::sync::atomic::AtomicBool,
+        reap_notifiers:
+            Mutex<std::collections::HashMap<u8, transport::channel_server::ReapNotifier>>,
         reader_calls: std::sync::atomic::AtomicUsize,
         resize_calls: std::sync::atomic::AtomicUsize,
         resize_fail: std::sync::atomic::AtomicBool,
@@ -165,6 +170,20 @@ pub(in crate::session_owner) mod integrated {
         held_polls: usize,
     }
     impl Io {
+        fn notify_reap(&self) {
+            let notifiers: Vec<_> = self
+                .reap_notifiers
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect();
+            // Notify the exact retained owner after releasing backend locks.
+            for notifier in notifiers {
+                notifier.notify();
+            }
+        }
+
         fn gate(&self, stream: u8, code: i32, held: bool) {
             let mut exits = self.exits.lock().unwrap();
             let gate = exits.entry(stream).or_default();
@@ -214,6 +233,13 @@ pub(in crate::session_owner) mod integrated {
             loop {
                 if self
                     .io
+                    .reader_finished
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Ok(0);
+                }
+                if self
+                    .io
                     .reader_held
                     .load(std::sync::atomic::Ordering::SeqCst)
                     && !state.0
@@ -260,7 +286,7 @@ pub(in crate::session_owner) mod integrated {
             while self.0.held.load(Ordering::SeqCst) && !state.0 {
                 state = self.0.changed.wait(state).unwrap();
             }
-            if state.0 {
+            if state.0 || self.0.writer_fail.swap(false, Ordering::SeqCst) {
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
             let n = b.len().min(2);
@@ -286,7 +312,22 @@ pub(in crate::session_owner) mod integrated {
         }
     }
     impl ChannelWait for Wait {
+        fn set_reap_notifier(&mut self, notifier: transport::channel_server::ReapNotifier) {
+            self.0
+                .reap_notifiers
+                .lock()
+                .unwrap()
+                .insert(self.1, notifier);
+        }
+
         fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
+            if self
+                .0
+                .leader_unobserved
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return None;
+            }
             Some(match self.exited() {
                 Some(code) => LeaderStatus::Exited { code },
                 None => LeaderStatus::Running,
@@ -455,6 +496,39 @@ pub(in crate::session_owner) mod integrated {
     }
     pub(in crate::session_owner) struct HostFixtureControl(Arc<Io>);
     impl HostFixtureControl {
+        pub(in crate::session_owner) fn fail_next_spawn(&self) {
+            self.0
+                .fail_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        pub(in crate::session_owner) fn hold_leader_observation(&self, held: bool) {
+            self.0
+                .leader_unobserved
+                .store(held, std::sync::atomic::Ordering::SeqCst);
+            self.0.changed.notify_all();
+            self.0.notify_reap();
+        }
+        pub(in crate::session_owner) fn exit_backend(&self) {
+            self.0.state.lock().unwrap().0 = true;
+            self.0.changed.notify_all();
+            self.0.notify_reap();
+        }
+        pub(in crate::session_owner) fn fail_writer(&self) {
+            self.0
+                .writer_fail
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        pub(in crate::session_owner) fn finish_reader(&self) {
+            let _state = self.0.state.lock().unwrap();
+            self.0
+                .reader_finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.changed.notify_all();
+        }
+        pub(in crate::session_owner) fn set_output_script(&self, script: Vec<u8>) {
+            *self.0.script.lock().unwrap() = Some(script);
+        }
+
         pub(in crate::session_owner) fn hold_reads(&self) {
             self.0
                 .reader_held

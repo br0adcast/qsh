@@ -70,6 +70,10 @@
 //! `monitor::fork_shell`'s docs. None of the calls is `std::env::set_var`, which this module
 //! deliberately avoids there -- see [`child_env`]'s docs.
 
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // No production durable monitor binding exists yet.
+pub(crate) mod durable_owner;
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};

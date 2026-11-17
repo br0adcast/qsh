@@ -1826,7 +1826,10 @@ fn personal_server_auth(
 fn run_transport_resume_command() -> Result<()> {
     let refuse = |why: String| -> anyhow::Error {
         serve::init_log(false);
-        log::error("update", &format!("transport-resume: {why}"));
+        log::error(
+            "update",
+            &format!("{}: {why}", qshd::update::RESUME_FAILED_LOG),
+        );
         anyhow::anyhow!(why)
     };
     // SAFETY: main enters this branch before opening descriptors or starting
@@ -1853,7 +1856,10 @@ fn run_transport_resume(handover: handover::PreparedHandover) -> Result<()> {
     }));
     let result = resume_personal_daemon(handover);
     if let Err(e) = &result {
-        log::error("update", &format!("transport-resume: {e:#}"));
+        log::error(
+            "update",
+            &format!("{}: {e:#}", qshd::update::RESUME_FAILED_LOG),
+        );
     }
     result
 }
@@ -1876,7 +1882,8 @@ fn resume_personal_daemon(handover: handover::PreparedHandover) -> Result<()> {
     log::info(
         "update",
         &format!(
-            "resumed after an update: pid={} build={}",
+            "{}: pid={} build={}",
+            qshd::update::RESUMED_LOG,
             std::process::id(),
             state::build_label()
         ),

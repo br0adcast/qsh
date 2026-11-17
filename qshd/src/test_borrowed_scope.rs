@@ -78,10 +78,21 @@ diagnostic_codes!(DiagnosticAssertion {
     ScreenControlJoin => "screen-control-join", ScreenScopeDrain => "screen-scope-drain",
     ScreenReservations => "screen-reservations", ScreenNoChildren => "screen-no-children",
     ScreenReceiptStatus => "screen-receipt-status",
+    CleanupJobStops => "cleanup-job-stops", CleanupHelperJoin => "cleanup-helper-join",
+    CleanupMonitorStop => "cleanup-monitor-stop", CleanupMonitorWait => "cleanup-monitor-wait",
+    CleanupLeaderWait => "cleanup-leader-wait", CleanupMemberWait => "cleanup-member-wait",
 });
 diagnostic_codes!(DiagnosticSource {
     Unknown => "unknown", Screen => "screen_native_tests.rs",
     Engine => "engine_native_tests.rs", BorrowedScope => "test_borrowed_scope.rs",
+    MonitorScope => "monitor_scope_tests.rs",
+});
+// Whether the private body can still wait a fixture member it expects to have
+// adopted, observed without consuming it. `not-a-child` means another waiter
+// (its original parent) already consumed it.
+diagnostic_codes!(DiagnosticAdoption {
+    Unavailable => "unavailable", Adopted => "adopted", NotChild => "not-a-child",
+    ProbeError => "probe-error",
 });
 diagnostic_codes!(DiagnosticRecordStatus {
     Unavailable => "unavailable", Available => "available", Invalid => "invalid",
@@ -99,6 +110,7 @@ impl DiagnosticLocation {
             Some("screen_native_tests.rs") => DiagnosticSource::Screen,
             Some("engine_native_tests.rs") => DiagnosticSource::Engine,
             Some("test_borrowed_scope.rs") => DiagnosticSource::BorrowedScope,
+            Some("monitor_scope_tests.rs") => DiagnosticSource::MonitorScope,
             _ => DiagnosticSource::Unknown,
         };
         Self {
@@ -127,6 +139,7 @@ struct Diagnostic {
     observations: usize,
     cleanup_stops: usize,
     exit_code: usize,
+    member_adoption: usize,
     screen_receipt_state: usize,
     screen_receipt_code: usize,
     failure: bool,
@@ -191,13 +204,17 @@ impl std::fmt::Debug for Diagnostic {
             .field("monitor_cleanup_stop", &(self.cleanup_stops & 4 != 0))
             .field("monitor_fixture_wait", &(self.cleanup_stops & 8 != 0))
             .field("leader_fixture_wait", &(self.cleanup_stops & 16 != 0))
+            .field(
+                "member_adoption",
+                &DiagnosticAdoption::label(self.member_adoption),
+            )
             .finish()
     }
 }
 impl Diagnostic {
     fn report_fields(self) -> String {
-        format!("mode={} phase={} assertion={} elapsed_ms={} observations={} cleanup_stops={} exit_code={} failure={} body_status={} body_source={} body_line={} body_column={} child_status={} child_source={} child_line={} child_column={} screen_receipt_state={} screen_receipt_code={}",
-            self.mode, self.phase, self.assertion, self.elapsed_ms, self.observations, self.cleanup_stops, self.exit_code,
+        format!("mode={} phase={} assertion={} elapsed_ms={} observations={} cleanup_stops={} exit_code={} member_adoption={} failure={} body_status={} body_source={} body_line={} body_column={} child_status={} child_source={} child_line={} child_column={} screen_receipt_state={} screen_receipt_code={}",
+            self.mode, self.phase, self.assertion, self.elapsed_ms, self.observations, self.cleanup_stops, self.exit_code, self.member_adoption,
             usize::from(self.failure), self.body_status, self.body.source, self.body.line, self.body.column,
             self.child_status, self.child.source, self.child.line, self.child.column,
             self.screen_receipt_state, self.screen_receipt_code)
@@ -221,6 +238,7 @@ impl Diagnostic {
             observations: field("observations"),
             cleanup_stops: field("cleanup_stops"),
             exit_code: field("exit_code"),
+            member_adoption: field("member_adoption"),
             screen_receipt_state,
             screen_receipt_code,
             failure: field("failure") != 0,
@@ -249,7 +267,7 @@ impl Diagnostic {
 thread_local! {
     static DIAGNOSTIC: std::cell::Cell<Diagnostic> = const { std::cell::Cell::new(Diagnostic {
         mode: 0, phase: 0, assertion: 0, elapsed_ms: 0, observations: 0, cleanup_stops: 0, exit_code: 0,
-        screen_receipt_state: 0, screen_receipt_code: 0,
+        member_adoption: 0, screen_receipt_state: 0, screen_receipt_code: 0,
         failure: false, body_status: 0, body: DiagnosticLocation { source: 0, line: 0, column: 0 },
         child_status: 0, child: DiagnosticLocation { source: 0, line: 0, column: 0 },
     }) };
@@ -358,7 +376,7 @@ fn parse_child_location(bytes: &[u8]) -> Option<DiagnosticLocation> {
     let [version, source, line, column] = values;
     if parts.next().is_some()
         || version != 1
-        || source > DiagnosticSource::BorrowedScope as usize
+        || source > DiagnosticSource::MonitorScope as usize
         || line == 0
         || column == 0
         || line > u32::MAX as usize
@@ -400,6 +418,16 @@ pub(crate) fn diagnostic_observations(bits: usize) {
     DIAGNOSTIC.with(|cell| {
         cell.set(Diagnostic {
             observations: bits,
+            ..cell.get()
+        })
+    });
+}
+/// Adds observation bits recorded during cleanup, never clearing earlier ones,
+/// so a later cleanup panic cannot lose what was already observed.
+pub(crate) fn diagnostic_add_observations(bits: usize) {
+    DIAGNOSTIC.with(|cell| {
+        cell.set(Diagnostic {
+            observations: cell.get().observations | bits,
             ..cell.get()
         })
     });
@@ -588,6 +616,38 @@ pub(crate) fn owned_children_absent() -> bool {
             other => panic!("owned fixture child probe: {other:?}"),
         }
     }
+}
+
+/// Non-consuming, closed classification of whether this body can wait the
+/// member it expects to have adopted. It never waits, signals or retries ECHILD,
+/// and it does not replace [`wait_expected`], which still requires the wait.
+pub(crate) fn diagnostic_member_adoption(fd: BorrowedFd<'_>) {
+    assert_eq!(std::env::var(MODE).as_deref(), Ok("body"));
+    let adoption = loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                fd.as_raw_fd() as u32,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL,
+            )
+        };
+        if result == 0 {
+            break DiagnosticAdoption::Adopted;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::ECHILD) => break DiagnosticAdoption::NotChild,
+            _ => break DiagnosticAdoption::ProbeError,
+        }
+    };
+    DIAGNOSTIC.with(|cell| {
+        cell.set(Diagnostic {
+            member_adoption: adoption as usize,
+            ..cell.get()
+        })
+    });
 }
 
 /// Called only for a positively identified fixture member, after its parent
@@ -1162,6 +1222,10 @@ mod tests {
                 "engine_native_tests.rs",
             ),
             ("qshd/src/test_borrowed_scope.rs", "test_borrowed_scope.rs"),
+            (
+                "qshd/src/helper/monitor_scope_tests.rs",
+                "monitor_scope_tests.rs",
+            ),
             ("/private/CANARY-IDENTITY/PAYLOAD.rs", "unknown"),
         ] {
             let location = DiagnosticLocation::from_source(file, 41, 7);
@@ -1341,6 +1405,7 @@ mod tests {
             ("observations".into(), usize::MAX),
             ("cleanup_stops".into(), usize::MAX),
             ("exit_code".into(), usize::MAX),
+            ("member_adoption".into(), usize::MAX),
             ("failure".into(), usize::MAX),
             ("body_status".into(), usize::MAX),
             ("body_source".into(), usize::MAX),
@@ -1414,6 +1479,94 @@ mod tests {
             std::panic::catch_unwind(|| write_report(&report_path, "x".repeat(REPORT_LIMIT + 1)));
         assert!(oversized.is_err());
         assert!(std::fs::metadata(&report_path).unwrap().len() <= REPORT_LIMIT as u64);
+    }
+
+    #[test]
+    // The std handle is dropped unwaited: the exact pidfd wait below consumes it.
+    #[allow(clippy::zombie_processes)]
+    fn member_adoption_probe_is_closed_and_non_consuming() {
+        use std::os::fd::AsFd;
+        const NAME: &str =
+            "test_borrowed_scope::tests::member_adoption_probe_is_closed_and_non_consuming";
+        run_exact(NAME, 0, || {
+            let adoption = || DIAGNOSTIC.get().member_adoption;
+            let running = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            let running = pin(running.id());
+            diagnostic_member_adoption(running.as_fd());
+            assert_eq!(adoption(), DiagnosticAdoption::Adopted as usize);
+            signal_kill(running.as_fd());
+            while !exited(running.as_fd()) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            diagnostic_member_adoption(running.as_fd());
+            assert_eq!(adoption(), DiagnosticAdoption::Adopted as usize);
+            // Still waitable: the probe neither waited nor released it.
+            wait_exact(running.as_fd());
+            // Consumed by another waiter: the probe reports it, never waits.
+            diagnostic_member_adoption(running.as_fd());
+            assert_eq!(adoption(), DiagnosticAdoption::NotChild as usize);
+            let own = pin(std::process::id());
+            diagnostic_member_adoption(own.as_fd());
+            assert_eq!(adoption(), DiagnosticAdoption::NotChild as usize);
+            assert!(owned_children_absent());
+        })
+        .assert_clean(0);
+        for (code, label) in [
+            (DiagnosticAdoption::Unavailable as usize, "unavailable"),
+            (DiagnosticAdoption::Adopted as usize, "adopted"),
+            (DiagnosticAdoption::NotChild as usize, "not-a-child"),
+            (DiagnosticAdoption::ProbeError as usize, "probe-error"),
+            (usize::MAX, "unknown"),
+        ] {
+            let fields = std::collections::BTreeMap::from([("member_adoption".into(), code)]);
+            let mut diagnostic = Diagnostic::from_fields(&fields);
+            for hop in 0..2 {
+                let report = if hop == 0 {
+                    format_body_report(false, 0, (0, 0), diagnostic)
+                } else {
+                    format_supervisor_report(false, false, 0, (0, 0), (0, 0), diagnostic)
+                };
+                diagnostic = Diagnostic::from_fields(&parse_receipt_report(&report));
+                assert_eq!(diagnostic.member_adoption, code);
+                let rendered = format!("{diagnostic:?}");
+                assert!(
+                    rendered.contains(&format!("member_adoption: {label:?}")),
+                    "{rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_observations_accumulate_and_cleanup_checkpoints_follow_the_first_failure() {
+        diagnostic_mode(DiagnosticMode::LoginEnded);
+        diagnostic_observations(1 | 2);
+        diagnostic_add_observations(1 << 6);
+        diagnostic_add_observations(1 << 5);
+        assert_eq!(DIAGNOSTIC.get().observations, 1 | 2 | (1 << 5) | (1 << 6));
+        diagnostic_phase(DiagnosticPhase::Cleanup);
+        diagnostic_assertion(DiagnosticAssertion::CleanupMemberWait, Duration::ZERO);
+        let rendered = format!("{:?}", DIAGNOSTIC.get());
+        assert!(rendered.contains("cleanup-member-wait"), "{rendered}");
+        assert!(rendered.contains("helper_joined: true"), "{rendered}");
+        let mut failed = DIAGNOSTIC.get();
+        failed.record_failure(Some(DiagnosticLocation::from_source(
+            "qshd/src/helper/monitor_scope_tests.rs",
+            12,
+            3,
+        )));
+        DIAGNOSTIC.set(failed);
+        // An unwinding second cleanup cannot rename the boundary that failed.
+        diagnostic_assertion(DiagnosticAssertion::CleanupJobStops, Duration::ZERO);
+        let retained = DIAGNOSTIC.get();
+        assert_eq!(
+            retained.assertion,
+            DiagnosticAssertion::CleanupMemberWait as usize
+        );
+        assert_eq!(
+            retained.body.source,
+            DiagnosticSource::MonitorScope as usize
+        );
     }
 
     #[test]
