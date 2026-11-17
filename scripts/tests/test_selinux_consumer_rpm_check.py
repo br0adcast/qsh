@@ -66,7 +66,7 @@ def generated_fixture(root):
 
 _XML_FORMAT = ('<q><p>%{NAME:xml}<n>%|EPOCH?{%{EPOCH}}:{0}|</n>%{VERSION:xml}%{RELEASE:xml}%{ARCH:xml}</p>'
                '<a>%{FILEDIGESTALGO}</a><files>'
-               '[<f>%{FILENAMES:xml}<n>%{FILESIZES}</n><n>%{FILEMODES}</n><n>%{FILEFLAGS}</n>'
+               '[<f>%{FILENAMES:xml}<n>%{LONGFILESIZES}</n><n>%{FILEMODES}</n><n>%{FILEFLAGS}</n>'
                '%{FILEUSERNAME:xml}%{FILEGROUPNAME:xml}%{FILEDIGESTS:xml}%{FILELINKTOS:xml}</f>]'
                '</files></q>\n')
 
@@ -321,6 +321,27 @@ class SourceTests(unittest.TestCase):
         for control in (b'\t',b'\n',b'\r',b'&#9;',b'&#10;',b'&#13;',b'\x01'):
             with self.subTest(control=control):
                 self.assert_refused(raw_header=good.replace(b'/etc/pam.d/qshd',b'/etc/pam.d/qshd'+control))
+
+    def test_long_size_accessor_absent_value_and_64bit_sizes(self):
+        module=checker()
+        # The storage-independent accessor, never the legacy 32-bit tag that
+        # RPM 6 packages leave unpopulated.
+        self.assertIn('<n>%{LONGFILESIZES}</n>',module._FORMAT)
+        self.assertNotIn('%{FILESIZES}',module._FORMAT)
+        for value,expected in (('0',0),('4294967295',2**32-1),('4294967296',2**32),(str(2**64-1),2**64-1)):
+            self.assertEqual(module._number(value),expected)
+        size=next(row['size'] for row in self.rows if row['path']=='/usr/bin/qshd')
+        selected=b'<string>/usr/bin/qshd</string><n>'+str(size).encode()+b'</n>'
+        good=header(self.rows)
+        self.assertEqual(good.count(selected),1)
+        # A placeholder or out-of-range length is refused, never read as zero.
+        for value in (b'(none)',b'(null)',b'',str(2**64).encode()):
+            with self.subTest(value=value):
+                result=self.assert_refused(raw_header=good.replace(selected,b'<string>/usr/bin/qshd</string><n>'+value+b'</n>'))
+                self.assertEqual(base64.b64decode(result['stderr']),b'CHECK_REFUSED NUMBER\n')
+        # A well-formed 64-bit length still has to equal the reviewed size.
+        result=self.assert_refused(raw_header=good.replace(selected,b'<string>/usr/bin/qshd</string><n>'+str(2**32+size).encode()+b'</n>'))
+        self.assertEqual(base64.b64decode(result['stderr']),b'CHECK_REFUSED SELECTED_HEADER\n')
 
     def test_xml_empty_digest_and_link_for_unselected_members_accept(self):
         rows=self.rows+[
@@ -653,7 +674,7 @@ NATIVE=False
 
 def load_tests(loader, tests, pattern):
     suite=loader.loadTestsFromTestCase(NativeTests if NATIVE else SourceTests)
-    expected=4 if NATIVE else 23
+    expected=4 if NATIVE else 24
     declared=unittest.TestLoader().loadTestsFromTestCase(NativeTests if NATIVE else SourceTests).countTestCases()
     if declared!=expected or not 0<suite.countTestCases()<=expected:
         raise AssertionError('required RPM checker test count drift')
@@ -673,5 +694,5 @@ if __name__=='__main__':
     if len(sys.argv)==3 and sys.argv[1]=='--_owned-source':
         raise SystemExit(owned_source(sys.argv[2]))
     program=unittest.main(exit=False)
-    expected=4 if NATIVE else 23
+    expected=4 if NATIVE else 24
     raise SystemExit(0 if program.result.wasSuccessful() and program.result.testsRun==expected and not program.result.skipped else 1)

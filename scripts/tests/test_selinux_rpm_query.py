@@ -383,6 +383,23 @@ class StrictParserTests(unittest.TestCase):
             with self.subTest(raw=raw[-70:]),self.assertRaises(m.RpmQueryError):
                 m._owner_records(raw,'/usr/bin/qshd')
 
+    def test_long_size_accessor_absent_value_and_64bit_sizes(self):
+        m=adapter()
+        # The storage-independent accessor, never the legacy 32-bit tag that
+        # RPM 6 headers leave unpopulated.
+        self.assertIn('\\t%{LONGFILESIZES}\\t',m._F)
+        self.assertNotIn('%{FILESIZES}',m._F)
+        for size in (0,2**32-1,2**32,2**64-1):
+            with self.subTest(size=size):
+                self.assertEqual(m._owner_records(files('/usr/bin/qshd',size=size),'/usr/bin/qshd')[1].authority.size,size)
+        # A placeholder is refused, never read as zero, for selected and other rows.
+        for value in ('(none)','(null)',''):
+            with self.subTest(value=value),self.assertRaises(m.RpmQueryError):
+                m._owner_records(files('/usr/bin/qshd',size=value),'/usr/bin/qshd')
+            raw=files('/usr/bin/qshd').replace(b'F\t"/usr"\t0',b'F\t"/usr"\t'+value.encode())
+            with self.subTest(value=value,row='unselected'),self.assertRaises(m.RpmQueryError):
+                m._owner_records(raw,'/usr/bin/qshd')
+
     def test_scalar_numeric_and_digest_ranges_are_strict(self):
         m=adapter()
         good=files('/usr/bin/qshd')
