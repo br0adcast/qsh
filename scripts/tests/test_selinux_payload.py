@@ -139,7 +139,7 @@ class PayloadTests(unittest.TestCase):
         path=self.source/'qshd_selinux_rpm_query.py'
         original=path.read_bytes()
         self.assertEqual(hashlib.sha256(original).hexdigest(),
-                         '9f57e56aef46b11c8c795b2aea22cbdc6b4dd7851f41d7caf04b14d5354b4d1d')
+                         '5d0bc58fbd728359b1007300eae00f76821af8c0049f42dd2a49fe2fce460bc5')
         supplied=self.base/'query-input.py'
         supplied.write_bytes(original)
         path.unlink()

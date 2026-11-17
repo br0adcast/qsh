@@ -53,7 +53,7 @@ _MANIFEST = '/usr/share/qshd/consumer-rpm.json'
 _FORMAT = ('<q><p>%{NAME:xml}<n>%|EPOCH?{%{EPOCH}}:{0}|</n>'
            '%{VERSION:xml}%{RELEASE:xml}%{ARCH:xml}</p>'
            '<a>%{FILEDIGESTALGO}</a><files>'
-           '[<f>%{FILENAMES:xml}<n>%{FILESIZES}</n><n>%{FILEMODES}</n>'
+           '[<f>%{FILENAMES:xml}<n>%{LONGFILESIZES}</n><n>%{FILEMODES}</n>'
            '<n>%{FILEFLAGS}</n>%{FILEUSERNAME:xml}%{FILEGROUPNAME:xml}'
            '%{FILEDIGESTS:xml}%{FILELINKTOS:xml}</f>]'
            '</files></q>\n')
