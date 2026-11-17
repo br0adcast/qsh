@@ -22,7 +22,7 @@ impl From<LocalEngineError> for LinuxOwnerError {
     }
 }
 #[cfg(feature = "system")]
-use crate::helper::server::durable_owner::DurableMonitorDestination;
+use crate::helper::server::durable_owner::{DurableMonitorBinding, DurableMonitorDestination};
 
 #[cfg(feature = "system")]
 pub(crate) struct RefusedMonitorDestination {
@@ -84,12 +84,13 @@ impl LinuxOwnerRoute {
         frontend: FrontendAdmission,
         attempt: AuthenticationAttempt,
         attachment: Attachment,
+        expected: &DurableMonitorBinding,
         destination: DurableMonitorDestination,
     ) -> Result<Self, RefusedMonitorDestination> {
         let binding = owner.supervision_binding();
         let admitted = (|| {
             let mode = host.authorize_linux_route(binding, frontend, attempt, attachment)?;
-            if mode != HostMode::System || !destination.matches(binding) {
+            if mode != HostMode::System || !destination.matches_expected(expected, binding) {
                 return Err(LinuxOwnerError::Refused);
             }
             owner.validate_attachment(attachment)?;
@@ -117,18 +118,21 @@ impl LinuxOwnerRoute {
         {
             return Err(LinuxOwnerError::Refused);
         }
-        #[cfg(feature = "system")]
-        if self
-            .monitor
-            .as_ref()
-            .is_some_and(|monitor| !monitor.matches(&self.binding))
-        {
-            return Err(LinuxOwnerError::Refused);
-        }
         Ok(())
     }
     fn current(&self, host: &HostState, owner: &LocalOwnerEngine) -> Result<(), LinuxOwnerError> {
         self.destination(host, owner)?;
+        // A route never prolongs helper admission. Only a NEW operation needs
+        // the live exact expected monitor binding; admitted cleanup below keeps
+        // its sealed correlation even after that helper/requester is retired.
+        #[cfg(feature = "system")]
+        if self
+            .monitor
+            .as_ref()
+            .is_some_and(|monitor| !monitor.matches_live(&self.binding))
+        {
+            return Err(LinuxOwnerError::Refused);
+        }
         host.authorize_linux_route(&self.binding, self.frontend, self.attempt, self.attachment)?;
         owner.validate_attachment(self.attachment)?;
         Ok(())
