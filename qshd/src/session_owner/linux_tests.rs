@@ -83,7 +83,7 @@ fn authorize(
     };
     authorized
 }
-fn attached(
+pub(crate) fn attached(
     mode: HostMode,
 ) -> (
     HostState,
@@ -445,4 +445,47 @@ async fn linux529_cancelled_termination_retains_exact_real_cleanup_and_foreign_d
         host.cleanup_operation_for_test(attachment.locator),
         operation
     );
+}
+
+#[tokio::test]
+async fn linux529_route_drop_preserves_supervisor_custody_and_omitted_owner_blocks_stop() {
+    use crate::session_owner::supervisor::{HostSupervisor, SupervisionError};
+    let (mut host, mut owner, frontend, attempt, attachment, _restart) = attached(PERSONAL);
+    let mut route =
+        LinuxOwnerRoute::bind_personal(&host, &owner, frontend, attempt, attachment).unwrap();
+    route.begin_terminate(&mut host, &mut owner).unwrap();
+    drop(route);
+    assert_eq!(host.catalog_len(), 1);
+    assert!(!owner.supervision_complete());
+    let mut supervisor = HostSupervisor::new(&mut host).unwrap();
+    assert!(HostSupervisor::new(&mut host).is_err());
+    supervisor.begin_stop(&mut host).unwrap();
+    assert!(matches!(
+        supervisor.finish_stop(&mut host, 7).await,
+        Err(SupervisionError::CleanupPending)
+    ));
+    assert_eq!(
+        host.catalog_len(),
+        1,
+        "an omitted owner must remain actual debt"
+    );
+    supervisor
+        .add_owner(&host, owner)
+        .unwrap_or_else(|_| panic!("actual retained owner refused"));
+    // The existing supervisor can resume the admitted close after route Drop.
+    // This fixture has no physical frontend Capsule: its separate debt must
+    // still refuse complete host-stop even after the owner really settles.
+    assert!(matches!(
+        supervisor.finish_stop(&mut host, 8).await,
+        Err(SupervisionError::CleanupPending)
+    ));
+    assert_eq!(host.catalog_len(), 0);
+    assert_eq!(host.frontend_obligations_for_test(), 1);
+}
+
+#[cfg(feature = "system")]
+pub(crate) fn destination_binding(
+    owner: &LocalOwnerEngine,
+) -> std::sync::Arc<crate::session_owner::host_engine::LocalBinding> {
+    owner.supervision_binding().clone()
 }

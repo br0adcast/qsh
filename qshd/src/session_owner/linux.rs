@@ -21,6 +21,20 @@ impl From<LocalEngineError> for LinuxOwnerError {
         Self::Engine(error)
     }
 }
+#[cfg(feature = "system")]
+use crate::helper::server::durable_owner::DurableMonitorDestination;
+
+#[cfg(feature = "system")]
+pub(crate) struct RefusedMonitorDestination {
+    error: LinuxOwnerError,
+    destination: DurableMonitorDestination,
+}
+#[cfg(feature = "system")]
+impl RefusedMonitorDestination {
+    pub(crate) fn into_parts(self) -> (LinuxOwnerError, DurableMonitorDestination) {
+        (self.error, self.destination)
+    }
+}
 /// Correlation fields alone cannot mint this checked route. It never owns an engine.
 pub(crate) struct LinuxOwnerRoute {
     binding: Arc<LocalBinding>,
@@ -28,6 +42,8 @@ pub(crate) struct LinuxOwnerRoute {
     attempt: AuthenticationAttempt,
     attachment: Attachment,
     operation: Operation,
+    #[cfg(feature = "system")]
+    monitor: Option<DurableMonitorDestination>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operation {
@@ -57,6 +73,38 @@ impl LinuxOwnerRoute {
             attempt,
             attachment,
             operation: Operation::Ready,
+            #[cfg(feature = "system")]
+            monitor: None,
+        })
+    }
+    #[cfg(feature = "system")]
+    pub(crate) fn bind_system(
+        host: &HostState,
+        owner: &LocalOwnerEngine,
+        frontend: FrontendAdmission,
+        attempt: AuthenticationAttempt,
+        attachment: Attachment,
+        destination: DurableMonitorDestination,
+    ) -> Result<Self, RefusedMonitorDestination> {
+        let binding = owner.supervision_binding();
+        let admitted = (|| {
+            let mode = host.authorize_linux_route(binding, frontend, attempt, attachment)?;
+            if mode != HostMode::System || !destination.matches(binding) {
+                return Err(LinuxOwnerError::Refused);
+            }
+            owner.validate_attachment(attachment)?;
+            Ok(())
+        })();
+        if let Err(error) = admitted {
+            return Err(RefusedMonitorDestination { error, destination });
+        }
+        Ok(Self {
+            binding: binding.clone(),
+            frontend,
+            attempt,
+            attachment,
+            operation: Operation::Ready,
+            monitor: Some(destination),
         })
     }
     fn destination(
@@ -66,6 +114,14 @@ impl LinuxOwnerRoute {
     ) -> Result<(), LinuxOwnerError> {
         if host.instance() != self.binding.identity.host
             || !Arc::ptr_eq(&self.binding, owner.supervision_binding())
+        {
+            return Err(LinuxOwnerError::Refused);
+        }
+        #[cfg(feature = "system")]
+        if self
+            .monitor
+            .as_ref()
+            .is_some_and(|monitor| !monitor.matches(&self.binding))
         {
             return Err(LinuxOwnerError::Refused);
         }
@@ -149,4 +205,4 @@ impl LinuxOwnerRoute {
 }
 #[cfg(test)]
 #[path = "linux_tests.rs"]
-mod tests;
+pub(crate) mod tests;

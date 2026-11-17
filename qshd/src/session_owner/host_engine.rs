@@ -59,7 +59,7 @@ pub(super) enum LocalLeasePhase {
     Complete,
 }
 #[derive(Debug)]
-pub(super) struct LocalBinding {
+pub(crate) struct LocalBinding {
     pub(super) identity: HostResourceBinding,
     pub(super) phase: Mutex<LocalLeasePhase>,
 }
