@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import io
@@ -65,7 +66,7 @@ def generated_fixture(root):
 
 _XML_FORMAT = ('<q><p>%{NAME:xml}<n>%|EPOCH?{%{EPOCH}}:{0}|</n>%{VERSION:xml}%{RELEASE:xml}%{ARCH:xml}</p>'
                '<a>%{FILEDIGESTALGO}</a><files>'
-               '[<f>%{FILENAMES:xml}<n>%{FILESIZES}</n><n>%{FILEMODES}</n><n>%{FILEFLAGS}</n>'
+               '[<f>%{FILENAMES:xml}<n>%{LONGFILESIZES}</n><n>%{FILEMODES}</n><n>%{FILEFLAGS}</n>'
                '%{FILEUSERNAME:xml}%{FILEGROUPNAME:xml}%{FILEDIGESTS:xml}%{FILELINKTOS:xml}</f>]'
                '</files></q>\n')
 
@@ -321,6 +322,27 @@ class SourceTests(unittest.TestCase):
             with self.subTest(control=control):
                 self.assert_refused(raw_header=good.replace(b'/etc/pam.d/qshd',b'/etc/pam.d/qshd'+control))
 
+    def test_long_size_accessor_absent_value_and_64bit_sizes(self):
+        module=checker()
+        # The storage-independent accessor, never the legacy 32-bit tag that
+        # RPM 6 packages leave unpopulated.
+        self.assertIn('<n>%{LONGFILESIZES}</n>',module._FORMAT)
+        self.assertNotIn('%{FILESIZES}',module._FORMAT)
+        for value,expected in (('0',0),('4294967295',2**32-1),('4294967296',2**32),(str(2**64-1),2**64-1)):
+            self.assertEqual(module._number(value),expected)
+        size=next(row['size'] for row in self.rows if row['path']=='/usr/bin/qshd')
+        selected=b'<string>/usr/bin/qshd</string><n>'+str(size).encode()+b'</n>'
+        good=header(self.rows)
+        self.assertEqual(good.count(selected),1)
+        # A placeholder or out-of-range length is refused, never read as zero.
+        for value in (b'(none)',b'(null)',b'',str(2**64).encode()):
+            with self.subTest(value=value):
+                result=self.assert_refused(raw_header=good.replace(selected,b'<string>/usr/bin/qshd</string><n>'+value+b'</n>'))
+                self.assertEqual(base64.b64decode(result['stderr']),b'CHECK_REFUSED NUMBER\n')
+        # A well-formed 64-bit length still has to equal the reviewed size.
+        result=self.assert_refused(raw_header=good.replace(selected,b'<string>/usr/bin/qshd</string><n>'+str(2**32+size).encode()+b'</n>'))
+        self.assertEqual(base64.b64decode(result['stderr']),b'CHECK_REFUSED SELECTED_HEADER\n')
+
     def test_xml_empty_digest_and_link_for_unselected_members_accept(self):
         rows=self.rows+[
             {'path':'/unselected-dir','size':0,'mode':0o40755,'flags':0,'owner':'root','group':'root','sha256':'','link':''},
@@ -532,7 +554,7 @@ class NativeTests(unittest.TestCase):
         cls.evidence['owners'].append({'label':label,'exit':outcome['exit'],
                                        'settled':outcome['settled'],'unreaped':outcome['unreaped'],
                                        'stdout_sha256':hashlib.sha256(base64.b64decode(outcome['stdout'])).hexdigest()})
-        if len(cls.evidence['owners'])>10:
+        if len(cls.evidence['owners'])>11:
             raise AssertionError('native owner count exceeded')
         return outcome
 
@@ -587,8 +609,56 @@ class NativeTests(unittest.TestCase):
             self.assertEqual(base64.b64decode(outcome['stderr']),('CHECK_REFUSED '+category+'\n').encode())
             print('NATIVE_RPM_CAUSAL_REFUSAL '+category)
 
+    def size_fields(self, rpm):
+        """Record what each size accessor returns for the real built package.
+
+        Bounded and sanitized: only the three fixed fixture paths, their known
+        sizes and a fixed classification per accessor. The legacy column also
+        records the checker's own numeric verdict, which is the first refusal
+        the unchanged query reaches.
+        """
+        outcome=self.invoke({'argv':['/usr/bin/rpm','--rcfile','/dev/null','--macros','/dev/null',
+                                     '--noplugins','--nosignature','--query','--package','--nomanifest',
+                                     '--noglob','--queryformat','[%{FILENAMES}\t%{FILESIZES}\t%{LONGFILESIZES}\n]',
+                                     str(rpm)]},'size-fields')
+        self.assertEqual(outcome['exit'],0)
+        self.assertEqual(base64.b64decode(outcome['stderr']),b'')
+        expected={'/etc/pam.d/qshd':len(self.pam.read_bytes()),'/usr/bin/qshd':len(self.binary.read_bytes()),
+                  '/usr/share/qshd/consumer-rpm.json':len(self.manifest.read_bytes())}
+        raw=base64.b64decode(outcome['stdout'])
+        self.assertLessEqual(len(raw),4096)
+        lines=raw.decode('ascii').splitlines()
+        self.assertEqual(len(lines),3)
+        module=checker()
+        def classify(value,size):
+            if value==str(size):
+                return 'MATCH'
+            if value in ('(none)','(null)',''):
+                return 'ABSENT'
+            return 'OTHER_NUMBER' if re.fullmatch('0|[1-9][0-9]{0,19}',value) else 'OTHER'
+        def verdict(value):
+            try:
+                module._number(value)
+            except module.CheckError as error:
+                return str(error)
+            return None
+        rows=[]
+        for line in lines:
+            fields=line.split('\t')
+            self.assertEqual(len(fields),3)
+            self.assertIn(fields[0],expected)
+            size=expected[fields[0]]
+            rows.append({'path':fields[0],'size':size,'filesizes':classify(fields[1],size),
+                         'filesizes_checker':verdict(fields[1]),'longfilesizes':classify(fields[2],size)})
+        self.assertEqual(sorted(row['path'] for row in rows),sorted(expected))
+        type(self).evidence['size_fields']=rows
+        # The storage-independent accessor must report every real length.
+        self.assertEqual([row['longfilesizes'] for row in rows],['MATCH']*3)
+
     def test_01_real_fixture_public_checker_success(self):
-        self.check(self.build('baseline'),'baseline')
+        rpm=self.build('baseline')
+        self.size_fields(rpm)
+        self.check(rpm,'baseline')
 
     def test_02_real_changed_binary_refuses_reviewed_header(self):
         self.check(self.build('binary',binary_change=True),'binary','SELECTED_HEADER')
@@ -604,7 +674,7 @@ NATIVE=False
 
 def load_tests(loader, tests, pattern):
     suite=loader.loadTestsFromTestCase(NativeTests if NATIVE else SourceTests)
-    expected=4 if NATIVE else 23
+    expected=4 if NATIVE else 24
     declared=unittest.TestLoader().loadTestsFromTestCase(NativeTests if NATIVE else SourceTests).countTestCases()
     if declared!=expected or not 0<suite.countTestCases()<=expected:
         raise AssertionError('required RPM checker test count drift')
@@ -624,5 +694,5 @@ if __name__=='__main__':
     if len(sys.argv)==3 and sys.argv[1]=='--_owned-source':
         raise SystemExit(owned_source(sys.argv[2]))
     program=unittest.main(exit=False)
-    expected=4 if NATIVE else 23
+    expected=4 if NATIVE else 24
     raise SystemExit(0 if program.result.wasSuccessful() and program.result.testsRun==expected and not program.result.skipped else 1)

@@ -24,7 +24,7 @@ _PATHS = ('/usr/bin/qshd', '/etc/pam.d/qshd')
 _PREFIX = ('/usr/bin/rpm', '--root', '/', '--dbpath', '/usr/lib/sysimage/rpm',
            '--define', '_db_backend sqlite')
 _P = r'P\t%{NAME:json}\t%|EPOCH?{%{EPOCH}}:{0}|\t%{VERSION:json}\t%{RELEASE:json}\t%{ARCH:json}\n'
-_F = _P + r'A\t%{FILEDIGESTALGO}\n[F\t%{FILENAMES:json}\t%{FILESIZES}\t%{FILEMODES}\t%{FILEFLAGS}\t%{FILEUSERNAME:json}\t%{FILEGROUPNAME:json}\t%{FILEDIGESTS:json}\t%{FILELINKTOS:json}\t%{FILESTATES}\n]E\n'
+_F = _P + r'A\t%{FILEDIGESTALGO}\n[F\t%{FILENAMES:json}\t%{LONGFILESIZES}\t%{FILEMODES}\t%{FILEFLAGS}\t%{FILEUSERNAME:json}\t%{FILEGROUPNAME:json}\t%{FILEDIGESTS:json}\t%{FILELINKTOS:json}\t%{FILESTATES}\n]E\n'
 _INVENTORY = _PREFIX + ('-qa', '--queryformat', _P)
 
 
