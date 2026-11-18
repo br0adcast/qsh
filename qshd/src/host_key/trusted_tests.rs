@@ -208,15 +208,8 @@ fn anchored_leaf_repair_and_read_do_not_follow_a_replacement_path() {
     let path = dir.path().join("key");
     key(&path, 0o644);
     let (parent, leaf) = parent(&path, Uid::effective()).unwrap();
-    let opened = owned(
-        fcntl::openat(
-            Some(parent.as_raw_fd()),
-            leaf.as_os_str(),
-            LEAF_FLAGS,
-            Mode::empty(),
-        )
-        .unwrap(),
-    );
+    let opened =
+        owned(fcntl::openat(&parent, leaf.as_os_str(), LEAF_FLAGS, Mode::empty()).unwrap());
     let original = dir.path().join("original");
     std::fs::rename(&path, &original).unwrap();
     std::fs::write(&path, [19; 64]).unwrap();
@@ -242,15 +235,8 @@ fn parent_descriptor_survives_rename_without_following_a_planted_directory() {
     std::fs::rename(&path, dir.path().join("original")).unwrap();
     make_dir(&path);
     std::fs::set_permissions(&path, Permissions::from_mode(0o777)).unwrap();
-    let opened = owned(
-        fcntl::openat(
-            Some(anchored.as_raw_fd()),
-            leaf.as_os_str(),
-            LEAF_FLAGS,
-            Mode::empty(),
-        )
-        .unwrap(),
-    );
+    let opened =
+        owned(fcntl::openat(&anchored, leaf.as_os_str(), LEAF_FLAGS, Mode::empty()).unwrap());
     assert_eq!(
         read_opened(opened, Uid::effective(), &mut FileIo)
             .unwrap()

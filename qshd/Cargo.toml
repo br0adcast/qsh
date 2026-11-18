@@ -7,17 +7,18 @@ license.workspace = true
 
 [dependencies]
 daemon-bootstrap-protocol = { path = "../crates/daemon-bootstrap-protocol" }
-rand_core = { version = "0.6", features = ["getrandom"] }
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
 tokio = { version = "1.53.3", features = ["full"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
-base64 = "0.22"
-dirs = "6"
+base64 = "0.23"
+dirs = "7"
 portable-pty = "0.9"
-nix = { version = "0.28", features = ["term", "user", "fs", "dir", "process", "signal", "socket"] }
+nix = { version = "0.32", features = ["term", "user", "fs", "dir", "process", "signal", "socket"] }
 log = "0.4"
 logging = { path = "../crates/logging" }
 transport = { path = "../crates/transport", features = ["tokio-driver"] }
@@ -49,7 +50,7 @@ test-darwin-keeper = ["test-build-labels"]
 transport = { path = "../crates/transport", features = ["tokio-driver", "testnet"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
-ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["getrandom", "std", "alloc", "ed25519"] }
+ssh-key = { version = "=0.7.0-rc.12", default-features = false, features = ["getrandom", "std", "alloc", "ed25519"] }
 # Only for `helper::server`'s own `Request::Verify` tests, to fabricate a
 # genuine signed proof with `signature::Signer::try_sign` the same way
 # `sshauth`'s own tests do -- pinned to the exact version `sshauth` uses so

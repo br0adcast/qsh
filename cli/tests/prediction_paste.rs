@@ -3,7 +3,6 @@ mod support;
 
 use sha2::{Digest, Sha256};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,9 +17,9 @@ fn screen(seen: &Arc<Mutex<Vec<u8>>>) -> String {
 // All duplicates share these flags. Install them before starting the matching
 // drain below, which explicitly retries WouldBlock instead of losing output.
 fn nonblocking(master: &std::fs::File) {
-    let flags = nix::fcntl::fcntl(master.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap();
+    let flags = nix::fcntl::fcntl(master, nix::fcntl::FcntlArg::F_GETFL).unwrap();
     nix::fcntl::fcntl(
-        master.as_raw_fd(),
+        master,
         nix::fcntl::FcntlArg::F_SETFL(
             nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
         ),
@@ -160,7 +159,7 @@ fn raw_and_bracketed_megabyte_pastes_arrive_with_adaptive_or_disabled_prediction
                 payload.extend_from_slice(b"\x1b[201~");
             }
             assert_eq!(payload.len(), 1 << 20);
-            let digest = format!("{:x}", Sha256::digest(&payload));
+            let digest = hex::encode(Sha256::digest(&payload));
             let paste_mode = if bracketed { "\\033[?2004h" } else { "" };
             // The reader runs with echo disabled. Its computed count and digest
             // cannot be supplied by local PTY echo or predicted text. Its file is

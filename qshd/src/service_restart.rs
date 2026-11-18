@@ -244,21 +244,20 @@ fn open_selected_file_with_parent(
     use crate::service_stage::StageError;
     use nix::fcntl::{openat, OFlag};
     use nix::sys::stat::Mode;
-    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::MetadataExt;
     if !path.is_absolute() {
         return Err(StageError::Invalid);
     }
     let (parent, leaf) = crate::host_key::trusted_parent(path, false)?;
     let fd = openat(
-        Some(parent.as_raw_fd()),
+        &parent,
         leaf.as_os_str(),
         OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
         Mode::empty(),
     )
     .map_err(std::io::Error::from)?;
     // SAFETY: openat returned a new read-only descriptor owned by this File.
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let file = std::fs::File::from(fd);
     let metadata = file.metadata()?;
     let uid = nix::unistd::geteuid().as_raw();
     if !metadata.is_file()

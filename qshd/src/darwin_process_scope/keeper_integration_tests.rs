@@ -1967,9 +1967,8 @@ pub(super) mod native {
         d
     }
     fn nonce() -> String {
-        use rand_core::RngCore;
         let mut b = [0; 16];
-        rand_core::OsRng.fill_bytes(&mut b);
+        getrandom::fill(&mut b).expect("operating system randomness is available");
         hex::encode(b)
     }
     fn read_gate(path: &Path) -> Option<Vec<u8>> {

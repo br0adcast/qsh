@@ -35,7 +35,7 @@ fn policy_token() -> [u8; 16] {
     // across this owned binary, so another login's diagnostic cannot satisfy a wait.
     let prefix = u16::try_from(NEXT.fetch_add(1, Ordering::Relaxed)).unwrap();
     let mut token = [0; 16];
-    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut token);
+    getrandom::fill(&mut token).expect("operating system randomness is available");
     token[..2].copy_from_slice(&prefix.to_be_bytes());
     token
 }
@@ -306,7 +306,8 @@ fn retained_login_keeps_policy_until_a_new_incarnation() {
             original.open_shell();
             let marker = format!(
                 "marker{:016x}",
-                rand_core::RngCore::next_u64(&mut rand_core::OsRng)
+                rand_core::TryRng::try_next_u64(&mut getrandom::SysRng)
+                    .expect("operating system randomness is available")
             );
             let before =
                 context(&original.run_in_shell(&format!("POLICY_MARKER={marker}; {CONTEXT}")));

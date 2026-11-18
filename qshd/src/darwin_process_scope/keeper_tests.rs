@@ -1230,7 +1230,7 @@ mod native_fixture {
         fn new(case: &str, selector: &str) -> Self {
             let deadline = Deadline::new();
             let mut nonce = [0; 16];
-            rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut nonce);
+            getrandom::fill(&mut nonce).expect("operating system randomness is available");
             let nonce = hex::encode(nonce);
             let mut environment = Environment::set(case, &nonce, deadline.raw);
             let directory = tempfile::Builder::new()
@@ -1493,7 +1493,7 @@ mod native_fixture {
                 end: original_deadline.end,
             };
             let mut nonce = [0; 16];
-            rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut nonce);
+            getrandom::fill(&mut nonce).expect("operating system randomness is available");
             let nonce = hex::encode(nonce);
             let mut environment = Environment::set("cancel", &nonce, deadline.raw);
             let directory = tempfile::Builder::new()

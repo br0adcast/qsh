@@ -30,9 +30,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use blake2::digest::consts::U16;
-use blake2::digest::Mac;
+use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2sMac;
-use rand::RngCore;
 use zeroize::Zeroizing;
 
 use crate::wire::{self, Kind, COOKIE_ECHO_LEN, COOKIE_LEN, MIN_MSG1_BODY};
@@ -359,12 +358,12 @@ pub(crate) fn source_group_key(ip: IpAddr) -> [u8; 16] {
 }
 
 /// A new cookie secret, straight from the operating system's randomness.
-/// `OsRng`, never `thread_rng()`, for the reason `auth::random_nonce` gives:
+/// Direct operating-system randomness, for the reason `auth::random_nonce` gives:
 /// the daemon forks, and a secret must not rest on a generator's state
 /// surviving that correctly.
 fn fresh_secret() -> Secret {
     let mut secret = Zeroizing::new([0u8; 32]);
-    rand::rngs::OsRng.fill_bytes(&mut secret[..]);
+    getrandom::fill(&mut secret[..]).expect("operating system randomness is available");
     secret
 }
 
@@ -372,7 +371,7 @@ fn fresh_secret() -> Secret {
 /// over the label, the address (IPv4 mapped to IPv6), the port and the
 /// msg1's ephemeral key.
 fn mac_domain(key: &[u8; 32], src: SocketAddr, msg1: &[u8], domain: &[u8]) -> Blake2sMac<U16> {
-    let mut m = <Blake2sMac<U16> as Mac>::new_from_slice(key)
+    let mut m = <Blake2sMac<U16> as KeyInit>::new_from_slice(key)
         .expect("a 32-byte key is a valid BLAKE2s key");
     m.update(domain);
     m.update(&address_bytes(src.ip()));

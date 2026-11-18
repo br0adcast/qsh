@@ -10,15 +10,16 @@ terminal-size = { path = "../terminal-size" }
 # The handshake and its hash only (spec §4.9). The raw split hands the two
 # transport keys over, and `chacha20poly1305` seals datagrams itself: snow's
 # transport state has no associated data.
-snow = { version = "0.9", features = ["risky-raw-split"] }
-chacha20poly1305 = "0.10"
+snow = { version = "0.10", features = ["risky-raw-split"] }
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 # Wipes the raw split's key copies once the ciphers hold them (the ciphers
 # wipe their own keys on drop). Already in the tree through chacha20poly1305.
 zeroize = { version = "1", default-features = false }
-rand = "0.8"
+rand = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
 # Keyed BLAKE2s for the return-address cookie (cookie.rs), as WireGuard's MAC.
 # The tests also hash the long reference ciphertexts with it (handshake.rs).
-blake2 = "0.10"
+blake2 = "0.11"
 # Socket buffer sizes (spec §4.12): set, and read back what the OS granted.
 socket2 = "0.6"
 # Wakeable socket readiness and producer notifications in the std driver.

@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use rand::Rng;
+use rand::RngExt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::auth::AUTH_NONCE_LEN;
@@ -1150,7 +1150,7 @@ impl Connection {
         // Spec §5.2: on when offered, allowed and implemented. The decision
         // is a function of msg1 and the configuration, so a retransmit twin
         // that went through probation on its own decides the same.
-        let session_id: u64 = rand::thread_rng().gen();
+        let session_id: u64 = rand::rng().random();
         conn.session_id = session_id;
         let msg2 = conn
             .handshake
@@ -2697,7 +2697,7 @@ impl Connection {
             return out;
         }
         // Random session id in the authenticated, versioned msg2 payload.
-        let session_id: u64 = rand::thread_rng().gen();
+        let session_id: u64 = rand::rng().random();
         self.session_id = session_id;
         // Fresh per handshake, and never reused: it is what stops a proof
         // made for one handshake from being presented for another.
@@ -2710,7 +2710,7 @@ impl Connection {
         // that runs `SshSignature` (`SessionManager::serve`) never calls this
         // method, only `accept`. A refactor that routed a signature server
         // through `on_datagram` would silently sidestep the helper here.
-        let nonce: [u8; AUTH_NONCE_LEN] = rand::thread_rng().gen();
+        let nonce: [u8; AUTH_NONCE_LEN] = rand::rng().random();
         let msg2_payload = if self.legacy_peer {
             encode_msg2_without_tail(session_id, false, &nonce)
         } else {

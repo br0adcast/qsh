@@ -15,7 +15,7 @@ impl Helper40VerificationFixture {
         let view = crate::process_scope::prepare().unwrap();
         let (report, output) = nix::unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
         nix::fcntl::fcntl(
-            report.as_raw_fd(),
+            &report,
             nix::fcntl::FcntlArg::F_SETFL(OFlag::O_NONBLOCK),
         )
         .unwrap();

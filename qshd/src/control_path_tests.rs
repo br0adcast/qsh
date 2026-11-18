@@ -332,7 +332,6 @@ fn directory_observed_stage_alias_before_chmod_cannot_touch_sentinel() {
 
 #[test]
 fn directory_sweep_refuses_a_replaced_candidate_name() {
-    use std::os::fd::AsRawFd;
     let dir = root();
     let mut child = std::process::Command::new("true").spawn().unwrap();
     let pid = child.id().try_into().unwrap();
@@ -363,7 +362,7 @@ fn directory_sweep_refuses_a_replaced_candidate_name() {
         .unwrap();
     let authority = path::EndpointAuthority::open(&dir.path().join("control.sock"), false).unwrap();
     let result = remove_if_stale_prepared(
-        authority.parent.as_raw_fd(),
+        &authority.parent,
         &name,
         pid,
         std::time::SystemTime::now(),

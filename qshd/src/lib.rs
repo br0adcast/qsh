@@ -57,6 +57,8 @@
 //! [`update`] -- the personal daemon's side of an update over qsh: the
 //! decision, the staged image, the self-check and the replacement.
 
+#[cfg(feature = "system")]
+mod ancillary;
 pub mod channel_backend;
 pub mod control;
 #[cfg(any(test, target_os = "macos"))]

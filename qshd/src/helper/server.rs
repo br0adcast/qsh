@@ -4079,7 +4079,7 @@ fn verdict_from_pipe(report: &OwnedFd, deadline: Instant) -> Option<Verdict> {
             Err(nix::Error::EINTR) => continue,
             Err(_) => return None,
         }
-        match nix::unistd::read(report.as_raw_fd(), &mut chunk) {
+        match nix::unistd::read(report, &mut chunk) {
             Ok(0) => break,
             Ok(n) => {
                 record.extend_from_slice(&chunk[..n]);
@@ -4255,7 +4255,7 @@ fn fork_verification_work(
         pipe2(OFlag::O_CLOEXEC).context("opening the verification report pipe")?;
     #[cfg(target_os = "linux")]
     nix::fcntl::fcntl(
-        report_read.as_raw_fd(),
+        &report_read,
         nix::fcntl::FcntlArg::F_SETFL(OFlag::O_NONBLOCK),
     )
     .context("making verification reports nonblocking before fork")?;
@@ -4742,7 +4742,7 @@ fn open_channel(
         // The account must own its own terminal (`give_terminal`): `openpty`
         // gives it to whoever opened it, and that is root here.
         give_terminal(
-            pty.slave.as_raw_fd(),
+            pty.slave.as_fd(),
             account.uid,
             config.tty_gid.unwrap_or(account.gid),
         )
@@ -5006,7 +5006,7 @@ pub(super) fn read_startup_report(report_read: &OwnedFd, deadline: Instant) -> S
             Err(nix::Error::EINTR) => continue,
             Err(_) => return StartupReport::TimedOut,
         }
-        match nix::unistd::read(report_read.as_raw_fd(), &mut buf[filled..]) {
+        match nix::unistd::read(report_read, &mut buf[filled..]) {
             Ok(0) => return StartupReport::Started,
             Ok(n) => {
                 filled += n;
@@ -5722,7 +5722,7 @@ pub(super) fn chdir_warning_bytes(home: &[u8]) -> Vec<u8> {
 /// group may only write to it, nobody else may touch it. `gid` is the `tty`
 /// group, resolved once at startup (`HelperConfig::tty_gid`), or the
 /// account's own group on a machine without one.
-fn give_terminal(slave: std::os::fd::RawFd, uid: Uid, gid: Gid) -> nix::Result<()> {
+fn give_terminal(slave: BorrowedFd<'_>, uid: Uid, gid: Gid) -> nix::Result<()> {
     use nix::sys::stat::{fchmod, Mode};
     fchmod(slave, Mode::from_bits_truncate(0o620))?;
     nix::unistd::fchown(slave, Some(uid), Some(gid))
@@ -6009,7 +6009,7 @@ fn max_open_descriptors() -> RawFd {
 }
 
 /// `close_range(first, last, 0)`: whether the kernel closed that whole
-/// range for us. `nix` 0.28 has no wrapper for it, so the syscall is made
+/// range for us. `nix` 0.32 has no wrapper for it, so the syscall is made
 /// directly.
 ///
 /// Called in the child between `fork` and `execve`: one syscall, three
@@ -6401,7 +6401,8 @@ pub(crate) mod tests {
         // A process name holds 15 bytes; this stays under that.
         let name = format!(
             "qsh{tag}{:08x}",
-            rand_core::RngCore::next_u32(&mut rand_core::OsRng)
+            rand_core::TryRng::try_next_u32(&mut getrandom::SysRng)
+                .expect("operating system randomness is available")
         );
         let path = dir.join(&name);
         std::os::unix::fs::symlink(target, &path).expect("link a uniquely named program");
@@ -6646,7 +6647,8 @@ pub(crate) mod tests {
 
         let bait_name = format!(
             "qshd-bait-{:08x}",
-            rand_core::RngCore::next_u32(&mut rand_core::OsRng)
+            rand_core::TryRng::try_next_u32(&mut getrandom::SysRng)
+                .expect("operating system randomness is available")
         );
         let bait_path = h.dir.path().join(&bait_name);
         std::fs::write(&bait_path, b"bait").expect("write the bait file");
@@ -6661,7 +6663,7 @@ pub(crate) mod tests {
         // and the check below would pass with the sweep having done
         // nothing at all.
         let flags = nix::fcntl::FdFlag::from_bits_truncate(
-            nix::fcntl::fcntl(bait, nix::fcntl::FcntlArg::F_GETFD).expect("fcntl(F_GETFD)"),
+            nix::fcntl::fcntl(&bait, nix::fcntl::FcntlArg::F_GETFD).expect("fcntl(F_GETFD)"),
         );
         assert!(
             !flags.contains(nix::fcntl::FdFlag::FD_CLOEXEC),
@@ -15732,7 +15734,7 @@ pub(crate) mod tests {
             ws_ypixel: 0,
         };
         let pty = nix::pty::openpty(&ws, None).expect("openpty");
-        let slave = pty.slave.as_raw_fd();
+        let slave = pty.slave.as_fd();
         fchmod(slave, Mode::from_bits_truncate(0o600)).expect("start from a non-0620 mode");
 
         give_terminal(slave, Uid::current(), Gid::current())

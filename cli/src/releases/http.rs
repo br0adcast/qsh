@@ -12,9 +12,41 @@ impl ReleaseTransport for HttpsTransport {
         cancel: &Cancel,
         observer: &dyn BringUpObserver,
     ) -> Result<Vec<u8>, FetchError> {
-        fetch(reqwest::Client::builder(), url, limits, cancel, observer)
+        if cancel.is_cancelled() {
+            return Err(FetchError::Rejected(ImageError::Cancelled));
+        }
+        fetch(
+            client_builder(mozilla_roots())?,
+            url,
+            limits,
+            cancel,
+            observer,
+        )
     }
 }
+
+fn mozilla_roots() -> rustls::RootCertStore {
+    webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect()
+}
+
+fn tls_config(roots: rustls::RootCertStore) -> Result<rustls::ClientConfig, FetchError> {
+    let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|error| rejected(clean(&error.to_string())))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    // Reqwest's preconfigured branch skips its normal ALPN setup. The CLI
+    // enables HTTP/1.1 only, so preserve that protocol advertisement explicitly.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+fn client_builder(roots: rustls::RootCertStore) -> Result<reqwest::ClientBuilder, FetchError> {
+    Ok(reqwest::Client::builder().tls_backend_preconfigured(tls_config(roots)?))
+}
+
 // Dropping a runtime normally joins blocking DNS workers. Cancellation must
 // return while a system resolver is still stuck, including during unwinding.
 struct RuntimeOwner(Option<tokio::runtime::Runtime>);
@@ -248,6 +280,75 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
+    fn fixture_builder(pem: Option<&[u8]>) -> reqwest::ClientBuilder {
+        use rustls::pki_types::pem::PemObject;
+        let mut roots = rustls::RootCertStore::empty();
+        if let Some(pem) = pem {
+            roots
+                .add(rustls::pki_types::CertificateDer::from_pem_slice(pem).unwrap())
+                .unwrap();
+        }
+        client_builder(roots).unwrap().no_proxy()
+    }
+
+    #[test]
+    fn release_tls_preserves_explicit_ring_mozilla_and_http1_policy() {
+        let default_before = rustls::crypto::CryptoProvider::get_default().map(Arc::as_ptr);
+        let roots = mozilla_roots();
+        assert_eq!(roots.roots.as_slice(), webpki_roots::TLS_SERVER_ROOTS);
+        let config = tls_config(roots).expect("construct explicit release TLS policy");
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert!(config.enable_sni);
+        assert!(!config.key_log.will_log("CLIENT_RANDOM"));
+        assert!(!config.client_auth_cert_resolver.has_certs());
+        let expected = rustls::crypto::ring::default_provider();
+        assert_eq!(
+            config
+                .crypto_provider()
+                .cipher_suites
+                .iter()
+                .map(|suite| suite.suite())
+                .collect::<Vec<_>>(),
+            expected
+                .cipher_suites
+                .iter()
+                .map(|suite| suite.suite())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            config
+                .crypto_provider()
+                .kx_groups
+                .iter()
+                .map(|group| group.name())
+                .collect::<Vec<_>>(),
+            expected
+                .kx_groups
+                .iter()
+                .map(|group| group.name())
+                .collect::<Vec<_>>()
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        client_builder(mozilla_roots())
+            .unwrap()
+            .build()
+            .expect("build client without global TLS provider");
+        let cancelled = Cancel::new();
+        cancelled.cancel();
+        assert!(matches!(
+            HttpsTransport.fetch("https://unused.invalid/", limits(), &cancelled, &Silent),
+            Err(FetchError::Rejected(ImageError::Cancelled))
+        ));
+        assert_eq!(
+            default_before,
+            rustls::crypto::CryptoProvider::get_default().map(Arc::as_ptr)
+        );
+    }
+
     struct Silent;
     impl BringUpObserver for Silent {
         fn on_progress(&self, _: bringup::BringUpProgress) {}
@@ -350,13 +451,11 @@ while True:
             }
         }
         fn builder(&self) -> reqwest::ClientBuilder {
-            reqwest::Client::builder().no_proxy().add_root_certificate(
-                reqwest::Certificate::from_pem(
-                    &std::fs::read(self.dir.path().join("cert.pem")).unwrap(),
-                )
-                .unwrap(),
-            )
+            fixture_builder(Some(
+                &std::fs::read(self.dir.path().join("cert.pem")).unwrap(),
+            ))
         }
+
         fn get(
             &self,
             path: &str,
@@ -407,7 +506,7 @@ while True:
         .is_err());
         assert!(matches!(
             fetch(
-                reqwest::Client::builder().no_proxy(),
+                client_builder(mozilla_roots()).unwrap().no_proxy(),
                 &format!("https://localhost:{}/ok", server.port),
                 limits(),
                 &cancel,
@@ -449,7 +548,8 @@ while True:
     #[test]
     fn dns_outage_is_a_temporary_failure() {
         let result = fetch(
-            reqwest::Client::builder()
+            client_builder(mozilla_roots())
+                .unwrap()
                 .no_proxy()
                 .dns_resolver(Arc::new(FailedDns)),
             "https://unreachable.invalid/",
@@ -824,7 +924,8 @@ while True:
             });
             let start = Instant::now();
             let result = fetch(
-                reqwest::Client::builder()
+                client_builder(mozilla_roots())
+                    .unwrap()
                     .no_proxy()
                     .dns_resolver(Arc::new(SlowDns {
                         started: started.clone(),
@@ -914,11 +1015,7 @@ while True:
                     url.ends_with("SHA256SUMS"),
                     "these cases must not fetch an archive"
                 );
-                let mut builder = reqwest::Client::builder().no_proxy();
-                if let Some(root) = &self.root {
-                    builder =
-                        builder.add_root_certificate(reqwest::Certificate::from_pem(root).unwrap());
-                }
+                let builder = fixture_builder(self.root.as_deref());
                 fetch(builder, &self.url, limits, cancel, observer)
             }
         }

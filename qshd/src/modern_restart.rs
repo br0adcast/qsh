@@ -75,9 +75,9 @@ fn run<W: Witness>(
 struct ControlPeer<'a>(&'a crate::control::EnsureLock);
 impl Peer for ControlPeer<'_> {
     fn info(&mut self) -> Result<BusyDaemonIdentity, ()> {
-        use rand_core::RngCore;
+        use rand_core::TryRng;
         let mut challenge = [0; 32];
-        rand_core::OsRng
+        getrandom::SysRng
             .try_fill_bytes(&mut challenge)
             .map_err(|_| ())?;
         let crate::control::ControlReply::Answered(line) = self

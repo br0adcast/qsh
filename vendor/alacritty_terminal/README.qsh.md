@@ -57,3 +57,20 @@ absent. An existing extra no longer constructs and discards a default Arc before
 append; the existing Arc copy-on-write and suffix behavior are unchanged. Product
 allocation controls cover steady unique appends, and semantic controls preserve
 empty/shared extras, underline attributes and all sixteen accepted marks.
+
+
+Dependency review on 2026-11-18 compared published 0.26.0 with upstream
+snapshot `aa5d942f46c40184a3f214830ff5f7989f4733a1`. Retain each functional hunk:
+
+| Local change | Published release and inspected upstream disposition |
+| --- | --- |
+| Pending-wrap conversion on width growth | Both still require reflow for the live cursor and lack the saved-cursor conversion. |
+| Partial-region history viewport anchoring | Both still increment the display offset before checking whether the region starts at the top. |
+| Damage when a wrapped wide-cell spacer changes | Both still remove the previous-row flag without equivalent visible-cell/history damage recording. |
+| Lazy zero-width extra storage | Both still construct the default extra eagerly with `get_or_insert` instead of constructing it only when absent. |
+
+Keep the manifest's omitted reference-test target and existing source/library
+coverage. Version 0.26.0 remains the latest published release; unrelated
+unreleased changes do not establish equivalence for these corrections. The
+existing resize, scrolling, repaint and allocation controls qualify the
+retained source separately from this comparison.

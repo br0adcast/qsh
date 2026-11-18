@@ -56,7 +56,7 @@ fn selinux_restore_error_keeps_exact_physical_kind_and_sticky_summary() {
         );
         assert_eq!(summary.failure, Some(failure));
         assert_eq!(
-            nix::fcntl::fcntl(raw, nix::fcntl::FcntlArg::F_GETFD),
+            nix::errno::Errno::result(unsafe { nix::libc::fcntl(raw, nix::libc::F_GETFD) }),
             Err(nix::errno::Errno::EBADF)
         );
     }

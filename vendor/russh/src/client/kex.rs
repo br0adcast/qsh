@@ -2,7 +2,7 @@
 // negotiated host-key algorithm (qsh #150), so an `ssh-rsa` (SHA-1)
 // signature on an `rsa-sha2-*` exchange is refused. The change is marked
 // below; see vendor/russh/README.qsh.md and qsh.patch. Otherwise this file
-// is russh 0.63.3 as published.
+// is russh 0.65.2 as published.
 
 use core::fmt;
 use std::cell::RefCell;
@@ -18,6 +18,7 @@ use super::IncomingSshPacket;
 use crate::client::{Config, NewKeys};
 use crate::kex::dh::groups::DhGroup;
 use crate::kex::{KEXES, KexAlgorithm, KexAlgorithmImplementor, KexCause, KexProgress};
+use crate::keys::agent::AgentSessionBinding;
 use crate::keys::key::parse_public_key;
 use crate::negotiation::{Names, Select};
 use crate::parsing::ensure_end;
@@ -27,6 +28,33 @@ use crate::{CryptoVec, Error, SshId, msg, negotiation, strict_kex_violation};
 
 thread_local! {
     static HASH_BUFFER: RefCell<CryptoVec> = RefCell::new(CryptoVec::new());
+}
+
+// Some servers (Huawei VRP among them) pad ECDSA signature scalars with leading
+// zeros. ssh-key rejects that as a non-canonical mpint; OpenSSH accepts it.
+// Re-encodes r and s canonically so the strict decoder can take it from there.
+fn canonicalize_ecdsa_signature(blob: &[u8]) -> Option<Vec<u8>> {
+    let mut reader = blob;
+    let algorithm = String::decode(&mut reader).ok()?;
+    if !algorithm.starts_with("ecdsa-sha2-") {
+        return None;
+    }
+    let inner = Vec::<u8>::decode(&mut reader).ok()?;
+    let mut scalars = inner.as_slice();
+    let mut canonical_scalars = Vec::new();
+    for _ in 0..2 {
+        let scalar = Vec::<u8>::decode(&mut scalars).ok()?;
+        Mpint::from_positive_bytes(&scalar)
+            .encode(&mut canonical_scalars)
+            .ok()?;
+    }
+    if !reader.is_empty() || !scalars.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    algorithm.encode(&mut out).ok()?;
+    canonical_scalars.encode(&mut out).ok()?;
+    Some(out)
 }
 
 #[derive(Debug)]
@@ -45,6 +73,7 @@ enum ClientKexState {
     WaitingForNewKeys {
         server_host_key: PublicKey,
         server_host_certificate: Option<Certificate>,
+        agent_session_binding: Option<AgentSessionBinding>,
         newkeys: NewKeys,
     },
 }
@@ -177,6 +206,7 @@ impl ClientKex {
 
                     return Ok(KexProgress::Done {
                         server_host_certificate: None,
+                        agent_session_binding: None,
                         newkeys,
                         server_host_key: None,
                     });
@@ -296,6 +326,7 @@ impl ClientKex {
                 // so there is nothing on the wire to compare against.
                 let server_host_key_blob = Bytes::decode(r)?;
                 let server_host_certificate = if names.host_key_is_certificate {
+                    crate::keys::key::check_cert_nesting(&server_host_key_blob)?;
                     Some(Certificate::from_bytes(&server_host_key_blob)?)
                 } else {
                     None
@@ -333,10 +364,20 @@ impl ClientKex {
                     }
                 })?;
 
-                let signature = Bytes::decode(r)?;
-                let mut signature_reader = &signature[..];
-                let signature = Signature::decode(&mut signature_reader)?;
-                ensure_end(&signature_reader)?;
+                let signature_blob = Bytes::decode(r)?;
+                let mut signature_reader = &signature_blob[..];
+                let signature = match Signature::decode(&mut signature_reader) {
+                    Err(err @ ssh_key::Error::Encoding(ssh_encoding::Error::MpintEncoding)) => {
+                        let canonical =
+                            canonicalize_ecdsa_signature(&signature_blob).ok_or(err)?;
+                        Signature::decode(&mut canonical.as_slice())?
+                    }
+                    result => {
+                        let signature = result?;
+                        ensure_end(&signature_reader)?;
+                        signature
+                    }
+                };
                 ensure_end(r)?;
 
                 // The signature must use the negotiated host-key algorithm
@@ -360,6 +401,13 @@ impl ClientKex {
                     return Err(Error::WrongServerSig);
                 }
 
+                let agent_session_binding = (!self.cause.is_rekey()).then(|| {
+                    AgentSessionBinding::new(
+                        server_host_key_blob.to_vec(),
+                        CryptoVec::from(&hash[..]),
+                        signature_blob.to_vec(),
+                    )
+                });
                 let newkeys = compute_keys(
                     hash,
                     kex,
@@ -378,6 +426,7 @@ impl ClientKex {
                 self.state = ClientKexState::WaitingForNewKeys {
                     server_host_key,
                     server_host_certificate,
+                    agent_session_binding,
                     newkeys,
                 };
 
@@ -389,6 +438,7 @@ impl ClientKex {
             ClientKexState::WaitingForNewKeys {
                 server_host_key,
                 server_host_certificate,
+                agent_session_binding,
                 newkeys,
             } => {
                 // At this point the exchange is complete
@@ -411,6 +461,7 @@ impl ClientKex {
 
                 Ok(KexProgress::Done {
                     server_host_certificate,
+                    agent_session_binding,
                     newkeys,
                     server_host_key: Some(server_host_key),
                 })
@@ -459,4 +510,61 @@ fn compute_keys(
         cipher: c,
         session_id: session_id_cv,
     })
+}
+
+#[cfg(test)]
+mod ecdsa_signature_canonicalization_tests {
+    use ssh_encoding::{Decode, Encode};
+    use ssh_key::Signature;
+
+    use super::canonicalize_ecdsa_signature;
+
+    fn blob(algorithm: &str, r: &[u8], s: &[u8]) -> Vec<u8> {
+        let mut scalars = Vec::new();
+        r.encode(&mut scalars).unwrap();
+        s.encode(&mut scalars).unwrap();
+        let mut out = Vec::new();
+        algorithm.encode(&mut out).unwrap();
+        scalars.encode(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn strips_leading_zeros() {
+        let r = [vec![0, 0, 0], vec![0x42; 65]].concat();
+        let s = [vec![0, 0], vec![0x80; 66]].concat();
+        let padded = blob("ecdsa-sha2-nistp521", &r, &s);
+        assert!(matches!(
+            Signature::decode(&mut padded.as_slice()),
+            Err(ssh_key::Error::Encoding(ssh_encoding::Error::MpintEncoding))
+        ));
+
+        let canonical = canonicalize_ecdsa_signature(&padded).unwrap();
+        assert_eq!(canonical, blob("ecdsa-sha2-nistp521", &r[3..], &s[1..]));
+        assert!(Signature::decode(&mut canonical.as_slice()).is_ok());
+
+        let p256 = blob("ecdsa-sha2-nistp256", &[0, 1], &[2]);
+        assert_eq!(
+            canonicalize_ecdsa_signature(&p256).unwrap(),
+            blob("ecdsa-sha2-nistp256", &[1], &[2])
+        );
+    }
+
+    #[test]
+    fn rejects_other_algorithms_and_malformed_blobs() {
+        assert!(canonicalize_ecdsa_signature(&blob("ssh-rsa", &[0, 1], &[2])).is_none());
+
+        let good = blob("ecdsa-sha2-nistp521", &[0, 1], &[2]);
+        assert!(canonicalize_ecdsa_signature(&good[..good.len() - 1]).is_none());
+        assert!(canonicalize_ecdsa_signature(&[good.clone(), vec![0xff]].concat()).is_none());
+
+        let mut scalars = Vec::new();
+        for s in [&[0, 1][..], &[2], &[3]] {
+            s.encode(&mut scalars).unwrap();
+        }
+        let mut three_scalars = Vec::new();
+        "ecdsa-sha2-nistp521".encode(&mut three_scalars).unwrap();
+        scalars.encode(&mut three_scalars).unwrap();
+        assert!(canonicalize_ecdsa_signature(&three_scalars).is_none());
+    }
 }

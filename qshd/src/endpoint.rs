@@ -34,7 +34,7 @@ impl EndpointLock {
         authority.entry()?;
         let file = authority.open_lock()?;
         let metadata = file.metadata()?;
-        let identity = nix::sys::stat::fstat(file.as_raw_fd())?;
+        let identity = nix::sys::stat::fstat(&file)?;
         if !metadata.is_file()
             || metadata.uid() != nix::unistd::geteuid().as_raw()
             || metadata.nlink() != 1
@@ -84,7 +84,7 @@ impl EndpointLock {
         }
         authority.validate_route()?;
         let current = nix::sys::stat::fstatat(
-            Some(authority.parent.as_raw_fd()),
+            &authority.parent,
             authority.lock.as_os_str(),
             nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
         )?;
@@ -188,9 +188,8 @@ impl Drop for SocketCleanup {
         }
         use nix::fcntl::AtFlags;
         use nix::sys::stat::{fstatat, SFlag};
-        use std::os::fd::AsRawFd;
         if let Ok(current) = fstatat(
-            Some(self.parent.as_raw_fd()),
+            &self.parent,
             self.leaf.as_os_str(),
             AtFlags::AT_SYMLINK_NOFOLLOW,
         ) {
@@ -199,7 +198,7 @@ impl Drop for SocketCleanup {
                 && current.st_ino == self.inode
             {
                 let _ = nix::unistd::unlinkat(
-                    Some(self.parent.as_raw_fd()),
+                    &self.parent,
                     self.leaf.as_os_str(),
                     nix::unistd::UnlinkatFlags::NoRemoveDir,
                 );
@@ -312,9 +311,8 @@ fn sweep_stale_staging_at(parent: &std::fs::File, now: std::time::SystemTime) ->
     use nix::dir::Dir;
     use nix::fcntl::OFlag;
     use nix::sys::stat::Mode;
-    use std::os::fd::AsRawFd;
     let Ok(mut entries) = Dir::openat(
-        Some(parent.as_raw_fd()),
+        parent,
         ".",
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
@@ -329,7 +327,7 @@ fn sweep_stale_staging_at(parent: &std::fs::File, now: std::time::SystemTime) ->
         let Some(pid) = staging_pid(name) else {
             continue;
         };
-        if remove_if_stale(parent.as_raw_fd(), name, pid, now) {
+        if remove_if_stale(parent, name, pid, now) {
             removed += 1;
         }
     }
@@ -338,7 +336,7 @@ fn sweep_stale_staging_at(parent: &std::fs::File, now: std::time::SystemTime) ->
 
 /// One directory of [`sweep_stale_staging`]: whether it was removed.
 fn remove_if_stale(
-    parent: std::os::fd::RawFd,
+    parent: &std::fs::File,
     name: &str,
     pid: i32,
     now: std::time::SystemTime,
@@ -347,7 +345,7 @@ fn remove_if_stale(
 }
 
 pub(crate) fn remove_if_stale_prepared(
-    parent: std::os::fd::RawFd,
+    parent: &std::fs::File,
     name: &str,
     pid: i32,
     now: std::time::SystemTime,
@@ -357,17 +355,19 @@ pub(crate) fn remove_if_stale_prepared(
     use nix::fcntl::{AtFlags, OFlag};
     use nix::sys::stat::{fstat, fstatat, Mode, SFlag};
     use nix::unistd::{geteuid, unlinkat, UnlinkatFlags};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, BorrowedFd};
 
     let Ok(mut dir) = Dir::openat(
-        Some(parent),
+        parent,
         name,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         Mode::empty(),
     ) else {
         return false;
     };
-    let fd = dir.as_raw_fd();
+    // SAFETY: dir retains sole ownership throughout iteration and all calls below;
+    // readdir/rewinddir mutate its cursor without closing its descriptor.
+    let fd = unsafe { BorrowedFd::borrow_raw(dir.as_raw_fd()) };
     let uid = geteuid().as_raw();
     let Ok(st) = fstat(fd) else {
         return false;
@@ -401,7 +401,7 @@ pub(crate) fn remove_if_stale_prepared(
         if entry_name != STAGED_NAME.as_bytes() {
             return false;
         }
-        let Ok(staged) = fstatat(Some(fd), STAGED_NAME, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+        let Ok(staged) = fstatat(fd, STAGED_NAME, AtFlags::AT_SYMLINK_NOFOLLOW) else {
             return false;
         };
         let kind = SFlag::from_bits_truncate(staged.st_mode) & SFlag::S_IFMT;
@@ -410,17 +410,17 @@ pub(crate) fn remove_if_stale_prepared(
         }
         socket = true;
     }
-    if socket && unlinkat(Some(fd), STAGED_NAME, UnlinkatFlags::NoRemoveDir).is_err() {
+    if socket && unlinkat(fd, STAGED_NAME, UnlinkatFlags::NoRemoveDir).is_err() {
         return false;
     }
     before_remove();
-    let Ok(current) = fstatat(Some(parent), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+    let Ok(current) = fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
         return false;
     };
     if !path::same(&current, &st) {
         return false;
     }
-    unlinkat(Some(parent), name, UnlinkatFlags::RemoveDir).is_ok()
+    unlinkat(parent, name, UnlinkatFlags::RemoveDir).is_ok()
 }
 
 #[cfg(test)]

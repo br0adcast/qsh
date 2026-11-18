@@ -1,13 +1,13 @@
 # qsh ssh-key maintenance patch
 
-This is the production source subset of crates.io `ssh-key` **0.7.0-rc.11**,
-from <https://crates.io/api/v1/crates/ssh-key/0.7.0-rc.11/download>. Upstream is
+This is the production source subset of crates.io `ssh-key` **0.7.0-rc.12**,
+from <https://crates.io/api/v1/crates/ssh-key/0.7.0-rc.12/download>. Upstream is
 <https://github.com/RustCrypto/SSH>; the published archive records commit
-`7a1c757d2e2fcde32680e373d5226481de6d434e` and path `ssh-key`. The SHA-256 of the
-exact upstream `.crate` archive, also its former lockfile checksum, is:
+`9a7a73baf33d83dd3d8b8b862c417a04c1e613eb` and path `ssh-key`. The SHA-256 of the
+exact upstream `.crate` archive matches the published registry checksum:
 
 ```
-f9a32fae177b74a22aa9c5b01bf7e68b33545be32d9e381e248058d2adc15ce3
+0701b552e6bd8f13a6e07bde25307c32d7daad80a79b65832d110c0416e7b638
 ```
 
 All 38 implementation source files and the required upstream README are
@@ -69,14 +69,14 @@ fields, fields deriving a different public key, and independently tampered
 original MAC fields. No private fixture is committed. The unrestricted
 random-key PPK test remains and covers each layout.
 
-The crates.io index lists `0.7.0-rc.11` as the latest release. Upstream `master`
-at `8deeb752f2bfb26bd47ed57a128b9a34d98a190b` still decodes the field as an
-mpint. Remove this patch when a compatible upstream version contains an
+The published `0.7.0-rc.12` release and upstream `master` snapshot
+at `a988e98de6339b1e652a5e91ab8a7d56d8b52b5c`, reviewed on 2026-11-17,
+still decode the field as an mpint. Remove this patch when a compatible upstream version contains an
 equivalent correction, after running these boundary regressions.
 
 The workspace root selects this exact source using `[patch.crates-io]` and
-excludes it from workspace membership. Existing exact `=0.7.0-rc.11`
-requirements and other lockfile versions are preserved. Patches apply only
+excludes it from workspace membership. Consuming manifests pin `=0.7.0-rc.12`
+to keep this source active. Patches apply only
 from the consuming workspace root: downstream workspaces must carry their
 own root patch. A version change must review the patch again; Cargo can
 otherwise leave a patch unused with only a warning.

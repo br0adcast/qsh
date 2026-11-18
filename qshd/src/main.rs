@@ -860,9 +860,8 @@ fn live_profiles(
     status: &control::StatusResponse,
     key: &[u8; 32],
 ) -> Result<LiveProfiles> {
-    use rand_core::RngCore;
     let mut challenge = [0; 32];
-    rand_core::OsRng.fill_bytes(&mut challenge);
+    getrandom::fill(&mut challenge).expect("operating system randomness is available");
     match transaction.request(&control::ControlRequest::ServerInfo(challenge))? {
         control::ControlReply::NoDaemon => Ok((None, None)),
         control::ControlReply::TimedOut => {
@@ -907,9 +906,8 @@ fn registration_request(
     generation: Option<&str>,
     key: [u8; 32],
 ) -> Result<control::ControlRequest> {
-    use rand_core::RngCore;
     let mut challenge = [0; 32];
-    rand_core::OsRng.fill_bytes(&mut challenge);
+    getrandom::fill(&mut challenge).expect("operating system randomness is available");
     match transaction.request(&control::ControlRequest::RegistrationInfo(challenge))? {
         control::ControlReply::NoDaemon => Ok(control::ControlRequest::AddClient(key)),
         control::ControlReply::TimedOut => {

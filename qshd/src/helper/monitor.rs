@@ -2067,7 +2067,7 @@ fn fork_shell(
 ) -> Result<ForkedShell, nix::Error> {
     use nix::fcntl::OFlag;
     use nix::sys::signal::{self, SigHandler, SigSet, SigmaskHow};
-    use nix::unistd::{close, dup2, fork, pipe2, setsid, ForkResult};
+    use nix::unistd::{close, fork, pipe2, setsid, ForkResult};
 
     let account = &plan.account;
     let shell = login_shell(account);
@@ -2111,7 +2111,7 @@ fn fork_shell(
     let (report_read, report_write) = pipe2(OFlag::O_CLOEXEC)?;
     #[cfg(target_os = "linux")]
     nix::fcntl::fcntl(
-        report_read.as_raw_fd(),
+        &report_read,
         nix::fcntl::FcntlArg::F_SETFL(OFlag::O_NONBLOCK),
     )?;
     #[cfg(target_os = "linux")]
@@ -2224,7 +2224,9 @@ fn fork_shell(
                 fail::<()>(report_write, nix::Error::last());
             }
             for target in [0, 1, 2] {
-                dup2(slave, target).unwrap_or_else(|e| fail(report_write, e));
+                // SAFETY: the child owns slave and deliberately replaces its standard fds.
+                nix::errno::Errno::result(unsafe { nix::libc::dup2(slave, target) })
+                    .unwrap_or_else(|e| fail(report_write, e));
             }
             if slave > 2 {
                 let _ = close(slave);
@@ -3458,12 +3460,10 @@ fn prepare_terminal(
     use nix::fcntl::{fcntl, FcntlArg, FdFlag};
     // SCM_RIGHTS receipt must have set CLOEXEC atomically. OwnedFd and the
     // sender's flags alone establish neither property.
-    let flags = fcntl(slave.as_raw_fd(), FcntlArg::F_GETFD).map_err(|error| {
-        TerminalPreparationFailure {
-            why: format!("read channel terminal descriptor flags: {error}"),
-            error: error.into(),
-            cleanup: None,
-        }
+    let flags = fcntl(&slave, FcntlArg::F_GETFD).map_err(|error| TerminalPreparationFailure {
+        why: format!("read channel terminal descriptor flags: {error}"),
+        error: error.into(),
+        cleanup: None,
     })?;
     if !FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC) {
         return Err(TerminalPreparationFailure {

@@ -476,9 +476,8 @@ mod tests {
         struct CorruptWinner;
         impl KeyFileIo for CorruptWinner {
             fn publish(&mut self, parent: &File, stage: &CStr, leaf: &OsStr) -> io::Result<()> {
-                use std::os::fd::{AsRawFd, FromRawFd};
                 let fd = nix::fcntl::openat(
-                    Some(parent.as_raw_fd()),
+                    parent,
                     leaf,
                     nix::fcntl::OFlag::O_CREAT
                         | nix::fcntl::OFlag::O_EXCL
@@ -486,7 +485,7 @@ mod tests {
                     nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
                 )?;
                 // SAFETY: openat returned a uniquely owned descriptor.
-                let mut corrupt = unsafe { File::from_raw_fd(fd) };
+                let mut corrupt = File::from(fd);
                 corrupt.write_all(b"incomplete existing identity")?;
                 FileIo.publish(parent, stage, leaf)
             }

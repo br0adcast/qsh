@@ -139,7 +139,7 @@ fn native_rsa_preserves_rfc5958_public_field_and_algorithm_parameter_policy() {
     let mut info = pkcs8::PrivateKeyInfoRef::from_der(&der).unwrap();
     info.public_key = Some(BitStringRef::from_bytes(&public).unwrap());
     // The previous shared decoder accepts RFC5958's optional public field.
-    assert!(rsa::RsaPrivateKey::try_from(info.clone()).is_ok());
+    assert!(rsa::PrivateKey::try_from(info.clone()).is_ok());
     let pem = Zeroizing::new(info.to_pem(pkcs8::LineEnding::LF).unwrap());
     let key = keyfile::decode(&pem)
         .expect("preserve accepted RFC5958 wrapper")
@@ -156,7 +156,7 @@ fn native_rsa_preserves_rfc5958_public_field_and_algorithm_parameter_policy() {
         Some(pkcs8::der::asn1::AnyRef::new(pkcs8::der::Tag::OctetString, b"generated").unwrap()),
     ] {
         info.algorithm.parameters = parameters;
-        assert!(rsa::RsaPrivateKey::try_from(info.clone()).is_err());
+        assert!(rsa::PrivateKey::try_from(info.clone()).is_err());
         let malformed = Zeroizing::new(info.to_pem(pkcs8::LineEnding::LF).unwrap());
         assert!(matches!(
             keyfile::decode(&malformed),

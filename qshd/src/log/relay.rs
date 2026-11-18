@@ -1,11 +1,9 @@
 //! Bounded, best-effort worker diagnostics. This is never an authentication seam.
 
-use std::io::{self, IoSliceMut};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
-use nix::sys::socket::{
-    recvmsg, send, socketpair, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType,
-};
+use nix::sys::socket::{send, socketpair, AddressFamily, MsgFlags, SockFlag, SockType};
 
 use super::Level;
 
@@ -69,32 +67,25 @@ impl Receiver {
             let mut packet = [0; PACKET_BYTES];
             // Linux permits at most 253 descriptors per SCM_RIGHTS message.
             // Own and close every installed descriptor even when rejecting it.
-            let mut ancillary = nix::cmsg_space!([RawFd; 253]);
-            let mut iov = [IoSliceMut::new(&mut packet)];
-            let msg = match recvmsg::<()>(
-                self.fd.as_raw_fd(),
-                &mut iov,
-                Some(&mut ancillary),
+            let control_bytes = crate::ancillary::space::<[RawFd; 253]>();
+            let received = match crate::ancillary::receive(
+                self.fd.as_fd(),
+                &mut packet,
+                control_bytes,
                 MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC,
             ) {
-                Ok(msg) => msg,
-                Err(nix::errno::Errno::EAGAIN) => return true,
-                Err(nix::errno::Errno::EINTR) => continue,
+                Ok(packet) => packet,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => return false,
             };
-            let count = msg.bytes;
-            let mut rejected = msg
+            let count = received.bytes;
+            let rejected = received
                 .flags
-                .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC);
-            for control in msg.cmsgs() {
-                rejected = true;
-                if let ControlMessageOwned::ScmRights(fds) = control {
-                    for fd in fds {
-                        // SAFETY: recvmsg installed this fd; nothing else owns it.
-                        drop(unsafe { OwnedFd::from_raw_fd(fd) });
-                    }
-                }
-            }
+                .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC)
+                || received.any_control
+                || received.unsupported;
+            drop(received.descriptors);
             if count == 0 {
                 return false;
             }
@@ -192,7 +183,7 @@ mod tests {
         )];
         assert_eq!(nix::poll::poll(&mut fd_poll, 0u8).unwrap(), 1);
         assert_eq!(
-            nix::unistd::read(read.as_raw_fd(), &mut [0]).unwrap(),
+            nix::unistd::read(&read, &mut [0]).unwrap(),
             0,
             "received write fd was closed"
         );

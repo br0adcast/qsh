@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 
 #[derive(Clone)]
 pub struct KnownHosts {
@@ -302,7 +302,7 @@ fn glob(p: &[u8], s: &[u8]) -> bool {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
 
     const K1: &[u8] =
         b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20one-one-one-one-one-one-one-one-";

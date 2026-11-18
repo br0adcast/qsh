@@ -3,7 +3,8 @@
 //! local peer admission remains unavailable until its real adapter is integrated.
 //! The verifier adapter must retain physical child custody independently when
 //! an intent is cancelled, expires, or loses its consumer.
-use rand_core::{OsRng, RngCore};
+use getrandom::SysRng;
+use rand_core::TryRng;
 use transport::session_resume::{FrontendGeneration, HostInstance, SessionLocator};
 
 use super::authorization_contract::AttachGrant;
@@ -22,7 +23,7 @@ pub(crate) enum AuthorityError {
 pub(super) fn fresh_bytes<const N: usize>() -> Result<[u8; N], AuthorityError> {
     for _ in 0..8 {
         let mut bytes = [0; N];
-        OsRng
+        SysRng
             .try_fill_bytes(&mut bytes)
             .map_err(|_| AuthorityError::Unavailable)?;
         if bytes != [0; N] {

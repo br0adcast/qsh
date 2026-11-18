@@ -461,7 +461,7 @@ impl russh::server::Handler for Login {
     async fn auth_publickey_offered(
         &mut self,
         _user: &str,
-        key: &russh::keys::PublicKey,
+        key: russh::server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
         self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
         if self.hangs_up_on_first_auth() {
@@ -470,7 +470,7 @@ impl russh::server::Handler for Login {
         if let Some(gate) = &self.auth.publickey_offer_gate {
             gate.notified().await;
         }
-        if self.auth.accept_any_key || self.is_partial_key(key) {
+        if self.auth.accept_any_key || self.is_partial_key(key.public_key) {
             return Ok(Auth::Accept);
         }
         Ok(self.reject())
@@ -479,7 +479,7 @@ impl russh::server::Handler for Login {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        key: &russh::keys::PublicKey,
+        key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
         self.auth
@@ -490,13 +490,10 @@ impl russh::server::Handler for Login {
             self.authenticated.store(true, Ordering::SeqCst);
             return Ok(Auth::Accept);
         }
-        if !self.is_partial_key(key) {
+        if !self.is_partial_key(key.public_key) {
             return Ok(self.reject());
         }
         self.first_factor = true;
-        // russh 0.63.3 sends `partial_success` as false after a publickey
-        // (it clears the flag it just set); the remaining methods still
-        // name the second factor, which is what the client goes by.
         Ok(Auth::Reject {
             proceed_with_methods: Some(MethodSet::from(&[MethodKind::KeyboardInteractive][..])),
             partial_success: true,

@@ -9,7 +9,7 @@
 use std::fmt;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use snow::{Builder, HandshakeState};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -142,8 +142,11 @@ impl Handshake {
     ) -> Self {
         let state = Builder::new(bootstrap_noise_params())
             .prologue(BOOTSTRAP_PROLOGUE)
+            .expect("Noise prologue is set once")
             .local_private_key(local_priv)
+            .expect("Noise private key is set once")
             .remote_public_key(remote_pub)
+            .expect("Noise remote public key is set once")
             .build_initiator()
             .expect("fixed bootstrap IK parameters and key lengths are valid");
         Self { state: Some(state) }
@@ -151,7 +154,9 @@ impl Handshake {
     pub(crate) fn new_bootstrap_responder(local_priv: &[u8; KEY_LEN]) -> Self {
         let state = Builder::new(bootstrap_noise_params())
             .prologue(BOOTSTRAP_PROLOGUE)
+            .expect("Noise prologue is set once")
             .local_private_key(local_priv)
+            .expect("Noise private key is set once")
             .build_responder()
             .expect("fixed bootstrap IK parameters and key length are valid");
         Self { state: Some(state) }
@@ -169,8 +174,11 @@ impl Handshake {
     ) -> Self {
         let state = Builder::new(noise_params())
             .prologue(prologue)
+            .expect("Noise prologue is set once")
             .local_private_key(local_priv)
+            .expect("Noise private key is set once")
             .remote_public_key(remote_pub)
+            .expect("Noise remote public key is set once")
             .build_initiator()
             .expect("building an IK initiator with valid keys cannot fail");
         Self { state: Some(state) }
@@ -186,7 +194,9 @@ impl Handshake {
     pub(crate) fn new_responder_with_prologue(local_priv: &[u8; KEY_LEN], prologue: &[u8]) -> Self {
         let state = Builder::new(noise_params())
             .prologue(prologue)
+            .expect("Noise prologue is set once")
             .local_private_key(local_priv)
+            .expect("Noise private key is set once")
             .build_responder()
             .expect("building an IK responder with a valid key cannot fail");
         Self { state: Some(state) }
@@ -299,8 +309,8 @@ impl TransportKeys {
     ) -> Self {
         let (send, recv) = if initiator { (k1, k2) } else { (k2, k1) };
         TransportKeys {
-            send: ChaCha20Poly1305::new(Key::from_slice(send)),
-            recv: ChaCha20Poly1305::new(Key::from_slice(recv)),
+            send: ChaCha20Poly1305::new(send.into()),
+            recv: ChaCha20Poly1305::new(recv.into()),
             header_aad,
         }
     }
@@ -371,7 +381,7 @@ fn nonce_for(counter: u64) -> Result<Nonce, TransportError> {
     }
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
-    Ok(*Nonce::from_slice(&nonce))
+    Ok(nonce.into())
 }
 
 #[cfg(test)]
@@ -384,6 +394,12 @@ mod tests {
 
     /// Buffer headroom for transport messages -- one AEAD authentication tag.
     const TRANSPORT_TAG_LEN: usize = 16;
+
+    #[test]
+    fn transport_cipher_keeps_zeroize_on_drop_contract() {
+        fn require<T: ZeroizeOnDrop>() {}
+        require::<ChaCha20Poly1305>();
+    }
 
     /// Fixed keys for the reference vectors (spec §4.9): the static and the
     /// ephemeral private key of each side.
@@ -408,12 +424,15 @@ mod tests {
         let responder_pub = public_of(&RESPONDER_STATIC);
         let mut ini = Builder::new(noise_params())
             .local_private_key(&INITIATOR_STATIC)
+            .expect("Noise private key is set once")
             .remote_public_key(&responder_pub)
+            .expect("Noise remote public key is set once")
             .fixed_ephemeral_key_for_testing_only(&INITIATOR_EPHEMERAL)
             .build_initiator()
             .expect("initiator");
         let mut res = Builder::new(noise_params())
             .local_private_key(&RESPONDER_STATIC)
+            .expect("Noise private key is set once")
             .fixed_ephemeral_key_for_testing_only(&RESPONDER_EPHEMERAL)
             .build_responder()
             .expect("responder");
@@ -815,8 +834,11 @@ mod tests {
             state: Some(
                 Builder::new(bootstrap_noise_params())
                     .prologue(BOOTSTRAP_PROLOGUE)
+                    .expect("Noise prologue is set once")
                     .local_private_key(&INITIATOR_STATIC)
+                    .expect("Noise private key is set once")
                     .remote_public_key(&remote)
+                    .expect("Noise remote public key is set once")
                     .fixed_ephemeral_key_for_testing_only(&INITIATOR_EPHEMERAL)
                     .build_initiator()
                     .unwrap(),
@@ -826,7 +848,9 @@ mod tests {
             state: Some(
                 Builder::new(bootstrap_noise_params())
                     .prologue(BOOTSTRAP_PROLOGUE)
+                    .expect("Noise prologue is set once")
                     .local_private_key(&RESPONDER_STATIC)
+                    .expect("Noise private key is set once")
                     .fixed_ephemeral_key_for_testing_only(&RESPONDER_EPHEMERAL)
                     .build_responder()
                     .unwrap(),

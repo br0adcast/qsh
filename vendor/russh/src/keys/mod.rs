@@ -1,59 +1,15 @@
-//! This crate contains methods to deal with SSH keys, as defined in
-//! crate Russh. This includes in particular various functions for
-//! opening key files, deciphering encrypted keys, and dealing with
-//! agents.
+// qsh modification: caller-provided key documentation and fixture-free tests; see README.qsh.md.
+//! Methods for opening SSH key files, decrypting caller-provided keys, and
+//! communicating with SSH agents.
 //!
-//! The following example shows how to do all these in a single example:
-//! start and SSH agent server, connect to it with a client, decipher
-//! an encrypted ED25519 private key (the password is `b"blabla"`), send it to
-//! the agent, and ask the agent to sign a piece of data
-//! (`b"Please sign this"`, below).
+//! Obtain encoded private-key material and any password from the caller:
 //!
-//!```
-//! use russh::keys::*;
-//! use futures::Future;
+//! ```
+//! use russh::keys::{decode_secret_key, Error, PrivateKey};
 //!
-//! #[derive(Clone)]
-//! struct X{}
-//! impl agent::server::Agent for X {
-//!     fn confirm(self, _: std::sync::Arc<PrivateKey>) -> Box<dyn Future<Output = (Self, bool)> + Send + Unpin> {
-//!         Box::new(futures::future::ready((self, true)))
-//!     }
+//! fn parse_private_key(encoded: &str, password: Option<&str>) -> Result<PrivateKey, Error> {
+//!     decode_secret_key(encoded, password)
 //! }
-//!
-//! const PKCS8_ENCRYPTED: &'static str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIGjMF8GCSqGSIb3DQEFDTBSMDEGCSqGSIb3DQEFDDAkBBAWQiUHKoocuxfoZ/hF\nYTjkAgIIADAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQ83d1d5/S2wz475uC\nCUrE7QRAvdVpD5e3zKH/MZjilWrMOm6cyI1LKBCssLztPyvOALtroLAPlp7WYWfu\n9Sncmm7u14n2lia7r1r5I3VBsVuH0g==\n-----END ENCRYPTED PRIVATE KEY-----\n";
-//!
-//! #[cfg(unix)]
-//! fn main() {
-//!    env_logger::try_init().unwrap_or(());
-//!    let dir = tempfile::tempdir().unwrap();
-//!    let agent_path = dir.path().join("agent");
-//!
-//!    let mut core = tokio::runtime::Runtime::new().unwrap();
-//!    let agent_path_ = agent_path.clone();
-//!    // Starting a server
-//!    core.spawn(async move {
-//!        let mut listener = tokio::net::UnixListener::bind(&agent_path_)
-//!            .unwrap();
-//!        russh::keys::agent::server::serve(tokio_stream::wrappers::UnixListenerStream::new(listener), X {}).await
-//!    });
-//!    let key = decode_secret_key(PKCS8_ENCRYPTED, Some("blabla")).unwrap();
-//!    let public = key.public_key().clone();
-//!    core.block_on(async move {
-//!        let stream = tokio::net::UnixStream::connect(&agent_path).await?;
-//!        let mut client = agent::client::AgentClient::connect(stream);
-//!        client.add_identity(&key, &[agent::Constraint::KeyLifetime { seconds: 60 }]).await?;
-//!        client.request_identities().await?;
-//!        let buf = b"signed message".to_vec();
-//!        let sig = client.sign_request(&public.into(), None, buf).await.unwrap();
-//!        // Here, `sig` is encoded in a format usable internally by the SSH protocol.
-//!        Ok::<(), Error>(())
-//!    }).unwrap()
-//! }
-//!
-//! #[cfg(not(unix))]
-//! fn main() {}
-//!
 //! ```
 
 use std::fs::File;
@@ -178,20 +134,9 @@ pub enum Error {
     #[error(transparent)]
     Utf8(#[from] FromUtf8Error),
 
-    #[error("ASN1 decoding error: {0}")]
-    #[cfg(feature = "legacy-ed25519-pkcs8-parser")]
-    LegacyASN1(::yasna::ASN1Error),
-
     #[cfg(windows)]
     #[error("Pageant: {0}")]
     Pageant(#[from] pageant::Error),
-}
-
-#[cfg(feature = "legacy-ed25519-pkcs8-parser")]
-impl From<yasna::ASN1Error> for Error {
-    fn from(e: yasna::ASN1Error) -> Error {
-        Error::LegacyASN1(e)
-    }
 }
 
 /// Load a public key from a file. Ed25519, EC-DSA and RSA keys are supported.
@@ -204,12 +149,23 @@ pub fn load_public_key<P: AsRef<Path>>(path: P) -> Result<ssh_key::PublicKey, Er
     let mut file = File::open(path.as_ref())?;
     file.read_to_string(&mut pubkey)?;
 
-    let mut split = pubkey.split_whitespace();
-    match (split.next(), split.next()) {
-        (Some(_), Some(key)) => parse_public_key_base64(key),
-        (Some(key), None) => parse_public_key_base64(key),
-        _ => Err(Error::CouldNotReadKey),
-    }
+    // First non-blank, non-`#` line: `<algorithm> <base64> [comment]` or a
+    // bare base64 blob. The comment may contain spaces.
+    let line = pubkey
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .ok_or(Error::CouldNotReadKey)?;
+    let Some((_, rest)) = line.split_once(char::is_whitespace) else {
+        return parse_public_key_base64(line);
+    };
+    let rest = rest.trim_start();
+    let (key, comment) = rest
+        .split_once(char::is_whitespace)
+        .unwrap_or((rest, ""));
+    let mut key = parse_public_key_base64(key)?;
+    key.set_comment(comment.trim_start());
+    Ok(key)
 }
 
 /// Reads a public key from the standard encoding. In some cases, the
@@ -287,174 +243,36 @@ mod test {
     use crate::keys::agent::AgentIdentity;
     use crate::keys::key::PublicKeyExt;
 
-    const ED25519_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jYmMAAAAGYmNyeXB0AAAAGAAAABDLGyfA39
-J2FcJygtYqi5ISAAAAEAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIN+Wjn4+4Fcvl2Jl
-KpggT+wCRxpSvtqqpVrQrKN1/A22AAAAkOHDLnYZvYS6H9Q3S3Nk4ri3R2jAZlQlBbUos5
-FkHpYgNw65KCWCTXtP7ye2czMC3zjn2r98pJLobsLYQgRiHIv/CUdAdsqbvMPECB+wl/UQ
-e+JpiSq66Z6GIt0801skPh20jxOO3F52SoX1IeO5D5PXfZrfSZlw6S8c7bwyp2FHxDewRx
-7/wNsnDM0T7nLv/Q==
------END OPENSSH PRIVATE KEY-----";
-
-    // password is 'test'
-    const ED25519_AESCTR_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABD1phlku5
-A2G7Q9iP+DcOc9AAAAEAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIHeLC1lWiCYrXsf/
-85O/pkbUFZ6OGIt49PX3nw8iRoXEAAAAkKRF0st5ZI7xxo9g6A4m4l6NarkQre3mycqNXQ
-dP3jryYgvsCIBAA5jMWSjrmnOTXhidqcOy4xYCrAttzSnZ/cUadfBenL+DQq6neffw7j8r
-0tbCxVGp6yCQlKrgSZf6c0Hy7dNEIU2bJFGxLe6/kWChcUAt/5Ll5rI7DVQPJdLgehLzvv
-sJWR7W+cGvJ/vLsw==
------END OPENSSH PRIVATE KEY-----";
-
-    #[cfg(feature = "rsa")]
-    const RSA_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn
-NhAAAAAwEAAQAAAQEAuSvQ9m76zhRB4m0BUKPf17lwccj7KQ1Qtse63AOqP/VYItqEH8un
-rxPogXNBgrcCEm/ccLZZsyE3qgp3DRQkkqvJhZ6O8VBPsXxjZesRCqoFNCczy+Mf0R/Qmv
-Rnpu5+4DDLz0p7vrsRZW9ji/c98KzxeUonWgkplQaCBYLN875WdeUYMGtb1MLfNCEj177j
-gZl3CzttLRK3su6dckowXcXYv1gPTPZAwJb49J43o1QhV7+1zdwXvuFM6zuYHdu9ZHSKir
-6k1dXOET3/U+LWG5ofAo8oxUWv/7vs6h7MeajwkUeIBOWYtD+wGYRvVpxvj7nyOoWtg+jm
-0X6ndnsD+QAAA8irV+ZAq1fmQAAAAAdzc2gtcnNhAAABAQC5K9D2bvrOFEHibQFQo9/XuX
-BxyPspDVC2x7rcA6o/9Vgi2oQfy6evE+iBc0GCtwISb9xwtlmzITeqCncNFCSSq8mFno7x
-UE+xfGNl6xEKqgU0JzPL4x/RH9Ca9Gem7n7gMMvPSnu+uxFlb2OL9z3wrPF5SidaCSmVBo
-IFgs3zvlZ15Rgwa1vUwt80ISPXvuOBmXcLO20tErey7p1ySjBdxdi/WA9M9kDAlvj0njej
-VCFXv7XN3Be+4UzrO5gd271kdIqKvqTV1c4RPf9T4tYbmh8CjyjFRa//u+zqHsx5qPCRR4
-gE5Zi0P7AZhG9WnG+PufI6ha2D6ObRfqd2ewP5AAAAAwEAAQAAAQAdELqhI/RsSpO45eFR
-9hcZtnrm8WQzImrr9dfn1w9vMKSf++rHTuFIQvi48Q10ZiOGH1bbvlPAIVOqdjAPtnyzJR
-HhzmyjhjasJlk30zj+kod0kz63HzSMT9EfsYNfmYoCyMYFCKz52EU3xc87Vhi74XmZz0D0
-CgIj6TyZftmzC4YJCiwwU8K+29nxBhcbFRxpgwAksFL6PCSQsPl4y7yvXGcX+7lpZD8547
-v58q3jIkH1g2tBOusIuaiphDDStVJhVdKA55Z0Kju2kvCqsRIlf1efrq43blRgJFFFCxNZ
-8Cpolt4lOHhg+o3ucjILlCOgjDV8dB21YLxmgN5q+xFNAAAAgQC1P+eLUkHDFXnleCEVrW
-xL/DFxEyneLQz3IawGdw7cyAb7vxsYrGUvbVUFkxeiv397pDHLZ5U+t5cOYDBZ7G43Mt2g
-YfWBuRNvYhHA9Sdf38m5qPA6XCvm51f+FxInwd/kwRKH01RHJuRGsl/4Apu4DqVob8y00V
-WTYyV6JBNDkQAAAIEA322lj7ZJXfK/oLhMM/RS+DvaMea1g/q43mdRJFQQso4XRCL6IIVn
-oZXFeOxrMIRByVZBw+FSeB6OayWcZMySpJQBo70GdJOc3pJb3js0T+P2XA9+/jwXS58K9a
-+IkgLkv9XkfxNGNKyPEEzXC8QQzvjs1LbmO59VLko8ypwHq/cAAACBANQqaULI0qdwa0vm
-d3Ae1+k3YLZ0kapSQGVIMT2lkrhKV35tj7HIFpUPa4vitHzcUwtjYhqFezVF+JyPbJ/Fsp
-XmEc0g1fFnQp5/SkUwoN2zm8Up52GBelkq2Jk57mOMzWO0QzzNuNV/feJk02b2aE8rrAqP
-QR+u0AypRPmzHnOPAAAAEXJvb3RAMTQwOTExNTQ5NDBkAQ==
------END OPENSSH PRIVATE KEY-----";
-
     #[test]
-    fn test_decode_ed25519_secret_key() {
-        env_logger::try_init().unwrap_or(());
-        decode_secret_key(ED25519_KEY, Some("blabla")).unwrap();
-    }
+    fn test_load_public_key_comment() {
+        const KEY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIK2pr+Bfus1hvPof4Wb/plZCzSbqadHH0u+/f4ODtKnE";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.pub");
+        let load = |contents: &str| {
+            std::fs::write(&path, contents).unwrap();
+            load_public_key(&path).unwrap()
+        };
 
-    #[test]
-    fn test_decode_ed25519_aesctr_secret_key() {
-        env_logger::try_init().unwrap_or(());
-        decode_secret_key(ED25519_AESCTR_KEY, Some("test")).unwrap();
-    }
-
-    // Key from RFC 8410 Section 10.3. This is a key using PrivateKeyInfo structure.
-    const RFC8410_ED25519_PRIVATE_ONLY_KEY: &str = "-----BEGIN PRIVATE KEY-----
-MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC
------END PRIVATE KEY-----";
-
-    #[test]
-    fn test_decode_rfc8410_ed25519_private_only_key() {
-        env_logger::try_init().unwrap_or(());
-        assert!(
-            decode_secret_key(RFC8410_ED25519_PRIVATE_ONLY_KEY, None)
-                .unwrap()
-                .algorithm()
-                == ssh_key::Algorithm::Ed25519,
+        let key = load(&format!("ssh-ed25519 {KEY} my comment\n"));
+        assert_eq!(key.comment().to_string(), "my comment");
+        assert_eq!(
+            key.to_openssh().unwrap(),
+            format!("ssh-ed25519 {KEY} my comment")
         );
-        // We always encode public key, skip test_decode_encode_symmetry.
-    }
 
-    // Key from RFC 8410 Section 10.3. This is a key using OneAsymmetricKey structure.
-    const RFC8410_ED25519_PRIVATE_PUBLIC_KEY: &str = "-----BEGIN PRIVATE KEY-----
-MHICAQEwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC
-oB8wHQYKKoZIhvcNAQkJFDEPDA1DdXJkbGUgQ2hhaXJzgSEAGb9ECWmEzf6FQbrB
-Z9w7lshQhqowtrbLDFw4rXAxZuE=
------END PRIVATE KEY-----";
+        let key = load(&format!("ssh-ed25519 {KEY}\n"));
+        assert!(key.comment().is_empty());
 
-    #[test]
-    fn test_decode_rfc8410_ed25519_private_public_key() {
-        env_logger::try_init().unwrap_or(());
-        assert!(
-            decode_secret_key(RFC8410_ED25519_PRIVATE_PUBLIC_KEY, None)
-                .unwrap()
-                .algorithm()
-                == ssh_key::Algorithm::Ed25519,
-        );
-        // We can't encode attributes, skip test_decode_encode_symmetry.
-    }
+        let key = load(&format!("{KEY}\n"));
+        assert!(key.comment().is_empty());
 
-    #[cfg(feature = "rsa")]
-    #[test]
-    fn test_decode_rsa_secret_key() {
-        env_logger::try_init().unwrap_or(());
-        decode_secret_key(RSA_KEY, None).unwrap();
-    }
+        let key = load(&format!("# a comment line\r\n\r\nssh-ed25519\t{KEY}  tabs and crlf \r\n"));
+        assert_eq!(key.comment().to_string(), "tabs and crlf");
 
-    #[test]
-    fn test_decode_openssh_p256_secret_key() {
-        // Generated using: ssh-keygen -t ecdsa -b 256 -m rfc4716 -f $file
-        let key = "-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
-1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQ/i+HCsmZZPy0JhtT64vW7EmeA1DeA
-M/VnPq3vAhu+xooJ7IMMK3lUHlBDosyvA2enNbCWyvNQc25dVt4oh9RhAAAAqHG7WMFxu1
-jBAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBD+L4cKyZlk/LQmG
-1Pri9bsSZ4DUN4Az9Wc+re8CG77GignsgwwreVQeUEOizK8DZ6c1sJbK81Bzbl1W3iiH1G
-EAAAAgLAmXR6IlN0SdiD6o8qr+vUr0mXLbajs/m0UlegElOmoAAAANcm9iZXJ0QGJic2Rl
-dgECAw==
------END OPENSSH PRIVATE KEY-----
-";
-        assert!(
-            decode_secret_key(key, None).unwrap().algorithm()
-                == ssh_key::Algorithm::Ecdsa {
-                    curve: ssh_key::EcdsaCurve::NistP256
-                },
-        );
-    }
-
-    #[test]
-    fn test_decode_openssh_p384_secret_key() {
-        // Generated using: ssh-keygen -t ecdsa -b 384 -m rfc4716 -f $file
-        let key = "-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAiAAAABNlY2RzYS
-1zaGEyLW5pc3RwMzg0AAAACG5pc3RwMzg0AAAAYQTkLnKPk/1NZD9mQ8XoebD7ASv9/svh
-5jO75HF7RYAqKK3fl5wsHe4VTJAOT3qH841yTcK79l0dwhHhHeg60byL7F9xOEzr2kqGeY
-Uwrl7fVaL7hfHzt6z+sG8smSQ3tF8AAADYHjjBch44wXIAAAATZWNkc2Etc2hhMi1uaXN0
-cDM4NAAAAAhuaXN0cDM4NAAAAGEE5C5yj5P9TWQ/ZkPF6Hmw+wEr/f7L4eYzu+Rxe0WAKi
-it35ecLB3uFUyQDk96h/ONck3Cu/ZdHcIR4R3oOtG8i+xfcThM69pKhnmFMK5e31Wi+4Xx
-87es/rBvLJkkN7RfAAAAMFzt6053dxaQT0Ta/CGfZna0nibHzxa55zgBmje/Ho3QDNlBCH
-Ylv0h4Wyzto8NfLQAAAA1yb2JlcnRAYmJzZGV2AQID
------END OPENSSH PRIVATE KEY-----
-";
-        assert!(
-            decode_secret_key(key, None).unwrap().algorithm()
-                == ssh_key::Algorithm::Ecdsa {
-                    curve: ssh_key::EcdsaCurve::NistP384
-                },
-        );
-    }
-
-    #[test]
-    fn test_decode_openssh_p521_secret_key() {
-        // Generated using: ssh-keygen -t ecdsa -b 521 -m rfc4716 -f $file
-        let key = "-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAArAAAABNlY2RzYS
-1zaGEyLW5pc3RwNTIxAAAACG5pc3RwNTIxAAAAhQQA7a9awmFeDjzYiuUOwMfXkKTevfQI
-iGlduu8BkjBOWXpffJpKsdTyJI/xI05l34OvqfCCkPUcfFWHK+LVRGahMBgBcGB9ZZOEEq
-iKNIT6C9WcJTGDqcBSzQ2yTSOxPXfUmVTr4D76vbYu5bjd9aBKx8HdfMvPeo0WD0ds/LjX
-LdJoDXcAAAEQ9fxlIfX8ZSEAAAATZWNkc2Etc2hhMi1uaXN0cDUyMQAAAAhuaXN0cDUyMQ
-AAAIUEAO2vWsJhXg482IrlDsDH15Ck3r30CIhpXbrvAZIwTll6X3yaSrHU8iSP8SNOZd+D
-r6nwgpD1HHxVhyvi1URmoTAYAXBgfWWThBKoijSE+gvVnCUxg6nAUs0Nsk0jsT131JlU6+
-A++r22LuW43fWgSsfB3XzLz3qNFg9HbPy41y3SaA13AAAAQgH4DaftY0e/KsN695VJ06wy
-Ve0k2ddxoEsSE15H4lgNHM2iuYKzIqZJOReHRCTff6QGgMYPDqDfFfL1Hc1Ntql0pwAAAA
-1yb2JlcnRAYmJzZGV2AQIDBAU=
------END OPENSSH PRIVATE KEY-----
-";
-        assert!(
-            decode_secret_key(key, None).unwrap().algorithm()
-                == ssh_key::Algorithm::Ecdsa {
-                    curve: ssh_key::EcdsaCurve::NistP521
-                },
-        );
+        for bad in ["", "\n# only a comment\n", "ssh-ed25519 not-base64\n"] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(load_public_key(&path).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -516,288 +334,6 @@ Ve0k2ddxoEsSE15H4lgNHM2iuYKzIqZJOReHRCTff6QGgMYPDqDfFfL1Hc1Ntql0pwAAAA
         parse_public_key_base64(key).unwrap();
     }
 
-    #[cfg(feature = "rsa")]
-    #[test]
-    fn test_nikao() {
-        env_logger::try_init().unwrap_or(());
-        let key = "-----BEGIN RSA PRIVATE KEY-----
-MIIEpQIBAAKCAQEAw/FG8YLVoXhsUVZcWaY7iZekMxQ2TAfSVh0LTnRuzsumeLhb
-0fh4scIt4C4MLwpGe/u3vj290C28jLkOtysqnIpB4iBUrFNRmEz2YuvjOzkFE8Ju
-0l1VrTZ9APhpLZvzT2N7YmTXcLz1yWopCe4KqTHczEP4lfkothxEoACXMaxezt5o
-wIYfagDaaH6jXJgJk1SQ5VYrROVpDjjX8/Zg01H1faFQUikYx0M8EwL1fY5B80Hd
-6DYSok8kUZGfkZT8HQ54DBgocjSs449CVqkVoQC1aDB+LZpMWovY15q7hFgfQmYD
-qulbZRWDxxogS6ui/zUR2IpX7wpQMKKkBS1qdQIDAQABAoIBAQCodpcCKfS2gSzP
-uapowY1KvP/FkskkEU18EDiaWWyzi1AzVn5LRo+udT6wEacUAoebLU5K2BaMF+aW
-Lr1CKnDWaeA/JIDoMDJk+TaU0i5pyppc5LwXTXvOEpzi6rCzL/O++88nR4AbQ7sm
-Uom6KdksotwtGvttJe0ktaUi058qaoFZbels5Fwk5bM5GHDdV6De8uQjSfYV813P
-tM/6A5rRVBjC5uY0ocBHxPXkqAdHfJuVk0uApjLrbm6k0M2dg1X5oyhDOf7ZIzAg
-QGPgvtsVZkQlyrD1OoCMPwzgULPXTe8SktaP9EGvKdMf5kQOqUstqfyx+E4OZa0A
-T82weLjBAoGBAOUChhaLQShL3Vsml/Nuhhw5LsxU7Li34QWM6P5AH0HMtsSncH8X
-ULYcUKGbCmmMkVb7GtsrHa4ozy0fjq0Iq9cgufolytlvC0t1vKRsOY6poC2MQgaZ
-bqRa05IKwhZdHTr9SUwB/ngtVNWRzzbFKLkn2W5oCpQGStAKqz3LbKstAoGBANsJ
-EyrXPbWbG+QWzerCIi6shQl+vzOd3cxqWyWJVaZglCXtlyySV2eKWRW7TcVvaXQr
-Nzm/99GNnux3pUCY6szy+9eevjFLLHbd+knzCZWKTZiWZWr503h/ztfFwrMzhoAh
-z4nukD/OETugPvtG01c2sxZb/F8LH9KORznhlSlpAoGBAJnqg1J9j3JU4tZTbwcG
-fo5ThHeCkINp2owPc70GPbvMqf4sBzjz46QyDaM//9SGzFwocplhNhaKiQvrzMnR
-LSVucnCEm/xdXLr/y6S6tEiFCwnx3aJv1uQRw2bBYkcDmBTAjVXPdUcyOHU+BYXr
-Jv6ioMlKlel8/SUsNoFWypeVAoGAXhr3Bjf1xlm+0O9PRyZjQ0RR4DN5eHbB/XpQ
-cL8hclsaK3V5tuek79JL1f9kOYhVeVi74G7uzTSYbCY3dJp+ftGCjDAirNEMaIGU
-cEMgAgSqs/0h06VESwg2WRQZQ57GkbR1E2DQzuj9FG4TwSe700OoC9o3gqon4PHJ
-/j9CM8kCgYEAtPJf3xaeqtbiVVzpPAGcuPyajTzU0QHPrXEl8zr/+iSK4Thc1K+c
-b9sblB+ssEUQD5IQkhTWcsXdslINQeL77WhIMZ2vBAH8Hcin4jgcLmwUZfpfnnFs
-QaChXiDsryJZwsRnruvMRX9nedtqHrgnIsJLTXjppIhGhq5Kg4RQfOU=
------END RSA PRIVATE KEY-----
-";
-        decode_secret_key(key, None).unwrap();
-    }
-
-    #[cfg(feature = "rsa")]
-    #[test]
-    fn test_decode_pkcs8_rsa_secret_key() {
-        // Generated using: ssh-keygen -t rsa -b 1024 -m pkcs8 -f $file
-        let key = "-----BEGIN PRIVATE KEY-----
-MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDTwWfiCKHw/1F6
-pvm6hZpFSjCVSu4Pp0/M4xT9Cec1+2uj/6uEE9Vh/UhlerkxVbrW/YaqjnlAiemZ
-0RGN+sq7b8LxsgvOAo7gdBv13TLkKxNFiRbSy8S257uA9/K7G4Uw+NW22zoLSKCp
-pdJOFzaYMIT/UX9EOq9hIIn4bS4nXJ4V5+aHBtMddHHDQPEDHBHuifpP2L4Wopzu
-WoQoVtN9cwHSLh0Bd7uT+X9useIJrFzcsxVXwD2WGfR59Ue3rxRu6JqC46Klf55R
-5NQ8OQ+7NHXjW5HO076W1GXcnhGKT5CGjglTdk5XxQkNZsz72cHu7RDaADdWAWnE
-hSyH7flrAgMBAAECggEAbFdpCjn2eTJ4grOJ1AflTYxO3SOQN8wXxTFuHKUDehgg
-E7GNFK99HnyTnPA0bmx5guQGEZ+BpCarsXpJbAYj0dC1wimhZo7igS6G272H+zua
-yZoBZmrBQ/++bJbvxxGmjM7TsZHq2bkYEpR3zGKOGUHB2kvdPJB2CNC4JrXdxl7q
-djjsr5f/SreDmHqcNBe1LcyWLSsuKTfwTKhsE1qEe6QA2uOpUuFrsdPoeYrfgapu
-sK6qnpxvOTJHCN/9jjetrP2fGl78FMBYfXzjAyKSKzLvzOwMAmcHxy50RgUvezx7
-A1RwMpB7VoV0MOpcAjlQ1T7YDH9avdPMzp0EZ24y+QKBgQD/MxDJjHu33w13MnIg
-R4BrgXvrgL89Zde5tML2/U9C2LRvFjbBvgnYdqLsuqxDxGY/8XerrAkubi7Fx7QI
-m2uvTOZF915UT/64T35zk8nAAFhzicCosVCnBEySvdwaaBKoj/ywemGrwoyprgFe
-r8LGSo42uJi0zNf5IxmVzrDlRwKBgQDUa3P/+GxgpUYnmlt63/7sII6HDssdTHa9
-x5uPy8/2ackNR7FruEAJR1jz6akvKnvtbCBeRxLeOFwsseFta8rb2vks7a/3I8ph
-gJlbw5Bttpc+QsNgC61TdSKVsfWWae+YT77cfGPM4RaLlxRnccW1/HZjP2AMiDYG
-WCiluO+svQKBgQC3a/yk4FQL1EXZZmigysOCgY6Ptfm+J3TmBQYcf/R4F0mYjl7M
-4coxyxNPEty92Gulieh5ey0eMhNsFB1SEmNTm/HmV+V0tApgbsJ0T8SyO41Xfar7
-lHZjlLN0xQFt+V9vyA3Wyh9pVGvFiUtywuE7pFqS+hrH2HNindfF1MlQAQKBgQDF
-YxBIxKzY5duaA2qMdMcq3lnzEIEXua0BTxGz/n1CCizkZUFtyqnetWjoRrGK/Zxp
-FDfDw6G50397nNPQXQEFaaZv5HLGYYC3N8vKJKD6AljqZxmsD03BprA7kEGYwtn8
-m+XMdt46TNMpZXt1YJiLMo1ETmjPXGdvX85tqLs2tQKBgQDCbwd+OBzSiic3IQlD
-E/OHAXH6HNHmUL3VD5IiRh4At2VAIl8JsmafUvvbtr5dfT3PA8HB6sDG4iXQsBbR
-oTSAo/DtIWt1SllGx6MvcPqL1hp1UWfoIGTnE3unHtgPId+DnjMbTcuZOuGl7evf
-abw8VeY2goORjpBXsfydBETbgQ==
------END PRIVATE KEY-----
-";
-        assert!(decode_secret_key(key, None).unwrap().algorithm().is_rsa());
-        test_decode_encode_symmetry(key);
-    }
-
-    #[test]
-    fn test_decode_pkcs8_p256_secret_key() {
-        // Generated using: ssh-keygen -t ecdsa -b 256 -m pkcs8 -f $file
-        let key = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgE0C7/pyJDcZTAgWo
-ydj6EE8QkZ91jtGoGmdYAVd7LaqhRANCAATWkGOof7R/PAUuOr2+ZPUgB8rGVvgr
-qa92U3p4fkJToKXku5eq/32OBj23YMtz76jO3yfMbtG3l1JWLowPA8tV
------END PRIVATE KEY-----
-";
-        assert!(
-            decode_secret_key(key, None).unwrap().algorithm()
-                == ssh_key::Algorithm::Ecdsa {
-                    curve: ssh_key::EcdsaCurve::NistP256
-                },
-        );
-        test_decode_encode_symmetry(key);
-    }
-
-    #[test]
-    fn test_decode_pkcs8_p384_secret_key() {
-        // Generated using: ssh-keygen -t ecdsa -b 384 -m pkcs8 -f $file
-        let key = "-----BEGIN PRIVATE KEY-----
-MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDCaqAL30kg+T5BUOYG9
-MrzeDXiUwy9LM8qJGNXiMYou0pVjFZPZT3jAsrUQo47PLQ6hZANiAARuEHbXJBYK
-9uyJj4PjT56OHjT2GqMa6i+FTG9vdLtu4OLUkXku+kOuFNjKvEI1JYBrJTpw9kSZ
-CI3WfCsQvVjoC7m8qRyxuvR3Rv8gGXR1coQciIoCurLnn9zOFvXCS2Y=
------END PRIVATE KEY-----
-";
-        assert!(
-            decode_secret_key(key, None).unwrap().algorithm()
-                == ssh_key::Algorithm::Ecdsa {
-                    curve: ssh_key::EcdsaCurve::NistP384
-                },
-        );
-        test_decode_encode_symmetry(key);
-    }
-
-    #[test]
-    fn test_decode_pkcs8_p521_secret_key() {
-        // Generated using: ssh-keygen -t ecdsa -b 521 -m pkcs8 -f $file
-        let key = "-----BEGIN PRIVATE KEY-----
-MIHuAgEAMBAGByqGSM49AgEGBSuBBAAjBIHWMIHTAgEBBEIB1As9UBUsCiMK7Rzs
-EoMgqDM/TK7y7+HgCWzw5UujXvSXCzYCeBgfJszn7dVoJE9G/1ejmpnVTnypdKEu
-iIvd4LyhgYkDgYYABAADBCrg7hkomJbCsPMuMcq68ulmo/6Tv8BDS13F8T14v5RN
-/0iT/+nwp6CnbBFewMI2TOh/UZNyPpQ8wOFNn9zBmAFCMzkQibnSWK0hrRstY5LT
-iaOYDwInbFDsHu8j3TGs29KxyVXMexeV6ROQyXzjVC/quT1R5cOQ7EadE4HvaWhT
-Ow==
------END PRIVATE KEY-----
-";
-        assert!(
-            decode_secret_key(key, None).unwrap().algorithm()
-                == ssh_key::Algorithm::Ecdsa {
-                    curve: ssh_key::EcdsaCurve::NistP521
-                },
-        );
-        test_decode_encode_symmetry(key);
-    }
-
-    #[test]
-    #[cfg(feature = "legacy-ed25519-pkcs8-parser")]
-    fn test_decode_pkcs8_ed25519_generated_by_russh_0_43() -> Result<(), crate::keys::Error> {
-        // Generated by russh 0.43
-        let key = "-----BEGIN PRIVATE KEY-----
-MHMCAQEwBQYDK2VwBEIEQBHw4cXPpGgA+KdvPF5gxrzML+oa3yQk0JzIbWvmqM5H30RyBF8GrOWz
-p77UAd3O4PgYzzFcUc79g8yKtbKhzJGhIwMhAN9EcgRfBqzls6e+1AHdzuD4GM8xXFHO/YPMirWy
-ocyR
-
------END PRIVATE KEY-----
-";
-
-        assert!(decode_secret_key(key, None)?.algorithm() == ssh_key::Algorithm::Ed25519,);
-
-        let k = decode_secret_key(key, None)?;
-        let inner = k.key_data().ed25519().unwrap();
-
-        assert_eq!(
-            &inner.private.to_bytes(),
-            &[
-                17, 240, 225, 197, 207, 164, 104, 0, 248, 167, 111, 60, 94, 96, 198, 188, 204, 47,
-                234, 26, 223, 36, 36, 208, 156, 200, 109, 107, 230, 168, 206, 71
-            ]
-        );
-
-        Ok(())
-    }
-
-    fn test_decode_encode_symmetry(key: &str) {
-        let original_key_bytes = data_encoding::BASE64_MIME
-            .decode(
-                key.lines()
-                    .filter(|line| !line.starts_with("-----"))
-                    .collect::<Vec<&str>>()
-                    .join("")
-                    .as_bytes(),
-            )
-            .unwrap();
-        let decoded_key = decode_secret_key(key, None).unwrap();
-        let encoded_key_bytes = pkcs8::encode_pkcs8(&decoded_key).unwrap();
-        assert_eq!(original_key_bytes, encoded_key_bytes);
-    }
-
-    #[cfg(feature = "rsa")]
-    #[test]
-    fn test_o01eg() {
-        env_logger::try_init().unwrap_or(());
-
-        let key = "-----BEGIN RSA PRIVATE KEY-----
-Proc-Type: 4,ENCRYPTED
-DEK-Info: AES-128-CBC,EA77308AAF46981303D8C44D548D097E
-
-QR18hXmAgGehm1QMMYGF34PAtBpTj+8/ZPFx2zZxir7pzDpfYoNAIf/fzLsW1ruG
-0xo/ZK/T3/TpMgjmLsCR6q+KU4jmCcCqWQIGWYJt9ljFI5y/CXr5uqP3DKcqtdxQ
-fbBAfXJ8ITF+Tj0Cljm2S1KYHor+mkil5Lf/ZNiHxcLfoI3xRnpd+2cemN9Ly9eY
-HNTbeWbLosfjwdfPJNWFNV5flm/j49klx/UhXhr5HNFNgp/MlTrvkH4rBt4wYPpE
-cZBykt4Fo1KGl95pT22inGxQEXVHF1Cfzrf5doYWxjiRTmfhpPSz/Tt0ev3+jIb8
-Htx6N8tNBoVxwCiQb7jj3XNim2OGohIp5vgW9sh6RDfIvr1jphVOgCTFKSo37xk0
-156EoCVo3VcLf+p0/QitbUHR+RGW/PvUJV/wFR5ShYqjI+N2iPhkD24kftJ/MjPt
-AAwCm/GYoYjGDhIzQMB+FETZKU5kz23MQtZFbYjzkcI/RE87c4fkToekNCdQrsoZ
-wG0Ne2CxrwwEnipHCqT4qY+lZB9EbqQgbWOXJgxA7lfznBFjdSX7uDc/mnIt9Y6B
-MZRXH3PTfotHlHMe+Ypt5lfPBi/nruOl5wLo3L4kY5pUyqR0cXKNycIJZb/pJAnE
-ryIb59pZP7njvoHzRqnC9dycnTFW3geK5LU+4+JMUS32F636aorunRCl6IBmVQHL
-uZ+ue714fn/Sn6H4dw6IH1HMDG1hr8ozP4sNUCiAQ05LsjDMGTdrUsr2iBBpkQhu
-VhUDZy9g/5XF1EgiMbZahmqi5WaJ5K75ToINHb7RjOE7MEiuZ+RPpmYLE0HXyn9X
-HTx0ZGr022dDI6nkvUm6OvEwLUUmmGKRHKe0y1EdICGNV+HWqnlhGDbLWeMyUcIY
-M6Zh9Dw3WXD3kROf5MrJ6n9MDIXx9jy7nmBh7m6zKjBVIw94TE0dsRcWb0O1IoqS
-zLQ6ihno+KsQHDyMVLEUz1TuE52rIpBmqexDm3PdDfCgsNdBKP6QSTcoqcfHKeex
-K93FWgSlvFFQQAkJumJJ+B7ZWnK+2pdjdtWwTpflAKNqc8t//WmjWZzCtbhTHCXV
-1dnMk7azWltBAuXnjW+OqmuAzyh3ayKgqfW66mzSuyQNa1KqFhqpJxOG7IHvxVfQ
-kYeSpqODnL87Zd/dU8s0lOxz3/ymtjPMHlOZ/nHNqW90IIeUwWJKJ46Kv6zXqM1t
-MeD1lvysBbU9rmcUdop0D3MOgGpKkinR5gy4pUsARBiz4WhIm8muZFIObWes/GDS
-zmmkQRO1IcfXKAHbq/OdwbLBm4vM9nk8vPfszoEQCnfOSd7aWrLRjDR+q2RnzNzh
-K+fodaJ864JFIfB/A+aVviVWvBSt0eEbEawhTmNPerMrAQ8tRRhmNxqlDP4gOczi
-iKUmK5recsXk5us5Ik7peIR/f9GAghpoJkF0HrHio47SfABuK30pzcj62uNWGljS
-3d9UQLCepT6RiPFhks/lgimbtSoiJHql1H9Q/3q4MuO2PuG7FXzlTnui3zGw/Vvy
-br8gXU8KyiY9sZVbmplRPF+ar462zcI2kt0a18mr0vbrdqp2eMjb37QDbVBJ+rPE
------END RSA PRIVATE KEY-----
-";
-        decode_secret_key(key, Some("12345")).unwrap();
-    }
-
-    #[cfg(feature = "rsa")]
-    pub const PKCS8_RSA: &str = "-----BEGIN RSA PRIVATE KEY-----
-MIIEpAIBAAKCAQEAwBGetHjW+3bDQpVktdemnk7JXgu1NBWUM+ysifYLDBvJ9ttX
-GNZSyQKA4v/dNr0FhAJ8I9BuOTjYCy1YfKylhl5D/DiSSXFPsQzERMmGgAlYvU2U
-+FTxpBC11EZg69CPVMKKevfoUD+PZA5zB7Hc1dXFfwqFc5249SdbAwD39VTbrOUI
-WECvWZs6/ucQxHHXP2O9qxWqhzb/ddOnqsDHUNoeceiNiCf2anNymovrIMjAqq1R
-t2UP3f06/Zt7Jx5AxKqS4seFkaDlMAK8JkEDuMDOdKI36raHkKanfx8CnGMSNjFQ
-QtvnpD8VSGkDTJN3Qs14vj2wvS477BQXkBKN1QIDAQABAoIBABb6xLMw9f+2ENyJ
-hTggagXsxTjkS7TElCu2OFp1PpMfTAWl7oDBO7xi+UqvdCcVbHCD35hlWpqsC2Ui
-8sBP46n040ts9UumK/Ox5FWaiuYMuDpF6vnfJ94KRcb0+KmeFVf9wpW9zWS0hhJh
-jC+yfwpyfiOZ/ad8imGCaOguGHyYiiwbRf381T/1FlaOGSae88h+O8SKTG1Oahq4
-0HZ/KBQf9pij0mfVQhYBzsNu2JsHNx9+DwJkrXT7K9SHBpiBAKisTTCnQmS89GtE
-6J2+bq96WgugiM7X6OPnmBmE/q1TgV18OhT+rlvvNi5/n8Z1ag5Xlg1Rtq/bxByP
-CeIVHsECgYEA9dX+LQdv/Mg/VGIos2LbpJUhJDj0XWnTRq9Kk2tVzr+9aL5VikEb
-09UPIEa2ToL6LjlkDOnyqIMd/WY1W0+9Zf1ttg43S/6Rvv1W8YQde0Nc7QTcuZ1K
-9jSSP9hzsa3KZtx0fCtvVHm+ac9fP6u80tqumbiD2F0cnCZcSxOb4+UCgYEAyAKJ
-70nNKegH4rTCStAqR7WGAsdPE3hBsC814jguplCpb4TwID+U78Xxu0DQF8WtVJ10
-SJuR0R2q4L9uYWpo0MxdawSK5s9Am27MtJL0mkFQX0QiM7hSZ3oqimsdUdXwxCGg
-oktxCUUHDIPJNVd4Xjg0JTh4UZT6WK9hl1zLQzECgYEAiZRCFGc2KCzVLF9m0cXA
-kGIZUxFAyMqBv+w3+zq1oegyk1z5uE7pyOpS9cg9HME2TAo4UPXYpLAEZ5z8vWZp
-45sp/BoGnlQQsudK8gzzBtnTNp5i/MnnetQ/CNYVIVnWjSxRUHBqdMdRZhv0/Uga
-e5KA5myZ9MtfSJA7VJTbyHUCgYBCcS13M1IXaMAt3JRqm+pftfqVs7YeJqXTrGs/
-AiDlGQigRk4quFR2rpAV/3rhWsawxDmb4So4iJ16Wb2GWP4G1sz1vyWRdSnmOJGC
-LwtYrvfPHegqvEGLpHa7UsgDpol77hvZriwXwzmLO8A8mxkeW5dfAfpeR5o+mcxW
-pvnTEQKBgQCKx6Ln0ku6jDyuDzA9xV2/PET5D75X61R2yhdxi8zurY/5Qon3OWzk
-jn/nHT3AZghGngOnzyv9wPMKt9BTHyTB6DlB6bRVLDkmNqZh5Wi8U1/IjyNYI0t2
-xV/JrzLAwPoKk3bkqys3bUmgo6DxVC/6RmMwPQ0rmpw78kOgEej90g==
------END RSA PRIVATE KEY-----
-";
-
-    #[cfg(feature = "rsa")]
-    #[test]
-    fn test_pkcs8() {
-        env_logger::try_init().unwrap_or(());
-        println!("test");
-        decode_secret_key(PKCS8_RSA, Some("blabla")).unwrap();
-    }
-
-    #[cfg(feature = "rsa")]
-    const PKCS8_ENCRYPTED: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----
-MIIFLTBXBgkqhkiG9w0BBQ0wSjApBgkqhkiG9w0BBQwwHAQITo1O0b8YrS0CAggA
-MAwGCCqGSIb3DQIJBQAwHQYJYIZIAWUDBAEqBBBtLH4T1KOfo1GGr7salhR8BIIE
-0KN9ednYwcTGSX3hg7fROhTw7JAJ1D4IdT1fsoGeNu2BFuIgF3cthGHe6S5zceI2
-MpkfwvHbsOlDFWMUIAb/VY8/iYxhNmd5J6NStMYRC9NC0fVzOmrJqE1wITqxtORx
-IkzqkgFUbaaiFFQPepsh5CvQfAgGEWV329SsTOKIgyTj97RxfZIKA+TR5J5g2dJY
-j346SvHhSxJ4Jc0asccgMb0HGh9UUDzDSql0OIdbnZW5KzYJPOx+aDqnpbz7UzY/
-P8N0w/pEiGmkdkNyvGsdttcjFpOWlLnLDhtLx8dDwi/sbEYHtpMzsYC9jPn3hnds
-TcotqjoSZ31O6rJD4z18FOQb4iZs3MohwEdDd9XKblTfYKM62aQJWH6cVQcg+1C7
-jX9l2wmyK26Tkkl5Qg/qSfzrCveke5muZgZkFwL0GCcgPJ8RixSB4GOdSMa/hAMU
-kvFAtoV2GluIgmSe1pG5cNMhurxM1dPPf4WnD+9hkFFSsMkTAuxDZIdDk3FA8zof
-Yhv0ZTfvT6V+vgH3Hv7Tqcxomy5Qr3tj5vvAqqDU6k7fC4FvkxDh2mG5ovWvc4Nb
-Xv8sed0LGpYitIOMldu6650LoZAqJVv5N4cAA2Edqldf7S2Iz1QnA/usXkQd4tLa
-Z80+sDNv9eCVkfaJ6kOVLk/ghLdXWJYRLenfQZtVUXrPkaPpNXgD0dlaTN8KuvML
-Uw/UGa+4ybnPsdVflI0YkJKbxouhp4iB4S5ACAwqHVmsH5GRnujf10qLoS7RjDAl
-o/wSHxdT9BECp7TT8ID65u2mlJvH13iJbktPczGXt07nBiBse6OxsClfBtHkRLzE
-QF6UMEXsJnIIMRfrZQnduC8FUOkfPOSXc8r9SeZ3GhfbV/DmWZvFPCpjzKYPsM5+
-N8Bw/iZ7NIH4xzNOgwdp5BzjH9hRtCt4sUKVVlWfEDtTnkHNOusQGKu7HkBF87YZ
-RN/Nd3gvHob668JOcGchcOzcsqsgzhGMD8+G9T9oZkFCYtwUXQU2XjMN0R4VtQgZ
-rAxWyQau9xXMGyDC67gQ5xSn+oqMK0HmoW8jh2LG/cUowHFAkUxdzGadnjGhMOI2
-zwNJPIjF93eDF/+zW5E1l0iGdiYyHkJbWSvcCuvTwma9FIDB45vOh5mSR+YjjSM5
-nq3THSWNi7Cxqz12Q1+i9pz92T2myYKBBtu1WDh+2KOn5DUkfEadY5SsIu/Rb7ub
-5FBihk2RN3y/iZk+36I69HgGg1OElYjps3D+A9AjVby10zxxLAz8U28YqJZm4wA/
-T0HLxBiVw+rsHmLP79KvsT2+b4Diqih+VTXouPWC/W+lELYKSlqnJCat77IxgM9e
-YIhzD47OgWl33GJ/R10+RDoDvY4koYE+V5NLglEhbwjloo9Ryv5ywBJNS7mfXMsK
-/uf+l2AscZTZ1mhtL38efTQCIRjyFHc3V31DI0UdETADi+/Omz+bXu0D5VvX+7c6
-b1iVZKpJw8KUjzeUV8yOZhvGu3LrQbhkTPVYL555iP1KN0Eya88ra+FUKMwLgjYr
-JkUx4iad4dTsGPodwEP/Y9oX/Qk3ZQr+REZ8lg6IBoKKqqrQeBJ9gkm1jfKE6Xkc
-Cog3JMeTrb3LiPHgN6gU2P30MRp6L1j1J/MtlOAr5rux
------END ENCRYPTED PRIVATE KEY-----";
-
     #[test]
     fn test_gpg() {
         env_logger::try_init().unwrap_or(());
@@ -826,14 +362,6 @@ Cog3JMeTrb3LiPHgN6gU2P30MRp6L1j1J/MtlOAr5rux
             152, 175, 26, 207, 91, 7,
         ];
         ssh_key::PublicKey::decode(&key).unwrap();
-    }
-
-    #[cfg(feature = "rsa")]
-    #[test]
-    fn test_pkcs8_encrypted() {
-        env_logger::try_init().unwrap_or(());
-        println!("test");
-        decode_secret_key(PKCS8_ENCRYPTED, Some("blabla")).unwrap();
     }
 
     #[cfg(unix)]
@@ -893,21 +421,21 @@ Cog3JMeTrb3LiPHgN6gU2P30MRp6L1j1J/MtlOAr5rux
     #[tokio::test]
     #[cfg(unix)]
     async fn test_client_agent_ed25519() {
-        let key = decode_secret_key(ED25519_KEY, Some("blabla")).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         test_client_agent(key).await.expect("ssh-agent test failed")
     }
 
     #[tokio::test]
     #[cfg(all(unix, feature = "rsa"))]
     async fn test_client_agent_rsa() {
-        let key = decode_secret_key(PKCS8_ENCRYPTED, Some("blabla")).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Rsa { hash: None }).unwrap();
         test_client_agent(key).await.expect("ssh-agent test failed")
     }
 
     #[tokio::test]
     #[cfg(all(unix, feature = "rsa"))]
     async fn test_client_agent_openssh_rsa() {
-        let key = decode_secret_key(RSA_KEY, None).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Rsa { hash: None }).unwrap();
         test_client_agent(key).await.expect("ssh-agent test failed")
     }
 
@@ -946,7 +474,7 @@ Cog3JMeTrb3LiPHgN6gU2P30MRp6L1j1J/MtlOAr5rux
             .await
         });
 
-        let key = decode_secret_key(PKCS8_ENCRYPTED, Some("blabla")).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         core.block_on(async move {
             let public = key.public_key();
             // make sure the listener created the file handle
@@ -971,6 +499,93 @@ Cog3JMeTrb3LiPHgN6gU2P30MRp6L1j1J/MtlOAr5rux
                 assert!(Verifier::verify(public, a, &sig).is_ok());
             }
         })
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_agent_rejects_duplicate_lifetime() {
+        #[derive(Clone)]
+        struct X {}
+        impl agent::server::Agent for X {}
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent_path = dir.path().join("agent");
+        let mut listener = tokio::net::UnixListener::bind(&agent_path).unwrap();
+        tokio::spawn(async move {
+            agent::server::serve(
+                Incoming {
+                    listener: &mut listener,
+                },
+                X {},
+            )
+            .await
+        });
+
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut client = agent::client::AgentClient::connect(stream);
+        let lifetime = || agent::Constraint::KeyLifetime { seconds: 60 };
+        assert!(client
+            .add_identity(&key, &[lifetime(), lifetime()])
+            .await
+            .is_err());
+        assert!(client.request_identities().await.unwrap().is_empty());
+        client.add_identity(&key, &[lifetime()]).await.unwrap();
+        assert_eq!(client.request_identities().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[cfg(all(unix, feature = "rsa"))]
+    async fn test_agent_sign_honors_rsa_hash_flags() {
+        use signature::Verifier;
+
+        #[derive(Clone)]
+        struct X {}
+        impl agent::server::Agent for X {}
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent_path = dir.path().join("agent");
+        let mut listener = tokio::net::UnixListener::bind(&agent_path).unwrap();
+        tokio::spawn(async move {
+            agent::server::serve(
+                Incoming {
+                    listener: &mut listener,
+                },
+                X {},
+            )
+            .await
+        });
+
+        let stream = tokio::net::UnixStream::connect(&agent_path).await.unwrap();
+        let mut client = agent::client::AgentClient::connect(stream);
+
+        let rsa = PrivateKey::random(&mut rand::rng(), Algorithm::Rsa { hash: None }).unwrap();
+        let ed25519 = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        client.add_identity(&rsa, &[]).await.unwrap();
+        client.add_identity(&ed25519, &[]).await.unwrap();
+
+        let data = b"blabla";
+        for (hash_alg, expected) in [
+            (Some(HashAlg::Sha256), "rsa-sha2-256"),
+            (Some(HashAlg::Sha512), "rsa-sha2-512"),
+            (None, "ssh-rsa"),
+        ] {
+            let sig = client
+                .sign_request_signature(rsa.public_key(), hash_alg, data)
+                .await
+                .unwrap();
+            assert_eq!(sig.algorithm().as_str(), expected);
+            assert!(Verifier::verify(rsa.public_key(), data, &sig).is_ok());
+        }
+
+        for hash_alg in [Some(HashAlg::Sha256), Some(HashAlg::Sha512), None] {
+            let sig = client
+                .sign_request_signature(ed25519.public_key(), hash_alg, data)
+                .await
+                .unwrap();
+            assert_eq!(sig.algorithm(), Algorithm::Ed25519);
+            assert!(Verifier::verify(ed25519.public_key(), data, &sig).is_ok());
+        }
     }
 
     #[cfg(unix)]

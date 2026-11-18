@@ -10,12 +10,11 @@
 //! connect to it.
 
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use nix::sys::socket::{
-    recvmsg, sendmsg, socketpair, AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags,
-    SockFlag, SockType,
+    sendmsg, socketpair, AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType,
 };
 
 use super::protocol::MAX_MESSAGE_LEN;
@@ -98,55 +97,30 @@ pub(super) struct OwnedPacket {
 
 fn receive_packet_raw(sock: &UnixStream, nonblocking: bool) -> io::Result<OwnedPacket> {
     let mut buf = vec![0u8; MAX_MESSAGE_LEN];
-    // Credential-enabled private monitor peers still carry one terminal fd.
+    // Preserve the existing payload and control-byte capacities exactly.
     #[cfg(target_os = "linux")]
-    let mut cmsg_space = nix::cmsg_space!([RawFd; 1], nix::libc::ucred);
+    let control_bytes =
+        crate::ancillary::space::<[RawFd; 1]>() + crate::ancillary::space::<nix::libc::ucred>();
     #[cfg(not(target_os = "linux"))]
-    let mut cmsg_space = nix::cmsg_space!([RawFd; 1]);
-    // `iov` must outlive `msg` (nix ties `RecvMsg`'s lifetime to it), so it
-    // stays in this scope rather than a nested block.
-    let mut iov = [io::IoSliceMut::new(&mut buf)];
-    let msg = recvmsg::<()>(
-        sock.as_raw_fd(),
-        &mut iov,
-        Some(&mut cmsg_space),
+    let control_bytes = crate::ancillary::space::<[RawFd; 1]>();
+    let packet = crate::ancillary::receive(
+        sock.as_fd(),
+        &mut buf,
+        control_bytes,
         MsgFlags::MSG_CMSG_CLOEXEC
             | if nonblocking {
                 MsgFlags::MSG_DONTWAIT
             } else {
                 MsgFlags::empty()
             },
-    )
-    .map_err(io::Error::from)?;
-
-    let bytes = msg.bytes;
-    let truncated = msg
+    )?;
+    let bytes = packet.bytes;
+    let truncated = packet
         .flags
         .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC);
-    let mut descriptors = Vec::new();
-    #[cfg(target_os = "linux")]
-    let mut sender = None;
-    #[cfg(not(target_os = "linux"))]
-    let sender = None;
-    let mut unsupported = false;
-    for cmsg in msg.cmsgs() {
-        match cmsg {
-            ControlMessageOwned::ScmRights(fds) => {
-                for raw in fds {
-                    descriptors.push(unsafe { OwnedFd::from_raw_fd(raw) });
-                }
-            }
-            #[cfg(target_os = "linux")]
-            ControlMessageOwned::ScmCredentials(cred) => {
-                if sender.replace(cred.pid()).is_some() {
-                    unsupported = true;
-                }
-            }
-            _ => unsupported = true,
-        }
-    }
-    // `msg` (and so `iov`'s borrow of `buf`) is not used past this point,
-    // which is why `buf` can be mutated again below.
+    let descriptors = packet.descriptors;
+    let sender = packet.sender;
+    let unsupported = packet.unsupported;
 
     buf.truncate(bytes);
     Ok(OwnedPacket {
@@ -327,11 +301,11 @@ mod tests {
 
         let (a, b) = pair().expect("socketpair");
         let file = tempfile::tempfile().expect("tempfile");
-        fcntl(file.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty())).expect("clear sender CLOEXEC");
+        fcntl(&file, FcntlArg::F_SETFD(FdFlag::empty())).expect("clear sender CLOEXEC");
         send(&a, b"descriptor", Some(file.as_fd())).expect("send");
         let (_, received) = recv(&b).expect("recv").expect("open peer");
         let received = received.expect("SCM_RIGHTS descriptor");
-        let flags = fcntl(received.as_raw_fd(), FcntlArg::F_GETFD).expect("get receiver flags");
+        let flags = fcntl(&received, FcntlArg::F_GETFD).expect("get receiver flags");
         assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
     }
 
@@ -368,7 +342,7 @@ mod tests {
 
         let (a, b) = pair().expect("socketpair");
         for sock in [&a, &b] {
-            let raw = fcntl(sock.as_raw_fd(), FcntlArg::F_GETFD).expect("fcntl(F_GETFD)");
+            let raw = fcntl(sock, FcntlArg::F_GETFD).expect("fcntl(F_GETFD)");
             let flags = FdFlag::from_bits_truncate(raw);
             assert!(
                 flags.contains(FdFlag::FD_CLOEXEC),

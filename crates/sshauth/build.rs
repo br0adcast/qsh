@@ -86,7 +86,7 @@ pub fn validate(target: &str, env: impl Fn(&str) -> Option<std::ffi::OsString>) 
         println!("cargo:rerun-if-changed={}", path.display());
         let bytes = std::fs::read(path).expect("complete native artifact");
         assert_eq!(
-            format!("{:x}", Sha256::digest(bytes)),
+            hex::encode(Sha256::digest(bytes)),
             expected.as_str().expect("native digest"),
             "native artifact changed after qualification"
         );

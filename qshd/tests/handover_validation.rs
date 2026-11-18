@@ -179,7 +179,9 @@ fn child(case: &str) {
     let state_fd = state.into_raw_fd();
     match case {
         "named-state" | "success" | "success-nonstandard-name" => {}
-        "dup-socket" => h.control_fd = nix::unistd::dup(udp_fd).unwrap(),
+        "dup-socket" => {
+            h.control_fd = nix::errno::Errno::result(unsafe { nix::libc::dup(udp_fd) }).unwrap()
+        }
         "state-control-alias" => h.control_fd = state_fd,
         "closed-control" => h.control_fd = 1_000_000,
         "negative-udp" => h.udp_fd = -1,

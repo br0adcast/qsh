@@ -11,7 +11,7 @@ use crate::session_owner::host_auth_contract::{
 use crate::session_owner::host_protocol::{self, HostDecoder, HostFrame, HostHeader, HostMessage};
 use crate::session_owner::local_channel::HostDispatchChannel;
 use crate::session_owner::protocol::{OwnerProtocolError, OwnerRole, MAX_OWNER_REQUESTS};
-use rand_core::RngCore;
+use rand_core::TryRng;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
@@ -71,7 +71,7 @@ pub(super) struct SystemHelperDispatch {
 fn reference() -> Result<AuthReference, BridgeError> {
     for _ in 0..8 {
         let mut bytes = [0; 16];
-        rand_core::OsRng
+        getrandom::SysRng
             .try_fill_bytes(&mut bytes)
             .map_err(|_| BridgeError::Refused)?;
         if let Some(value) = AuthReference::new(bytes) {

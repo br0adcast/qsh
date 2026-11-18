@@ -16,7 +16,7 @@ pub fn request() -> ImageRequest {
     ImageRequest::new(Platform::from_uname("Linux", "x86_64").unwrap(), "0.4.0").unwrap()
 }
 pub fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 pub fn sums(bytes: &[u8]) -> Vec<u8> {
     fixture_manifest(

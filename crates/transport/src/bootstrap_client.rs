@@ -1,7 +1,6 @@
 //! Attempt-local concurrent discovery. Silence remains unknown; admission never waits.
 use crate::bootstrap::{BootstrapClient, BootstrapError, VerifiedServerInfo};
 use crate::Datagram;
-use rand::RngCore;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -31,7 +30,7 @@ impl DiscoveryRound {
                 continue;
             }
             let mut challenge = [0; 32];
-            rand::rngs::OsRng.fill_bytes(&mut challenge);
+            getrandom::fill(&mut challenge).expect("operating system randomness is available");
             probes.push(Probe {
                 endpoint,
                 client: BootstrapClient::new(*secret, pinned_server, challenge),

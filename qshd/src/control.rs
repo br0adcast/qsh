@@ -833,11 +833,10 @@ impl EnsureLock {
     /// Exercise the actual filesystem primitive on an operation-owned absent
     /// name before STOP. Cleanup retains only this probe's inode.
     pub fn preflight_absent_publication(&self) -> std::io::Result<()> {
-        use rand_core::RngCore;
-        use std::os::fd::AsRawFd;
+        use rand_core::TryRng;
         self.validate_route()?;
         let mut random = [0u8; 16];
-        rand_core::OsRng
+        getrandom::SysRng
             .try_fill_bytes(&mut random)
             .map_err(std::io::Error::other)?;
         let route = self
@@ -847,8 +846,8 @@ impl EnsureLock {
             .with_file_name(format!(".restart-probe-{}", hex::encode(random)));
         let authority = path::EndpointAuthority::open(&route, false)?;
         if !path::same(
-            &nix::sys::stat::fstat(self.endpoint.authority().parent.as_raw_fd())?,
-            &nix::sys::stat::fstat(authority.parent.as_raw_fd())?,
+            &nix::sys::stat::fstat(&self.endpoint.authority().parent)?,
+            &nix::sys::stat::fstat(&authority.parent)?,
         ) {
             return Err(path::refused("the restart preflight parent changed"));
         }
@@ -1264,13 +1263,12 @@ mod tests {
         }
 
         fn probe_lock_creation(&self, leaf: &std::ffi::OsStr) -> std::io::Result<()> {
-            use std::os::fd::{AsRawFd, FromRawFd};
             use std::os::unix::ffi::OsStrExt;
             self.assert_unchanged();
             let mut lock = leaf.to_owned();
             lock.push(".lock");
             let descriptor = nix::fcntl::openat(
-                Some(self.parent.as_raw_fd()),
+                &self.parent,
                 lock.as_os_str(),
                 nix::fcntl::OFlag::O_WRONLY
                     | nix::fcntl::OFlag::O_CREAT
@@ -1281,8 +1279,8 @@ mod tests {
                 nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
             )?;
             // SAFETY: openat returned this fixture's newly owned descriptor.
-            let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
-            let held = nix::sys::stat::fstat(file.as_raw_fd()).unwrap();
+            let file = std::fs::File::from(descriptor);
+            let held = nix::sys::stat::fstat(&file).unwrap();
             assert_eq!(held.st_mode & nix::libc::S_IFMT, nix::libc::S_IFREG);
             assert_eq!(held.st_mode & 0o7777, 0o600);
             assert_eq!(held.st_uid, nix::unistd::geteuid().as_raw());
@@ -1292,7 +1290,7 @@ mod tests {
             assert_eq!(self.current_names(), expected);
             self.assert_sentinel_and_parent();
             let named = nix::sys::stat::fstatat(
-                Some(self.parent.as_raw_fd()),
+                &self.parent,
                 lock.as_os_str(),
                 nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
             )
@@ -1302,7 +1300,7 @@ mod tests {
                 "only unlink this probe's exact inode"
             );
             nix::unistd::unlinkat(
-                Some(self.parent.as_raw_fd()),
+                &self.parent,
                 lock.as_os_str(),
                 nix::unistd::UnlinkatFlags::NoRemoveDir,
             )
@@ -1313,7 +1311,6 @@ mod tests {
         }
 
         fn assert_publication(&self, leaf: &std::ffi::OsStr) {
-            use std::os::fd::AsRawFd;
             use std::os::unix::ffi::OsStrExt;
             let endpoint = self.directory.path().join(leaf);
             let transaction = EnsureLock::acquire(&endpoint, Duration::from_secs(1))
@@ -1333,7 +1330,7 @@ mod tests {
             drop(cleanup);
             assert!(matches!(
                 nix::sys::stat::fstatat(
-                    Some(self.parent.as_raw_fd()),
+                    &self.parent,
                     leaf,
                     nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
                 ),

@@ -162,7 +162,7 @@ pub(crate) fn statement(
     };
     if s.kind != "https://in-toto.io/Statement/v1"
         || subject.name != "SHA256SUMS"
-        || subject.digest.sha256 != format!("{:x}", Sha256::digest(manifest))
+        || subject.digest.sha256 != hex::encode(Sha256::digest(manifest))
         || s.predicate_type != "https://github.com/br0adcast/qsh/release-manifest/v1"
         || s.predicate.manifest_format != "qsh-sha256sums-v1"
         || s.predicate.version != version
