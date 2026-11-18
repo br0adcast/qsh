@@ -1,0 +1,132 @@
+{
+  "schema": 1,
+  "repository": "br0adcast/qsh",
+  "lanes": {
+    "check": {"workflow": ".github/workflows/ci.yml", "job": "check", "rust": "workspace",
+              "cells": ["check"]},
+    "container": {"workflow": ".github/workflows/ci.yml", "job": "container", "rust": "workspace",
+                  "cells": ["container"]},
+    "docs": {"workflow": ".github/workflows/ci.yml", "job": "docs", "rust": "none",
+             "cells": ["Documentation controls"]},
+    "floors": {"workflow": ".github/workflows/native-crypto.yml", "job": "system-floors",
+               "rust": "closure:qshd", "input": "floors",
+               "cells": ["Native system floor (deb)", "Native system floor (rpm)"]},
+    "fuzz": {"workflow": ".github/workflows/fuzz.yml", "job": "fuzz-smoke", "rust": "closure:fuzz",
+             "cells": ["Build and smoke the parser fuzz targets"]},
+    "intel-legacy": {"workflow": ".github/workflows/native-crypto.yml", "job": "darwin-legacy-service-intel",
+                     "rust": "workspace", "input": "intel-legacy",
+                     "cells": ["Native Intel Darwin legacy service",
+                               "Native Intel Darwin legacy service on macOS 26"]},
+    "intel-owner": {"workflow": ".github/workflows/native-crypto.yml", "job": "darwin-owner-intel",
+                    "rust": "closure:qshd", "input": "intel-owner",
+                    "cells": ["Native Intel Darwin process owner",
+                              "Native Intel Darwin process owner on macOS 26"]},
+    "macos": {"workflow": ".github/workflows/ci.yml", "job": "macos", "rust": "workspace",
+              "cells": ["macOS portable tests", "macOS 26 portable tests"]},
+    "native": {"workflow": ".github/workflows/native-crypto.yml", "job": "portable", "rust": "workspace",
+               "input": "portable",
+               "cells": ["Native x86_64-unknown-linux-musl", "Native aarch64-unknown-linux-musl",
+                         "Native aarch64-apple-darwin", "Native x86_64-apple-darwin"]},
+    "peers": {"workflow": ".github/workflows/released-peer-acceptance.yml", "job": "released-peers",
+              "rust": "paths", "cells": ["released-peers"]}
+  },
+  "calls": {
+    "fuzz": ".github/workflows/fuzz.yml",
+    "native-crypto": ".github/workflows/native-crypto.yml",
+    "released-peer-acceptance": ".github/workflows/released-peer-acceptance.yml"
+  },
+  "caller_runs": "native peers fuzz",
+  "administrative": {
+    ".github/workflows/ci.yml": {
+      "select": {"name": "Select CI lanes", "accept": ["success"]},
+      "policy": {"name": "Selection policy controls", "accept": ["success"]},
+      "gate": {"name": "CI gate", "accept": ["success"]}
+    },
+    ".github/workflows/native-crypto.yml": {
+      "lanes": {"name": "Validate native lanes", "accept": ["success"]},
+      "dispatch-mode": {"name": "Validate manual mode", "accept": ["success", "skipped"]},
+      "pty-eof-diagnostic": {"name": "PTY EOF ${{ inputs.mode == 'pty-eof-build' && 'build' || 'control' }} (${{ matrix.target }})",
+                             "accept": ["skipped"]}
+    },
+    ".github/workflows/released-peer-acceptance.yml": {},
+    ".github/workflows/fuzz.yml": {}
+  },
+  "full": [
+    ".github/workflows/**",
+    "scripts/ci-select.py", "scripts/ci-gate.py", "scripts/ci-selection.json",
+    "scripts/tests/test_ci_select.py", "scripts/tests/test_ci_gate.py",
+    "scripts/tests/test_ci_workflows.py", "scripts/tests/ci-fixtures/**",
+    "scripts/tests/test_ci_package_scope.py",
+    "Cargo.toml", "**/Cargo.toml", "Cargo.lock", "**/Cargo.lock",
+    "rust-toolchain", "rust-toolchain.toml", "**/rust-toolchain", "**/rust-toolchain.toml",
+    ".config/**", "deny.toml", "build-support/**", "**/build.rs",
+    "scripts/*openssl*", "scripts/openssl/**", "scripts/tests/test_build_openssl.py",
+    "scripts/check-dependencies.py", "scripts/install-dependency-tools.py",
+    "scripts/dependency-exceptions.json", "scripts/dependency-tools.json",
+    "scripts/tests/test_dependency_policy.py",
+    "scripts/check-qualified-rust.sh",
+    "scripts/run-nextest-ci.py", "scripts/nextest_report.py", "scripts/nextest-exclusions.json",
+    "scripts/no-silent-skips.sh", "scripts/tests/test_nextest_report.py"
+  ],
+  "policy_files": [
+    "scripts/ci-select.py", "scripts/ci-gate.py", "scripts/ci-selection.json",
+    "scripts/tests/test_ci_select.py", "scripts/tests/test_ci_gate.py",
+    "scripts/tests/test_ci_workflows.py", "scripts/tests/ci-fixtures/**"
+  ],
+  "packaging_lanes": ["check", "floors"],
+  "script_lanes": ["check"],
+  "documents": {
+    "consumed": {
+      "README.md": ["check", "docs"],
+      "CHANGELOG.md": ["check", "docs"],
+      "docs/release-security.md": ["check", "docs"],
+      "LICENSE": ["check"],
+      "docs/licenses/**": ["check"]
+    },
+    "prose": [
+      ".github/pull_request_template.md",
+      "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md",
+      "docs/actions-maintenance.md", "docs/cli-guide.md", "docs/dependency-policy.md",
+      "docs/native-crypto.md", "docs/performance-baseline.md", "docs/private-data-check.md",
+      "docs/protocol.md", "docs/qshd-service.md", "docs/terminal-resources.md",
+      "docs/three-channel-functional.md", "docs/assets/qsh-banner.svg"
+    ],
+    "reviewed_mentions": [
+      {"document": "docs/dependency-policy.md", "file": "deny.toml", "reason": "header comment"},
+      {"document": "docs/terminal-resources.md", "file": "scripts/check-qualified-rust.sh", "reason": "error message"},
+      {"document": "docs/performance-baseline.md", "file": "scripts/perf_baseline.py", "reason": "docstring"},
+      {"document": "docs/performance-baseline.md", "file": "scripts/perf_baseline_system.Dockerfile", "reason": "comment"},
+      {"document": "docs/qshd-service.md", "file": "cli/src/trust.rs", "reason": "error message"},
+      {"document": "docs/qshd-service.md", "file": "qshd/src/main.rs", "reason": "error message and module comment"},
+      {"document": "docs/qshd-service.md", "file": "qshd/src/serve.rs", "reason": "error message and comments"}
+    ]
+  },
+  "check_only": [".gitignore"],
+  "boundary": {
+    "lanes": ["check", "container"],
+    "crates": {
+      "render": {
+        "reason": "Pure transformation from terminal frames to bytes; forbid(unsafe_code); no platform API",
+        "dependencies": ["alacritty_terminal", "terminal"],
+        "dependents": ["qsh"]
+      },
+      "prediction": {
+        "reason": "Pure local-echo model over terminal state; forbid(unsafe_code); no platform API",
+        "dependencies": ["terminal"],
+        "dependents": ["bringup", "client", "qsh", "ssh"]
+      }
+    },
+    "std_modules": ["alloc", "array", "borrow", "boxed", "cell", "char", "cmp", "collections",
+                    "convert", "default", "fmt", "hash", "iter", "marker", "mem", "num", "ops",
+                    "option", "rc", "result", "slice", "str", "string", "sync", "vec"]
+  },
+  "peer_paths": [
+    "cli/tests/mixed_versions.rs", "qshd/tests/mixed_versions.rs",
+    "crates/daemon-bootstrap-protocol/**", "crates/bringup/src/**",
+    "qshd/src/main.rs", "qshd/src/control.rs", "qshd/src/control/**",
+    "qshd/src/transport_daemon.rs", "qshd/src/destructive_restart.rs",
+    "qshd/src/modern_restart.rs", "qshd/src/service_restart.rs",
+    "qshd/src/control_service_tests.rs", "cli/src/ssh_step.rs",
+    "cli/src/busy_daemon.rs", "cli/src/climb.rs"
+  ]
+}

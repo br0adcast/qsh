@@ -1,0 +1,94 @@
+{
+ "jobs": [
+  {
+   "completed_at": "2026-11-15T09:56:47Z",
+   "conclusion": "failure",
+   "head_sha": "784a4ae5f1e884f57bcebfd1ac46e86751381572",
+   "id": 132770982902,
+   "name": "container",
+   "run_attempt": 1,
+   "run_id": 43700703996,
+   "started_at": "2026-11-15T09:44:45Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-15T10:14:20Z",
+   "conclusion": "success",
+   "head_sha": "784a4ae5f1e884f57bcebfd1ac46e86751381572",
+   "id": 132770983092,
+   "name": "macOS 26 portable tests",
+   "run_attempt": 1,
+   "run_id": 43700703996,
+   "started_at": "2026-11-15T09:52:01Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-15T10:15:35Z",
+   "conclusion": "success",
+   "head_sha": "784a4ae5f1e884f57bcebfd1ac46e86751381572",
+   "id": 132770983094,
+   "name": "macOS portable tests",
+   "run_attempt": 1,
+   "run_id": 43700703996,
+   "started_at": "2026-11-15T09:51:39Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-15T10:04:02Z",
+   "conclusion": "success",
+   "head_sha": "784a4ae5f1e884f57bcebfd1ac46e86751381572",
+   "id": 132770983181,
+   "name": "check",
+   "run_attempt": 1,
+   "run_id": 43700703996,
+   "started_at": "2026-11-15T09:44:46Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-15T11:24:12Z",
+   "conclusion": "success",
+   "head_sha": "784a4ae5f1e884f57bcebfd1ac46e86751381572",
+   "id": 132792510467,
+   "name": "container",
+   "run_attempt": 2,
+   "run_id": 43700703996,
+   "started_at": "2026-11-15T11:12:23Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-15T10:15:35Z",
+   "conclusion": "success",
+   "head_sha": "784a4ae5f1e884f57bcebfd1ac46e86751381572",
+   "id": 132792511332,
+   "name": "macOS portable tests",
+   "run_attempt": 2,
+   "run_id": 43700703996,
+   "started_at": "2026-11-15T09:51:39Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-15T10:14:20Z",
+   "conclusion": "success",
+   "head_sha": "784a4ae5f1e884f57bcebfd1ac46e86751381572",
+   "id": 132792512092,
+   "name": "macOS 26 portable tests",
+   "run_attempt": 2,
+   "run_id": 43700703996,
+   "started_at": "2026-11-15T09:52:01Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-15T10:04:02Z",
+   "conclusion": "success",
+   "head_sha": "784a4ae5f1e884f57bcebfd1ac46e86751381572",
+   "id": 132792550594,
+   "name": "check",
+   "run_attempt": 2,
+   "run_id": 43700703996,
+   "started_at": "2026-11-15T09:44:46Z",
+   "status": "completed"
+  }
+ ],
+ "source": "CI run 43700703996 (PR #599), filter=all",
+ "total_count": 8
+}

@@ -5,7 +5,18 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Release and nightly qualification call this workflow and run the native,
+  # released-peer and fuzz workflows themselves; they must say so (#609).
   workflow_call:
+    inputs:
+      caller-runs:
+        type: string
+        required: false
+        default: ''
+    outputs:
+      record:
+        description: Canonical CI selection record of the called run
+        value: ${{ jobs.select.outputs.record }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,16 +33,19 @@ permissions:
   contents: read
 
 # A push to an open pull request supersedes the run already in flight for
-# it, so cancel that one instead of paying for both; a push to main never
-# cancels another push to main (there is no prior run in the same group to
-# race with in practice, and we don't want a queued main run dropped).
+# it, so cancel that one -- with the native, peer and fuzz runs it called --
+# instead of paying for both. A push to main, a dispatch and a run called by
+# Release or Nightly never cancel. The `qsh-ci-` prefix and the event keep a
+# called run's group distinct from its caller's: shared groups cancel callers.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: qsh-ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.workflow == 'CI' }}
 
 jobs:
   macos:
     name: ${{ matrix.name }}
+    needs: select
+    if: ${{ contains(fromJSON(needs.select.outputs.lanes), 'macos') }}
     strategy:
       fail-fast: false
       matrix:
@@ -1449,6 +1463,8 @@ jobs:
           cargo test -p qsh --test paths --locked
 
   check:
+    needs: select
+    if: ${{ contains(fromJSON(needs.select.outputs.lanes), 'check') }}
     runs-on: ubuntu-latest
     env:
       HISTFILE: /dev/null
@@ -2083,6 +2099,8 @@ jobs:
     # the container, so the container's glibc (and libpam) must not be older
     # than the runner's; `ubuntu-latest` moving on first would break every
     # run of this job with a loader error that says nothing about the code.
+    needs: select
+    if: ${{ contains(fromJSON(needs.select.outputs.lanes), 'container') }}
     runs-on: ubuntu-24.04
     env:
       RUSTUP_TOOLCHAIN: "1.98.1"
@@ -3001,3 +3019,144 @@ jobs:
             echo "::error::$failures of 8 test binaries failed, skipped a test or left one out"
             exit 1
           }
+
+  # Lane selection by change consumers (#609): scripts/ci-selection.json and
+  # docs/actions-maintenance.md. Invalid source identity fails this job and
+  # the gate; uncertain impact selects every lane.
+  select:
+    name: Select CI lanes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      lanes: ${{ steps.select.outputs.lanes }}
+      native_lanes: ${{ steps.select.outputs.native_lanes }}
+      calls: ${{ steps.select.outputs.calls }}
+      record: ${{ steps.select.outputs.record }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select lanes for the exact source
+        id: select
+        env:
+          QSH_CALLER_RUNS: ${{ inputs.caller-runs }}
+          QSH_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: python3 -I -B scripts/ci-select.py
+
+  policy:
+    name: Selection policy controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      HISTFILE: /dev/null
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the exact source commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Selector, gate and workflow contract controls
+        run: |
+          python3 -I -B - <<'PY_SELECTION_TESTS'
+          import sys
+          import unittest
+          sys.path.insert(0, '.')
+          names = ['scripts.tests.test_ci_select', 'scripts.tests.test_ci_gate', 'scripts.tests.test_ci_workflows']
+          suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+          count = suite.countTestCases()
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if count > 0 and result.wasSuccessful() and not result.skipped else 1)
+          PY_SELECTION_TESTS
+
+  docs:
+    name: Documentation controls
+    needs: select
+    if: ${{ contains(fromJSON(needs.select.outputs.lanes), 'docs') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      HISTFILE: /dev/null
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the exact source commit
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      # The recipe test runs every shell it finds; require all three so a
+      # missing one cannot silently narrow it.
+      - name: Install the documented shells
+        run: |
+          sudo apt-get update && sudo apt-get install -y zsh dash
+          for shell in bash dash zsh; do command -v "$shell"; done
+      - name: Release verification recipes
+        run: |
+          python3 -I -B - <<'PY_DOCUMENT_TESTS'
+          import sys
+          import unittest
+          sys.path.insert(0, '.')
+          suite = unittest.defaultTestLoader.loadTestsFromName('scripts.tests.test_release_verification_docs')
+          count = suite.countTestCases()
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(0 if count > 0 and result.wasSuccessful() and not result.skipped else 1)
+          PY_DOCUMENT_TESTS
+
+  # Top-level CI runs these itself; Release and Nightly call them directly
+  # and declare it through `caller-runs`, so nothing runs twice.
+  native-crypto:
+    needs: select
+    if: ${{ contains(fromJSON(needs.select.outputs.calls), 'native-crypto') }}
+    uses: ./.github/workflows/native-crypto.yml
+    with:
+      lanes: ${{ needs.select.outputs.native_lanes }}
+    permissions:
+      contents: read
+
+  released-peer-acceptance:
+    needs: select
+    if: ${{ contains(fromJSON(needs.select.outputs.calls), 'released-peer-acceptance') }}
+    uses: ./.github/workflows/released-peer-acceptance.yml
+    permissions:
+      contents: read
+
+  fuzz:
+    needs: select
+    if: ${{ contains(fromJSON(needs.select.outputs.calls), 'fuzz') }}
+    uses: ./.github/workflows/fuzz.yml
+    permissions:
+      contents: read
+
+  # The one result a branch rule needs: every selected cell succeeded exactly
+  # once, by the jobs API, and every other lane is named as not applicable,
+  # deferred to Nightly or delegated to the caller -- never as passed.
+  gate:
+    name: CI gate
+    if: ${{ always() }}
+    needs: [select, policy, docs, check, container, macos, native-crypto, released-peer-acceptance, fuzz]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Account for every selected cell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QSH_GATE_NEEDS: ${{ toJSON(needs) }}
+          QSH_GATE_RECORD: ${{ needs.select.outputs.record }}
+          QSH_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: python3 -I -B scripts/ci-gate.py ci --output "$RUNNER_TEMP/qualification.json"
+      - name: Retain the qualification record
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification.json
+          if-no-files-found: error

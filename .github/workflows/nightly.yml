@@ -1,0 +1,103 @@
+name: Nightly qualification
+
+# The full matrix for main's current commit (#609). PRs select lanes by
+# change and main pushes run the Linux smoke; this run supplies the rest.
+# A failed run stays failed and the next schedule tries again; it never
+# counts as qualification. Release qualification runs its own full matrix.
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One nightly per ref at a time; a running one is never cancelled.
+concurrency:
+  group: qsh-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # A scheduled run is skipped only when trusted, completed full evidence for
+  # this exact commit and policy already exists; it then reports REUSED.
+  freshness:
+    name: Nightly freshness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.freshness.outputs.run }}
+      reused: ${{ steps.freshness.outputs.reused }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Look for full qualification of this exact commit
+        id: freshness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/ci-gate.py freshness
+
+  ordinary-ci:
+    needs: freshness
+    if: ${{ needs.freshness.outputs.run == 'true' }}
+    uses: ./.github/workflows/ci.yml
+    with:
+      caller-runs: native peers fuzz
+    permissions:
+      contents: read
+      actions: read
+
+  native-crypto:
+    needs: freshness
+    if: ${{ needs.freshness.outputs.run == 'true' }}
+    uses: ./.github/workflows/native-crypto.yml
+    permissions:
+      contents: read
+
+  released-peer-acceptance:
+    needs: freshness
+    if: ${{ needs.freshness.outputs.run == 'true' }}
+    uses: ./.github/workflows/released-peer-acceptance.yml
+    permissions:
+      contents: read
+
+  fuzz:
+    needs: freshness
+    if: ${{ needs.freshness.outputs.run == 'true' }}
+    uses: ./.github/workflows/fuzz.yml
+    permissions:
+      contents: read
+
+  qualification:
+    name: Nightly qualification
+    if: ${{ always() }}
+    needs: [freshness, ordinary-ci, native-crypto, released-peer-acceptance, fuzz]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Account for every cell of the full qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QSH_GATE_NEEDS: ${{ toJSON(needs) }}
+          QSH_GATE_RECORD: ${{ needs.ordinary-ci.outputs.record }}
+          QSH_GATE_REUSED: ${{ needs.freshness.outputs.reused }}
+          QSH_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: python3 -I -B scripts/ci-gate.py nightly --output "$RUNNER_TEMP/qualification.json"
+      - name: Retain the qualification record
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification.json
+          if-no-files-found: error

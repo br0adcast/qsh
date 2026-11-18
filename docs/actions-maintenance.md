@@ -52,14 +52,116 @@ is independently shown to be unrelated, record that evidence and any diagnostic
 rerun explicitly. Include upstream revisions, relevant migration decisions and
 completed validation in the PR so the next update has a traceable starting point.
 
+## CI lane selection
+
+A pull request runs only the lanes its change can reach (#609). The `Select CI
+lanes` job of [CI](../.github/workflows/ci.yml) classifies every changed path
+with [`scripts/ci-selection.json`](../scripts/ci-selection.json); the `CI gate`
+job is the single result to watch.
+
+| Lane | Cells |
+|---|---|
+| `docs` | `Documentation controls`: release verification recipes with bash, dash and zsh |
+| `check` | Linux formatting, Clippy, nextest, doctests and script controls |
+| `container` | floor compiler and the privileged disposable tier |
+| `macos` | macOS 15 and macOS 26 portable tests |
+| `native` | the four native product targets |
+| `intel-owner`, `intel-legacy` | Intel Darwin process owner and legacy service, macOS 15 and 26 |
+| `floors` | deb and rpm system package floors |
+| `peers` | released-peer acceptance |
+| `fuzz` | fuzz smoke |
+
+How a path selects lanes:
+
+- **Full matrix:** workflows, the selection policy and its controls, every
+  Cargo manifest and lock file, toolchain files, `.config/`, `deny.toml`,
+  `build-support/`, every `build.rs`, the OpenSSL, dependency-policy and
+  nextest runner inputs, an unknown path, and any uncertainty about the change
+  set (an unreadable manifest, a malformed diff, an empty change).
+- **Rust crates:** every lane whose jobs build the crate. The dependency
+  closure comes from the manifests at both base and head, with every edge kind.
+  `intel-owner` and `floors` build only the `qshd` closure, and `fuzz` only the
+  fuzz crate's closure. The other Rust lanes build the whole workspace.
+- **Reviewed boundary crates** (`render`, `prediction`) select `check` and
+  `container`. `check` runs their tests and every dependent workspace test.
+  The boundary is revoked, and the crate takes its dependent lanes again, if:
+  - the crate enters the `qshd` closure;
+  - its dependents or dependencies differ from the reviewed sets;
+  - a file outside the crate includes one of its files;
+  - a tripwire finds a platform surface: a `cfg` other than `test`, a `std`
+    module outside the reviewed list, `Instant`, `SystemTime`, `unsafe`,
+    `extern`, `asm!`, `env!`, `file!` or an include;
+  - a tripwire finds a path it cannot follow: an alias or bare use of `std`,
+    `core` or `alloc` (`use std as p`, `std::{self as p}`, `std::*`, a root
+    handed to a macro or call), a nested or computed `std::` path,
+    `macro_rules!`, or a `#[path]` other than a plain file name.
+
+  Tripwires read the code with its comments removed by a Rust lexer, so a
+  line such as `*out = …` stays code and `std /* */ :: fs` is still `std::fs`.
+  Doc comments count as code for platform names, because doctests compile them.
+  Source the lexer cannot follow revokes the boundary.
+  Tripwires only revoke the boundary; membership is a reviewed policy change.
+  The residual risk is platform-specific output volume or timing; Nightly and
+  release qualification still run every lane.
+- **Scripts and packaging:** `check` (and `floors` for `packaging/`), plus
+  every lane whose job, script, test or crate reads the file, transitively. A
+  file that only mentions another is counted as reading it, so this side
+  errs broad.
+- **Documents:**
+  - `README.md` and `CHANGELOG.md` select `docs` and `check`, which runs the
+    release assembly and output controls. Package and artifact acceptance
+    stay with release qualification. Release notes extraction from
+    `CHANGELOG.md` runs only in `publish`.
+  - Licenses select `check`.
+  - The listed prose files select `docs`, unless a file outside the reviewed
+    mentions reads them or a Rust file includes them; then the full matrix
+    runs.
+
+A push to `main` runs the Linux smoke: `check` and `container`, or `docs` for
+a documentation-only push. The other lanes are reported as
+`DEFERRED_TO_NIGHTLY`. [Nightly](../.github/workflows/nightly.yml) runs every
+lane for main's commit. A scheduled run reuses evidence only when it finds a
+completed, successful full qualification of the same commit under the same
+policy digest: a release, a Nightly or a top-level CI dispatch with its
+`qualification.json`. It then reports `REUSED`. A reduced PR gate or main
+smoke never qualifies. A failed Nightly stays failed and the next schedule runs
+again.
+
+To qualify any branch or commit in full, dispatch CI (`workflow_dispatch`) or
+Nightly on it.
+
+The `CI gate` reads the jobs API for its own run (`actions: read` only). The
+jobs API names a pull request's head commit, while the checkout tests the
+synthetic merge; both are verified and recorded. The gate fails when:
+
+- a selected cell is missing, duplicated, not successful, or still unresolved
+  after five minutes (a job listed as completed without a conclusion yet
+  counts as unresolved, not failed);
+- a job it does not know appears in its run;
+- a skipped job keeps a lane template that the lane needed;
+- the selection record is missing or names another source;
+- a not-selected lane ran and failed.
+
+On a partial rerun, each job's newest execution counts. Successes kept from
+an earlier attempt are reported as retained, with the attempt that executed
+them.
+
+`main` has no required checks. Making `CI gate` required is a separate,
+reviewed settings change.
+
 ## Release source qualification
 
 Tag publication requires the complete ordinary CI workflow at the release run's
 exact commit: macOS 15 and macOS 26 portable tests; formatting, Clippy,
 workspace unit and integration tests, and separate doctests; and the privileged
 disposable container tier with its required-test and silent-skip checks. Native
-crypto, package builds and installed-package acceptance remain required
-independently.
+crypto, released peers, fuzz smoke, package builds and installed-package
+acceptance remain required independently.
+
+`Release qualification` accounts for every expected cell of every lane by the
+jobs API before `publish` may start; a called workflow's success cannot hide a
+skipped cell. Release calls CI with `caller-runs: native peers fuzz`: CI then
+runs only its own lanes and reports the rest as delegated to the caller.
 
 The release workflow calls the local reusable CI definition from its own
 commit. Source checkouts use `github.sha` and log and verify the actual checked
