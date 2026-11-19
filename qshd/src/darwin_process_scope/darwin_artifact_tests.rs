@@ -20,7 +20,7 @@ fn darwin185_outcome_encoding_is_closed_and_bounded() {
         "unowned wait",
         "synthetic-private-canary",
     ] {
-        let raw = execute_outcome(true, Err(error));
+        let raw = execute_outcome(true, Err(error), None);
         assert!(raw.len() <= 512 && raw.is_ascii());
         let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(value["mode"], "failure");
@@ -37,7 +37,8 @@ fn darwin185_outcome_encoding_is_closed_and_bounded() {
             .unwrap()
             .contains("synthetic-private-canary"));
     }
-    let value: serde_json::Value = serde_json::from_slice(&execute_outcome(false, Ok(()))).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&execute_outcome(false, Ok(()), None)).unwrap();
     assert_eq!(value["mode"], "positive");
     assert_eq!(value["outcome"], "ok");
     assert!(value["code"].is_null());
@@ -61,21 +62,200 @@ fn darwin185_optional_outcome_preserves_original_result() {
     }
 }
 
-fn execute_outcome(fault: bool, result: Result<(), &'static str>) -> Vec<u8> {
-    let code = result.err().map(|error| match error {
+/// The closed execute error vocabulary; any other text is masked.
+fn closed_code(error: &'static str) -> &'static str {
+    match error {
         "INPUT" | "HOST" | "DEADLINE" | "START" | "CUSTODY" | "IO" | "CONNECT" | "OUTPUT"
         | "IDENTITY" | "CANCELLED" | "CLIENT_EXIT" | "UNSETTLED" | "FAILURE_CUSTODY"
         | "unowned wait" => error,
         _ => "OTHER_EXECUTE_ERROR",
-    });
+    }
+}
+
+/// Every predicate the controlled-failure branch checks before it refuses
+/// with `FAILURE_CUSTODY`, and the masked category of the body's own result
+/// (#515). Failure-only diagnostics: no path, key, nonce or process id.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FailureCustody {
+    body: Option<&'static str>,
+    fault_reached: bool,
+    started: bool,
+    all_waited: bool,
+    io_joined: bool,
+    daemon_exit: Option<i32>,
+    rescue: bool,
+    cleanup_failed: bool,
+    open: bool,
+    bound: bool,
+    actor_exit: bool,
+}
+impl FailureCustody {
+    fn observe(body: Result<(), &'static str>, fault_reached: bool, custody: &Custody) -> Self {
+        Self {
+            body: body.err(),
+            fault_reached,
+            started: !custody.started.is_empty(),
+            all_waited: custody.started == custody.waited,
+            io_joined: custody.io_joined,
+            daemon_exit: custody.daemon_exit,
+            rescue: custody.rescue,
+            cleanup_failed: custody.cleanup_failed,
+            open: custody.open,
+            bound: custody.bound,
+            actor_exit: custody.actor_exit,
+        }
+    }
+    /// Closed ASCII JSON; an out-of-range status is not projected.
+    fn encode(&self) -> String {
+        let body = self.body.map_or_else(
+            || "null".to_owned(),
+            |error| format!("\"{}\"", closed_code(error)),
+        );
+        let daemon_exit = self
+            .daemon_exit
+            .filter(|code| (-255..=255).contains(code))
+            .map_or_else(|| "null".to_owned(), |code| code.to_string());
+        format!(
+            "{{\"schema\":1,\"body\":{body},\"fault_reached\":{},\"started\":{},\"all_waited\":{},\"io_joined\":{},\"daemon_exit\":{daemon_exit},\"rescue\":{},\"cleanup_failed\":{},\"open\":{},\"bound\":{},\"actor_exit\":{}}}",
+            self.fault_reached,
+            self.started,
+            self.all_waited,
+            self.io_joined,
+            self.rescue,
+            self.cleanup_failed,
+            self.open,
+            self.bound,
+            self.actor_exit,
+        )
+    }
+}
+
+fn execute_outcome(
+    fault: bool,
+    result: Result<(), &'static str>,
+    custody: Option<&FailureCustody>,
+) -> Vec<u8> {
+    let code = result.err().map(closed_code);
+    // Only the controlled-failure custody refusal carries its predicates.
+    let custody = custody
+        .filter(|_| fault && code == Some("FAILURE_CUSTODY"))
+        .map_or_else(String::new, |custody| {
+            format!(",\"custody\":{}", custody.encode())
+        });
     // All interpolated values are closed ASCII constants, never an error message.
     let code = code.map_or_else(|| "null".to_owned(), |code| format!("\"{code}\""));
     format!(
-        "{{\"schema\":1,\"kind\":\"darwin-archive-execute-outcome\",\"mode\":\"{}\",\"outcome\":\"{}\",\"code\":{code}}}\n",
+        "{{\"schema\":1,\"kind\":\"darwin-archive-execute-outcome\",\"mode\":\"{}\",\"outcome\":\"{}\",\"code\":{code}{custody}}}\n",
         if fault { "failure" } else { "positive" },
         if result.is_ok() { "ok" } else { "error" },
     )
     .into_bytes()
+}
+
+#[test]
+fn darwin515_failure_custody_projects_each_predicate_and_masks_the_body() {
+    const KEYS: [&str; 12] = [
+        "schema",
+        "body",
+        "fault_reached",
+        "started",
+        "all_waited",
+        "io_joined",
+        "daemon_exit",
+        "rescue",
+        "cleanup_failed",
+        "open",
+        "bound",
+        "actor_exit",
+    ];
+    let settled = || {
+        let mut custody = Custody::default();
+        custody.start(1).unwrap();
+        custody.wait(1).unwrap();
+        custody.io_joined = true;
+        custody.daemon_exit = Some(0);
+        custody
+    };
+    assert!(settled().settled());
+    // Each case breaks exactly one settlement predicate, or none (an unreached fault).
+    let cases: [(&str, fn(&mut Custody)); 8] = [
+        ("none", |_| {}),
+        ("started", |c| {
+            c.started.clear();
+            c.waited.clear();
+        }),
+        ("all_waited", |c| {
+            c.start(2).unwrap();
+        }),
+        ("io_joined", |c| c.io_joined = false),
+        ("daemon_exit", |c| c.daemon_exit = Some(-1)),
+        ("rescue", |c| c.rescue = true),
+        ("cleanup_failed", |c| c.cleanup_failed = true),
+        ("open", |c| {
+            c.open = true;
+            c.bound = true;
+        }),
+    ];
+    for (broken, change) in cases {
+        let mut custody = settled();
+        change(&mut custody);
+        assert_eq!(custody.settled(), broken == "none", "{broken}");
+        let reached = broken != "none";
+        let diagnostic = FailureCustody::observe(Err("CANCELLED"), reached, &custody);
+        let raw = execute_outcome(true, Err("FAILURE_CUSTODY"), Some(&diagnostic));
+        assert!(raw.len() <= 512 && raw.is_ascii(), "{broken}");
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(value["code"], "FAILURE_CUSTODY");
+        let record = value["custody"].as_object().unwrap();
+        assert_eq!(
+            record.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            KEYS.into_iter().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(record["schema"], 1);
+        assert_eq!(record["body"], "CANCELLED");
+        assert_eq!(record["fault_reached"], reached);
+        assert_eq!(record["started"], broken != "started");
+        assert_eq!(record["all_waited"], broken != "all_waited");
+        assert_eq!(record["io_joined"], broken != "io_joined");
+        assert_eq!(
+            record["daemon_exit"],
+            if broken == "daemon_exit" { -1 } else { 0 }
+        );
+        assert_eq!(record["rescue"], broken == "rescue");
+        assert_eq!(record["cleanup_failed"], broken == "cleanup_failed");
+        assert_eq!(record["open"], broken == "open");
+        assert_eq!(record["bound"], broken == "open");
+        assert_eq!(record["actor_exit"], false);
+    }
+}
+
+#[test]
+fn darwin515_failure_custody_is_failure_only_and_bounded() {
+    let mut custody = Custody::default();
+    custody.daemon_exit = Some(4096);
+    let unknown = FailureCustody::observe(Err("synthetic-private-canary"), false, &custody);
+    let raw = execute_outcome(true, Err("FAILURE_CUSTODY"), Some(&unknown));
+    let text = String::from_utf8(raw).unwrap();
+    assert!(!text.contains("synthetic-private-canary"));
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["custody"]["body"], "OTHER_EXECUTE_ERROR");
+    // An out-of-range status is not projected as a number.
+    assert!(value["custody"]["daemon_exit"].is_null());
+    let ok = FailureCustody::observe(Ok(()), false, &Custody::default());
+    let value: serde_json::Value =
+        serde_json::from_slice(&execute_outcome(true, Err("FAILURE_CUSTODY"), Some(&ok))).unwrap();
+    assert!(value["custody"]["body"].is_null());
+    // Every other outcome keeps the original five-key record.
+    for (fault, result) in [
+        (true, Err("UNSETTLED")),
+        (true, Ok(())),
+        (false, Err("FAILURE_CUSTODY")),
+        (false, Ok(())),
+    ] {
+        let value: serde_json::Value =
+            serde_json::from_slice(&execute_outcome(fault, result, Some(&ok))).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 5, "{fault} {result:?}");
+    }
 }
 
 fn preserve_execute_outcome(
@@ -789,9 +969,10 @@ mod native {
     }
     fn execute(fault: bool) -> Result<()> {
         let (request, directory) = request()?;
-        let result = execute_validated(fault, &request, &directory);
+        let mut custody = None;
+        let result = execute_validated(fault, &request, &directory, &mut custody);
         super::preserve_execute_outcome(result, || {
-            let raw = super::execute_outcome(fault, result);
+            let raw = super::execute_outcome(fault, result, custody.as_ref());
             if raw.len() > 512 || !raw.is_ascii() {
                 return Err("OUTPUT");
             }
@@ -813,7 +994,12 @@ mod native {
             file.write_all(&raw).map_err(|_| "OUTPUT")
         })
     }
-    fn execute_validated(fault: bool, request: &Value, directory: &Path) -> Result<()> {
+    fn execute_validated(
+        fault: bool,
+        request: &Value,
+        directory: &Path,
+        diagnostic: &mut Option<super::FailureCustody>,
+    ) -> Result<()> {
         let prepared = &request["prepared"];
         let host = host(text(prepared, "target")?)?;
         let end = Instant::now() + Duration::from_secs(55);
@@ -1194,6 +1380,11 @@ mod native {
         }
         if fault {
             if !fault_reached || !custody.settled() {
+                *diagnostic = Some(super::FailureCustody::observe(
+                    body,
+                    fault_reached,
+                    &custody,
+                ));
                 return Err("FAILURE_CUSTODY");
             }
             return write_json(

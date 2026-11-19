@@ -64,8 +64,25 @@ def _status(value):
     return value if type(value) is int and -2147483648<=value<=2147483647 else None
 
 
+_CUSTODY_FLAGS=('fault_reached','started','all_waited','io_joined','rescue','cleanup_failed',
+    'open','bound','actor_exit')
+
+
+def _custody(value):
+    """Failure-only predicates of a controlled-failure custody refusal (#515)."""
+    _keys(value,('schema','body','daemon_exit',*_CUSTODY_FLAGS))
+    if type(value['schema']) is not int or value['schema']!=1:fail('SCHEMA')
+    if value['body'] is not None and (type(value['body']) is not str or value['body'] not in _EXECUTE_CODES):
+        fail('SCHEMA')
+    if value['daemon_exit'] is not None and (type(value['daemon_exit']) is not int
+                                             or not -255<=value['daemon_exit']<=255):fail('SCHEMA')
+    if any(type(value[key]) is not bool for key in _CUSTODY_FLAGS):fail('SCHEMA')
+    return value
+
+
 def _outcome(value,mode):
-    _keys(value,('schema','kind','mode','outcome','code'))
+    custody=type(value) is dict and 'custody' in value
+    _keys(value,('schema','kind','mode','outcome','code',*(('custody',) if custody else ())))
     if (type(value['schema']) is not int or value['schema']!=1
             or value['kind']!='darwin-archive-execute-outcome'
             or type(value['mode']) is not str or value['mode'] not in ('failure','positive')
@@ -75,6 +92,9 @@ def _outcome(value,mode):
     elif value['outcome']=='error':
         if type(value['code']) is not str or value['code'] not in _EXECUTE_CODES:fail('SCHEMA')
     else:fail('SCHEMA')
+    if custody:
+        if value['mode']!='failure' or value['code']!='FAILURE_CUSTODY':fail('SCHEMA')
+        _custody(value['custody'])
     return value
 
 

@@ -714,6 +714,54 @@ class RefusalDiagnosticsTests(unittest.TestCase):
         path.unlink();os.link(other,path)
         self.assertEqual(adapter._read_outcome(self.root,'failure'),('INVALID',None))
 
+    def custody_outcome(self,**changes):
+        custody=dict(schema=1,body='CANCELLED',fault_reached=True,started=True,all_waited=True,io_joined=False,
+                     daemon_exit=0,rescue=False,cleanup_failed=False,open=True,bound=True,actor_exit=False)
+        custody.update(changes)
+        return dict(self.outcome(code='FAILURE_CUSTODY'),custody=custody)
+
+    def test_failure_custody_predicates_are_read_only_from_the_exact_closed_record(self):
+        adapter=self.adapter();path=self.root/'execute-outcome.json'
+        def write(value):
+            path.write_bytes(encoded(value) if type(value) is dict else value);path.chmod(0o600)
+        for valid in (self.custody_outcome(),self.custody_outcome(body=None,daemon_exit=None,fault_reached=False),
+                      self.custody_outcome(body='OTHER_EXECUTE_ERROR',daemon_exit=-255)):
+            write(valid)
+            with self.subTest(valid=valid['custody']):
+                self.assertEqual(adapter._read_outcome(self.root,'failure'),('VALID',valid))
+        base=self.custody_outcome()
+        for invalid in (dict(base,code='UNSETTLED'),dict(base,outcome='ok',code=None),
+                        dict(base,mode='positive'),dict(base,custody=None),dict(base,custody=[]),
+                        dict(base,custody=dict(base['custody'],extra=True)),
+                        {**base,'custody':{k:v for k,v in base['custody'].items() if k!='bound'}},
+                        self.custody_outcome(schema=2),self.custody_outcome(schema=True),
+                        self.custody_outcome(body='private-canary'),self.custody_outcome(body=1),
+                        self.custody_outcome(daemon_exit=256),self.custody_outcome(daemon_exit=True),
+                        self.custody_outcome(daemon_exit=0.0),self.custody_outcome(open=1),
+                        self.custody_outcome(rescue=None),self.custody_outcome(actor_exit='false')):
+            write(invalid)
+            mode='positive' if invalid.get('mode')=='positive' else 'failure'
+            with self.subTest(invalid=encoded(invalid)[-90:]):
+                self.assertEqual(adapter._read_outcome(self.root,mode),('INVALID',None))
+
+    def test_failure_custody_refusal_projection_is_bounded_and_preserves_category(self):
+        adapter=self.adapter();context=adapter.DiagnosticContext();context.phase='CONTROLLED_EXECUTE'
+        context.harness_status=-2147483648;context.diagnostic_state='VALID'
+        context.rust_outcome=self.custody_outcome(body='OTHER_EXECUTE_ERROR',daemon_exit=-255,
+            **{key:True for key in adapter._CUSTODY_FLAGS})
+        record=adapter._refusal_record(adapter.SmokeError('HARNESS_FAILED'),context)
+        raw=b'DARWIN_SMOKE_REFUSED '+adapter.canonical(record)
+        self.assertLessEqual(len(raw),1024);self.assertTrue(raw.isascii())
+        self.assertEqual((record['phase'],record['category'],record['diagnostic_state']),
+                         ('CONTROLLED_EXECUTE','HARNESS_FAILED','VALID'))
+        self.assertEqual(record['rust_outcome'],context.rust_outcome)
+        # A malformed in-memory record is withheld; the refusal itself is unchanged.
+        context.rust_outcome=self.custody_outcome(body='private-canary')
+        record=adapter._refusal_record(adapter.SmokeError('HARNESS_FAILED'),context)
+        self.assertEqual((record['category'],record['diagnostic_state'],record['rust_outcome']),
+                         ('HARNESS_FAILED','INVALID',None))
+        self.assertNotIn(b'private-canary',adapter.canonical(record))
+
     def test_nonzero_child_reads_outcome_only_after_wait_and_preserves_failure(self):
         import subprocess
         adapter=self.adapter();waits=[]
