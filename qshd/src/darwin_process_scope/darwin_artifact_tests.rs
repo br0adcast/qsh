@@ -926,7 +926,10 @@ mod native {
             // A fixed actor owns no descendants. Its own deadline is below the
             // enclosing run budget; no interactive user shell is accepted.
             let mut input = Vec::new();
-            let mut stdin = std::io::stdin();
+            // Read the terminal descriptor itself: a buffered `Stdin` would take
+            // the whole line on its first read, and poll(2) would then report
+            // nothing readable while the rest waited in user space.
+            let mut stdin = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
             loop {
                 if monotonic_ms()? >= actor_end {
                     return Err("DEADLINE");
