@@ -279,8 +279,10 @@ fn release_assembly_writes_the_manifest_this_contract_accepts() {
         let artifacts = work.path().join("artifacts");
         let products = contracts::products(version).unwrap();
         for name in &products {
-            let producer = if name.contains("-apple-darwin") {
-                "macos"
+            let producer = if name.contains("aarch64-apple-darwin") {
+                "macos-aarch64-apple-darwin"
+            } else if name.contains("x86_64-apple-darwin") {
+                "macos-x86_64-apple-darwin"
             } else if name.starts_with("qshd") {
                 "server-packages"
             } else if ["x86_64", "amd64"].iter().any(|arch| name.contains(arch)) {
