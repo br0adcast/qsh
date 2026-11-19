@@ -15,7 +15,6 @@ chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 # Wipes the raw split's key copies once the ciphers hold them (the ciphers
 # wipe their own keys on drop). Already in the tree through chacha20poly1305.
 zeroize = { version = "1", default-features = false }
-rand = "0.10"
 getrandom = { version = "0.4", features = ["sys_rng"] }
 # Keyed BLAKE2s for the return-address cookie (cookie.rs), as WireGuard's MAC.
 # The tests also hash the long reference ciphertexts with it (handshake.rs).
@@ -44,6 +43,9 @@ tokio-driver = ["dep:tokio"]
 testnet = []
 
 [dev-dependencies]
+# Test nonce sources only. Handshake values come from the OS through getrandom:
+# rand 0.10's thread generator is not reseeded in a forked child.
+rand = "0.10"
 # The lifecycle tests drive tokio's pausable clock (`start_paused` + `advance`),
 # so the test build needs `test-util`.
 tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread", "time", "sync", "net"] }

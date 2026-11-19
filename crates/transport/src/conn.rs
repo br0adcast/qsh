@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use rand::RngExt;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::auth::AUTH_NONCE_LEN;
@@ -522,6 +521,13 @@ pub struct RttSample {
 
 /// A measured round trip as the header shows it: whole milliseconds, rounded,
 /// and never 0 -- 0 in `Stats::rtt_ms` means nothing has been measured.
+/// A handshake's session id, straight from the operating system's randomness
+/// for the reason [`crate::auth::random_nonce`] gives: rand 0.10's thread
+/// generator is not reseeded in a forked child.
+fn fresh_session_id() -> u64 {
+    getrandom::u64().expect("operating system randomness is available")
+}
+
 fn display_ms(rtt: Duration) -> u32 {
     let ms = (rtt.as_micros() + 500) / 1000;
     ms.clamp(1, u128::from(u32::MAX)) as u32
@@ -1150,7 +1156,7 @@ impl Connection {
         // Spec §5.2: on when offered, allowed and implemented. The decision
         // is a function of msg1 and the configuration, so a retransmit twin
         // that went through probation on its own decides the same.
-        let session_id: u64 = rand::rng().random();
+        let session_id = fresh_session_id();
         conn.session_id = session_id;
         let msg2 = conn
             .handshake
@@ -2697,7 +2703,7 @@ impl Connection {
             return out;
         }
         // Random session id in the authenticated, versioned msg2 payload.
-        let session_id: u64 = rand::rng().random();
+        let session_id = fresh_session_id();
         self.session_id = session_id;
         // Fresh per handshake, and never reused: it is what stops a proof
         // made for one handshake from being presented for another.
@@ -2710,7 +2716,7 @@ impl Connection {
         // that runs `SshSignature` (`SessionManager::serve`) never calls this
         // method, only `accept`. A refactor that routed a signature server
         // through `on_datagram` would silently sidestep the helper here.
-        let nonce: [u8; AUTH_NONCE_LEN] = rand::rng().random();
+        let nonce: [u8; AUTH_NONCE_LEN] = crate::auth::random_nonce();
         let msg2_payload = if self.legacy_peer {
             encode_msg2_without_tail(session_id, false, &nonce)
         } else {

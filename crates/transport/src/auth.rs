@@ -73,9 +73,10 @@ pub const AUTH_LOGIN_MAX: usize = 255;
 /// operating system's own randomness (`getrandom`).
 ///
 /// Ask the operating system directly instead of using a thread-local PRNG:
-/// fork can copy a generator's state into a child. The replay defence rests
-/// on these bytes staying fresh and unguessable. `getrandom` asks the kernel
-/// each time and carries no userspace generator state across the fork.
+/// fork can copy a generator's state into a child, and rand 0.10's thread
+/// generator is not reseeded there. The replay defence rests on these bytes
+/// staying fresh and unguessable. `getrandom` asks the kernel each time and
+/// carries no userspace generator state across the fork.
 pub fn random_nonce() -> [u8; AUTH_NONCE_LEN] {
     let mut nonce = [0u8; AUTH_NONCE_LEN];
     getrandom::fill(&mut nonce).expect("operating system randomness is available");
