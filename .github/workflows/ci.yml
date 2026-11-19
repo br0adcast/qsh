@@ -1480,8 +1480,10 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     # The integration tests bring up real daemons; a hang there (or
     # anywhere else in this job) would otherwise burn the default 360
-    # minutes before GitHub kills it.
-    timeout-minutes: 30
+    # minutes before GitHub kills it. A warm run takes about 23 minutes; a
+    # cold Rust cache or a slow runner each take about 30 (#622), and the
+    # cache is saved only after a completed run.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

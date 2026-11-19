@@ -453,7 +453,7 @@ class PackageScopeTests(unittest.TestCase):
         job = check_job(self.source)
         header = job.split('    steps:\n', 1)[0]
         self.assertIn('    runs-on: ubuntu-latest\n', header)
-        self.assertIn('    timeout-minutes: 30\n', header)
+        self.assertIn('    timeout-minutes: 45\n', header)
         self.assertEqual(re.findall(r'^      ([A-Z_]+): (.*)$', header, re.M), [
             ('HISTFILE', '/dev/null'), ('CARGO_PROFILE_TEST_DEBUG', 'line-tables-only')])
         self.assertIn('actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1', job)
