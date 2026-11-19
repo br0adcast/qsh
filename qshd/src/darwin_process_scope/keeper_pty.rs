@@ -441,7 +441,7 @@ impl super::keeper::KeeperOwner {
             term,
         } = options;
         use super::keeper_helper::{Channel, Launch, ENTRY};
-        use rand_core::RngCore;
+        use rand_core::TryRng;
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
         use std::os::unix::process::CommandExt;
@@ -464,7 +464,7 @@ impl super::keeper::KeeperOwner {
             None => vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())],
         };
         let mut instance = [0; 16];
-        rand_core::OsRng
+        getrandom::SysRng
             .try_fill_bytes(&mut instance)
             .map_err(|_| before("keeper instance could not be allocated"))?;
         if instance == [0; 16] {

@@ -70,7 +70,6 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use rand_core::{OsRng, RngCore};
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
 use sshauth::sign_file::FileSigner;
 
@@ -368,7 +367,7 @@ fn cmd_probe(args: Vec<String>) -> ExitCode {
     let mut token = [0u8; 16];
     match parsed.token {
         Some(forced) => token = forced,
-        None => OsRng.fill_bytes(&mut token),
+        None => getrandom::fill(&mut token).expect("operating system randomness is available"),
     }
 
     let events = Arc::new(Events::default());

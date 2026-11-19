@@ -44,6 +44,20 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor, Rgb};
 
+/// Qualified existing replay format's maximum encoded bytes, including the
+/// longest retained unfinished parser tail. Pure arithmetic, never admission.
+/// See docs/terminal-resources.md; no title/hyperlink fidelity is added.
+pub fn replay_allocation_bound(size: TerminalSize) -> Option<usize> {
+    153usize
+        .checked_mul(usize::from(size.cols()))?
+        .checked_add(555)?
+        .checked_mul(usize::from(size.rows()))?
+        .checked_mul(2)?
+        .checked_add(12usize.checked_mul(usize::from(size.cols()))?)?
+        .checked_add(6956)?
+        .checked_add(1_052_672)
+}
+
 /// Cell flag: bold text.
 pub const FLAG_BOLD: u16 = 0b0001;
 /// Cell flag: underline (any of alacritty's variants - single, double,

@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use rand::Rng;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::auth::AUTH_NONCE_LEN;
@@ -522,6 +521,13 @@ pub struct RttSample {
 
 /// A measured round trip as the header shows it: whole milliseconds, rounded,
 /// and never 0 -- 0 in `Stats::rtt_ms` means nothing has been measured.
+/// A handshake's session id, straight from the operating system's randomness
+/// for the reason [`crate::auth::random_nonce`] gives: rand 0.10's thread
+/// generator is not reseeded in a forked child.
+fn fresh_session_id() -> u64 {
+    getrandom::u64().expect("operating system randomness is available")
+}
+
 fn display_ms(rtt: Duration) -> u32 {
     let ms = (rtt.as_micros() + 500) / 1000;
     ms.clamp(1, u128::from(u32::MAX)) as u32
@@ -624,6 +630,8 @@ pub struct Connection {
     /// [`AcceptOutcome::Accepted`] instead). Meaningful once the link is
     /// `Live`.
     server_nonce: Option<[u8; AUTH_NONCE_LEN]>,
+    server_generation: Option<[u8; 16]>,
+    expected_generation: Option<[u8; 16]>,
     peer: Option<SocketAddr>,
     /// Daemon probation accepts transport only from its handshake's source.
     /// Noise possession alone must not redirect replies before admission.
@@ -962,6 +970,8 @@ impl Connection {
             death_after_override: None,
             resumed: false,
             server_nonce: None,
+            server_generation: None,
+            expected_generation: None,
             peer: None,
             probation_source: None,
             peer_static: None,
@@ -1085,6 +1095,17 @@ impl Connection {
         msg1_bytes: &[u8],
         resolve: &mut dyn FnMut(&Msg1Payload) -> Option<Msg2Resolution>,
     ) -> ResolvedAccept {
+        Self::accept_resolved_with_generation(cfg, now, src, msg1_bytes, resolve, None)
+    }
+
+    pub(crate) fn accept_resolved_with_generation(
+        cfg: ConnectionConfig,
+        now: Instant,
+        src: SocketAddr,
+        msg1_bytes: &[u8],
+        resolve: &mut dyn FnMut(&Msg1Payload) -> Option<Msg2Resolution>,
+        generation: Option<[u8; 16]>,
+    ) -> ResolvedAccept {
         let mut conn = Connection::new(cfg);
         let payload_bytes = {
             let hs = match conn.handshake.as_mut() {
@@ -1104,6 +1125,16 @@ impl Connection {
             Ok(m) => m,
             Err(_) => return ResolvedAccept::Rejected,
         };
+        let (generation_aware, expected) =
+            match crate::handshake_payload::parse_expected_generation(&payload_bytes) {
+                Ok(parsed) => parsed,
+                Err(_) => return ResolvedAccept::Rejected,
+            };
+        if expected.is_some() && expected != generation {
+            return ResolvedAccept::Rejected;
+        }
+        let generation = generation.filter(|_| generation_aware);
+        conn.server_generation = generation;
         // The client must announce the method this server actually runs:
         // silently downgrading a signature client to the allowlist path (or
         // the other way round) would leave one side thinking it authenticated.
@@ -1125,13 +1156,17 @@ impl Connection {
         // Spec §5.2: on when offered, allowed and implemented. The decision
         // is a function of msg1 and the configuration, so a retransmit twin
         // that went through probation on its own decides the same.
-        let session_id: u64 = rand::thread_rng().gen();
+        let session_id = fresh_session_id();
         conn.session_id = session_id;
         let msg2 = conn
             .handshake
             .as_mut()
             .expect("handshake not yet taken")
-            .write_msg(&encode_msg2(session_id, resumed, &nonce, features));
+            .write_msg(&{
+                let mut payload = encode_msg2(session_id, resumed, &nonce, features);
+                crate::handshake_payload::append_generation(&mut payload, generation);
+                payload
+            });
         let hs = conn.handshake.take().expect("handshake still present");
         conn.handshake_hash = hs.handshake_hash();
         // The server switches as it writes msg2 (spec §5.4).
@@ -1279,12 +1314,16 @@ impl Connection {
         start_kind: StartKind,
         token: [u8; SESSION_TOKEN_LEN],
     ) -> Vec<Datagram> {
-        let payload = encode_msg1(&Msg1Payload {
+        let mut payload = encode_msg1(&Msg1Payload {
             start_kind,
             token,
             method: self.auth.method(),
             offered: self.allowed_features & Features::SUPPORTED,
         });
+        crate::handshake_payload::append_expected_generation(
+            &mut payload,
+            self.expected_generation,
+        );
         self.start_with_payload(now, peer, &payload)
     }
 
@@ -2280,6 +2319,19 @@ impl Connection {
         self.set_state(LinkState::Closed);
     }
 
+    /// Retire local data storage while an independent metadata owner finishes.
+    /// No peer record is emitted and no remote session is closed.
+    pub(crate) fn retire_data_for_discovery(&mut self) {
+        self.abandon();
+        self.streams.clear();
+        self.undelivered = 0;
+        self.acks_due.clear();
+        self.credits_due.clear();
+        self.keys = None;
+        self.handshake = None;
+        self.stop_recovery_handshake();
+    }
+
     /// Request an immediate PING on the next `on_timeout`, and restart the
     /// liveness window. Called on a rebind (network change) and on a
     /// Doze/freeze resume: we ping right away from the new local address (this
@@ -2520,6 +2572,15 @@ impl Connection {
     /// server too old to send one. Meaningful on a client once the link is
     /// `Live`; always `None` on a server, which keeps its own copy in
     /// [`AcceptOutcome::Accepted`] instead.
+    /// Bind a future handshake to freshly discovered process metadata.
+    pub fn set_expected_generation(&mut self, generation: Option<[u8; 16]>) {
+        self.expected_generation = generation;
+    }
+
+    pub fn server_generation(&self) -> Option<[u8; 16]> {
+        self.server_generation
+    }
+
     pub fn server_nonce(&self) -> Option<[u8; AUTH_NONCE_LEN]> {
         self.server_nonce
     }
@@ -2642,7 +2703,7 @@ impl Connection {
             return out;
         }
         // Random session id in the authenticated, versioned msg2 payload.
-        let session_id: u64 = rand::thread_rng().gen();
+        let session_id = fresh_session_id();
         self.session_id = session_id;
         // Fresh per handshake, and never reused: it is what stops a proof
         // made for one handshake from being presented for another.
@@ -2655,7 +2716,7 @@ impl Connection {
         // that runs `SshSignature` (`SessionManager::serve`) never calls this
         // method, only `accept`. A refactor that routed a signature server
         // through `on_datagram` would silently sidestep the helper here.
-        let nonce: [u8; AUTH_NONCE_LEN] = rand::thread_rng().gen();
+        let nonce: [u8; AUTH_NONCE_LEN] = crate::auth::random_nonce();
         let msg2_payload = if self.legacy_peer {
             encode_msg2_without_tail(session_id, false, &nonce)
         } else {
@@ -2772,6 +2833,21 @@ impl Connection {
         }
         self.session_id = msg2.session_id;
         self.resumed = msg2.resumed;
+        self.server_generation = match crate::handshake_payload::parse_generation(&payload, 30) {
+            Ok(generation) => generation,
+            Err(reason) => {
+                self.handshake = None;
+                self.events.push(Event::InvalidHandshakeResponse { reason });
+                self.set_state(LinkState::Closed);
+                return out;
+            }
+        };
+        if self.expected_generation.is_some() && self.expected_generation != self.server_generation
+        {
+            self.handshake = None;
+            self.set_state(LinkState::Closed);
+            return out;
+        }
         self.server_nonce = msg2.nonce;
         let hs = self.handshake.take().expect("handshake still present");
         self.handshake_hash = hs.handshake_hash();

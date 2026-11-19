@@ -57,15 +57,27 @@
 //! [`update`] -- the personal daemon's side of an update over qsh: the
 //! decision, the staged image, the self-check and the replacement.
 
+#[cfg(feature = "system")]
+mod ancillary;
 pub mod channel_backend;
 pub mod control;
 #[cfg(any(test, target_os = "macos"))]
 mod darwin_process_scope;
+mod destructive_restart;
+mod endpoint;
+pub mod service_restart;
+#[doc(hidden)]
+pub mod service_stage;
+#[doc(hidden)]
+pub use destructive_restart::Actions as RestartActions;
 pub mod handover;
 #[cfg(feature = "system")]
 pub mod helper;
 pub mod helper_status;
 pub mod log;
+mod modern_restart;
+#[doc(hidden)]
+pub use modern_restart::{interrupt_selected, RestartOutcome};
 #[cfg(feature = "system")]
 pub mod nonce_pool;
 #[cfg(target_os = "linux")]
@@ -157,4 +169,21 @@ fn qualify_borrowed_fixture() {
 #[doc(hidden)]
 pub fn darwin_keeper_entry(args: &[std::ffi::OsString]) -> Option<std::io::Result<()>> {
     darwin_process_scope::keeper_helper_entry(args)
+}
+
+/// Refuse to start a daemon on a Darwin runtime without a qualified process
+/// ownership contract, naming the observed kernel (#551).
+#[cfg(target_os = "macos")]
+pub fn darwin_runtime_admission() -> anyhow::Result<()> {
+    darwin_process_scope::require_admitted_runtime().map_err(anyhow::Error::msg)
+}
+
+pub mod server_info;
+
+pub mod session_owner;
+
+/// Private fixed-descriptor child entry; performs no normal daemon dispatch.
+#[doc(hidden)]
+pub fn frontend_admission_entry(args: &[std::ffi::OsString]) -> Option<std::io::Result<()>> {
+    session_owner::inherited_launch::child::entry(args)
 }

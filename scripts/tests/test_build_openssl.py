@@ -1067,12 +1067,58 @@ esac
 
 
 class ProductEntrypointTests(unittest.TestCase):
+    def native_assignments_by_role(self, source, pattern):
+        import re
+        roles = {
+            'portable': 'Build and execute the pinned backend',
+            'darwin-owner-intel': 'Build and execute the pinned owner backend',
+            'darwin-legacy-service-intel': 'Build and execute the pinned legacy service backend',
+            'pty-eof-diagnostic': 'Qualify the pinned diagnostic backend',
+        }
+        jobs = list(re.finditer(r'(?m)^  ([a-z][a-z0-9-]*):\s*$', source))
+        mapped = {}
+        for role, step_name in roles.items():
+            selected = [index for index, job in enumerate(jobs) if job[1] == role]
+            self.assertEqual(len(selected), 1, role)
+            index = selected[0]
+            start = jobs[index].end()
+            end = jobs[index + 1].start() if index + 1 < len(jobs) else len(source)
+            steps = list(re.finditer(r'(?m)^      - (?:name: (.*)|uses: .*)$', source[start:end]))
+            selected = [index for index, step in enumerate(steps) if step[1] == step_name]
+            self.assertEqual(len(selected), 1, (role, step_name))
+            index = selected[0]
+            step_start = start + steps[index].end()
+            step_end = start + steps[index + 1].start() if index + 1 < len(steps) else end
+            assignments = list(pattern.finditer(source, step_start, step_end))
+            self.assertEqual(len(assignments), 1, (role, step_name))
+            mapped[role] = assignments[0]
+        self.assertEqual(sorted(match.span() for match in mapped.values()),
+                         [match.span() for match in pattern.finditer(source)])
+        return mapped
+
+    def test_native_assignment_mapping_refuses_missing_or_duplicate_invocations(self):
+        import re
+        source = (ROOT / '.github/workflows/native-crypto.yml').read_text()
+        pattern = re.compile(
+            r'(?m)^[ \t]*(?P<name>(?:native_)?prefix)=\$\('
+            r'(?P<command>[^\n]*build-openssl\.sh[\s\S]*?)\)')
+        assignments = self.native_assignments_by_role(source, pattern)
+        for role in ('darwin-legacy-service-intel', 'pty-eof-diagnostic'):
+            assignment = assignments[role]
+            for copies in (0, 2):
+                with self.subTest(role=role, copies=copies):
+                    changed = (source[:assignment.start()] + '\n'.join([assignment[0]] * copies)
+                               + source[assignment.end():])
+                    with self.assertRaises(AssertionError):
+                        self.native_assignments_by_role(changed, pattern)
+
     def test_product_callers_execute_the_nonexecutable_checkout_wrapper(self):
         import re
         import shutil
         callers = {
             '.github/workflows/ci.yml': 3,
-            '.github/workflows/native-crypto.yml': 3,  # Includes the closed diagnostic job.
+            # Independent legacy service and closed diagnostic callers both execute.
+            '.github/workflows/native-crypto.yml': 4,
             '.github/workflows/release.yml': 2,
             'packaging/build-server-packages.sh': 1,
             'packaging/acceptance.sh': 1,
@@ -1103,10 +1149,15 @@ class ProductEntrypointTests(unittest.TestCase):
                        native_uapi=temp, uapi=temp, CARGO_TARGET_DIR=temp,
                        QSH_TEST_ARGUMENTS=str(record), QSH_TEST_PREFIX=expected)
             for caller, count in callers.items():
-                assignments = list(pattern.finditer((ROOT / caller).read_text()))
+                source = (ROOT / caller).read_text()
+                assignments = list(pattern.finditer(source))
                 self.assertEqual(len(assignments), count, caller)
-                for index, assignment in enumerate(assignments):
-                    with self.subTest(caller=caller, invocation=index):
+                if caller == '.github/workflows/native-crypto.yml':
+                    invocations = self.native_assignments_by_role(source, pattern).items()
+                else:
+                    invocations = enumerate(assignments)
+                for role, assignment in invocations:
+                    with self.subTest(caller=caller, invocation=role):
                         record.unlink(missing_ok=True)
                         script = ('set -euo pipefail\nargs=()\nnative_args=()\n'
                                   + assignment.group(0).strip()
@@ -1119,7 +1170,7 @@ class ProductEntrypointTests(unittest.TestCase):
                         argv = json.loads(record.read_text())
                         self.assertEqual(argv[:2], ['--target', target])
                         self.assertIn('--cache', argv)
-                        if caller == '.github/workflows/native-crypto.yml' and index == 2:
+                        if caller == '.github/workflows/native-crypto.yml':
                             self.assertEqual(argv, ['--target', target, '--cache',
                                                     str(Path(temp) / 'native-crypto'),
                                                     '--toolchain-id', 'fixture/1'])

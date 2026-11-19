@@ -12,10 +12,11 @@ cargo-fuzz = true
 members = ["."]
 resolver = "2"
 
-# Match the product parser, including qsh's bounded OSC handling.
+# Match the product parser and key-decoder maintenance patches.
 [patch.crates-io]
 vte = { path = "../vendor/vte" }
 alacritty_terminal = { path = "../vendor/alacritty_terminal" }
+ssh-key = { path = "../vendor/ssh-key" }
 
 [dependencies]
 # Observe OSC dispatch at the exact shipped parser boundary.
@@ -27,7 +28,7 @@ terminal = { path = "../crates/terminal" }
 terminal-size = { path = "../crates/terminal-size" }
 # The same exact upstream parser sshauth passes to key_is_listed; this edge
 # only names the fixed public key type in the harness.
-ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "ed25519"] }
+ssh-key = { version = "=0.7.0-rc.12", default-features = false, features = ["std", "ed25519"] }
 
 [[bin]]
 name = "channel_codec"

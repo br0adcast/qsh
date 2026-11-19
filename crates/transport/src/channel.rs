@@ -714,6 +714,31 @@ fn take_open(payload: &[u8], pos: &mut usize) -> Result<OpenRequest, ChannelCode
     })
 }
 
+/// Borrowed checked adapter for retained owner OPEN only. The existing legacy
+/// decoder keeps its compatibility behavior; this seam validates all bounds,
+/// classification and geometry before the shared parser copies command bytes.
+pub(crate) fn decode_checked_open(payload: &[u8]) -> Result<OpenRequest, ChannelCodecError> {
+    if payload.len() < OPEN_HEADER_LEN || payload.len() > OPEN_HEADER_LEN + MAX_COMMAND_LEN {
+        return Err(ChannelCodecError::Malformed);
+    }
+    let command_len = u16::from_be_bytes([payload[7], payload[8]]) as usize;
+    if payload[0] < FIRST_CHANNEL_STREAM
+        || payload[1] > 1
+        || (payload[1] == 0 && command_len != 0)
+        || command_len > MAX_COMMAND_LEN
+        || payload.len() != OPEN_HEADER_LEN + command_len
+    {
+        return Err(ChannelCodecError::Malformed);
+    }
+    let cols = u16::from_be_bytes([payload[2], payload[3]]);
+    let rows = u16::from_be_bytes([payload[4], payload[5]]);
+    if cols != 0 && rows != 0 {
+        terminal_size::TerminalSize::new(cols, rows).map_err(|_| ChannelCodecError::Malformed)?;
+    }
+    let mut pos = 0;
+    take_open(payload, &mut pos)
+}
+
 /// Encode a record the client sends on [`CONTROL_STREAM`].
 pub fn encode_client(rec: &ClientRecord) -> Vec<u8> {
     match rec {

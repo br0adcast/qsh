@@ -232,6 +232,35 @@ impl AdoptedOpen {
         drop(removed);
         Some(bridges)
     }
+    pub(crate) fn commit_retained(
+        self,
+        epoch: &IdleEpochGuard<'_>,
+        expected: &OpenIdentity,
+        installation: crate::channel_owner::PreparedRetainedInstallation<'_>,
+    ) -> Option<()> {
+        let mut state = self.job.registry.state.lock().ok()?;
+        let registered = state.jobs.get(&self.job.id)?;
+        if state.fence.is_some()
+            || !Arc::ptr_eq(registered, &self.job.registration)
+            || registered.request.identity != *expected
+            || expected.invalidation_epoch != epoch.epoch()
+            || !installation.matches(expected, &self.job.registry, self.job.id)
+            || !Arc::ptr_eq(&self.channel.custody.inner, &registered.custody.inner)
+        {
+            return None;
+        }
+        let spawned = self.channel.adopt().ok()?;
+        let slot = InstalledSlot {
+            session: registered.session.clone(),
+            uid: registered.request.owner.uid,
+        };
+        installation.commit(spawned, slot);
+        let removed = state.jobs.remove(&self.job.id);
+        release_uid(&mut state, self.job.registration.request.owner.uid);
+        drop(state);
+        drop(removed);
+        Some(())
+    }
 }
 
 impl Drop for OpenJob {

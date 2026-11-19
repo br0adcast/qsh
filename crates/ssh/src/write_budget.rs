@@ -1,4 +1,4 @@
-//! Keep logical payload credits through pinned russh 0.63.3's write pipeline.
+//! Keep logical payload credits through pinned russh 0.65.2's write pipeline.
 //!
 //! `data_bytes` only enqueues Bytes; the last owner is dropped after russh
 //! serializes them (possibly after an earlier flush if its sending future

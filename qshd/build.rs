@@ -6,7 +6,8 @@
 // byte-different binaries then carried the SAME stamp. The commit time
 // advances on every commit, including dependency edits.
 
-use std::process::Command;
+#[path = "../build-support/git_metadata.rs"]
+mod git_metadata;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
@@ -29,32 +30,13 @@ fn main() {
             .compile("qsh_darwin_process_scope");
         println!("cargo:rustc-link-lib=proc");
     }
-    // Rebuild when HEAD (or a ref it points at) moves, so the stamp tracks
-    // commits. Best-effort: even if a rerun is missed, `git log` yields the
-    // right value whenever the script does run, and reconcile's `>=` branch
-    // (see version.rs) backstops a stale-equal stamp.
-    println!("cargo:rerun-if-changed=../.git/HEAD");
-    println!("cargo:rerun-if-changed=../.git/refs");
-    println!("cargo:rerun-if-changed=../.git/packed-refs");
-    let stamp = git_commit_epoch().unwrap_or_else(wallclock_epoch);
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../build-support/git_metadata.rs");
+    let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let stamp = git_metadata::watch_git_metadata(root.parent().unwrap())
+        .and_then(|metadata| metadata.commit_epoch())
+        .unwrap_or_else(wallclock_epoch);
     println!("cargo:rustc-env=QSHD_BUILD={stamp}");
-}
-
-/// UNIX seconds of the HEAD commit, or None if git is unavailable (build
-/// outside a repo) -- then we fall back to wall-clock so the build never fails.
-fn git_commit_epoch() -> Option<u64> {
-    let out = Command::new("git")
-        .args(["log", "-1", "--format=%ct"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout)
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
 }
 
 fn wallclock_epoch() -> u64 {

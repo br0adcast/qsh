@@ -478,3 +478,5 @@ async fn auth17_failed_warm_enqueue_reports_fresh_despite_tentative_resumed_hint
         "fallback keeps the proven helper login"
     );
 }
+
+include!("personal_admission_tests.rs");

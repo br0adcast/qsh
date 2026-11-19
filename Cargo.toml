@@ -1,12 +1,12 @@
 [workspace]
-exclude = ["vendor/vte", "vendor/alacritty_terminal", "vendor/russh"]
+exclude = ["vendor/vte", "vendor/alacritty_terminal", "vendor/russh", "vendor/ssh-key"]
 resolver = "2"
-members = ["crates/release-auth", "crates/terminal-size", "qshd", "crates/transport", "crates/terminal", "crates/prediction", "crates/client", "crates/render", "crates/sshauth", "crates/knock", "crates/ssh", "crates/bringup", "crates/connect", "crates/logging", "cli"]
+members = ["crates/daemon-bootstrap-protocol", "crates/release-auth", "crates/terminal-size", "qshd", "crates/transport", "crates/terminal", "crates/prediction", "crates/client", "crates/render", "crates/sshauth", "crates/knock", "crates/ssh", "crates/bringup", "crates/connect", "crates/logging", "cli"]
 
 [workspace.package]
 edition = "2021"
 rust-version = "1.98.1"
-version = "0.5.0"
+version = "0.6.0-rc1"
 license = "AGPL-3.0-only"
 
 # Tests build lightly optimized. The transport crate's network simulator
@@ -25,3 +25,4 @@ overflow-checks = true
 vte = { path = "vendor/vte" }
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
 russh = { path = "vendor/russh" }
+ssh-key = { path = "vendor/ssh-key" }

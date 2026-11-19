@@ -178,7 +178,37 @@ impl ChannelInputBudget {
         bytes: Vec<u8>,
         origin: InputOrigin,
     ) -> Result<Option<InputChunk>, InputLimit> {
-        let len = bytes.len();
+        let Some(permit) = self.reserve(bytes.len(), origin)? else {
+            return Ok(None);
+        };
+        // Normalize only after admission. The permit refunds if normalization unwinds.
+        let bytes = bytes.into_boxed_slice().into_vec();
+        Ok(Some(InputChunk { bytes, permit }))
+    }
+
+    /// Reserve both scopes before copying borrowed network bytes.
+    pub fn try_network_slice(&self, bytes: &[u8]) -> Result<Option<InputChunk>, InputLimit> {
+        self.try_slice(bytes, InputOrigin::Network)
+    }
+
+    /// Local replies keep their independent limits and never consume user credit.
+    pub fn try_local_reply_slice(&self, bytes: &[u8]) -> Result<Option<InputChunk>, InputLimit> {
+        self.try_slice(bytes, InputOrigin::LocalReply)
+    }
+
+    fn try_slice(
+        &self,
+        bytes: &[u8],
+        origin: InputOrigin,
+    ) -> Result<Option<InputChunk>, InputLimit> {
+        let Some(permit) = self.reserve(bytes.len(), origin)? else {
+            return Ok(None);
+        };
+        let bytes = bytes.to_vec().into_boxed_slice().into_vec();
+        Ok(Some(InputChunk { bytes, permit }))
+    }
+
+    fn reserve(&self, len: usize, origin: InputOrigin) -> Result<Option<InputPermit>, InputLimit> {
         let quota = self.session.0.limits.quota(origin);
         let permit = {
             // Admission and release always lock session before channel. Validate
@@ -222,11 +252,7 @@ impl ChannelInputBudget {
                 len,
             }
         };
-        // Do not allocate/normalize before checking the limits. The owned permit
-        // also refunds if a future fallible normalization unwinds. Keep no spare
-        // Vec capacity beyond the charged length in a queued or held chunk.
-        let bytes = bytes.into_boxed_slice().into_vec();
-        Ok(Some(InputChunk { bytes, permit }))
+        Ok(Some(permit))
     }
 
     pub fn close(&self) {
@@ -690,5 +716,40 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(session.usage(), Usage::default());
         assert!(channel.try_network(vec![2; 4]).unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod borrowed_tests {
+    use super::*;
+    #[test]
+    fn borrowed_admission_charges_before_copy_and_keeps_partial_payload_owned() {
+        let session = SessionInputBudget::with_limits(InputLimits {
+            network: QuotaLimits {
+                channel_bytes: 4,
+                session_bytes: 4,
+                channel_items: 1,
+                session_items: 1,
+            },
+            local: QuotaLimits {
+                channel_bytes: 3,
+                session_bytes: 3,
+                channel_items: 1,
+                session_items: 1,
+            },
+        });
+        let channel = session.channel();
+        let held = channel.try_network_slice(b"four").unwrap().unwrap();
+        assert_eq!(held.bytes.capacity(), 4);
+        assert_eq!(held.bytes(), b"four");
+        assert!(channel.try_network_slice(b"x").is_err());
+        assert_eq!(session.usage().network.bytes, 4);
+        let local = channel.try_local_reply_slice(b"abc").unwrap().unwrap();
+        assert_eq!(local.network_bytes(), 0);
+        assert!(channel.try_local_reply_slice(b"x").is_err());
+        drop(held);
+        assert!(channel.try_network_slice(b"x").unwrap().is_some());
+        drop(local);
+        assert_eq!(session.usage(), Usage::default());
     }
 }

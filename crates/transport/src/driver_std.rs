@@ -261,6 +261,18 @@ pub trait ClientEvents: Send + Sync {
     /// What the handshake agreed (spec §5.5), once per handshake, before
     /// `Live` reaches `on_state`. The default takes no notice.
     fn on_features(&self, _features: Features) {}
+    /// Authenticated process metadata, independent of client/session admission.
+    fn on_server_info(&self, _info: crate::bootstrap::VerifiedServerInfo) {}
+    fn on_server_info_from(
+        &self,
+        _endpoint: SocketAddr,
+        info: crate::bootstrap::VerifiedServerInfo,
+    ) {
+        self.on_server_info(info);
+    }
+    fn on_server_generation(&self, _generation: Option<[u8; 16]>) {}
+    /// This attempt's bounded independent discovery has completed or been canceled.
+    fn on_discovery_complete(&self) {}
     /// A bounded authenticated protocol failure, delivered before Closed.
     fn on_protocol_failure(&self, _failure: crate::ProtocolFailure) {}
     /// Authenticated terminal peer failure, delivered before Closed.
@@ -362,6 +374,8 @@ enum Command {
     /// connection the same way every other setting does: it lives on the
     /// driver thread.
     SetPaths(Vec<SocketAddr>),
+    RefreshServerInfo,
+    RetireForDiscovery,
     /// How far a stream has got. The connection lives on the driver thread,
     /// so the answer comes back on `reply`.
     StreamProgress {
@@ -406,6 +420,8 @@ struct AuthResult {
 /// promise -- the driver thread may already be reading.
 #[derive(Clone, Debug, Default)]
 pub struct DriverSetup {
+    /// Optional fresh process binding known before the ordinary handshake starts.
+    pub expected_generation: Option<[u8; 16]>,
     #[cfg(test)]
     pub(crate) wait_control: Option<Arc<wait::TestControl>>,
     /// How the streams nobody declared count their consumption (spec
@@ -447,6 +463,7 @@ pub struct StdClient {
     /// when it completes; `None` before that. Shared for the same reason
     /// `resumed` is.
     features: Arc<Mutex<Option<Features>>>,
+    discovery: Arc<Mutex<DiscoverySnapshot>>,
     /// The road the traffic is going down, shared with the driver thread
     /// because only that thread may touch the connection.
     active_path: Arc<Mutex<Option<SocketAddr>>>,
@@ -469,6 +486,29 @@ pub struct StdClient {
     /// doesn't try to join itself when called from a callback on the driver
     /// thread.
     driver_thread: Option<ThreadId>,
+}
+
+#[derive(Default)]
+struct DiscoverySnapshot {
+    complete: bool,
+    deadline: Option<Instant>,
+    generation: Option<[u8; 16]>,
+    proofs: Vec<(SocketAddr, crate::bootstrap::VerifiedServerInfo)>,
+}
+impl DiscoverySnapshot {
+    fn record(&mut self, endpoint: SocketAddr, info: crate::bootstrap::VerifiedServerInfo) {
+        self.proofs.retain(|(from, previous)| {
+            *from != endpoint
+                || (Some(previous.info().generation) == self.generation
+                    && previous.info().generation != info.info().generation)
+        });
+        self.proofs.push((endpoint, info));
+    }
+    fn refresh(&mut self) {
+        self.complete = false;
+        self.proofs
+            .retain(|(_, proof)| Some(proof.info().generation) == self.generation);
+    }
 }
 
 enum HandshakeTarget {
@@ -539,6 +579,8 @@ impl StdClient {
         let closed_gracefully_thread = Arc::clone(&closed_gracefully);
         let features = Arc::new(Mutex::new(None));
         let features_thread = Arc::clone(&features);
+        let discovery = Arc::new(Mutex::new(DiscoverySnapshot::default()));
+        let discovery_thread = discovery.clone();
         let active_path = Arc::new(Mutex::new(None));
         let active_path_thread = Arc::clone(&active_path);
         let roads = Arc::new(Mutex::new(RoadSnapshot::default()));
@@ -571,6 +613,7 @@ impl StdClient {
                 gates_thread,
                 socket_buffers_thread,
                 last_send_error_thread,
+                discovery_thread,
             );
         });
         let driver_thread = Some(handle.thread().id());
@@ -583,6 +626,7 @@ impl StdClient {
             resumed,
             closed_gracefully,
             features,
+            discovery,
             active_path,
             roads,
             gates,
@@ -671,6 +715,10 @@ impl StdClient {
             resumed: Arc::new(AtomicBool::new(false)),
             closed_gracefully: Arc::new(AtomicBool::new(false)),
             features: Arc::new(Mutex::new(None)),
+            discovery: Arc::new(Mutex::new(DiscoverySnapshot {
+                complete: true,
+                ..DiscoverySnapshot::default()
+            })),
             active_path: Arc::new(Mutex::new(None)),
             roads: Arc::new(Mutex::new(RoadSnapshot::default())),
             gates: Arc::new(GateTable::new()),
@@ -694,6 +742,23 @@ impl StdClient {
 
     /// Tell the session which roads lead to the same server. Nonempty updates
     /// retain the actual active peer; an empty list disables path checking.
+    /// Refresh authenticated metadata without touching the live connection or admission.
+    pub fn retire_for_discovery(&self) {
+        let _ = self
+            .tx
+            .lock()
+            .expect("command channel mutex")
+            .send(Command::RetireForDiscovery);
+    }
+
+    pub fn refresh_server_info(&self) {
+        let _ = self
+            .tx
+            .lock()
+            .expect("command channel mutex")
+            .send(Command::RefreshServerInfo);
+    }
+
     pub fn set_paths(&self, addrs: Vec<SocketAddr>) {
         let _ = self
             .tx
@@ -739,6 +804,45 @@ impl StdClient {
     /// §5.5): the features both sides use. `None` until the handshake
     /// completes, and for a client that never ran. Set before `Live` reaches
     /// the callbacks.
+    pub fn discovery_deadline(&self) -> Option<Instant> {
+        self.discovery.lock().expect("discovery mutex").deadline
+    }
+
+    pub fn discovery_complete(&self) -> bool {
+        self.discovery.lock().expect("discovery mutex").complete
+    }
+
+    pub fn server_generation(&self) -> Option<[u8; 16]> {
+        self.discovery.lock().expect("discovery mutex").generation
+    }
+    /// Attempt-local provisional evidence; never substitutes for committed admission.
+    pub fn discovered_server_info(&self) -> Vec<crate::bootstrap::VerifiedServerInfo> {
+        self.discovery
+            .lock()
+            .expect("discovery mutex")
+            .proofs
+            .iter()
+            .map(|(_, proof)| proof.clone())
+            .collect()
+    }
+    pub fn discovered_server_info_by_endpoint(
+        &self,
+    ) -> Vec<(SocketAddr, crate::bootstrap::VerifiedServerInfo)> {
+        self.discovery
+            .lock()
+            .expect("discovery mutex")
+            .proofs
+            .clone()
+    }
+    pub fn server_info(&self) -> Option<crate::bootstrap::VerifiedServerInfo> {
+        let snapshot = self.discovery.lock().expect("discovery mutex");
+        snapshot
+            .proofs
+            .iter()
+            .find(|(_, proof)| Some(proof.info().generation) == snapshot.generation)
+            .map(|(_, proof)| proof.clone())
+    }
+
     pub fn features(&self) -> Option<Features> {
         *self.features.lock().expect("features mutex")
     }
@@ -1141,6 +1245,7 @@ fn with_receive_mode<T>(
 
 /// A readable hint can be stale. Drain nonblocking, then restore blocking
 /// before any generated datagram reaches the unchanged blocking send path.
+#[cfg(test)]
 fn drain_ready(
     socket: &UdpSocket,
     conn: &mut Connection,
@@ -1148,13 +1253,44 @@ fn drain_ready(
     max: usize,
     clock: &wait::Clock,
 ) -> std::io::Result<Vec<Datagram>> {
+    let mut discovery =
+        crate::bootstrap_client::DiscoveryRound::new(clock.now(), Vec::new(), [0; 32], [0; 32]);
+    drain_ready_discovery(
+        socket,
+        conn,
+        buf,
+        max,
+        clock,
+        &mut discovery,
+        &mut |_, _| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_ready_discovery(
+    socket: &UdpSocket,
+    conn: &mut Connection,
+    buf: &mut [u8],
+    max: usize,
+    clock: &wait::Clock,
+    discovery: &mut crate::bootstrap_client::DiscoveryRound,
+    proof: &mut impl FnMut(SocketAddr, crate::bootstrap::VerifiedServerInfo),
+) -> std::io::Result<Vec<Datagram>> {
     with_receive_mode(
         |nonblocking| socket.set_nonblocking(nonblocking),
         || {
             let mut out = Vec::new();
             for _ in 0..max {
                 match socket.recv_from(buf) {
-                    Ok((len, src)) => out.extend(conn.on_datagram(clock.now(), src, &buf[..len])),
+                    Ok((len, src)) => {
+                        if crate::bootstrap::is_bootstrap(&buf[..len]) {
+                            if let Some(info) = discovery.accept(clock.now(), src, &buf[..len]) {
+                                proof(src, info);
+                            }
+                        } else {
+                            out.extend(conn.on_datagram(clock.now(), src, &buf[..len]));
+                        }
+                    }
                     Err(_) => break,
                 }
             }
@@ -1183,6 +1319,25 @@ impl Drop for CloseGatesOnExit {
     }
 }
 
+fn publish_discovery_complete(snapshot: &Mutex<DiscoverySnapshot>, events: &dyn ClientEvents) {
+    let mut state = snapshot.lock().expect("discovery mutex");
+    let first = !state.complete;
+    state.complete = true;
+    drop(state);
+    if first {
+        events.on_discovery_complete();
+    }
+}
+struct CompleteDiscoveryOnExit {
+    snapshot: Arc<Mutex<DiscoverySnapshot>>,
+    events: Arc<dyn ClientEvents>,
+}
+impl Drop for CompleteDiscoveryOnExit {
+    fn drop(&mut self) {
+        publish_discovery_complete(&self.snapshot, self.events.as_ref());
+    }
+}
+
 /// The driver thread body.
 #[allow(clippy::too_many_arguments)]
 fn run_driver(
@@ -1206,7 +1361,12 @@ fn run_driver(
     gates: Arc<GateTable>,
     buffers_out: Arc<Mutex<Option<BufferReport>>>,
     last_send_error: Arc<Mutex<Option<SendFailure>>>,
+    discovery_out: Arc<Mutex<DiscoverySnapshot>>,
 ) {
+    let _discovery_completion = CompleteDiscoveryOnExit {
+        snapshot: discovery_out.clone(),
+        events: events.clone(),
+    };
     let _close_gates = CloseGatesOnExit(Arc::clone(&gates));
     // Private to this driver instance -- see the module doc's "Authentication
     // proof" section for why this must NOT be a clone of the external `tx`
@@ -1247,6 +1407,12 @@ fn run_driver(
 
     *buffers_out.lock().expect("buffers mutex") = Some(initial_buffers);
     let mut sends = SendRecord::new(last_send_error, Arc::clone(&events));
+    let discovery_endpoints = match &target {
+        HandshakeTarget::Single(server) => vec![*server],
+        HandshakeTarget::Recovery(endpoints) => endpoints.iter().map(|e| e.endpoint).collect(),
+    };
+    let discovery_private = zeroize::Zeroizing::new(cfg.local_static_priv);
+    let discovery_server = cfg.remote_static_pub.unwrap_or([0; 32]);
     let allowlist_proof = matches!(cfg.auth, crate::conn::AuthPolicy::Allowlist(_));
     let mut owned = DriverConnection {
         connection: Connection::new(cfg),
@@ -1254,6 +1420,7 @@ fn run_driver(
     };
     let conn = &mut owned.connection;
     let inputs = &mut owned.inputs;
+    conn.set_expected_generation(setup.expected_generation);
     // Before msg1: no byte can arrive before these are in force.
     conn.set_default_consumption(setup.default_consumption);
     for (stream_id, consumption) in setup.stream_consumption {
@@ -1278,6 +1445,15 @@ fn run_driver(
         }
     };
     send_recovery_aware(socket.socket(), &first_msg1, &mut sends, conn);
+    // Ordinary admission is sent before constructing discovery's independent initiators.
+    let mut discovery = crate::bootstrap_client::DiscoveryRound::new(
+        clock.now(),
+        discovery_endpoints.iter().copied(),
+        *discovery_private,
+        discovery_server,
+    );
+    discovery_out.lock().expect("discovery mutex").deadline = Some(discovery.deadline());
+    send_all(socket.socket(), &discovery.poll(clock.now()), &mut sends);
 
     // The handshake retransmit timer is driven by the driver: during
     // `Connecting` the core doesn't ask to be woken for it.
@@ -1341,6 +1517,8 @@ fn run_driver(
                     Command::Rebind => "Rebind".into(),
                     Command::SetDeathAfter(_) => "SetDeathAfter".into(),
                     Command::SetPaths(_) => "SetPaths".into(),
+                    Command::RefreshServerInfo => "RefreshServerInfo".into(),
+                    Command::RetireForDiscovery => "RetireForDiscovery".into(),
                     Command::SetStreamClass { .. } => "SetStreamClass".into(),
                     Command::StreamProgress { .. } => "StreamProgress".into(),
                     Command::UseRoad { .. } => "UseRoad".into(),
@@ -1377,6 +1555,22 @@ fn run_driver(
                 }
                 Ok(Command::SetDeathAfter(after)) => conn.set_death_after(after),
                 Ok(Command::SetPaths(addrs)) => conn.set_paths(addrs),
+                Ok(Command::RetireForDiscovery) => {
+                    conn.retire_data_for_discovery();
+                    gates.close_all();
+                    *inputs = InputQueue::default();
+                }
+                Ok(Command::RefreshServerInfo) => {
+                    discovery = crate::bootstrap_client::DiscoveryRound::new(
+                        clock.now(),
+                        discovery_endpoints.iter().copied(),
+                        *discovery_private,
+                        discovery_server,
+                    );
+                    let mut snapshot = discovery_out.lock().expect("discovery mutex");
+                    snapshot.refresh();
+                    snapshot.deadline = Some(discovery.deadline());
+                }
                 Ok(Command::StreamProgress { stream_id, reply }) => {
                     let _ = reply.send(conn.stream_progress(stream_id));
                 }
@@ -1432,7 +1626,7 @@ fn run_driver(
         should_close |= disposition != 0;
         graceful &= disposition != 2;
         inputs.acknowledge(conn);
-        if !should_close {
+        if !should_close && conn.state() != LinkState::Closed {
             match inputs.drain(conn, clock.now(), &gates) {
                 Ok(out) => send_all(socket.socket(), &out, &mut sends),
                 Err(failure) => {
@@ -1454,7 +1648,7 @@ fn run_driver(
         while let Ok(AuthResult { generation, record }) = auth_rx.try_recv() {
             auth_processed = true;
             // A processed stop also retires results already queued by the signer.
-            if !should_close && generation == auth_generation {
+            if !should_close && conn.state() != LinkState::Closed && generation == auth_generation {
                 match record {
                     Some(bytes) => {
                         let now = clock.now();
@@ -1469,8 +1663,15 @@ fn run_driver(
                         // until the server's own `AUTH_DEADLINE`. No further
                         // datagram goes out -- like `detach`, there is
                         // nothing left worth saying.
-                        events.on_state(LinkState::Closed);
-                        return;
+                        conn.retire_data_for_discovery();
+                        gates.close_all();
+                        *inputs = InputQueue::default();
+                        dispatch_event(
+                            Event::StateChanged(LinkState::Closed),
+                            events.as_ref(),
+                            &mut state,
+                            &mut handshake_pending,
+                        );
                     }
                 }
             }
@@ -1506,10 +1707,18 @@ fn run_driver(
         } else {
             handshake_pending.then_some(handshake_sent_at + HANDSHAKE_RETRANSMIT)
         };
+        discovery.expire(now);
+        if discovery.is_complete(now) {
+            publish_discovery_complete(&discovery_out, events.as_ref());
+        }
+        send_all(socket.socket(), &discovery.poll(now), &mut sends);
         let effective = next_wait_deadline(
             now,
             conn.next_timeout(),
-            handshake_deadline,
+            match (handshake_deadline, discovery.next_deadline()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
             last_stats_at,
             command_processed
                 || auth_processed
@@ -1566,7 +1775,20 @@ fn run_driver(
             readable = false; // A stale old-generation event never reads a replacement.
         }
         let mut out = if readable {
-            match drain_ready(socket.socket(), conn, &mut buf, READY_DRAIN_MAX, &clock) {
+            match drain_ready_discovery(
+                socket.socket(),
+                conn,
+                &mut buf,
+                READY_DRAIN_MAX,
+                &clock,
+                &mut discovery,
+                &mut |endpoint, info| {
+                    let mut snapshot = discovery_out.lock().expect("discovery mutex");
+                    snapshot.record(endpoint, info.clone());
+                    drop(snapshot);
+                    events.on_server_info_from(endpoint, info);
+                },
+            ) {
                 Ok(out) => out,
                 Err(error) => {
                     log::error!("client UDP receive mode transition failed: {error}");
@@ -1582,6 +1804,9 @@ fn run_driver(
         } else {
             Vec::new()
         };
+        if discovery.is_complete(clock.now()) {
+            publish_discovery_complete(&discovery_out, events.as_ref());
+        }
         // Timers after EVERY wake-up, not only after a read timeout (spec
         // §4.1): datagrams arriving more often than the read timeout used to
         // starve the PINGs, retransmits, `PathDown`, road checks and the
@@ -1648,6 +1873,9 @@ fn run_driver(
                     conn.request_ping(now);
                     send_all(socket.socket(), &conn.on_timeout(now), &mut sends);
                 }
+                let generation = conn.server_generation();
+                discovery_out.lock().expect("discovery mutex").generation = generation;
+                events.on_server_generation(generation);
                 resumed_flag.store(conn.resumed(), Ordering::SeqCst);
                 *features_flag.lock().expect("features mutex") = Some(conn.features());
                 events.on_features(conn.features());
@@ -1667,6 +1895,9 @@ fn run_driver(
                 }
             }
             if matches!(ev, Event::StateChanged(LinkState::Closed)) {
+                conn.retire_data_for_discovery();
+                gates.close_all();
+                *inputs = InputQueue::default();
                 closed_gracefully_flag.store(conn.closed_gracefully(), Ordering::SeqCst);
             }
             let acceptance = dispatch_authenticated_event(
@@ -1684,7 +1915,9 @@ fn run_driver(
                     .on_protocol_failure(crate::ProtocolFailure::InvalidAuthentication { reason });
                 // Do not send Close: a malformed admission response must not
                 // accidentally destroy a session the tentative msg2 resumed.
-                conn.abandon();
+                conn.retire_data_for_discovery();
+                gates.close_all();
+                *inputs = InputQueue::default();
                 dispatch_event(
                     Event::StateChanged(LinkState::Closed),
                     events.as_ref(),
@@ -1714,9 +1947,15 @@ fn run_driver(
         // (spec §4.7.3): an ACK that shrank a tail opens its gate here.
         let _ = gates.refresh(|stream| conn.stream_progress(stream).unacked);
 
-        // Don't spin uselessly on a dead session.
+        // A failed ordinary admission must not cancel independent server discovery.
+        // The caller may retain this failed owner while trying other routes; cancel
+        // and external-sender drop still end the complete driver immediately.
         if matches!(state, LinkState::Closed) {
-            break;
+            gates.close_all();
+            conn.stop_recovery_handshake();
+            if discovery.is_complete(clock.now()) {
+                break;
+            }
         }
     }
 }

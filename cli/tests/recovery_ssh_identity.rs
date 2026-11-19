@@ -31,6 +31,7 @@ fn attempt(home: &Path, server: &fake::Server) {
         background: true,
         install_policy: bringup::InstallPolicy::RestartOnly,
         images: Arc::new(qsh::releases::GitHubImages::new(Some(home.join("cache")))),
+        server_info: None,
     };
     let route = connect::SshRoute {
         port: server.port,

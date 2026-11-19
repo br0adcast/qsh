@@ -256,6 +256,68 @@ class ReleaseOutputTests(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertEqual(output.debian_version(raw), expected)
 
+    def test_rpm_prerelease_version_and_filename(self):
+        self.assertEqual(output.rpm_version('0.6.0-rc.1+build.2'), '0.6.0~rc.1+build.2')
+        for raw, expected in [('0.6.0-rc1', '0.6.0~rc1'), ('0.6.0', '0.6.0')]:
+            with self.subTest(raw=raw):
+                self.assertEqual(output.rpm_version(raw), expected)
+                output.check_fields('rpm', ['qsh', expected, '1', 'x86_64'],
+                                    f'qsh-{raw}-1.x86_64.rpm', 'qsh', raw, 'x86_64')
+                if raw != expected:
+                    with self.assertRaises(ValueError):
+                        output.check_fields('rpm', ['qsh', raw, '1', 'x86_64'],
+                                            f'qsh-{raw}-1.x86_64.rpm', 'qsh', raw, 'x86_64')
+                    # The generator's own name, which GitHub rewrites, is not published.
+                    with self.assertRaises(ValueError):
+                        output.check_fields('rpm', ['qsh', expected, '1', 'x86_64'],
+                                            f'qsh-{expected}-1.x86_64.rpm', 'qsh', raw, 'x86_64')
+
+    def test_package_file_names_use_the_release_version_and_revision(self):
+        for fmt, program, version, arch, name in [
+                ('deb', 'qsh', '0.6.0', 'amd64', 'qsh_0.6.0-1_amd64.deb'),
+                ('rpm', 'qshd', '0.6.0', 'aarch64', 'qshd-0.6.0-1.aarch64.rpm'),
+                ('deb', 'qshd', '0.6.0-rc.2', 'arm64', 'qshd_0.6.0-rc.2-1_arm64.deb'),
+                ('rpm', 'qsh', '0.6.0-rc.2', 'x86_64', 'qsh-0.6.0-rc.2-1.x86_64.rpm')]:
+            with self.subTest(name=name):
+                self.assertEqual(output.package_file_name(fmt, program, version, arch), name)
+                self.assertTrue(output.github_safe_name(name))
+        # Stable names are what the generators already produce.
+        self.assertEqual(output.package_file_name('deb', 'qsh', '0.6.0', 'amd64'),
+                         'qsh_{}_amd64.deb'.format(output.debian_version('0.6.0')))
+        self.assertEqual(output.package_file_name('rpm', 'qsh', '0.6.0', 'x86_64'),
+                         'qsh-{}-1.x86_64.rpm'.format(output.rpm_version('0.6.0')))
+        with self.assertRaises(ValueError):
+            output.package_file_name('deb', 'qsh', '0.6.0+build.1', 'amd64')
+        fields = [['qsh', '0.6.0~rc.2-1', 'amd64'], ['qsh', '0.6.0~rc.2', '1', 'x86_64']]
+        for (fmt, arch), metadata in zip([('deb', 'amd64'), ('rpm', 'x86_64')], fields):
+            with self.subTest(fmt=fmt):
+                # Metadata keeps '~', so dpkg and rpm order the prerelease first.
+                output.check_fields(fmt, metadata,
+                                    output.package_file_name(fmt, 'qsh', '0.6.0-rc.2', arch),
+                                    'qsh', '0.6.0-rc.2', arch)
+
+    def test_github_safe_name_matches_names_github_keeps(self):
+        for name in ['SHA256SUMS', 'SHA256SUMS.sigstore.json', 'qsh_0.6.0-rc.2-1_amd64.deb',
+                     'qsh-0.6.0-rc1-x86_64-unknown-linux-musl.tar.gz', 'a', 'a_']:
+            with self.subTest(name=name):
+                self.assertTrue(output.github_safe_name(name))
+        for name in ['qsh_0.6.0~rc1-1_amd64.deb', 'qsh-0.6.0+b-1.x86_64.rpm', '.hidden',
+                     'trailing.', '_leading', 'a b', 'a/b', '', 'qsh\u00e9']:
+            with self.subTest(name=name):
+                self.assertFalse(output.github_safe_name(name))
+
+    def test_package_name_cli_contract(self):
+        script = str(ROOT / 'scripts/check-release-output.py')
+        for version, expected in [('0.6.0-rc.2', b'qshd-0.6.0-rc.2-1.x86_64.rpm\n'),
+                                  ('0.6.0+build.1', b''), ('not-a-version', b'')]:
+            with self.subTest(version=version):
+                result = subprocess.run(
+                    [sys.executable, script, 'package-name', '--format', 'rpm',
+                     '--program', 'qshd', '--version', version, '--arch', 'x86_64'],
+                    capture_output=True, timeout=5)
+                self.assertEqual(result.stdout, expected)
+                self.assertEqual(result.returncode, 0 if expected else 1)
+
     def test_package_fields_and_filename_must_both_match(self):
         for fmt, fields, filename, arch in [
                 ('deb', ['qsh', '0.5.0-1', 'amd64'], 'qsh_0.5.0-1_amd64.deb', 'amd64'),
@@ -323,6 +385,133 @@ class DarwinMetadataTests(unittest.TestCase):
             decoy=home/'.rustup/toolchains/1.99.1/bin';decoy.mkdir(parents=True)
             (decoy/'rustc').write_text('DECOY MUST NOT BE SELECTED')
         return env,proxy,resolver,compiler,record,resolver_record
+
+    def multicall_tools(self):
+        env,proxy,resolver,compiler,record,resolver_record=self.rust_tools()
+        target=self.root/'rustup-init';resolver.rename(target)
+        source=target.read_text();shebang,body=source.split('\n',1)
+        target.write_text(shebang+'\nimport sys\nfrom pathlib import Path\n'
+            'if Path(sys.argv[0]).name!="rustup":\n'
+            '    sys.stderr.write("synthetic-private-multicall-canary\\n");raise SystemExit(1)\n'+body)
+        resolver.symlink_to(target)
+        return env,resolver,target,compiler
+
+    def test_rustup_multicall_fixture_distinguishes_invocation_name(self):
+        env,alias,target,compiler=self.multicall_tools()
+        homes=dict(RUSTUP_HOME=str(Path(env['HOME'])/'.rustup'),CARGO_HOME=str(Path(env['HOME'])/'.cargo'))
+        with mock.patch.dict(os.environ,env,clear=True):
+            self.assertEqual(output.metadata_command([str(alias),'which','--toolchain','1.99.1','rustc'],category='rust-toolchain',toolchain_homes=homes),(str(compiler)+'\n').encode())
+            with self.assertRaisesRegex(ValueError,'tool refused status=1 stderr_present=true')as error:
+                output.metadata_command([str(target),'which','--toolchain','1.99.1','rustc'],category='rust-toolchain',toolchain_homes=homes)
+        self.assertNotIn('synthetic-private-multicall-canary',str(error.exception))
+
+    def test_rustup_symlink_lookup_preserves_management_invocation(self):
+        env,alias,target,compiler=self.multicall_tools()
+        with mock.patch.dict(os.environ,env,clear=True):
+            try:selected=output._metadata_rustc()
+            except ValueError as error:self.fail('management alias must select the inert compiler: '+str(error))
+        self.assertEqual(selected,compiler)
+
+    def test_rustup_alias_and_target_drift_refuse_after_success_only(self):
+        env,alias,target,compiler=self.multicall_tools()
+        with mock.patch.dict(os.environ,env,clear=True):
+            def mutate(argv,**kwargs):
+                target.write_text(target.read_text()+'# identity drift\n')
+                return (str(compiler)+'\n').encode()
+            with mock.patch.object(output,'metadata_command',side_effect=mutate),self.assertRaisesRegex(ValueError,'TARGET_CHANGED'):output._metadata_rustc()
+            def replace_alias(argv,**kwargs):
+                alias.unlink();alias.symlink_to(compiler)
+                return (str(compiler)+'\n').encode()
+            with mock.patch.object(output,'metadata_command',side_effect=replace_alias),self.assertRaisesRegex(ValueError,'TARGET_CHANGED'):output._metadata_rustc()
+            alias.unlink();alias.symlink_to(target)
+            def refused(argv,**kwargs):
+                alias.unlink();raise output._MetadataRefusal('rust-toolchain',7,True)
+            with mock.patch.object(output,'metadata_command',side_effect=refused),self.assertRaisesRegex(ValueError,'tool refused status=7 stderr_present=true'):output._metadata_rustc()
+
+    def test_rustup_same_basename_target_and_hardlink_invocation(self):
+        env,proxy,alias,compiler,record,resolver_record=self.rust_tools()
+        target_dir=self.root/'target';target_dir.mkdir();target=target_dir/'rustup';alias.rename(target);alias.symlink_to(target)
+        with mock.patch.dict(os.environ,env,clear=True):self.assertEqual(output._metadata_rustc(),compiler)
+        alias.unlink();os.link(target,alias)
+        with mock.patch.dict(os.environ,env,clear=True):self.assertEqual(output._metadata_rustc(),compiler)
+        alias.chmod(0o600)
+        with mock.patch.dict(os.environ,env,clear=True),mock.patch.object(output.shutil,'which',return_value=str(alias)),self.assertRaisesRegex(ValueError,'TARGET_INVALID'):output._metadata_rustc()
+
+    def lookup_context(self):
+        return dict(invocation='rustup',target_name='RUSTUP_INIT',alias=True,force_arg0_present=False)
+
+    def assert_lookup_api(self):
+        import inspect
+        self.assertIn('lookup_identity',inspect.signature(output.metadata_command).parameters,'closed lookup context missing')
+
+    def test_lookup_context_closed_fields_and_private_formatter(self):
+        self.assert_lookup_api();context=self.lookup_context()
+        for name in ('RUSTUP','RUSTUP_INIT','OTHER'):
+            value=dict(context,target_name=name)
+            error=output._MetadataRefusal('rust-toolchain',1,True,lookup_identity=value)
+            self.assertIn('lookup=COMPLETED_REFUSAL invocation=rustup target_name='+name,str(error))
+            self.assertIn('alias=true force_arg0_present=false',str(error));self.assertLessEqual(len(str(error).encode('ascii')),512)
+        for key,value in [('invocation','private-canary'),('target_name','private-canary'),('alias',1),('force_arg0_present',0)]:
+            with mock.patch.object(output.subprocess,'Popen')as spawn,self.assertRaises(ValueError)as error:
+                output.metadata_command(['unused'],category='rust-toolchain',lookup_identity=dict(context,**{key:value}))
+            spawn.assert_not_called();self.assertNotIn('private-canary',str(error.exception)+repr(error.exception))
+        for bad in (dict(context,extra=True),{k:v for k,v in context.items()if k!='alias'}):
+            with self.assertRaises(ValueError):output.metadata_command(['unused'],category='rust-toolchain',lookup_identity=bad)
+        with self.assertRaises(ValueError):output.metadata_command(['unused'],category='rust-version',lookup_identity=context)
+
+    def test_lookup_classification_and_alias_entry_replacement(self):
+        self.assert_lookup_api();env,proxy,alias,compiler,record,resolver_record=self.rust_tools();source=alias.read_text()
+        with mock.patch.dict(os.environ,env,clear=True):
+            for name,kind in [('rustup','RUSTUP'),('rustup-init','RUSTUP_INIT'),('unrecognized-private-name','OTHER')]:
+                if name!='rustup':
+                    target=self.root/name;target.write_text(source);target.chmod(0o700);alias.unlink();alias.symlink_to(target)
+                seen=[]
+                def selected(argv,**kwargs):seen.append((argv,kwargs['lookup_identity']));return (str(compiler)+'\n').encode()
+                with mock.patch.object(output,'metadata_command',side_effect=selected):self.assertEqual(output._metadata_rustc(),compiler)
+                self.assertEqual(seen[0][0],[str(alias),'which','--toolchain','1.99.1','rustc'])
+                self.assertEqual(seen[0][1],dict(invocation='rustup',target_name=kind,alias=name!='rustup',force_arg0_present=False))
+            def replace(argv,**kwargs):
+                target=alias.resolve();alias.unlink();alias.symlink_to(target)
+                return (str(compiler)+'\n').encode()
+            with mock.patch.object(output,'metadata_command',side_effect=replace),self.assertRaisesRegex(ValueError,'TARGET_CHANGED'):output._metadata_rustc()
+
+    def test_lookup_completed_context_zero_stderr_and_error_precedence(self):
+        self.assert_lookup_api();program=self.helper.executable('inert','import sys\nsys.stderr.write("synthetic-private-canary")\n')
+        with self.assertRaises(ValueError)as error:output.metadata_command([str(program)],category='rust-toolchain',lookup_identity=self.lookup_context())
+        self.assertIn('status=0 stderr_present=true lookup=COMPLETED_REFUSAL',str(error.exception));self.assertNotIn('private-canary',str(error.exception))
+        env,alias,target,compiler=self.multicall_tools()
+        with mock.patch.dict(os.environ,env,clear=True):
+            for reason in ('timed out','output limit'):
+                def refuse(argv,**kwargs):
+                    target.write_text(target.read_text()+'# mutation\n');raise output._metadata_failure('rust-toolchain',reason)
+                with mock.patch.object(output,'metadata_command',side_effect=refuse),self.assertRaisesRegex(ValueError,reason):output._metadata_rustc()
+
+    def test_lookup_cli_diagnostic_never_includes_private_context(self):
+        self.assert_lookup_api();context=self.lookup_context();context['force_arg0_present']=True
+        error=output._MetadataRefusal('rust-toolchain',1,True,lookup_identity=context)
+        stderr=io.StringIO();stdout=io.StringIO()
+        argv=['check-release-output.py','archive','--version','0.5.0','--target','aarch64-apple-darwin','--inputs','synthetic','synthetic']
+        with mock.patch.object(sys,'argv',argv),mock.patch.object(output,'check_archive',side_effect=error), \
+                mock.patch.object(output.sys,'stderr',stderr),mock.patch.object(output.sys,'stdout',stdout):
+            self.assertEqual(output.main(),1)
+        line=stderr.getvalue();self.assertLessEqual(len(line.encode('ascii')),512)
+        self.assertIn('lookup=COMPLETED_REFUSAL invocation=rustup target_name=RUSTUP_INIT alias=true force_arg0_present=true',line)
+        self.assertNotIn(str(self.root),line);self.assertEqual(stdout.getvalue(),'')
+
+    def test_lookup_refusal_context_preserves_status_and_environment(self):
+        self.assert_lookup_api();env,alias,target,compiler=self.multicall_tools()
+        env['RUSTUP_FORCE_ARG0']='synthetic-private-env-canary'
+        native=output.metadata_command;seen=[]
+        def command(argv,**kwargs):
+            seen.append(kwargs['lookup_identity'])
+            return native([str(target),*argv[1:]],**kwargs)
+        with mock.patch.dict(os.environ,env,clear=True),mock.patch.object(output,'metadata_command',side_effect=command),self.assertRaises(ValueError)as error:output._metadata_rustc()
+        self.assertEqual(seen,[dict(self.lookup_context(),force_arg0_present=True)])
+        self.assertIn('status=1 stderr_present=true lookup=COMPLETED_REFUSAL',str(error.exception))
+        self.assertNotIn('private-',str(error.exception)+repr(error.exception));self.assertNotIn(str(self.root),str(error.exception))
+        with mock.patch.object(output,'_metadata_lookup_suffix',side_effect=RuntimeError('private-format-canary')):
+            error=output._MetadataRefusal('rust-toolchain',3,True,lookup_identity=self.lookup_context())
+        self.assertEqual(str(error),'Darwin metadata rust-toolchain: tool refused status=3 stderr_present=true')
 
     def test_rustup_proxy_home_isolation_uses_one_resolved_compiler(self):
         self.fixture();env,proxy,resolver,compiler,record,resolver_record=self.rust_tools()

@@ -192,6 +192,12 @@ fn replacement_guard(identity: Classified, sid: i32, cookie: u64) -> DescendantG
         token: token.handle,
         watch: watch.handle,
         normal_exit: false,
+        teardown: Some(match cookie {
+            1 => TeardownGuard::Descendant,
+            2 => TeardownGuard::Application,
+            3 => TeardownGuard::Session,
+            _ => TeardownGuard::Other,
+        }),
     }
 }
 fn replacement_absent(identity: Identity) -> bool {
@@ -987,6 +993,8 @@ struct DescendantGuard {
     token: super::native::Token,
     watch: super::native::Watch,
     normal_exit: bool,
+    // Reports its failure-only teardown when set.
+    teardown: Option<TeardownGuard>,
 }
 impl DescendantGuard {
     fn finish(&mut self) {
@@ -1005,19 +1013,129 @@ impl Drop for DescendantGuard {
     fn drop(&mut self) {
         if !self.normal_exit {
             let mut ops = NativeOps;
-            let _ = ops.signal_exact(&self.token, Signal::Kill);
+            let signaled = ops.signal_exact(&self.token, Signal::Kill).is_ok();
             let deadline = Instant::now() + Duration::from_secs(5);
+            let mut exited = false;
             while Instant::now() < deadline {
                 if matches!(ops.observe_exit(&mut self.watch), Ok(Some(_))) {
-                    return;
+                    exited = true;
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
+            }
+            if let Some(guard) = self.teardown {
+                emit_teardown(&TeardownRecord {
+                    guard,
+                    signal: Some(if signaled {
+                        TeardownSignal::Sent
+                    } else {
+                        TeardownSignal::Refused
+                    }),
+                    stop: None,
+                    exit: if exited {
+                        TeardownExit::Observed
+                    } else {
+                        TeardownExit::Unobserved
+                    },
+                    owner: None,
+                    log_read: None,
+                    log: None,
+                });
             }
         }
     }
 }
+/// What a failure-only guard teardown did, in closed values: printed after
+/// the failure record, which is written before any teardown and so cannot
+/// say whether teardown left a process behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum TeardownGuard {
+    Daemon,
+    Application,
+    Descendant,
+    Session,
+    Other,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum TeardownSignal {
+    // The exact token delivered SIGKILL.
+    Sent,
+    // The exact token refused: the process was already gone or unbound.
+    Refused,
+    // The daemon's rescue was not eligible: no armed identity still matched.
+    NotEligible,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum TeardownStop {
+    Answered,
+    NoDaemon,
+    TimedOut,
+    RequestError,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum TeardownExit {
+    // The bound exit watch fired (for the daemon: after STOP, no rescue).
+    Observed,
+    // The daemon's exit was observed only in the window after the rescue
+    // decision; `signal` says whether a rescue signal was sent.
+    ObservedAfterRescue,
+    Unobserved,
+    // No exit watch was ever bound.
+    NoWatch,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum TeardownOwner {
+    // The daemon's exclusive Child custody consumed its exit.
+    Reaped,
+    Running,
+    Error,
+}
+#[derive(Debug, serde::Serialize)]
+struct TeardownRecord {
+    guard: TeardownGuard,
+    signal: Option<TeardownSignal>,
+    stop: Option<TeardownStop>,
+    exit: TeardownExit,
+    owner: Option<TeardownOwner>,
+    log_read: Option<LogRead>,
+    log: Option<crate::update::RestartLogFacts>,
+}
+fn teardown_bytes(record: &TeardownRecord) -> Option<Vec<u8>> {
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        schema: u8,
+        kind: &'static str,
+        #[serde(flatten)]
+        record: &'a TeardownRecord,
+    }
+    let value = serde_json::to_value(Envelope {
+        schema: 1,
+        kind: "darwin223-fixture-teardown",
+        record,
+    })
+    .ok()?;
+    let mut bytes = serde_json::to_vec(&value).ok()?;
+    bytes.push(b'\n');
+    (bytes.len() <= 1024).then_some(bytes)
+}
+// Runs inside Drop, possibly while unwinding: it never panics, and a record
+// it cannot form or write is simply absent.
+fn emit_teardown(record: &TeardownRecord) {
+    use std::io::Write;
+    if let Some(bytes) = teardown_bytes(record) {
+        let mut stderr = std::io::stderr().lock();
+        let _ = stderr.write_all(b"QSH223_FIXTURE_TEARDOWN ");
+        let _ = stderr.write_all(&bytes);
+    }
+}
 #[test]
 fn darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins() {
+    use super::fixture_input_ordering::{release_after_input, write_fixture_input};
     use std::io::Read;
     let qualification = prepare().expect("production admission");
     let directory = tempfile::tempdir().unwrap();
@@ -1049,9 +1167,12 @@ fn darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins() {
         token: token.handle,
         watch: watch.handle,
         normal_exit: false,
+        teardown: None,
     };
     let mut reader = master.try_clone_reader().unwrap();
     let writer = master.take_writer().unwrap();
+    let (accepted, input_receipt) = std::sync::mpsc::channel();
+    let deadline = Instant::now() + Duration::from_secs(15);
     let reading = std::thread::spawn(move || {
         let mut bytes = [0; 256];
         loop {
@@ -1064,14 +1185,17 @@ fn darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins() {
         }
     });
     let writing = std::thread::spawn(move || {
-        use std::io::Write;
         let mut writer = writer;
-        writer.write_all(b"fixture-input\n")
+        write_fixture_input(&mut writer, accepted)
     });
-    publish(&directory.path().join("controller-bound"));
     let mut wait = own_child(child, qualification);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // Confirm the actual master-side write before the silent actor can exit.
+        // The receipt does not claim actor consumption or discharge either join.
+        release_after_input(&input_receipt, deadline, || {
+            publish(&directory.path().join("controller-bound"));
+        })
+        .expect("actual PTY input receipt before actor release");
         loop {
             match wait.poll_exit() {
                 ChildStatus::Reaped { code } => {
@@ -1097,11 +1221,18 @@ fn darwin223_native_silent_pty_leader_first_other_group_and_real_io_joins() {
     drop(master);
     let read_join = reading.join();
     let write_join = writing.join();
+    // Check both original worker outcomes even if the receipt/owner stage failed.
+    let read_check = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_join.expect("actual PTY EOF join");
+    }));
+    let write_check = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        write_join
+            .expect("actual writer join")
+            .expect("actual PTY write");
+    }));
     result.unwrap();
-    read_join.expect("actual PTY EOF join");
-    write_join
-        .expect("actual writer join")
-        .expect("actual PTY write");
+    read_check.unwrap();
+    write_check.unwrap();
 
     eprintln!("darwin223 silent_leader=first descendant_other_pgrp=true process_reap=normal reader_join=actual writer_join=actual rescue=false");
 }
@@ -1250,6 +1381,7 @@ impl ConnectedActorAuthority {
             token: token.handle,
             watch: watch.handle,
             normal_exit: false,
+            teardown: None,
         });
         publish(&self.path().join("controller-bound"));
     }
@@ -1677,6 +1809,9 @@ struct ReplacementDiagnostic<'a> {
     replacement: Option<(&'a str, ReplacementActorRole)>,
     status_wait: Option<&'a std::cell::Cell<StatusWaitObservation>>,
     update_wait: Option<UpdateWaitSnapshot>,
+    // The actual daemon's cache directory (its own log) and the native
+    // identity bound when it was armed.
+    daemon: Option<(&'a Path, Option<Identity>)>,
 }
 #[derive(serde::Serialize)]
 struct MarkerFacts {
@@ -1722,7 +1857,98 @@ enum FailurePayload {
         status_wait: Option<StatusWaitObservation>,
         update_wait: Option<UpdateWaitSnapshot>,
         actor_stage: Option<ReplacementActorProjection>,
+        daemon: Option<DaemonFacts>,
     },
+}
+/// The actual daemon at the moment of a failure, from what it owns: its
+/// native process identity against the one armed, and its own log of the
+/// replacement steps. Closed values only.
+#[derive(Clone, Debug, serde::Serialize)]
+struct DaemonFacts {
+    image: DaemonImage,
+    log_read: LogRead,
+    log: crate::update::RestartLogFacts,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum DaemonImage {
+    // Same process, same execution: no exec has replaced the armed image.
+    SameExecution,
+    // Same process, fresh execution version: an exec replaced it.
+    Replaced,
+    // The armed PID names another process now.
+    OtherProcess,
+    // The kernel reports no such process.
+    Absent,
+    // No armed identity, or no conclusive answer.
+    Unavailable,
+}
+fn daemon_image_of(armed: Option<Identity>, observed: Result<Identity, Failure>) -> DaemonImage {
+    let Some(armed) = armed else {
+        return DaemonImage::Unavailable;
+    };
+    match observed {
+        Ok(current) if current.same_process(armed) && current.version == armed.version => {
+            DaemonImage::SameExecution
+        }
+        Ok(current) if current.same_process(armed) => DaemonImage::Replaced,
+        Ok(current) if current.pid == armed.pid => DaemonImage::OtherProcess,
+        Ok(_) => DaemonImage::Unavailable,
+        Err(Failure::Errno(number)) if number == nix::libc::ESRCH => DaemonImage::Absent,
+        Err(_) => DaemonImage::Unavailable,
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum LogRead {
+    Whole,
+    // Only the last DAEMON_LOG_TAIL bytes were read.
+    Tail,
+    Missing,
+    Error,
+}
+const DAEMON_LOG_TAIL: u64 = 64 * 1024;
+fn daemon_log_facts(cache: &Path) -> (LogRead, crate::update::RestartLogFacts) {
+    use std::io::{Read, Seek, SeekFrom};
+    let empty = crate::update::RestartLogFacts::default();
+    let mut file = match std::fs::File::open(cache.join("qshd.log")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (LogRead::Missing, empty)
+        }
+        Err(_) => return (LogRead::Error, empty),
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return (LogRead::Error, empty);
+    };
+    let read = if length > DAEMON_LOG_TAIL {
+        if file
+            .seek(SeekFrom::Start(length - DAEMON_LOG_TAIL))
+            .is_err()
+        {
+            return (LogRead::Error, empty);
+        }
+        LogRead::Tail
+    } else {
+        LogRead::Whole
+    };
+    let mut bytes = Vec::new();
+    if file.take(DAEMON_LOG_TAIL).read_to_end(&mut bytes).is_err() {
+        return (LogRead::Error, empty);
+    }
+    (read, crate::update::RestartLogFacts::parse(&bytes))
+}
+fn daemon_facts(cache: &Path, armed: Option<Identity>) -> DaemonFacts {
+    let observed = match armed {
+        Some(armed) => NativeOps.identity(armed.pid),
+        None => Err(Failure::Invalid),
+    };
+    let (log_read, log) = daemon_log_facts(cache);
+    DaemonFacts {
+        image: daemon_image_of(armed, observed),
+        log_read,
+        log,
+    }
 }
 #[derive(Clone, Copy, Default, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1767,6 +1993,10 @@ struct CachedAtWaitEntry {
 struct StatusWaitObservation {
     last_result: StatusResult,
     last_build: StatusBuild,
+    // Which image answered the last valid STATUS, by its own checksum: the
+    // build alone cannot tell an old image from a new one whose label
+    // lookup failed.
+    last_image: StatusImage,
     seen: SeenStatusResults,
     completed_calls: u32,
     cached_at_wait_entry: CachedAtWaitEntry,
@@ -1776,11 +2006,36 @@ impl StatusWaitObservation {
         Self {
             last_result: StatusResult::Unobserved,
             last_build: StatusBuild::Unknown,
+            last_image: StatusImage::Unknown,
             seen: SeenStatusResults::default(),
             completed_calls: 0,
             cached_at_wait_entry,
         }
     }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum StatusImage {
+    #[default]
+    Unknown,
+    OldImage,
+    NewImage,
+    Other,
+}
+fn status_image(checksum: Option<&str>, old: &str, new: &str) -> StatusImage {
+    match checksum {
+        None => StatusImage::Unknown,
+        Some(sum) if sum == new => StatusImage::NewImage,
+        Some(sum) if sum == old => StatusImage::OldImage,
+        Some(_) => StatusImage::Other,
+    }
+}
+// Called from inside the predicate's one request, before the predicate
+// records that request's result, which keeps this field.
+fn record_status_image(observation: &std::cell::Cell<StatusWaitObservation>, image: StatusImage) {
+    let mut value = observation.get();
+    value.last_image = image;
+    observation.set(value);
 }
 fn status_wait_predicate(
     observation: &std::cell::Cell<StatusWaitObservation>,
@@ -1881,6 +2136,7 @@ fn fixture_status_projection_controls() {
         status_wait: Some(state.get()),
         update_wait: None,
         actor_stage: None,
+        daemon: None,
     };
     let bytes = failure_bytes(&record).unwrap();
     assert!(bytes.len() <= 2048);
@@ -1898,6 +2154,193 @@ fn fixture_status_projection_controls() {
     );
     assert!(value["status_wait"].get("build").is_none());
     assert!(value["status_wait"].get("pid").is_none());
+}
+fn fixture_daemon_evidence_controls() {
+    let contains_canary = |bytes: &[u8]| {
+        bytes
+            .windows(b"PRIVATE_CANARY".len())
+            .any(|w| w == b"PRIVATE_CANARY")
+    };
+    // Native image identity: every answer maps to one closed value, and a
+    // PID alone never counts as the armed process.
+    let armed = Identity {
+        pid: 41,
+        unique: 410,
+        version: 3,
+    };
+    for (expected, observed) in [
+        (DaemonImage::SameExecution, Ok(armed)),
+        (
+            DaemonImage::Replaced,
+            Ok(Identity {
+                version: 4,
+                ..armed
+            }),
+        ),
+        (
+            DaemonImage::OtherProcess,
+            Ok(Identity {
+                unique: 411,
+                ..armed
+            }),
+        ),
+        (DaemonImage::Unavailable, Ok(Identity { pid: 42, ..armed })),
+        (DaemonImage::Absent, Err(Failure::Errno(nix::libc::ESRCH))),
+        (
+            DaemonImage::Unavailable,
+            Err(Failure::Errno(nix::libc::EPERM)),
+        ),
+        (DaemonImage::Unavailable, Err(Failure::Invalid)),
+    ] {
+        assert_eq!(daemon_image_of(Some(armed), observed), expected);
+    }
+    assert_eq!(daemon_image_of(None, Ok(armed)), DaemonImage::Unavailable);
+    // The daemon's own log: missing, whole, tail-only and unreadable.
+    let directory = tempfile::tempdir().unwrap();
+    let (read, facts) = daemon_log_facts(directory.path());
+    assert_eq!(read, LogRead::Missing);
+    assert_eq!(facts, crate::update::RestartLogFacts::default());
+    let line = |text: &str| {
+        logging::format_lines(
+            std::time::SystemTime::now(),
+            7,
+            crate::log::Level::Info,
+            "update",
+            text,
+        )
+        .concat()
+            + "\n"
+    };
+    let step = |step: crate::update::RestartStep| {
+        line(&format!(
+            "{}{}",
+            crate::update::RESTART_STEP_LOG,
+            step.token()
+        ))
+    };
+    let log = directory.path().join("qshd.log");
+    std::fs::write(
+        &log,
+        step(crate::update::RestartStep::Announced) + &step(crate::update::RestartStep::DrainLate),
+    )
+    .unwrap();
+    let (read, facts) = daemon_log_facts(directory.path());
+    assert_eq!(read, LogRead::Whole);
+    assert_eq!(facts.steps, vec!["announced", "drain-late"]);
+    let mut large = line("PRIVATE_CANARY")
+        .repeat((DAEMON_LOG_TAIL as usize) / line("PRIVATE_CANARY").len() + 2);
+    large.push_str(&step(crate::update::RestartStep::Exec));
+    std::fs::write(&log, &large).unwrap();
+    let (read, facts) = daemon_log_facts(directory.path());
+    assert_eq!(read, LogRead::Tail);
+    assert_eq!(facts.last_step, Some("exec"));
+    assert!(!facts.unrecognized);
+    std::fs::remove_file(&log).unwrap();
+    std::fs::create_dir(&log).unwrap();
+    assert_eq!(daemon_log_facts(directory.path()).0, LogRead::Error);
+    // Status image by checksum, kept by the predicate around its request.
+    assert_eq!(status_image(None, "a", "b"), StatusImage::Unknown);
+    assert_eq!(status_image(Some("a"), "a", "b"), StatusImage::OldImage);
+    assert_eq!(status_image(Some("b"), "a", "b"), StatusImage::NewImage);
+    assert_eq!(
+        status_image(Some("PRIVATE_CANARY"), "a", "b"),
+        StatusImage::Other
+    );
+    let state = std::cell::Cell::new(StatusWaitObservation::new(CachedAtWaitEntry {
+        status: CachedStatus::from_status(None),
+        stderr_eof: false,
+        stderr_bytes: usize::MAX,
+    }));
+    assert!(!status_wait_predicate(&state, 10, 20, || {
+        record_status_image(&state, StatusImage::OldImage);
+        (Some(10), "VALID_STATUS")
+    }));
+    assert_eq!(state.get().last_image, StatusImage::OldImage);
+    assert_eq!(state.get().completed_calls, 1);
+    // The largest failure record with daemon facts stays within its bound.
+    let mut status = state.get();
+    status.completed_calls = u32::MAX;
+    status.last_image = StatusImage::Unknown;
+    let full = crate::update::RestartLogFacts {
+        steps: crate::update::RestartStep::ALL
+            .iter()
+            .map(|step| step.token())
+            .collect(),
+        last_step: Some(crate::update::RestartStep::ControlGate.token()),
+        stopped: Some(crate::update::RestartStop::IdentityExhausted.token()),
+        resumed: true,
+        resume_failed: true,
+        unrecognized: true,
+    };
+    let record = FailurePayload::Replacement {
+        stage: ReplacementSite::NewBuildStatus,
+        progress: ReplacementProgress {
+            open_enqueued: true,
+            offer_enqueued: true,
+            accepted: true,
+            upload_enqueued: true,
+            restarting: true,
+        },
+        events: Some(EventFacts {
+            opened: true,
+            refused: true,
+            update_accept: true,
+            update_reject: true,
+            restarting: true,
+            exit0: true,
+            exitother: true,
+            parked_terminal: Some(super::keeper_integration_tests::ReplacementTerminal {
+                stream: u8::MAX,
+                code: i32::MIN,
+            }),
+        }),
+        markers: marker_facts(directory.path(), directory.path()),
+        status_wait: Some(status),
+        update_wait: None,
+        actor_stage: None,
+        daemon: Some(DaemonFacts {
+            image: DaemonImage::SameExecution,
+            log_read: LogRead::Tail,
+            log: full.clone(),
+        }),
+    };
+    let bytes = failure_bytes(&record).unwrap();
+    assert!(bytes.len() <= 2048);
+    assert!(!contains_canary(&bytes));
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["daemon"]["image"], "SAME_EXECUTION");
+    assert_eq!(value["daemon"]["log"]["steps"].as_array().unwrap().len(), 8);
+    assert_eq!(value["status_wait"]["last_image"], "UNKNOWN");
+    // Teardown records: bounded, closed, for every guard and outcome.
+    for guard in [
+        TeardownGuard::Daemon,
+        TeardownGuard::Application,
+        TeardownGuard::Descendant,
+        TeardownGuard::Session,
+        TeardownGuard::Other,
+    ] {
+        for exit in [
+            TeardownExit::Observed,
+            TeardownExit::ObservedAfterRescue,
+            TeardownExit::Unobserved,
+            TeardownExit::NoWatch,
+        ] {
+            let record = TeardownRecord {
+                guard,
+                signal: Some(TeardownSignal::NotEligible),
+                stop: Some(TeardownStop::RequestError),
+                exit,
+                owner: Some(TeardownOwner::Running),
+                log_read: Some(LogRead::Error),
+                log: Some(full.clone()),
+            };
+            let bytes = teardown_bytes(&record).unwrap();
+            assert!(bytes.len() <= 1024);
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["kind"], "darwin223-fixture-teardown");
+            assert_eq!(value["exit"], serde_json::to_value(exit).unwrap());
+        }
+    }
 }
 fn fixture_status_single_request_controls() {
     let cache = CachedAtWaitEntry {
@@ -2305,6 +2748,7 @@ fn fixture_update_record_controls() {
                 failure,
             }),
             actor_stage: None,
+            daemon: None,
         };
         let bytes = failure_bytes(&record).unwrap();
         assert!(bytes.len() <= 2048);
@@ -2337,6 +2781,7 @@ fn fixture_update_record_controls() {
         status_wait: None,
         update_wait: None,
         actor_stage: None,
+        daemon: None,
     };
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&failure_bytes(&record).unwrap()).unwrap()
@@ -2595,6 +3040,9 @@ fn replacement_failure(context: ReplacementDiagnostic<'_>) {
         actor_stage: context.replacement.and_then(|(nonce, role)| {
             replacement_stage_observe(context.actor, Some(nonce)).filter(|stage| stage.role == role)
         }),
+        daemon: context
+            .daemon
+            .map(|(cache, armed)| daemon_facts(cache, armed)),
     });
 }
 fn connected_failure(
@@ -2701,6 +3149,7 @@ fn fixture_timeout_formatter_controls() {
             status_wait: None,
             update_wait: None,
             actor_stage: None,
+            daemon: None,
         };
         assert!(failure_bytes(&record).unwrap().len() <= 2048);
     }
@@ -2734,6 +3183,7 @@ fn fixture_timeout_tag_control() {
             replacement: None,
             status_wait: None,
             update_wait: None,
+            daemon: None,
         });
     }
     assert!(!progress.get().offer_enqueued);
@@ -3361,6 +3811,7 @@ fn darwin223_native_exit_before_binding_exclusion_zombie_and_last_fork() {
             token: token.handle,
             watch: watch.handle,
             normal_exit: false,
+            teardown: None,
         };
         let candidate_value = native.classify(candidate).unwrap();
         let candidate_token = native
@@ -3372,6 +3823,7 @@ fn darwin223_native_exit_before_binding_exclusion_zombie_and_last_fork() {
             token: candidate_token.handle,
             watch: candidate_watch.handle,
             normal_exit: false,
+            teardown: None,
         };
         let mut scope = super::native::owned_scope(child, qualification);
         scope.request_stop();
@@ -3410,6 +3862,7 @@ fn darwin223_native_exit_before_binding_exclusion_zombie_and_last_fork() {
                 token: token.handle,
                 watch: watch.handle,
                 normal_exit: false,
+                teardown: None,
             });
         }
         publish(&directory.path().join("exit"));
@@ -4923,17 +5376,57 @@ impl Drop for DirectDaemonGuard {
         if self.normal {
             return;
         }
-        let _ = crate::control::client_request(&self.socket, &crate::control::ControlRequest::Stop);
-        let mut ops = NativeOps;
-        if let Some(watch) = self.watch.as_mut() {
-            let end = Instant::now() + Duration::from_secs(15);
-            while Instant::now() < end {
-                if matches!(ops.observe_exit(watch), Ok(Some(_))) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(20));
+        let stop = match crate::control::client_request(
+            &self.socket,
+            &crate::control::ControlRequest::Stop,
+        ) {
+            Ok(crate::control::ControlReply::Answered(_)) => TeardownStop::Answered,
+            Ok(crate::control::ControlReply::NoDaemon) => TeardownStop::NoDaemon,
+            Ok(crate::control::ControlReply::TimedOut) => TeardownStop::TimedOut,
+            Err(_) => TeardownStop::RequestError,
+        };
+        let (signal, exit) = self.stop_or_rescue();
+        // Exclusive Child custody consumes the exit now, as its own drop
+        // would, so the record can say whether a process was left.
+        let owner = match self.owner.poll() {
+            Ok(Some(_)) => TeardownOwner::Reaped,
+            Ok(None) => TeardownOwner::Running,
+            Err(_) => TeardownOwner::Error,
+        };
+        let (log_read, log) = match self.socket.parent() {
+            Some(cache) => {
+                let (read, log) = daemon_log_facts(cache);
+                (Some(read), Some(log))
             }
+            None => (None, None),
+        };
+        emit_teardown(&TeardownRecord {
+            guard: TeardownGuard::Daemon,
+            signal,
+            stop: Some(stop),
+            exit,
+            owner: Some(owner),
+            log_read,
+            log,
+        });
+    }
+}
+impl DirectDaemonGuard {
+    // STOP was sent: wait for the bound exit, and only then rescue an
+    // armed identity that still matches exactly.
+    fn stop_or_rescue(&mut self) -> (Option<TeardownSignal>, TeardownExit) {
+        let mut ops = NativeOps;
+        let Some(watch) = self.watch.as_mut() else {
+            return (None, TeardownExit::NoWatch);
+        };
+        let end = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < end {
+            if matches!(ops.observe_exit(watch), Ok(Some(_))) {
+                return (None, TeardownExit::Observed);
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
+        let mut signal = TeardownSignal::NotEligible;
         if let Some(original) = self.identity {
             if let Ok(current) = ops.classify(original.identity.pid) {
                 if current.identity.same_process(original.identity)
@@ -4942,21 +5435,27 @@ impl Drop for DirectDaemonGuard {
                     if let Class::Session(sid) = current.class {
                         if let Ok(token) = ops.acquire_signal_token(current.identity, sid) {
                             self.rescues += 1;
-                            let _ = ops.signal_exact(&token.handle, Signal::Kill);
+                            signal = if ops.signal_exact(&token.handle, Signal::Kill).is_ok() {
+                                TeardownSignal::Sent
+                            } else {
+                                TeardownSignal::Refused
+                            };
                         }
                     }
                 }
             }
         }
-        if let Some(watch) = self.watch.as_mut() {
-            let end = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < end {
-                if matches!(ops.observe_exit(watch), Ok(Some(_))) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(20));
+        let Some(watch) = self.watch.as_mut() else {
+            return (Some(signal), TeardownExit::NoWatch);
+        };
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            if matches!(ops.observe_exit(watch), Ok(Some(_))) {
+                return (Some(signal), TeardownExit::ObservedAfterRescue);
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
+        (Some(signal), TeardownExit::Unobserved)
     }
 }
 // Exclusive unreaped Child custody starts immediately after spawn.
@@ -5234,6 +5733,7 @@ fn fixture_replacement_role_controls() {
             status_wait: None,
             update_wait: None,
             actor_stage: Some(parse_replacement_stage(&bytes, &nonce).unwrap()),
+            daemon: None,
         };
         let bytes = failure_bytes(&record).unwrap();
         assert!(bytes.len() <= 2048);
@@ -5274,6 +5774,7 @@ fn fixture_command_controls() {
     fixture_update_record_controls();
     fixture_status_projection_controls();
     fixture_status_single_request_controls();
+    fixture_daemon_evidence_controls();
     fixture_timeout_formatter_controls();
     fixture_timeout_owner_control();
     fixture_timeout_tag_control();
@@ -5726,11 +6227,12 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
     // Installed before Open enqueue; leader retains its real child until the
     // controller binds both watches, and observes abort even before Opened.
     let _actor_abort = AbortActor(actor_directory.path());
-    use rand_core::RngCore;
     let mut nonce_bytes = [0u8; 16];
-    rand_core::OsRng.fill_bytes(&mut nonce_bytes);
+    getrandom::fill(&mut nonce_bytes).expect("operating system randomness is available");
     let actor_nonce = hex::encode(nonce_bytes);
     let progress = std::cell::Cell::new(ReplacementProgress::default());
+    let daemon_cache = home.path().join("qsh");
+    let daemon_identity = daemon.identity.map(|armed| armed.identity);
     let diagnostic = |site, events| ReplacementDiagnostic {
         site,
         progress: &progress,
@@ -5739,6 +6241,7 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
         replacement: Some((&actor_nonce, role)),
         status_wait: None,
         update_wait: None,
+        daemon: Some((daemon_cache.as_path(), daemon_identity)),
     };
     let (parked, parked_events) = actual_connect_tagged(
         port,
@@ -5936,10 +6439,20 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
         stderr_eof: daemon.owner.captured_stderr.is_none(),
         stderr_bytes: daemon.owner.stderr_bytes.len(),
     }));
+    let (old_checksum, new_checksum) = (hex::encode(old_hash), hex::encode(new_hash));
+    let status_wait_started = Instant::now();
     until_tagged(
         || {
             status_wait_predicate(&status_wait, before.build, new_build, || {
                 let (status, family) = daemon_status_observation(&socket);
+                record_status_image(
+                    &status_wait,
+                    status_image(
+                        status.as_ref().map(|status| status.checksum.as_str()),
+                        &old_checksum,
+                        &new_checksum,
+                    ),
+                );
                 (status.map(|status| status.build), family)
             })
         },
@@ -5947,6 +6460,16 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
             status_wait: Some(&status_wait),
             ..diagnostic(ReplacementSite::NewBuildStatus, Some(&events))
         }),
+    );
+    let status_waited = status_wait_started.elapsed();
+    // Passing runs show how much of the status deadline the replacement
+    // used and which steps its own log recorded.
+    let (log_read, log) = daemon_log_facts(&daemon_cache);
+    eprintln!(
+        "darwin223 replacement_status_wait_ms={} log_read={} restart_log={}",
+        status_waited.as_millis(),
+        serde_json::to_string(&log_read).unwrap_or_default(),
+        serde_json::to_string(&log).unwrap_or_default()
     );
     let after = daemon_status(&socket).unwrap();
     assert_eq!(after.pid, before.pid);

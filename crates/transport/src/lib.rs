@@ -2,10 +2,16 @@
 
 pub mod auth;
 pub mod auth_acceptance;
+pub mod bootstrap;
+pub mod bootstrap_client;
 pub mod channel;
 pub mod channel_geometry;
 #[cfg(feature = "tokio-driver")]
 mod channel_input;
+#[cfg(feature = "tokio-driver")]
+pub use channel_input::{
+    ChannelInputBudget, InputChunk, InputLimit, InputOrigin, InputScope, SessionInputBudget,
+};
 #[cfg(feature = "tokio-driver")]
 pub mod channel_open;
 #[cfg(feature = "tokio-driver")]
@@ -108,3 +114,11 @@ mod session_deadline;
 
 #[cfg(all(feature = "tokio-driver", any(test, feature = "testnet")))]
 pub mod qualification305;
+
+pub mod session_resume;
+
+#[cfg(feature = "tokio-driver")]
+pub mod channel_owner;
+
+#[cfg(feature = "tokio-driver")]
+pub mod personal_admission;

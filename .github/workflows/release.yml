@@ -11,6 +11,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Only tagged builds in the official release workflow enable managed installs.
+  QSH_OFFICIAL_RELEASE: ${{ github.repository == 'br0adcast/qsh' && github.ref_type == 'tag' && '1' || '0' }}
   RUSTUP_TOOLCHAIN: "1.99.1"
 
 # Least privilege by default: the `publish` job below grants itself
@@ -26,11 +28,16 @@ permissions:
 jobs:
   # Tags must qualify the exact source, not a nearby main or PR merge commit.
   # Branch package runs do not publish or repeat the full ordinary suite.
+  # This workflow runs the native, released-peer and fuzz workflows itself;
+  # the called CI must be told so, and its gate reads the jobs API (#609).
   ordinary-ci:
     if: github.ref_type == 'tag'
     uses: ./.github/workflows/ci.yml
+    with:
+      caller-runs: native peers fuzz
     permissions:
       contents: read
+      actions: read
 
   # Focused published-peer checks run for candidate packages and gate publication.
   released-peer-acceptance:
@@ -42,6 +49,46 @@ jobs:
   # Product builds below link this same verified native source statically.
   native-crypto:
     uses: ./.github/workflows/native-crypto.yml
+
+  # Fuzz smoke of the exact tag source, part of its full qualification.
+  fuzz:
+    if: github.ref_type == 'tag'
+    uses: ./.github/workflows/fuzz.yml
+    permissions:
+      contents: read
+
+  # Every expected cell of every lane, by the jobs API, for this exact
+  # candidate: no nearby nightly or main evidence stands in for it (#609).
+  # A called workflow's success can hide a skipped cell; this cannot. If a
+  # caller already failed, this is skipped and `publish` is blocked alike.
+  release-qualification:
+    name: Release qualification
+    if: github.ref_type == 'tag'
+    needs: [ordinary-ci, native-crypto, released-peer-acceptance, fuzz]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Account for every cell of the full qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QSH_GATE_NEEDS: ${{ toJSON(needs) }}
+          QSH_GATE_RECORD: ${{ needs.ordinary-ci.outputs.record }}
+          QSH_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: python3 -I -B scripts/ci-gate.py release --output "$RUNNER_TEMP/qualification.json"
+      - name: Retain the qualification record
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification.json
+          if-no-files-found: error
 
   linux:
     strategy:
@@ -175,20 +222,27 @@ jobs:
             cargo deb -p qsh --target "$target" --no-build --no-strip
             cargo generate-rpm -p cli --target "$target"
           done
-          cp target/*/debian/*.deb dist/
-          cp target/*/generate-rpm/*.rpm dist/
           case "$NATIVE_TARGET" in
             x86_64-*) deb_arch=amd64; rpm_arch=x86_64 ;;
             aarch64-*) deb_arch=arm64; rpm_arch=aarch64 ;;
             *) echo 'unsupported package architecture' >&2; exit 1 ;;
           esac
-          for package in dist/*.deb; do
-            python3 scripts/check-release-output.py package --format deb --program qsh \
-              --version "$VERSION" --arch "$deb_arch" --probe "$package"
-          done
-          for package in dist/*.rpm; do
-            python3 scripts/check-release-output.py package --format rpm --program qsh \
-              --version "$VERSION" --arch "$rpm_arch" --probe "$package"
+          # The generators name files after the package version, whose '~'
+          # GitHub rewrites on upload (#526). Publish the release-version name.
+          for fmt in deb rpm; do
+            if [ "$fmt" = deb ]; then
+              arch=$deb_arch; built=(target/"$NATIVE_TARGET"/debian/*.deb)
+            else
+              arch=$rpm_arch; built=(target/"$NATIVE_TARGET"/generate-rpm/*.rpm)
+            fi
+            if [ "${#built[@]}" -ne 1 ] || [ ! -f "${built[0]}" ]; then
+              echo "expected exactly one built $fmt package" >&2; exit 1
+            fi
+            name=$(python3 scripts/check-release-output.py package-name --format "$fmt" \
+              --program qsh --version "$VERSION" --arch "$arch")
+            cp "${built[0]}" "dist/$name"
+            python3 scripts/check-release-output.py package --format "$fmt" --program qsh \
+              --version "$VERSION" --arch "$arch" --probe "dist/$name"
           done
 
       - name: Exercise shipped Linux clients before upload
@@ -199,15 +253,18 @@ jobs:
             aarch64-*) deb_arch=arm64; rpm_arch=aarch64 ;;
             *) echo 'unsupported client runtime architecture' >&2; exit 1 ;;
           esac
-          deb_version=$(python3 -c 'import runpy,sys; print(runpy.run_path("scripts/check-release-output.py")["debian_version"](sys.argv[1]))' "$RELEASE_VERSION")
+          deb=$(python3 scripts/check-release-output.py package-name --format deb \
+            --program qsh --version "$RELEASE_VERSION" --arch "$deb_arch")
+          rpm=$(python3 scripts/check-release-output.py package-name --format rpm \
+            --program qsh --version "$RELEASE_VERSION" --arch "$rpm_arch")
           archive="dist/qsh-$RELEASE_VERSION-$NATIVE_TARGET.tar.gz"
           python3 packaging/client-acceptance.py --archive "$archive" \
             --version "$RELEASE_VERSION" --target "$NATIVE_TARGET"
           python3 packaging/client-acceptance.py --archive "$archive" \
-            --package "dist/qsh_${deb_version}_${deb_arch}.deb" \
+            --package "dist/$deb" \
             --version "$RELEASE_VERSION" --target "$NATIVE_TARGET"
           python3 packaging/client-acceptance.py --archive "$archive" \
-            --package "dist/qsh-$RELEASE_VERSION-1.$rpm_arch.rpm" \
+            --package "dist/$rpm" \
             --version "$RELEASE_VERSION" --target "$NATIVE_TARGET"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -713,12 +770,18 @@ jobs:
   # verifier accepts, and uploads the fourteen release files.
   publish:
     if: github.ref_type == 'tag' && github.repository == 'br0adcast/qsh'
-    needs: [release, ordinary-ci, released-peer-acceptance, release-verifier]
+    needs: [release, ordinary-ci, released-peer-acceptance, release-verifier, release-qualification]
     runs-on: ubuntu-latest
+    # Its required reviewer approves each publication before any step runs.
+    # The tagged commit supplies this file, so the tag ruleset, not this
+    # line, limits who can publish; see docs/release-security.md.
+    environment: release
     permissions:
       contents: write
       id-token: write
       attestations: write
+      # Reads the release environment's protection rules.
+      actions: read
     # One publication per tag at a time: another run waits for this one
     # rather than racing it, and a running publication is never cancelled.
     # GitHub keeps one waiting run per group; a newer one replaces it.
@@ -746,6 +809,32 @@ jobs:
           test "$GITHUB_REF_TYPE" = tag
           test -n "$RELEASE_VERSION"
           test "$GITHUB_REF" = "refs/tags/v$RELEASE_VERSION"
+      # Read-only, before a signature can be requested: a release run stops
+      # if the tag ruleset or the environment reviewer has been removed.
+      # Immutability is checked on the published release by the uploader.
+      - name: Require the release authority settings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check-release-settings.py --repo "$GITHUB_REPOSITORY"
+      # SemVer precedence drives update offers, downgrade refusal and remote
+      # daemon cache selection. Refuse a tag that does not outrank every other
+      # tag of its major.minor.patch before anything is signed (#554). A
+      # retry of the tag's already published immutable release is exempt:
+      # it reuses the verified signature and cannot change any asset.
+      - name: Require the tag to follow its version's existing tags
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tags="$RUNNER_TEMP/version-tags"
+          releases="$RUNNER_TEMP/version-releases"
+          git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY.git" 'refs/tags/v*' \
+            | awk '{ sub(/^refs\/tags\//, "", $2); print $2 }' > "$tags"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | [.tag_name, (.draft | tostring), (.immutable | tostring)] | @tsv' > "$releases"
+          python3 scripts/check-release-version.py --ref-type "$GITHUB_REF_TYPE" \
+            --ref-name "$GITHUB_REF_NAME" --existing-tags "$tags" --releases "$releases"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist

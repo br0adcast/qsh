@@ -424,6 +424,10 @@ pub fn run_serve_command(args: &[String]) -> Result<()> {
 /// OS-aware entrypoint; parsing still precedes all startup side effects.
 pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
     let parsed = parse_serve_args_os(args)?;
+    // Every channel needs the reviewed Darwin runtime; refuse before binding
+    // the port rather than at the first channel open (#551).
+    #[cfg(target_os = "macos")]
+    crate::darwin_process_scope::require_admitted_runtime().map_err(anyhow::Error::msg)?;
 
     // First, before this process opens a single descriptor of its own: in
     // the system mode the helper's channels rely on 0, 1 and 2 being taken

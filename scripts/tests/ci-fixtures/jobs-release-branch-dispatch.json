@@ -1,0 +1,248 @@
+{
+ "jobs": [
+  {
+   "completed_at": "2026-11-07T02:45:55Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273872666,
+   "name": "server-packages",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:34:37Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:54:16Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273872880,
+   "name": "macos",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:41:21Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:34:41Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273872966,
+   "name": "native-crypto / Validate manual mode",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:34:38Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T03:01:16Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273872971,
+   "name": "native-crypto / Native Intel Darwin process owner",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:51:12Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:43:25Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273872981,
+   "name": "linux (ubuntu-24.04, x86_64-unknown-linux-musl)",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:34:39Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:41:23Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273873009,
+   "name": "linux (ubuntu-24.04-arm, aarch64-unknown-linux-musl)",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:34:46Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:39:32Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273873036,
+   "name": "native-crypto / Native x86_64-unknown-linux-musl",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:34:38Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:53:19Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273873050,
+   "name": "native-crypto / Native x86_64-apple-darwin",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:42:33Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:39:38Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273873063,
+   "name": "native-crypto / Native aarch64-unknown-linux-musl",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:35:12Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:45:00Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273873107,
+   "name": "native-crypto / Native system floor (rpm)",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:34:38Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:41:18Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273873112,
+   "name": "native-crypto / Native system floor (deb)",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:34:38Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:46:17Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273873113,
+   "name": "released-peer-acceptance / released-peers",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:35:52Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:51:07Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273873142,
+   "name": "native-crypto / Native aarch64-apple-darwin",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:43:49Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:34:35Z",
+   "conclusion": "skipped",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273873705,
+   "name": "ordinary-ci",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:34:35Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:34:35Z",
+   "conclusion": "skipped",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273873841,
+   "name": "release-verifier",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:34:35Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:34:41Z",
+   "conclusion": "skipped",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128273898660,
+   "name": "native-crypto / PTY EOF ${{ (((inputs.mode == 'pty-eof-build') && 'build') || 'control') }} (${{ matrix.target }})",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:34:41Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:48:01Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128276711774,
+   "name": "server-packages-acceptance-aarch64 (qshd-*.aarch64.rpm)",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:45:58Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:48:59Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128276711776,
+   "name": "server-packages-acceptance (qshd_*_amd64.deb)",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:45:58Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:46:46Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128276711799,
+   "name": "server-packages-acceptance-aarch64 (qshd_*_arm64.deb)",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:45:58Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T02:49:54Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128276711826,
+   "name": "server-packages-acceptance (qshd-*.x86_64.rpm)",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T02:45:58Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T03:01:47Z",
+   "conclusion": "success",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128280426430,
+   "name": "release",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T03:01:19Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-07T03:01:47Z",
+   "conclusion": "skipped",
+   "head_sha": "ebe985985adbcd149c98816ea075e753032bda14",
+   "id": 128280562275,
+   "name": "publish",
+   "run_attempt": 1,
+   "run_id": 42329927293,
+   "started_at": "2026-11-07T03:01:48Z",
+   "status": "completed"
+  }
+ ],
+ "source": "Release run 42329927293, branch dispatch, filter=latest",
+ "total_count": 22
+}

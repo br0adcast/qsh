@@ -53,6 +53,8 @@ fn hinted(reason: &::connect::Reason) -> bool {
 /// more than one cause, name the likely ones.
 fn no_answer_words(host: &str, port: u16, why: &NoAnswerWhy) -> String {
     match why {
+        NoAnswerWhy::ServerIncompatible { version, wire, handshake, channel } => format!(
+            "authenticated qshd {} does not support this client's session profile (wire {wire}, handshake {handshake}, channel {channel})", printable(version)),
         NoAnswerWhy::UnsupportedProtocol { supported } => format!("incompatible authenticated handshake; this client requires QSH protocol {supported}"),
         NoAnswerWhy::MissingRequiredFeatures { required, enabled } => format!("incompatible authenticated capabilities (required {required:#010x}, enabled {enabled:#010x})"),
         NoAnswerWhy::InvalidProtocol => "invalid authenticated handshake".to_string(),

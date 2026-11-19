@@ -10,7 +10,7 @@ transport = { path = "../transport" }
 # The upstream SSH formats are shared with russh. RSA private operations use
 # the separately pinned native backend; verification retains upstream support.
 # Algorithm acceptance is explicit in verify.rs, independent of feature union.
-ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "alloc", "ed25519", "p256", "p384", "p521", "rsa", "encryption", "ppk"] }
+ssh-key = { version = "=0.7.0-rc.12", default-features = false, features = ["std", "alloc", "ed25519", "p256", "p384", "p521", "rsa", "encryption", "ppk"] }
 ssh-encoding = "=0.3.0"
 signature = "=3.0.0"
 # Used by known_hosts.rs for the file format and the server-key fingerprint.
@@ -19,18 +19,18 @@ signature = "=3.0.0"
 # silently change what is accepted; these are single-purpose, stable-API
 # hashing/encoding with nothing to reinterpret, so an ordinary minor-version
 # range is the considered choice, not an inconsistency.
-base64 = "0.22"
-sha2 = "0.10"
+base64 = "0.23"
+sha2 = "0.11"
 # `flock(2)` for known_hosts.rs's advisory pin lock (Unix only). Already a
 # transitive dependency of the workspace at this exact version, so this adds
 # no new crate to the supply chain -- just a direct edge to one already there.
 libc = "0.2"
-rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process"] }
 
 # Shared private-file decoding uses upstream format and key conversions.
-openssl = "=0.10.81"
+openssl = "=0.10.82"
 # Direct metadata edge for the exact native version check in build.rs.
-openssl-sys = "=0.9.117"
+openssl-sys = "=0.9.118"
 ed25519-dalek = { version = "3", default-features = false, features = ["pem", "zeroize"] }
 p256 = { version = "0.14", default-features = false, features = ["arithmetic", "pem"] }
 pkcs8 = { version = "0.11", features = ["pem"] }
@@ -40,17 +40,21 @@ p384 = { version = "0.14", default-features = false, features = ["arithmetic", "
 p521 = { version = "0.14", default-features = false, features = ["arithmetic", "pem"] }
 
 [dev-dependencies]
+hex = "0.4"
 # Safe portable FIFO fixture creation; rustix does not expose mkfifo on Apple.
-nix = { version = "0.28", default-features = false, features = ["fs"] }
+nix = { version = "0.32", default-features = false, features = ["fs"] }
 serde_json = "1"
-rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["std", "encoding"] }
+rsa = { version = "=0.10.0", default-features = false, features = ["std", "encoding"] }
 tempfile = "3"
 # Exercise the same SHA-1-capable decoder as the workspace's russh feature union.
 # QSH must reject legacy RSA signatures explicitly, independently of this backend.
-ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["getrandom", "sha1", "p521"] }
+ssh-key = { version = "=0.7.0-rc.12", default-features = false, features = ["getrandom", "sha1", "p521"] }
 
-hmac = "0.12"
+hmac = "0.13"
+# PPK v2 fixture MACs; the same version the CLI already uses.
+sha1 = "0.11"
 
 [build-dependencies]
+hex = "0.4"
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"

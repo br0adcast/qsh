@@ -5,7 +5,6 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use nix::fcntl::{fcntl, FcntlArg};
 
 use super::Handover;
 
@@ -13,7 +12,10 @@ pub(super) fn validate_number(fd: RawFd) -> Result<()> {
     if fd <= 2 {
         bail!("handover descriptor must be above stderr");
     }
-    fcntl(fd, FcntlArg::F_GETFD).context("handover descriptor is not open")?;
+    // An untrusted number may be closed; no Rust fd lifetime exists yet.
+    if unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("handover descriptor is not open");
+    }
     Ok(())
 }
 

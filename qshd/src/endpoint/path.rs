@@ -1,0 +1,407 @@
+use std::ffi::OsString;
+use std::fs::File;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+use nix::fcntl::{self, AtFlags, OFlag};
+use nix::sys::stat::{self, Mode, SFlag};
+
+/// One atomic no-replace move between the retained staging and endpoint
+/// directories. Use the kernel operation: the nix/libc wrapper is unavailable
+/// on some supported musl toolchains. There is deliberately no fallback.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_absent(
+    source: &File,
+    source_name: &std::ffi::OsStr,
+    destination: &File,
+    destination_name: &std::ffi::OsStr,
+) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let source_name = CString::new(source_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in control staging name"))?;
+    let destination_name = CString::new(destination_name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in control endpoint name"))?;
+    // SAFETY: both retained directories and checked NUL-terminated relative
+    // names stay live through this call; pointers and FDs use native ABI types.
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_renameat2,
+            source.as_raw_fd(),
+            source_name.as_ptr(),
+            destination.as_raw_fd(),
+            destination_name.as_ptr(),
+            nix::libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        nix::libc::renameatx_np(
+            source.as_raw_fd(),
+            source_name.as_ptr(),
+            destination.as_raw_fd(),
+            destination_name.as_ptr(),
+            nix::libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+pub(crate) fn refused(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+
+pub(crate) struct EndpointAuthority {
+    pub parent: File,
+    pub leaf: OsString,
+    pub route: PathBuf,
+    pub syscall_path: PathBuf,
+    cwd: Option<File>,
+    pub lock: OsString,
+    private_parent: bool,
+}
+
+impl EndpointAuthority {
+    pub(crate) fn open_private(path: &Path) -> io::Result<Self> {
+        let mut authority = Self::open(path, false)?;
+        authority.private_parent = true;
+        authority.validate_route()?;
+        Ok(authority)
+    }
+
+    pub fn open(path: &Path, create: bool) -> io::Result<Self> {
+        let current_dir = if path.is_absolute() {
+            None
+        } else {
+            Some(std::env::current_dir()?)
+        };
+        let route = current_dir
+            .as_ref()
+            .map_or_else(|| path.to_owned(), |cwd| cwd.join(path));
+        // The traversal opens only the parent, never this marker leaf. Retain
+        // search-only access instead of requiring read permission on cwd.
+        let cwd = current_dir
+            .as_ref()
+            .map(|cwd| {
+                crate::host_key::trusted_parent(&cwd.join(".qsh-control-cwd"), false)
+                    .map(|(directory, _)| directory)
+            })
+            .transpose()?;
+        let (parent, leaf) = crate::host_key::trusted_parent(&route, create)?;
+        let mut lock = leaf.clone();
+        lock.push(".lock");
+        let authority = Self {
+            parent,
+            leaf,
+            route,
+            syscall_path: path.to_owned(),
+            cwd,
+            lock,
+            private_parent: false,
+        };
+        authority.validate_route()?;
+        Ok(authority)
+    }
+
+    pub fn validate_route(&self) -> io::Result<()> {
+        if let Some(captured) = &self.cwd {
+            let (current, _) =
+                crate::host_key::trusted_parent(Path::new(".qsh-control-cwd"), false)?;
+            let old = captured.metadata()?;
+            let new = current.metadata()?;
+            if old.dev() != new.dev() || old.ino() != new.ino() {
+                return Err(refused("the control endpoint working directory changed"));
+            }
+        }
+        let (current, _) = crate::host_key::trusted_parent(&self.route, false)?;
+        let old = self.parent.metadata()?;
+        let new = current.metadata()?;
+        if old.dev() != new.dev() || old.ino() != new.ino() {
+            return Err(refused("the control endpoint parent changed"));
+        }
+        if self.private_parent
+            && (old.uid() != nix::unistd::geteuid().as_raw() || old.mode() & 0o7777 != 0o700)
+        {
+            return Err(refused(
+                "the host endpoint requires an existing private directory owned by this account",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn entry(&self) -> io::Result<Option<nix::libc::stat>> {
+        match stat::fstatat(
+            &self.parent,
+            self.leaf.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Ok(st) => {
+                if st.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFSOCK.bits()
+                    || st.st_uid != nix::unistd::geteuid().as_raw()
+                {
+                    return Err(refused(
+                        "the control endpoint must be a socket owned by this account",
+                    ));
+                }
+                Ok(Some(st))
+            }
+            Err(nix::errno::Errno::ENOENT) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn open_lock(&self) -> io::Result<File> {
+        let fd = fcntl::openat(
+            &self.parent,
+            self.lock.as_os_str(),
+            OFlag::O_WRONLY
+                | OFlag::O_CREAT
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC
+                | OFlag::O_NONBLOCK,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )?;
+        // SAFETY: openat returned a newly owned descriptor.
+        Ok(File::from(fd))
+    }
+}
+
+pub(crate) fn same(a: &nix::libc::stat, b: &nix::libc::stat) -> bool {
+    a.st_dev == b.st_dev && a.st_ino == b.st_ino
+}
+
+pub(crate) struct Stage {
+    parent: File,
+    pub directory: File,
+    name: OsString,
+    identity: nix::libc::stat,
+    socket: Option<nix::libc::stat>,
+    #[cfg(test)]
+    pub before_chmod: Option<Box<dyn FnOnce()>>,
+    #[cfg(test)]
+    pub after_publish: Option<Box<dyn FnOnce()>>,
+    #[cfg(test)]
+    pub before_publish: Option<Box<dyn FnOnce()>>,
+    #[cfg(test)]
+    pub no_replace_error: Option<i32>,
+}
+
+impl Stage {
+    pub fn create(authority: &EndpointAuthority) -> io::Result<Self> {
+        authority.validate_route()?;
+        let parent = authority.parent.try_clone()?;
+        let name = OsString::from(format!(".c{}", std::process::id()));
+        stat::mkdirat(&authority.parent, name.as_os_str(), Mode::S_IRWXU)?;
+        let fd = fcntl::openat(
+            &authority.parent,
+            name.as_os_str(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        // SAFETY: openat returned a new uniquely owned descriptor.
+        let directory = File::from(fd);
+        let identity = stat::fstat(&directory)?;
+        if identity.st_uid != nix::unistd::geteuid().as_raw() || identity.st_mode & 0o7777 != 0o700
+        {
+            return Err(refused(
+                "the new control stage is not private and owned by this account",
+            ));
+        }
+        let stage = Self {
+            parent,
+            directory,
+            name,
+            identity,
+            socket: None,
+            #[cfg(test)]
+            before_chmod: None,
+            #[cfg(test)]
+            after_publish: None,
+            #[cfg(test)]
+            before_publish: None,
+            #[cfg(test)]
+            no_replace_error: None,
+        };
+        stage.validate(authority)?;
+        Ok(stage)
+    }
+
+    pub fn validate(&self, authority: &EndpointAuthority) -> io::Result<()> {
+        authority.validate_route()?;
+        let current = stat::fstatat(
+            &self.parent,
+            self.name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
+        let held = stat::fstat(&self.directory)?;
+        if !same(&current, &self.identity)
+            || !same(&held, &self.identity)
+            || held.st_uid != nix::unistd::geteuid().as_raw()
+            || held.st_mode & 0o7777 != 0o700
+        {
+            return Err(refused("the private control stage changed"));
+        }
+        Ok(())
+    }
+
+    pub fn bind(
+        &mut self,
+        authority: &EndpointAuthority,
+    ) -> io::Result<std::os::unix::net::UnixListener> {
+        self.validate(authority)?;
+        let parent = authority
+            .syscall_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        // No portable bindat exists. Only trusted namespace owners can change
+        // this checked private route between these checks and pathname bind.
+        // Keep the original spelling: an absolute cwd may exceed sun_path even
+        // when this supported relative syscall path fits. Cwd identity checks
+        // detect observed changes; they do not make process-wide chdir atomic.
+        let listener = std::os::unix::net::UnixListener::bind(
+            parent.join(&self.name).join(super::STAGED_NAME),
+        )?;
+        let socket = stat::fstatat(
+            &self.directory,
+            super::STAGED_NAME,
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
+        if socket.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFSOCK.bits()
+            || socket.st_uid != nix::unistd::geteuid().as_raw()
+        {
+            return Err(refused("the bound control stage entry is not our socket"));
+        }
+        self.socket = Some(socket);
+        #[cfg(test)]
+        if let Some(before) = self.before_chmod.take() {
+            before();
+        }
+        self.validate(authority)?;
+        // Explicit flags0 preserves older GNU/musl support. Untrusted users
+        // cannot replace this leaf inside the exclusive 0700 stage; this is not
+        // atomic conditional chmod against a malicious same-account owner.
+        stat::fchmodat(
+            &self.directory,
+            super::STAGED_NAME,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+            stat::FchmodatFlags::FollowSymlink,
+        )?;
+        let checked = stat::fstatat(
+            &self.directory,
+            super::STAGED_NAME,
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
+        if !same(&socket, &checked) || checked.st_mode & 0o7777 != 0o600 {
+            return Err(refused(
+                "the bound control socket changed during permission setup",
+            ));
+        }
+        self.validate(authority)?;
+        Ok(listener)
+    }
+
+    pub fn socket(&self) -> &nix::libc::stat {
+        self.socket.as_ref().expect("bound before publication")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn publish_absent(&mut self, authority: &EndpointAuthority) -> io::Result<()> {
+        self.publish_mode(authority, false)
+    }
+    pub fn publish(&mut self, authority: &EndpointAuthority) -> io::Result<()> {
+        self.publish_mode(authority, true)
+    }
+    fn publish_mode(&mut self, authority: &EndpointAuthority, replace: bool) -> io::Result<()> {
+        self.validate(authority)?;
+        authority.entry()?;
+        let current = stat::fstatat(
+            &self.directory,
+            super::STAGED_NAME,
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
+        if !same(&current, self.socket())
+            || current.st_uid != nix::unistd::geteuid().as_raw()
+            || current.st_mode & 0o7777 != 0o600
+        {
+            return Err(refused("the staged control socket changed"));
+        }
+        #[cfg(test)]
+        if let Some(before) = self.before_publish.take() {
+            before();
+        }
+        #[cfg(test)]
+        if !replace {
+            if let Some(errno) = self.no_replace_error.take() {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+        }
+        if replace {
+            fcntl::renameat(
+                &self.directory,
+                super::STAGED_NAME,
+                &authority.parent,
+                authority.leaf.as_os_str(),
+            )?;
+        } else {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            rename_absent(
+                &self.directory,
+                std::ffi::OsStr::new(super::STAGED_NAME),
+                &authority.parent,
+                authority.leaf.as_os_str(),
+            )?;
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exclusive restart publication is unavailable",
+            ));
+        }
+        self.socket = None;
+        #[cfg(test)]
+        if let Some(after) = self.after_publish.take() {
+            after();
+        }
+        authority.validate_route()?;
+        Ok(())
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        if let Some(owned) = &self.socket {
+            if let Ok(current) = stat::fstatat(
+                &self.directory,
+                super::STAGED_NAME,
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            ) {
+                if same(&current, owned) {
+                    let _ = nix::unistd::unlinkat(
+                        &self.directory,
+                        super::STAGED_NAME,
+                        nix::unistd::UnlinkatFlags::NoRemoveDir,
+                    );
+                }
+            }
+        }
+        if let Ok(current) = stat::fstatat(
+            &self.parent,
+            self.name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            if same(&current, &self.identity) {
+                let _ = nix::unistd::unlinkat(
+                    &self.parent,
+                    self.name.as_os_str(),
+                    nix::unistd::UnlinkatFlags::RemoveDir,
+                );
+            }
+        }
+    }
+}

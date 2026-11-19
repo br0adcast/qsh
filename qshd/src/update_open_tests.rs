@@ -268,7 +268,9 @@ mod open24_exec_tests {
         let job = pending_job(&daemon.opens);
         job.cancel();
         let image = script_image(101, 0);
+        let lease=daemon.handover.as_ref().unwrap().actions.state.lock().unwrap().begin_replacement().unwrap();
         let staged = StagedImage {
+            lease: Some(lease),
             offer: offer_for(&image, 101), path: daemon.staging_path(), file: None, created: false,
             hasher: Sha256::new(), written: 0, closed_admission: false,
             binary_path: daemon.binary_path.clone(), active: daemon.active.clone(), in_progress: daemon.in_progress.clone(),

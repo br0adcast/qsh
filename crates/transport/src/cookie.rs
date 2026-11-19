@@ -30,9 +30,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use blake2::digest::consts::U16;
-use blake2::digest::Mac;
+use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2sMac;
-use rand::RngCore;
 use zeroize::Zeroizing;
 
 use crate::wire::{self, Kind, COOKIE_ECHO_LEN, COOKIE_LEN, MIN_MSG1_BODY};
@@ -126,6 +125,7 @@ type Secret = Zeroizing<[u8; 32]>;
 /// The daemon's cookie secret and load meter. Deliberately not `Debug`: it
 /// holds the secrets, and wipes them when dropped (`Secret`).
 pub struct CookieCheck {
+    domain: &'static [u8],
     current: Secret,
     previous: Secret,
     rotated_at: Instant,
@@ -144,6 +144,7 @@ impl CookieCheck {
 
     pub fn with_limits(now: Instant, limits: LoadLimits) -> Self {
         CookieCheck {
+            domain: COOKIE_LABEL,
             current: fresh_secret(),
             previous: fresh_secret(),
             rotated_at: now,
@@ -154,6 +155,19 @@ impl CookieCheck {
             loaded: false,
             proven_rate: ProvenRate::new(now),
         }
+    }
+
+    /// Bootstrap cookies always prove return address before any Noise work.
+    pub(crate) fn bootstrap(now: Instant) -> Self {
+        let mut check = Self::with_limits(
+            now,
+            LoadLimits {
+                handshakes_per_window: 0,
+                probation_seats: 0,
+            },
+        );
+        check.domain = b"qsh/bootstrap/1/cookie";
+        check
     }
 
     /// Decide about one datagram of `kind` (`HandshakeInit` or
@@ -202,7 +216,7 @@ impl CookieCheck {
         echo.copy_from_slice(&msg1[..COOKIE_ECHO_LEN]);
         Verdict::Reply(wire::encode_cookie_reply(
             &echo,
-            &mint(&self.current, src, msg1),
+            &mint_domain(&self.current, src, msg1, self.domain),
         ))
     }
 
@@ -214,9 +228,11 @@ impl CookieCheck {
     /// Whether `cookie` is this sender's for this msg1 under either secret.
     /// Each comparison is constant-time (`verify_slice`).
     fn accepts(&self, src: SocketAddr, msg1: &[u8], cookie: &[u8; COOKIE_LEN]) -> bool {
-        [&self.current, &self.previous]
-            .into_iter()
-            .any(|key| mac(key, src, msg1).verify_slice(cookie).is_ok())
+        [&self.current, &self.previous].into_iter().any(|key| {
+            mac_domain(key, src, msg1, self.domain)
+                .verify_slice(cookie)
+                .is_ok()
+        })
     }
 
     fn rotate(&mut self, now: Instant) {
@@ -342,30 +358,30 @@ pub(crate) fn source_group_key(ip: IpAddr) -> [u8; 16] {
 }
 
 /// A new cookie secret, straight from the operating system's randomness.
-/// `OsRng`, never `thread_rng()`, for the reason `auth::random_nonce` gives:
+/// Direct operating-system randomness, for the reason `auth::random_nonce` gives:
 /// the daemon forks, and a secret must not rest on a generator's state
 /// surviving that correctly.
 fn fresh_secret() -> Secret {
     let mut secret = Zeroizing::new([0u8; 32]);
-    rand::rngs::OsRng.fill_bytes(&mut secret[..]);
+    getrandom::fill(&mut secret[..]).expect("operating system randomness is available");
     secret
 }
 
 /// The cookie MAC for `src` and this msg1, under `key`: keyed BLAKE2s-128
 /// over the label, the address (IPv4 mapped to IPv6), the port and the
 /// msg1's ephemeral key.
-fn mac(key: &[u8; 32], src: SocketAddr, msg1: &[u8]) -> Blake2sMac<U16> {
-    let mut m = <Blake2sMac<U16> as Mac>::new_from_slice(key)
+fn mac_domain(key: &[u8; 32], src: SocketAddr, msg1: &[u8], domain: &[u8]) -> Blake2sMac<U16> {
+    let mut m = <Blake2sMac<U16> as KeyInit>::new_from_slice(key)
         .expect("a 32-byte key is a valid BLAKE2s key");
-    m.update(COOKIE_LABEL);
+    m.update(domain);
     m.update(&address_bytes(src.ip()));
     m.update(&src.port().to_be_bytes());
     m.update(&msg1[..EPHEMERAL_LEN]);
     m
 }
 
-fn mint(key: &[u8; 32], src: SocketAddr, msg1: &[u8]) -> [u8; COOKIE_LEN] {
-    let tag = mac(key, src, msg1).finalize().into_bytes();
+fn mint_domain(key: &[u8; 32], src: SocketAddr, msg1: &[u8], domain: &[u8]) -> [u8; COOKIE_LEN] {
+    let tag = mac_domain(key, src, msg1, domain).finalize().into_bytes();
     let mut cookie = [0u8; COOKIE_LEN];
     cookie.copy_from_slice(&tag);
     cookie

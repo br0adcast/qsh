@@ -283,12 +283,12 @@ fn slot_name(login: &str, host: &str, port: u16, slot: usize) -> String {
         hash.update(text.as_bytes());
     }
     hash.update(port.to_be_bytes());
-    format!("v2-{:x}-{slot}", hash.finalize())
+    format!("v2-{}-{slot}", hex::encode(hash.finalize()))
 }
 
 fn fresh_token() -> [u8; 16] {
     let mut token = [0u8; 16];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut token);
+    rand::RngExt::fill(&mut rand::rng(), &mut token);
     token
 }
 

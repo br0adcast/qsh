@@ -1,12 +1,12 @@
 [
   {
-    "id": "RUSTSEC-2023-0071",
-    "package": "rsa",
-    "version": "0.10.0-rc.18",
-    "kind": "vulnerability",
+    "id": "RUSTSEC-2026-0543",
+    "package": "chrono",
+    "version": "0.4.45",
+    "kind": "unmaintained",
     "owner": "br0adcast (repository maintainer)",
-    "review_by": "2027-01-24",
-    "tracking": "https://github.com/br0adcast/qsh/issues/62",
-    "reason": "Local RSA preparation and signing use the qualified native backend with no RustCrypto private fallback (#59/#121). Retain guarded native dispatch, parsing, cancellation and platform qualification tests. Upstream formats/public verification and external signers remain separate boundaries; this is not a whole-library safety claim. Review on pin, callsite or advisory changes."
+    "review_by": "2027-02-17",
+    "tracking": "https://github.com/br0adcast/qsh/issues/618",
+    "reason": "Unmaintained notice, not a vulnerability. chrono is locked only through russh-sftp 3.0.1 (unconditional) and russh-util 0.52.0 (wasm32 targets only, not built for qsh). russh-sftp calls chrono only in FileAttributes::from(&Metadata) and protocol::File::new/longname; the qsh SFTP upload uses RawSftpSession init/open/write/close with explicit FileAttributes and reaches neither. Review on any russh-sftp/russh-util pin, new SFTP operation or callsite, or advisory change; replacement is tracked in #618."
   }
 ]

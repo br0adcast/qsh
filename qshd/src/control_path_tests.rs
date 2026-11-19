@@ -332,7 +332,6 @@ fn directory_observed_stage_alias_before_chmod_cannot_touch_sentinel() {
 
 #[test]
 fn directory_sweep_refuses_a_replaced_candidate_name() {
-    use std::os::fd::AsRawFd;
     let dir = root();
     let mut child = std::process::Command::new("true").spawn().unwrap();
     let pid = child.id().try_into().unwrap();
@@ -363,7 +362,7 @@ fn directory_sweep_refuses_a_replaced_candidate_name() {
         .unwrap();
     let authority = path::EndpointAuthority::open(&dir.path().join("control.sock"), false).unwrap();
     let result = remove_if_stale_prepared(
-        authority.parent.as_raw_fd(),
+        &authority.parent,
         &name,
         pid,
         std::time::SystemTime::now(),
@@ -408,7 +407,7 @@ fn directory_post_publication_failure_cleans_only_its_owned_socket() {
     let before = fs::metadata(&replacement_path).unwrap();
     let old = dir.path().join("old-cache");
     let changed_parent = parent.clone();
-    let result = bind_prepared(&transaction.authority, |stage| {
+    let result = bind_prepared(transaction.endpoint.authority(), |stage| {
         stage.after_publish = Some(Box::new(move || {
             fs::rename(&changed_parent, &old).unwrap();
             fs::create_dir(&changed_parent).unwrap();

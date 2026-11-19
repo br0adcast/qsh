@@ -1,0 +1,16 @@
+{
+ "run": {
+  "conclusion": "success",
+  "event": "pull_request",
+  "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+  "id": 43860415054,
+  "path": ".github/workflows/native-crypto.yml",
+  "repository": {
+   "full_name": "br0adcast/qsh"
+  },
+  "run_attempt": 1,
+  "status": "completed",
+  "workflow_id": 389305846
+ },
+ "source": "Workflow run 43860415054 (PR #588)"
+}

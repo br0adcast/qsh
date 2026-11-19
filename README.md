@@ -56,8 +56,8 @@ not liable for any damages arising from its use.
 
 ## Quick start
 
-Install the client from [GitHub Releases](https://github.com/br0adcast/qsh/releases),
-then connect to a host where `qshd` is already running:
+Install the client from [GitHub Releases](https://github.com/br0adcast/qsh/releases)
+(see [installation choices](#installing)), then connect to a host where `qshd` is already running:
 
 ```sh
 qsh user@server.example.org
@@ -100,8 +100,43 @@ options, recovery behavior, logging, and exit codes.
 
 ## Installing
 
-Download packages or archives and `SHA256SUMS` from the
+Choose a user-home standalone client or a Linux package managed by your package
+manager. Download packages or archives and `SHA256SUMS` from the
 [releases page](https://github.com/br0adcast/qsh/releases).
+
+The managed home installer described on `main` requires a later release containing
+`--self-install`; no published release contains it, and neither did the
+withdrawn `0.6.0-rc1`. It fails closed with older binaries.
+
+Once an installer-capable release is published, download and inspect the script:
+
+```sh
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  https://raw.githubusercontent.com/br0adcast/qsh/main/scripts/install.sh -o install-qsh.sh
+# Review install-qsh.sh before running it.
+sh install-qsh.sh
+# An RC is selected only explicitly, using its exact version:
+# sh install-qsh.sh --version VERSION
+```
+
+The default selects the latest stable release and installs only `qsh` at
+`~/.local/bin/qsh`, without `sudo` or source compilation. `--prefix PATH` selects
+a separate prefix inside your home; the executable is `PATH/bin/qsh`. The
+installer reports PATH conflicts and never edits shell profiles. Add the printed
+bin directory to PATH yourself if needed, or use the printed absolute path.
+
+The script and its temporary bootstrap executable are trusted through official
+GitHub HTTPS. That executable then downloads and authenticates the final release
+before persistent installation. This does not authenticate the bootstrap before
+it runs. See [client installation](docs/cli-guide.md#client-installation-and-updates)
+and [release authentication](docs/release-security.md#client-bootstrap-trust).
+
+A registered managed copy can explicitly check for a newer stable release with
+`qsh --self-update`; use `qsh --self-update --version VERSION` for an exact RC.
+This command also requires the later installer-capable release. Updates do not
+restart a running client; run the printed executable path next. Package-owned
+copies use their package manager. Development builds never download, install,
+or switch console clients.
 
 | Platform | Architectures | Downloads |
 | --- | --- | --- |
@@ -111,13 +146,18 @@ Download packages or archives and `SHA256SUMS` from the
 On Linux, the portable binaries use static musl builds. The packaged system-mode
 `qshd` instead links glibc and PAM and has a minimum supported system version.
 macOS builds target Darwin and use macOS system libraries; they are not musl
-binaries. Windows packages are not currently produced.
+binaries. On macOS, `qshd` runs on macOS 14.6, 15.6 and 26; see
+[macOS kernel support](docs/qshd-service.md#macos-kernel-support) for the
+exact kernels. Windows packages are not currently produced.
 
 <details>
 <summary><strong>Package and archive installation examples</strong></summary>
 
 Replace `0.5.0` with the version you downloaded. On Linux ARM64, use `_arm64.deb`,
-`.aarch64.rpm`, or the `aarch64-unknown-linux-musl` archive.
+`.aarch64.rpm`, or the `aarch64-unknown-linux-musl` archive. Prerelease package
+files carry the release version, for example `qsh_0.6.0-rc.2-1_amd64.deb`; the
+version inside the package is `0.6.0~rc.2-1`, so package managers order it
+before `0.6.0`.
 
 ```sh
 # Debian / Ubuntu: the client; install qshd separately if this is a server
@@ -128,14 +168,21 @@ sudo apt install ./qshd_0.5.0-1_amd64.deb
 sudo dnf install ./qsh-0.5.0-1.x86_64.rpm
 sudo dnf install ./qshd-0.5.0-1.x86_64.rpm
 
-# Portable Linux binaries, personal daemon mode
+# Manual portable Linux client (unmanaged)
 tar xzf qsh-0.5.0-x86_64-unknown-linux-musl.tar.gz
-sudo install -m755 qsh-0.5.0-*/qsh qsh-0.5.0-*/qshd /usr/local/bin/
+mkdir -p "$HOME/.local/bin"
+install -m755 qsh-0.5.0-x86_64-unknown-linux-musl/qsh "$HOME/.local/bin/qsh"
 
 # macOS Apple Silicon; use x86_64-apple-darwin on Intel
 tar xzf qsh-0.5.0-aarch64-apple-darwin.tar.gz
-sudo install -m755 qsh-0.5.0-*/qsh qsh-0.5.0-*/qshd /usr/local/bin/
+mkdir -p "$HOME/.local/bin"
+install -m755 qsh-0.5.0-aarch64-apple-darwin/qsh "$HOME/.local/bin/qsh"
 ```
+
+Manual archive copies are not registered for self-update. Install `qshd`
+separately on a server using the [service guide](docs/qshd-service.md).
+There is no official apt/dnf repository, Homebrew formula, or `cargo install qsh`
+channel. The package commands above install local release files.
 
 The client package does not depend on the daemon package, or vice versa. The
 server package supports a shared system service with account lookup and PAM;
@@ -145,20 +192,40 @@ See the [service guide](docs/qshd-service.md) for platform requirements.
 
 </details>
 
-Verify downloads against the checksums from the same release:
+Verify downloads in two steps. First authenticate `SHA256SUMS` with the
+`SHA256SUMS.sigstore.json` bundle from the same release, using
+[GitHub CLI](https://cli.github.com/). Verifying a local bundle needs no GitHub
+login. Set `VERSION` to the release you downloaded, without the leading `v`:
 
 ```sh
-# Linux
-sha256sum --ignore-missing -c SHA256SUMS
-
-# macOS
-shasum -a 256 --ignore-missing -c SHA256SUMS
+VERSION=0.6.0
+gh attestation verify SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+  --repo br0adcast/qsh \
+  --cert-identity "https://github.com/br0adcast/qsh/.github/workflows/release.yml@refs/tags/v$VERSION" \
+  --predicate-type https://github.com/br0adcast/qsh/release-manifest/v1 \
+  --deny-self-hosted-runners
 ```
+
+Then check each downloaded file by its exact name. The lookup fails unless the
+verified manifest lists that name exactly once, so a file missing from the
+manifest fails instead of being skipped. Set `FILE` to each file in turn; on
+macOS, use `shasum -a 256 -c` for `sha256sum -c`:
+
+```sh
+FILE=qsh_0.6.0-1_amd64.deb
+awk -v f="$FILE" '$2 == f { print; n++ } END { exit (n != 1) }' SHA256SUMS > "$FILE.sha256" &&
+  sha256sum -c "$FILE.sha256"
+```
+
+Releases without `SHA256SUMS.sigstore.json`, such as v0.5.0, are unsigned;
+their checksums only detect damaged downloads. See
+[release authentication](docs/release-security.md#independent-verification)
+for what this checks and for authenticating the first-install executable.
 
 ### Installing a missing daemon over SSH
 
 For an interactive `,ssh` connection, qsh can download its **exact release
-version**, verify SHA-256, and transfer the daemon over SFTP. It verifies the
+version**, authenticate its signed checksums, and transfer the daemon over SFTP. It verifies the
 uploaded file before atomically publishing it in the remote user's cache.
 A verified local cache avoids repeated archive downloads; each installation
 still attempts a release metadata check. See the [installation guide](docs/cli-guide.md#ssh-startup-and-installation)

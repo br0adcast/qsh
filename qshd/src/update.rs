@@ -49,7 +49,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 use transport::channel_open::{ChannelOpenRegistry, OpenExecPermit, RestartOpenFence};
@@ -65,6 +65,7 @@ use transport::channel::{
 use transport::channel_server::{DaemonUpdates, RestartPhase, RestartSignal, UpdateTransfer};
 use transport::{NonceSource, Principal, SharedAllowlist, AUTH_NONCE_LEN};
 
+use crate::destructive_restart::{Actions, ExecAttemptGuard, ReplacementLease};
 use crate::handover::{self, Handover};
 use crate::state::{self, SelfCheck, HANDOVER_VERSION};
 use crate::version::{replacement, Replacement};
@@ -101,6 +102,197 @@ pub const CONTROL_GATE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The staged files' name prefix, next to the binary.
 pub(crate) const STAGED_PREFIX: &str = ".qshd-update-";
 
+/// How a replacement records its steps in the daemon log: `replacement
+/// step: <token>` as it reaches each one, and `replacement stopped: <token>`
+/// when it gives up short of a successful exec. The client that asked for
+/// the update was told `Restarting` before any of this, so the log is the
+/// only place that says how far an announced replacement got.
+pub(crate) const RESTART_STEP_LOG: &str = "replacement step: ";
+pub(crate) const RESTART_STOP_LOG: &str = "replacement stopped: ";
+
+/// The steps of [`StagedImage::restart`], in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestartStep {
+    Announced,
+    Joined,
+    JoinLate,
+    Drained,
+    DrainLate,
+    Fenced,
+    ControlGate,
+    Exec,
+}
+
+impl RestartStep {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 8] = [
+        Self::Announced,
+        Self::Joined,
+        Self::JoinLate,
+        Self::Drained,
+        Self::DrainLate,
+        Self::Fenced,
+        Self::ControlGate,
+        Self::Exec,
+    ];
+
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Announced => "announced",
+            Self::Joined => "joined",
+            Self::JoinLate => "join-late",
+            Self::Drained => "drained",
+            Self::DrainLate => "drain-late",
+            Self::Fenced => "fenced",
+            Self::ControlGate => "control-gate",
+            Self::Exec => "exec",
+        }
+    }
+}
+
+/// Why [`StagedImage::restart`] returned instead of replacing the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestartStop {
+    NoHandover,
+    Revoked,
+    CleanupPending,
+    FenceUnavailable,
+    IdentityExhausted,
+    CleanupUnproved,
+    ControlBusy,
+    ExecFailed,
+}
+
+impl RestartStop {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 8] = [
+        Self::NoHandover,
+        Self::Revoked,
+        Self::CleanupPending,
+        Self::FenceUnavailable,
+        Self::IdentityExhausted,
+        Self::CleanupUnproved,
+        Self::ControlBusy,
+        Self::ExecFailed,
+    ];
+
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::NoHandover => "no-handover",
+            Self::Revoked => "revoked",
+            Self::CleanupPending => "cleanup-pending",
+            Self::FenceUnavailable => "fence-unavailable",
+            Self::IdentityExhausted => "identity-exhausted",
+            Self::CleanupUnproved => "cleanup-unproved",
+            Self::ControlBusy => "control-busy",
+            Self::ExecFailed => "exec-failed",
+        }
+    }
+}
+
+/// The new image's first line once it runs ([`RESUMED_LOG`]), and its line
+/// when taking the handover fails ([`RESUME_FAILED_LOG`]).
+pub const RESUMED_LOG: &str = "resumed after an update";
+pub const RESUME_FAILED_LOG: &str = "transport-resume";
+
+fn restart_text(prefix: &str, token: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        format!("{prefix}{token}")
+    } else {
+        format!("{prefix}{token} -- {detail}")
+    }
+}
+
+/// One step line: the token, then what the step adds, if anything.
+fn restart_step(level: crate::log::Level, step: RestartStep, detail: &str) {
+    let text = restart_text(RESTART_STEP_LOG, step.token(), detail);
+    crate::log::record(level, "update", &text);
+}
+
+/// Logs why the replacement stopped and hands `result` back unchanged.
+fn restart_stopped(stop: RestartStop, result: UpdateResult) -> UpdateResult {
+    let detail = match &result {
+        UpdateResult::Rejected { detail, .. } => detail.as_str(),
+        _ => "",
+    };
+    let text = restart_text(RESTART_STOP_LOG, stop.token(), detail);
+    crate::log::warn("update", &text);
+    result
+}
+
+/// What a daemon log says about replacements, in closed values only: which
+/// steps were reached, the last one, the last stop, and whether a new image
+/// resumed or failed to. Nothing of a line beyond its token is kept.
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RestartLogFacts {
+    pub steps: Vec<&'static str>,
+    pub last_step: Option<&'static str>,
+    pub stopped: Option<&'static str>,
+    pub resumed: bool,
+    pub resume_failed: bool,
+    /// A replacement line whose token is none of the known ones.
+    pub unrecognized: bool,
+}
+
+#[cfg(test)]
+impl RestartLogFacts {
+    /// Reads `log` -- the daemon log's bytes, possibly cut anywhere -- line
+    /// by line. Only lines of the `update` component count.
+    pub(crate) fn parse(log: &[u8]) -> Self {
+        let mut facts = Self::default();
+        for line in log.split(|byte| *byte == b'\n') {
+            let Ok(line) = std::str::from_utf8(line) else {
+                continue;
+            };
+            let Some(text) = update_log_text(line) else {
+                continue;
+            };
+            if let Some(rest) = text.strip_prefix(RESTART_STEP_LOG) {
+                match RestartStep::ALL
+                    .into_iter()
+                    .find(|step| log_token(rest) == step.token())
+                {
+                    Some(step) => {
+                        if !facts.steps.contains(&step.token()) {
+                            facts.steps.push(step.token());
+                        }
+                        facts.last_step = Some(step.token());
+                    }
+                    None => facts.unrecognized = true,
+                }
+            } else if let Some(rest) = text.strip_prefix(RESTART_STOP_LOG) {
+                match RestartStop::ALL
+                    .into_iter()
+                    .find(|stop| log_token(rest) == stop.token())
+                {
+                    Some(stop) => facts.stopped = Some(stop.token()),
+                    None => facts.unrecognized = true,
+                }
+            } else if text.starts_with(RESUMED_LOG) {
+                facts.resumed = true;
+            } else if text.starts_with(RESUME_FAILED_LOG) {
+                facts.resume_failed = true;
+            }
+        }
+        facts
+    }
+}
+
+/// The message of one `update` log line, after its
+/// `<time> [<pid>] <level> update: ` header.
+#[cfg(test)]
+fn update_log_text(line: &str) -> Option<&str> {
+    let (_, after_pid) = line.split_once("] ")?;
+    let (_level, rest) = after_pid.split_once(' ')?;
+    rest.trim_start().strip_prefix("update: ")
+}
+
+#[cfg(test)]
+fn log_token(rest: &str) -> &str {
+    rest.split(' ').next().unwrap_or("")
+}
+
 /// Held for reading around every child the personal daemon spawns, and for
 /// writing through the exec window (see the module docs).
 static SPAWN_GATE: RwLock<()> = RwLock::new(());
@@ -126,20 +318,22 @@ pub(crate) fn exec_window_for_test() -> std::sync::RwLockWriteGuard<'static, ()>
 /// exec window (see the module docs).
 #[derive(Debug, Default)]
 pub struct AdmissionGate {
-    closed: AtomicBool,
+    // Temporary replacement closure and irreversible shutdown share one
+    // atomic word: clearing the former can never clear the latter.
+    state: AtomicU8,
 }
-
 impl AdmissionGate {
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        self.state.fetch_or(1, Ordering::SeqCst);
     }
-
     pub fn open(&self) {
-        self.closed.store(false, Ordering::SeqCst);
+        self.state.fetch_and(!1, Ordering::SeqCst);
     }
-
+    pub(crate) fn seal_shutdown(&self) {
+        self.state.fetch_or(2, Ordering::SeqCst);
+    }
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.state.load(Ordering::SeqCst) != 0
     }
 }
 
@@ -224,6 +418,9 @@ pub struct HandoverBase {
     /// The gate of the [`GatedNonces`] the session router was given: closed
     /// from the last count of the sessions through the exec.
     pub admission: Arc<AdmissionGate>,
+    /// The same action coordinator passed to the personal transport owner.
+    /// It shares this control gate and the router's actual nonce admission gate.
+    pub actions: Arc<Actions>,
 }
 
 /// Everything an offer is decided by.
@@ -517,7 +714,7 @@ pub struct DaemonSelf {
     restarts: Arc<Restarts>,
     opens: Arc<ChannelOpenRegistry>,
     handover: Option<Arc<HandoverBase>>,
-    exec: ExecFn,
+    exec: Option<ExecFn>,
 }
 
 impl DaemonSelf {
@@ -548,7 +745,7 @@ impl DaemonSelf {
             restarts: Arc::new(Restarts::new()),
             opens,
             handover: handover.map(Arc::new),
-            exec: Arc::new(handover::exec_staged),
+            exec: None,
         }
     }
 
@@ -565,13 +762,13 @@ impl DaemonSelf {
             restarts: Arc::new(Restarts::new()),
             opens,
             handover: None,
-            exec: Arc::new(handover::exec_staged),
+            exec: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_exec(mut self, exec: ExecFn) -> DaemonSelf {
-        self.exec = exec;
+        self.exec = Some(exec);
         self
     }
 
@@ -653,6 +850,16 @@ impl DaemonUpdates for DaemonSelf {
         from: &Principal,
         offer: &UpdateOffer,
     ) -> Result<Box<dyn UpdateTransfer>, UpdateAnswer> {
+        if let Some(base) = &self.handover {
+            let state = base
+                .actions
+                .state
+                .lock()
+                .map_err(|_| UpdateAnswer::NotAllowed)?;
+            if state.shutdown_committed() {
+                return Err(UpdateAnswer::NotAllowed);
+            }
+        }
         if self.managed {
             return Err(UpdateAnswer::Managed);
         }
@@ -698,7 +905,8 @@ impl DaemonUpdates for DaemonSelf {
             restarts: Arc::clone(&self.restarts),
             opens: self.opens.clone(),
             handover: self.handover.clone(),
-            exec: Arc::clone(&self.exec),
+            exec: self.exec.clone(),
+            lease: None,
         }))
     }
 
@@ -718,6 +926,7 @@ impl DaemonUpdates for DaemonSelf {
 /// An accepted image on its way to replacing the daemon. Dropped before the
 /// exec succeeds, it removes its staged file and frees the slot.
 struct StagedImage {
+    lease: Option<ReplacementLease>,
     offer: UpdateOffer,
     path: PathBuf,
     /// Opened on the first write, so a directory that cannot take the file
@@ -735,7 +944,7 @@ struct StagedImage {
     restarts: Arc<Restarts>,
     opens: Arc<ChannelOpenRegistry>,
     handover: Option<Arc<HandoverBase>>,
-    exec: ExecFn,
+    exec: Option<ExecFn>,
 }
 
 impl StagedImage {
@@ -763,7 +972,11 @@ impl StagedImage {
     fn reopen_admission(&mut self) {
         if std::mem::take(&mut self.closed_admission) {
             if let Some(base) = &self.handover {
-                base.admission.open();
+                if let (Some(lease), Ok(state)) = (self.lease, base.actions.state.lock()) {
+                    if state.owns_replacement(lease) {
+                        base.admission.open();
+                    }
+                }
             }
         }
     }
@@ -790,6 +1003,18 @@ impl UpdateTransfer for StagedImage {
     }
 
     fn verify(&mut self) -> Result<(), UpdateResult> {
+        if let Some(base) = &self.handover {
+            if self.lease.is_none() {
+                self.lease = Some(
+                    base.actions
+                        .state
+                        .lock()
+                        .map_err(|_| revoked_update())?
+                        .begin_replacement()
+                        .map_err(|_| revoked_update())?,
+                );
+            }
+        }
         let rejected = |code: RejectCode, detail: String| UpdateResult::Rejected { code, detail };
         if self.written != self.offer.size {
             return Err(rejected(
@@ -857,6 +1082,13 @@ impl UpdateTransfer for StagedImage {
         // -- and it comes before anything is announced: a `Busy` here has
         // told no session `Restarting`, and cut none.
         if let Some(base) = &self.handover {
+            let state = base.actions.state.lock().map_err(|_| revoked_update())?;
+            if !self
+                .lease
+                .is_some_and(|lease| state.owns_replacement(lease))
+            {
+                return Err(revoked_update());
+            }
             base.admission.close();
             self.closed_admission = true;
         }
@@ -878,17 +1110,31 @@ impl UpdateTransfer for StagedImage {
     /// else here: it sleeps, waits for locks and execs.
     fn restart(mut self: Box<Self>) -> UpdateResult {
         let Some(base) = self.handover.clone() else {
-            return UpdateResult::Rejected {
-                code: RejectCode::ExecFailed,
-                detail: "this daemon cannot hand itself over".to_string(),
-            };
+            return restart_stopped(
+                RestartStop::NoHandover,
+                UpdateResult::Rejected {
+                    code: RejectCode::ExecFailed,
+                    detail: "this daemon cannot hand itself over".to_string(),
+                },
+            );
         };
         // Closed already by the last count in `verify`, and kept closed to
         // the exec: no new session from here on (see the module docs).
-        base.admission.close();
-        self.closed_admission = true;
+        let Some(lease) = self.lease else {
+            return restart_stopped(RestartStop::Revoked, revoked_update());
+        };
+        {
+            let Ok(state) = base.actions.state.lock() else {
+                return restart_stopped(RestartStop::Revoked, revoked_update());
+            };
+            if !state.owns_replacement(lease) {
+                return restart_stopped(RestartStop::Revoked, revoked_update());
+            }
+            base.admission.close();
+            self.closed_admission = true;
+        }
         if let Err(error) = self.cleanup_preflight() {
-            return error;
+            return restart_stopped(RestartStop::CleanupPending, error);
         }
         // Test only: inject a late arrival after the final favorable snapshot.
         #[cfg(test)]
@@ -898,31 +1144,49 @@ impl UpdateTransfer for StagedImage {
                 hook();
             }
         }
-        let fence = match self.opens.begin_restart_fence() {
-            Ok(fence) => fence,
-            Err(_) => {
-                return UpdateResult::Rejected {
-                    code: RejectCode::ExecFailed,
-                    detail: "channel opening could not be fenced".into(),
-                };
+        let (undo, restart) = {
+            let Ok(state) = base.actions.state.lock() else {
+                return restart_stopped(RestartStop::Revoked, revoked_update());
+            };
+            if !state.owns_replacement(lease) {
+                return restart_stopped(RestartStop::Revoked, revoked_update());
+            }
+            let fence = match self.opens.begin_restart_fence() {
+                Ok(fence) => fence,
+                Err(_) => {
+                    return restart_stopped(
+                        RestartStop::FenceUnavailable,
+                        UpdateResult::Rejected {
+                            code: RejectCode::ExecFailed,
+                            detail: "channel opening could not be fenced".into(),
+                        },
+                    )
+                }
+            };
+            let undo = UndoRestart {
+                admission: base.admission.clone(),
+                restarts: self.restarts.clone(),
+                opens: Some(fence),
+                actions: base.actions.clone(),
+                lease,
+            };
+            // On exhaustion, release the action lock before undo runs.
+            let announced = self.restarts.announce();
+            drop(state);
+            match announced {
+                Ok(restart) => (undo, restart),
+                Err(_) => {
+                    return restart_stopped(
+                        RestartStop::IdentityExhausted,
+                        UpdateResult::Rejected {
+                            code: RejectCode::ExecFailed,
+                            detail: "restart identity exhausted".into(),
+                        },
+                    )
+                }
             }
         };
-        // Fence first: cancellation survives a dropped runner and precedes
-        // watch publication. Every failure unwinds Idle -> registry -> admission.
-        let undo = UndoRestart {
-            admission: Arc::clone(&base.admission),
-            restarts: Arc::clone(&self.restarts),
-            opens: Some(fence),
-        };
-        let restart = match self.restarts.announce() {
-            Ok(restart) => restart,
-            Err(_) => {
-                return UpdateResult::Rejected {
-                    code: RejectCode::ExecFailed,
-                    detail: "restart identity exhausted".into(),
-                };
-            }
-        };
+        restart_step(crate::log::Level::Info, RestartStep::Announced, "");
         // Only for the sessions to put `Restarting` on the wire: the
         // decision is made, and nobody is admitted meanwhile.
         std::thread::sleep(RESTART_GRACE);
@@ -931,17 +1195,31 @@ impl UpdateTransfer for StagedImage {
         // bound of its own; then every one that joined confirms, with the
         // whole drain budget: one stuck session must not use up the others'
         // time to reap.
-        if !self.restarts.wait_joined(restart, JOIN_TIMEOUT) {
-            crate::log::warn(
-                "update",
+        if self.restarts.wait_joined(restart, JOIN_TIMEOUT) {
+            restart_step(crate::log::Level::Info, RestartStep::Joined, "");
+        } else {
+            restart_step(
+                crate::log::Level::Warn,
+                RestartStep::JoinLate,
                 "not every session heard the restart in time; draining anyway",
             );
         }
         let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
-        self.restarts.drain(restart);
-        if !self.restarts.wait_drained_until(restart, drain_deadline) {
-            crate::log::warn(
-                "update",
+        {
+            let Ok(state) = base.actions.state.lock() else {
+                return restart_stopped(RestartStop::Revoked, revoked_update());
+            };
+            if !state.owns_replacement(lease) {
+                return restart_stopped(RestartStop::Revoked, revoked_update());
+            }
+            self.restarts.drain(restart);
+        }
+        if self.restarts.wait_drained_until(restart, drain_deadline) {
+            restart_step(crate::log::Level::Info, RestartStep::Drained, "");
+        } else {
+            restart_step(
+                crate::log::Level::Warn,
+                RestartStep::DrainLate,
                 &format!(
                     "not every session reaped its installed channels within {} s",
                     DRAIN_TIMEOUT.as_secs()
@@ -953,11 +1231,15 @@ impl UpdateTransfer for StagedImage {
             .as_ref()
             .and_then(|fence| fence.wait_until(drain_deadline))
         else {
-            return UpdateResult::Rejected {
-                code: RejectCode::ExecFailed,
-                detail: "pending channel creation has not proved cleanup".into(),
-            };
+            return restart_stopped(
+                RestartStop::CleanupUnproved,
+                UpdateResult::Rejected {
+                    code: RejectCode::ExecFailed,
+                    detail: "pending channel creation has not proved cleanup".into(),
+                },
+            );
         };
+        restart_step(crate::log::Level::Info, RestartStep::Fenced, "");
         // No `ADD-CLIENT` between the allowlist snapshot and the exec: the
         // gate is taken here, after the drain -- a key added during the
         // drain is in the snapshot, and `STATUS` is answered throughout it
@@ -965,30 +1247,43 @@ impl UpdateTransfer for StagedImage {
         // Bounded: a control client that never finishes must not keep the
         // daemon closed to every session.
         let Some(_control) = write_within(&base.control_gate, CONTROL_GATE_TIMEOUT) else {
-            let reason = format!(
-                "the control socket stayed busy for {} s",
-                CONTROL_GATE_TIMEOUT.as_secs()
+            return restart_stopped(
+                RestartStop::ControlBusy,
+                UpdateResult::Rejected {
+                    code: RejectCode::ControlBusy,
+                    detail: format!(
+                        "the control socket stayed busy for {} s",
+                        CONTROL_GATE_TIMEOUT.as_secs()
+                    ),
+                },
             );
-            crate::log::warn("update", &reason);
-            return UpdateResult::Rejected {
-                code: RejectCode::ControlBusy,
-                detail: reason,
-            };
         };
+        restart_step(crate::log::Level::Info, RestartStep::ControlGate, "");
         let reason = self.exec_with_handover(&base, &open_exec_permit);
         // Still here: the exec failed, and this daemon goes on as it was --
         // minus the channels it drained.
-        crate::log::warn("update", &reason);
-        UpdateResult::Rejected {
-            code: RejectCode::ExecFailed,
-            detail: reason,
-        }
+        restart_stopped(
+            RestartStop::ExecFailed,
+            UpdateResult::Rejected {
+                code: RejectCode::ExecFailed,
+                detail: reason,
+            },
+        )
     }
 }
 
 /// Undoes an attempt on every way out of [`StagedImage::restart`] short of a
 /// successful exec, a panic included.
+fn revoked_update() -> UpdateResult {
+    UpdateResult::Rejected {
+        code: RejectCode::ExecFailed,
+        detail: "replacement authority was revoked by daemon shutdown or another operation".into(),
+    }
+}
+
 struct UndoRestart {
+    actions: Arc<Actions>,
+    lease: ReplacementLease,
     admission: Arc<AdmissionGate>,
     restarts: Arc<Restarts>,
     opens: Option<RestartOpenFence>,
@@ -996,11 +1291,15 @@ struct UndoRestart {
 
 impl Drop for UndoRestart {
     fn drop(&mut self) {
-        self.restarts.end();
-        if let Some(fence) = self.opens.take() {
-            fence.reopen();
+        if let Ok(state) = self.actions.state.lock() {
+            if state.owns_replacement(self.lease) {
+                self.restarts.end();
+                if let Some(fence) = self.opens.take() {
+                    fence.reopen();
+                }
+                self.admission.open();
+            }
         }
-        self.admission.open();
     }
 }
 
@@ -1081,11 +1380,19 @@ impl StagedImage {
                 return format!("could not keep descriptor {fd} across exec: {e}");
             }
         }
-        crate::log::info(
-            "update",
+        restart_step(
+            crate::log::Level::Info,
+            RestartStep::Exec,
             &format!("replacing this process with build {}", self.offer.build),
         );
-        let err = (self.exec)(&self.path, memfd.as_raw_fd());
+        let Some(lease) = self.lease else {
+            return "replacement authority missing".into();
+        };
+        let guard = ExecAttemptGuard::new(&base.actions, lease);
+        let err = match &self.exec {
+            Some(exec) => guard.attempt(|| exec(&self.path, memfd.as_raw_fd())),
+            None => handover::exec_staged_guarded(&self.path, memfd.as_raw_fd(), &guard),
+        };
         // Closed while the spawn gate is still held: it is inheritable now.
         // (The sockets are put back by `_put_back`, dropped before the gate.)
         drop(memfd);
@@ -1096,6 +1403,11 @@ impl StagedImage {
 impl Drop for StagedImage {
     fn drop(&mut self) {
         self.reopen_admission();
+        if let (Some(base), Some(lease)) = (&self.handover, self.lease.take()) {
+            if let Ok(mut state) = base.actions.state.lock() {
+                state.finish_replacement(lease);
+            }
+        }
         self.file = None;
         if self.created {
             let _ = std::fs::remove_file(&self.path);
@@ -1117,6 +1429,24 @@ pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck
 /// Non-Linux cleanup remains a separate platform acceptance requirement.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck, String> {
+    run_threaded_self_check(path, timeout, |stdout, line_tx| {
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(stdout.take(4096)).read_line(&mut line);
+            let _ = line_tx.send(line);
+        })
+    })
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn run_threaded_self_check(
+    path: &Path,
+    timeout: Duration,
+    spawn_reader: impl FnOnce(
+        std::process::ChildStdout,
+        std::sync::mpsc::Sender<String>,
+    ) -> std::thread::JoinHandle<()>,
+) -> Result<SelfCheck, String> {
     let mut child = spawn_self_check(path)?;
     let deadline = Instant::now() + timeout;
     // Read on a thread of its own, up to the first line: a process the
@@ -1125,13 +1455,10 @@ pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck
     // with it. A reader still blocked past the deadline is left to finish
     // on its own.
     let (line_tx, line_rx) = std::sync::mpsc::channel();
-    if let Some(stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let _ = std::io::BufReader::new(stdout.take(4096)).read_line(&mut line);
-            let _ = line_tx.send(line);
-        });
-    }
+    let reader = child
+        .stdout
+        .take()
+        .map(|stdout| spawn_reader(stdout, line_tx));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1158,6 +1485,14 @@ pub(crate) fn run_self_check(path: &Path, timeout: Duration) -> Result<SelfCheck
                 timeout.as_secs()
             )
         })?;
+    // The bounded read already completed and the reader has dropped its
+    // BufReader before sending. Join its remaining nonblocking tail before a
+    // caller can reexec or fork a staged candidate. Error/timeout paths above
+    // never grant that eligibility and do not wait on an unfinished read.
+    reader
+        .ok_or_else(|| "self-check reader was not started".to_owned())?
+        .join()
+        .map_err(|_| "self-check reader failed after its output".to_owned())?;
     SelfCheck::from_line(out.lines().next().unwrap_or(""))
         .map_err(|e| format!("self-check printed something else: {e:#}"))
 }
@@ -1206,9 +1541,26 @@ fn spawn_self_check(path: &Path) -> Result<Child, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shutdown_seal_cannot_be_cleared_by_replacement_rollback() {
+        let gate = AdmissionGate::default();
+        gate.close();
+        gate.seal_shutdown();
+        gate.open();
+        assert!(gate.is_closed());
+        gate.close();
+        gate.open();
+        assert!(gate.is_closed());
+        let ordinary = AdmissionGate::default();
+        ordinary.close();
+        ordinary.open();
+        assert!(!ordinary.is_closed());
+    }
+
     include!("update_restart_bounds_tests.rs");
     include!("update_open_tests.rs");
     include!("update_scope_tests.rs");
+    include!("update_restart_log_tests.rs");
     use super::*;
     use crate::test_support::{fd_flags_lock, suppress_shell_history};
     use std::io::Read;
@@ -1436,7 +1788,16 @@ mod tests {
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let control_path = dir.join("control.sock");
         let control = std::os::unix::net::UnixListener::bind(&control_path).unwrap();
+        let control_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let admission = Arc::new(AdmissionGate::default());
+        let actions = Arc::new(Actions::new(
+            None,
+            control_gate.clone(),
+            admission.clone(),
+            false,
+        ));
         let base = HandoverBase {
+            actions,
             udp_fd: udp.as_raw_fd(),
             control_fd: control.as_raw_fd(),
             control_path,
@@ -1445,10 +1806,149 @@ mod tests {
             ports: vec![1],
             name: "main".to_string(),
             allowlist: Arc::new(Mutex::new(vec![[3u8; 32]])),
-            control_gate: Arc::new(tokio::sync::RwLock::new(())),
-            admission: Arc::new(AdmissionGate::default()),
+            control_gate,
+            admission,
         };
         (base, udp, control)
+    }
+
+    #[test]
+    fn service_stage_update_handover_retains_persistent_install_destination() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let _fds = crate::test_support::fd_flags_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("installed/qshd");
+        std::fs::create_dir(installed.parent().unwrap()).unwrap();
+        let executing = dir.path().join("service-staging/stage-owned/qshd");
+        std::fs::create_dir_all(executing.parent().unwrap()).unwrap();
+        std::fs::write(&executing, b"retained selected stage").unwrap();
+        let expected = installed.clone();
+        let selected = executing.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        let exec: ExecFn = Arc::new(move |staged, fd| {
+            assert_eq!(staged.parent(), expected.parent());
+            assert_ne!(staged.parent(), selected.parent());
+            let copy = unsafe { nix::libc::fcntl(fd, nix::libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(copy >= 0);
+            // SAFETY: fcntl returned a fresh descriptor owned by this read.
+            let description =
+                handover::read_handover(unsafe { OwnedFd::from_raw_fd(copy) }).unwrap();
+            assert_eq!(description.binary_path, expected);
+            assert_eq!(description.staged_path, staged);
+            assert_ne!(description.binary_path, selected);
+            called.fetch_add(1, Ordering::SeqCst);
+            Errno::ENOENT
+        });
+        let (base, _udp, _control) = handover_base(dir.path());
+        let own = OwnImage {
+            checksum: hex::encode(sha2::Sha256::digest(b"retained selected stage")),
+            ..own_image()
+        };
+        let daemon = DaemonSelf::personal(
+            ChannelOpenRegistry::new(Default::default()),
+            Some(own.clone()),
+            installed.clone(),
+            uid(),
+            Arc::new(AtomicUsize::new(1)),
+            Some(base),
+        )
+        .with_exec(exec);
+        assert_eq!(daemon.own.get(), Some(&Some(own)));
+        let image = script_image(101, 0);
+        let mut transfer = daemon.offer(&me(), &offer_for(&image, 101)).unwrap();
+        transfer.write(&image).unwrap();
+        transfer.verify().unwrap();
+        assert!(matches!(transfer.restart(), UpdateResult::Rejected { .. }));
+        assert!(calls.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            std::fs::read(&executing).unwrap(),
+            b"retained selected stage"
+        );
+        assert!(!installed.exists());
+    }
+
+    #[test]
+    fn terminal_shutdown_revokes_verified_update_without_exec_or_reopen() {
+        let _fds = crate::test_support::fd_flags_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let ready = verified_transfer(
+            dir.path(),
+            Arc::new(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Errno::ENOENT
+            }),
+        );
+        let actions = ready.daemon.handover.as_ref().unwrap().actions.clone();
+        actions.administrative_shutdown();
+        assert!(matches!(
+            ready.transfer.restart(),
+            UpdateResult::Rejected { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(ready.admission.is_closed());
+        assert_eq!(ready.daemon.restarts.phase(), RestartPhase::Idle);
+        assert!(actions.shutdown.is_requested());
+        let image = script_image(101, 0);
+        assert!(matches!(
+            ready.daemon.offer(&me(), &offer_for(&image, 101)),
+            Err(UpdateAnswer::NotAllowed)
+        ));
+    }
+
+    #[test]
+    fn shutdown_during_restart_keeps_channel_fence_and_never_publishes_idle() {
+        let _fds = crate::test_support::fd_flags_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let ready = verified_transfer(
+            dir.path(),
+            Arc::new(|_, _| panic!("shutdown must revoke exec")),
+        );
+        let daemon = ready.daemon.clone();
+        let actions = daemon.handover.as_ref().unwrap().actions.clone();
+        let rx = daemon.restart_signal();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while rx.borrow().phase != RestartPhase::Announced {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            let restart = rx.borrow().restart;
+            assert!(daemon.restart_joined(restart));
+            actions.administrative_shutdown();
+        });
+        assert!(matches!(
+            ready.transfer.restart(),
+            UpdateResult::Rejected { .. }
+        ));
+        worker.join().unwrap();
+        assert!(ready.admission.is_closed());
+        assert_eq!(ready.daemon.restarts.phase(), RestartPhase::Announced);
+        assert!(ready.daemon.opens.begin_restart_fence().is_err());
+    }
+
+    #[test]
+    fn replacement_claims_action_before_verify_closes_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _udp, _control) = handover_base(dir.path());
+        let actions = base.actions.clone();
+        let daemon = DaemonSelf::personal(
+            ChannelOpenRegistry::new(Default::default()),
+            Some(own_image()),
+            dir.path().join("qshd"),
+            uid(),
+            Arc::new(AtomicUsize::new(1)),
+            Some(base),
+        );
+        let image = script_image(101, 0);
+        let mut transfer = daemon.offer(&me(), &offer_for(&image, 101)).unwrap();
+        transfer.write(&image).unwrap();
+        actions.administrative_shutdown();
+        assert!(transfer.verify().is_err());
+        drop(transfer);
+        assert!(actions.admission.is_closed());
     }
 
     #[test]
@@ -1886,6 +2386,30 @@ mod tests {
         ));
         drop(first);
         assert!(daemon.offer(&me(), &offer_for(&image, 101)).is_ok());
+    }
+
+    #[test]
+    fn service_self_check_reader_panic_refuses_launch_eligibility() {
+        use std::io::{BufRead, Read};
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("self-check");
+        std::fs::write(&path, script_image(101, 0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let result = run_threaded_self_check(&path, Duration::from_secs(2), |stdout, line_tx| {
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                std::io::BufReader::new(stdout.take(4096))
+                    .read_line(&mut line)
+                    .unwrap();
+                line_tx.send(line).unwrap();
+                panic!("owned self-check reader failed after delivering its line");
+            })
+        });
+        assert!(
+            result.is_err(),
+            "a self-check is not reexec-eligible before its reader joins"
+        );
     }
 
     /// Another thread forking while the staged file is still open for
@@ -2565,6 +3089,28 @@ mod tests {
             daemon.offer(&me(), &offer_for(&image, 101)).is_ok(),
             "the slot is free"
         );
+    }
+
+    #[test]
+    fn shutdown_between_exec_panic_and_rollback_keeps_terminal_fences() {
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let dir = tempfile::tempdir().unwrap();
+        let ready = verified_transfer(dir.path(), Arc::new(|_, _| panic!("injected exec panic")));
+        let actions = ready.daemon.handover.as_ref().unwrap().actions.clone();
+        let shutdown = actions.clone();
+        *actions.after_exec_panic.lock().unwrap() =
+            Some(Box::new(move || shutdown.administrative_shutdown()));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ready.transfer.restart()))
+                .is_err()
+        );
+        assert!(ready.admission.is_closed());
+        assert_eq!(ready.daemon.restarts.phase(), RestartPhase::Draining);
+        assert!(ready.daemon.opens.begin_restart_fence().is_err());
+        assert!(handover::is_cloexec(ready.udp.as_raw_fd()).unwrap());
+        assert!(handover::is_cloexec(ready.control.as_raw_fd()).unwrap());
+        assert!(spawn_gate_free());
     }
 
     /// The daemon's receivers are the sessions' alone: it keeps none of its

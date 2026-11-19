@@ -44,8 +44,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::destructive_restart::Actions;
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use transport::{BackendFactory, LoginEndedReports, ServerAuth, SessionBackend, SessionManager};
@@ -85,6 +86,29 @@ pub fn decide_reuse(action: &ReconcileAction) -> EnsureDecision {
     match action {
         ReconcileAction::UpToDate | ReconcileAction::KeepOldWarn(_) => EnsureDecision::Reuse,
         ReconcileAction::Replace => EnsureDecision::BecomeDaemon,
+    }
+}
+
+/// Compatibility is established only by complete profiles from the live daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseCompatibility {
+    Unknown,
+    Compatible,
+    Incompatible,
+}
+pub fn reuse_compatibility(profiles: Option<&[[u8; 3]]>) -> ReuseCompatibility {
+    let Some(profiles) = profiles else {
+        return ReuseCompatibility::Unknown;
+    };
+    let required = [
+        transport::wire::VERSION,
+        transport::handshake_payload::HS_VERSION,
+        transport::channel::PROTOCOL_VERSION,
+    ];
+    if profiles.contains(&required) {
+        ReuseCompatibility::Compatible
+    } else {
+        ReuseCompatibility::Incompatible
     }
 }
 
@@ -223,6 +247,45 @@ pub async fn run_transport_daemon_until_stop(
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
     stop: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
+    let actions = Arc::new(Actions::new(
+        None,
+        control_gate,
+        Arc::new(crate::update::AdmissionGate::default()),
+        false,
+    ));
+    run_transport_daemon_until_stop_with_actions(
+        socket,
+        server_priv,
+        auth,
+        backend,
+        listener,
+        _cleanup,
+        ports,
+        active_count,
+        actions,
+        cleanup_registry,
+        stop,
+    )
+    .await
+}
+
+/// Personal production entry: use the same coordinator in HandoverBase and
+/// the auth router's nonce gate. Wrappers without it never advertise receipts.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_transport_daemon_until_stop_with_actions(
+    socket: std::net::UdpSocket,
+    server_priv: [u8; 32],
+    auth: ServerAuth,
+    backend: Arc<dyn SessionBackend>,
+    listener: std::os::unix::net::UnixListener,
+    _cleanup: control::SocketCleanup,
+    ports: Vec<u16>,
+    active_count: Arc<AtomicUsize>,
+    actions: Arc<Actions>,
+    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    stop: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let control_gate = actions.control_gate.clone();
     listener
         .set_nonblocking(true)
         .context("switching the control socket to non-blocking mode")?;
@@ -240,6 +303,7 @@ pub async fn run_transport_daemon_until_stop(
         control_gate,
         cleanup_registry,
         stop,
+        Some(actions),
     )
     .await
 }
@@ -290,6 +354,7 @@ async fn run_transport_daemon_with_acceptor(
     control_gate: Arc<tokio::sync::RwLock<()>>,
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
     stop: impl std::future::Future<Output = Result<()>>,
+    actions: Option<Arc<Actions>>,
 ) -> Result<()> {
     // Sized here, where every socket the daemon serves passes -- one it
     // bound, and one an older binary handed over on an update (spec §4.12).
@@ -320,8 +385,15 @@ async fn run_transport_daemon_with_acceptor(
     // The multi-session router: one UDP socket, per-token sessions, the
     // per-session channel backend. It snapshots the allowlist fresh at every
     // handshake and scrubs an ended session's key off it.
-    let shutdown = transport::Shutdown::default();
-    let manager_loop = SessionManager::serve_until_shutdown(
+    let shutdown = actions
+        .as_ref()
+        .map(|a| a.shutdown.clone())
+        .unwrap_or_default();
+    let running_info = Arc::new(crate::server_info::RunningServerInfo {
+        public_key: auth.server_pub,
+        info: crate::server_info::current(),
+    });
+    let manager_loop = SessionManager::serve_with_server_info(
         Arc::new(socket),
         server_priv,
         auth,
@@ -329,6 +401,7 @@ async fn run_transport_daemon_with_acceptor(
         active_count.clone(),
         LoginEndedReports::none(),
         shutdown.clone(),
+        Some(running_info.info.clone()),
     );
     tokio::pin!(manager_loop);
 
@@ -345,6 +418,7 @@ async fn run_transport_daemon_with_acceptor(
                 break None;
             }
             _ = stop_rx.recv() => break None,
+            _ = shutdown.requested() => break None,
             result = &mut manager_loop => break Some(result),
             result = handlers.join_next(), if !handlers.is_empty() => {
                 if let Some(Err(error)) = result {
@@ -366,7 +440,7 @@ async fn run_transport_daemon_with_acceptor(
                     retry_delay = CONTROL_ACCEPT_RETRY_INITIAL;
                     spawn_control_handler(&mut handlers, stream,
                         shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                        active_count.clone(), control_gate.clone(), cleanup_registry.clone());
+                        active_count.clone(), control_gate.clone(), cleanup_registry.clone(), Some(running_info.clone()), actions.clone());
                 }
                 Err(error) if recoverable_control_accept(&error) => {
                     let now = tokio::time::Instant::now();
@@ -384,10 +458,15 @@ async fn run_transport_daemon_with_acceptor(
             }
         }
     };
-    // Close admission before requesting drain. Accepted STOP acknowledgments
-    // retain their tasks and original deadlines while the manager joins.
+    // Revoke replacement exec before releasing the original handover
+    // descriptor. A syscall already holding authority must return first.
+    // Accepted STOP acknowledgments retain their tasks and deadlines.
+    if let Some(actions) = &actions {
+        actions.administrative_shutdown();
+    } else {
+        shutdown.request();
+    }
     drop(listener);
-    shutdown.request();
     let (manager_result, control_result) = match completed {
         Some(result) => (
             result,
@@ -527,7 +606,7 @@ pub(crate) async fn run_serve_loop_until_shutdown(
     })?;
     // Retained by the caller until this real lifecycle drain returns. An error
     // is not a producer-fence receipt, even though sibling tasks were joined.
-    SessionManager::serve_until_shutdown(
+    SessionManager::serve_with_server_info(
         Arc::new(socket),
         server_priv,
         auth,
@@ -535,6 +614,7 @@ pub(crate) async fn run_serve_loop_until_shutdown(
         Arc::new(AtomicUsize::new(0)),
         login_ends,
         shutdown,
+        Some(crate::server_info::current()),
     )
     .await
     .map_err(ServeLoopError::Shutdown)
@@ -561,7 +641,7 @@ pub async fn serve_transport_control(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => spawn_control_handler(&mut handlers, stream,
                     shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                    active_count.clone(), control_gate.clone(), cleanup_registry.clone()),
+                    active_count.clone(), control_gate.clone(), cleanup_registry.clone(), None, None),
                 Err(error) => log::warn("qshd", &format!("error accepting transport control connection: {error}")),
             },
             result = handlers.join_next(), if !handlers.is_empty() => {
@@ -583,10 +663,12 @@ fn spawn_control_handler(
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
+    actions: Option<Arc<Actions>>,
 ) {
     let deadline = tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT;
     handlers.spawn(async move {
-        if let Err(error) = handle_transport_control_connection(
+        if let Err(error) = handle_transport_control_connection_with_info(
             stream,
             shared_allowlist,
             ports,
@@ -595,6 +677,8 @@ fn spawn_control_handler(
             control_gate,
             cleanup_registry,
             deadline,
+            running_info,
+            actions,
         )
         .await
         {
@@ -647,6 +731,7 @@ async fn join_control_handlers(
 /// replacement waits for. Read, gate, delivery and reply share the original
 /// accepted deadline.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn handle_transport_control_connection(
     stream: tokio::net::UnixStream,
     shared_allowlist: SharedAllowlist,
@@ -657,7 +742,7 @@ async fn handle_transport_control_connection(
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
-    handle_transport_control_connection_with_peer_check(
+    handle_transport_control_connection_with_info(
         stream,
         shared_allowlist,
         ports,
@@ -666,6 +751,36 @@ async fn handle_transport_control_connection(
         control_gate,
         cleanup_registry,
         deadline,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_transport_control_connection_with_info(
+    stream: tokio::net::UnixStream,
+    shared_allowlist: SharedAllowlist,
+    ports: Vec<u16>,
+    stop_tx: mpsc::Sender<()>,
+    active_count: Arc<AtomicUsize>,
+    control_gate: Arc<tokio::sync::RwLock<()>>,
+    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    deadline: tokio::time::Instant,
+    running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
+    actions: Option<Arc<Actions>>,
+) -> Result<()> {
+    handle_transport_control_connection_with_peer_check_and_info(
+        stream,
+        shared_allowlist,
+        ports,
+        stop_tx,
+        active_count,
+        control_gate,
+        cleanup_registry,
+        deadline,
+        running_info,
+        actions,
         |stream| {
             control::require_same_account(
                 control::peer_uid(stream),
@@ -677,6 +792,7 @@ async fn handle_transport_control_connection(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn handle_transport_control_connection_with_peer_check(
     stream: tokio::net::UnixStream,
     shared_allowlist: SharedAllowlist,
@@ -688,30 +804,98 @@ async fn handle_transport_control_connection_with_peer_check(
     deadline: tokio::time::Instant,
     check: impl FnOnce(&tokio::net::UnixStream) -> Result<()>,
 ) -> Result<()> {
+    handle_transport_control_connection_with_peer_check_and_info(
+        stream,
+        shared_allowlist,
+        ports,
+        stop_tx,
+        active_count,
+        control_gate,
+        cleanup_registry,
+        deadline,
+        None,
+        None,
+        check,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_transport_control_connection_with_peer_check_and_info(
+    stream: tokio::net::UnixStream,
+    shared_allowlist: SharedAllowlist,
+    ports: Vec<u16>,
+    stop_tx: mpsc::Sender<()>,
+    active_count: Arc<AtomicUsize>,
+    control_gate: Arc<tokio::sync::RwLock<()>>,
+    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    deadline: tokio::time::Instant,
+    running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
+    actions: Option<Arc<Actions>>,
+    check: impl FnOnce(&tokio::net::UnixStream) -> Result<()>,
+) -> Result<()> {
     check(&stream)?;
 
     tokio::time::timeout_at(deadline, async {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(read_half);
         let mut line = String::new();
-        reader
+        (&mut reader).take(4097)
             .read_line(&mut line)
             .await
             .context("reading the request from the transport control socket")?;
+        anyhow::ensure!(line.len()<=4096 && line.ends_with('\n'),"control request exceeds limit or is incomplete");
         let line = line.trim_end_matches('\n');
 
-        // Held for the rest of the request: a replacement takes this for writing
-        // before it snapshots the allowlist, so an `ADD-CLIENT` either lands
-        // before the snapshot or waits -- and then meets the new process.
-        let _gate = control_gate.read().await;
-
-        let Some(request) = control::parse_request(line) else {
-            // Unparseable request -- silently close the connection: the only
-            // client is `transport-ensure` itself, not external input.
+        let Some(request)=control::parse_request(line) else {return Ok(());};
+        // Commit takes the exclusive gate directly, never by upgrading the
+        // ordinary request's read guard. No ACK is part of commitment.
+        if let ControlRequest::CommitDestructiveStop { receipt,ref consent }=request {
+            let response=match &actions {Some(actions)=>actions.commit(receipt,consent).await, None=>Err(crate::destructive_restart::Rejected::Unavailable)};
+            write_half.write_all(format!("{}\n",serde_json::to_string(&control::DestructiveCommitResponse::from_result(response,receipt,consent.clone()))?).as_bytes()).await?;
             return Ok(());
-        };
-
+        }
+        let _gate=control_gate.read().await;
         match request {
+            ControlRequest::CommitDestructiveStop {..}=>unreachable!("handled before read gate"),
+            ControlRequest::DestructiveRestartInfo(challenge)=> {
+                if let Some(actions)=&actions {
+                    if let Some(identity)=actions.receipt_identity() {
+                        let response=control::DestructiveRestartInfoResponse {schema:1,challenge:hex::encode(challenge),capability:"conditional-stop-receipt-v1".into(),identity};
+                        write_half.write_all(format!("{}\n",serde_json::to_string(&response)?).as_bytes()).await?;
+                    }
+                }
+            }
+            ControlRequest::PrepareDestructiveStop(consent)=> {
+                let result=actions.as_ref().ok_or(crate::destructive_restart::Rejected::Unavailable).and_then(|actions| actions.prepare(consent.clone()));
+                let response=control::DestructivePrepareResponse::from_result(result,consent);
+                write_half.write_all(format!("{}\n",serde_json::to_string(&response)?).as_bytes()).await?;
+            }
+            ControlRequest::ServerInfo(challenge) => {
+                if let Some(info) = running_info {
+                    write_half
+                        .write_all(info.response(challenge)?.as_bytes())
+                        .await?;
+                }
+            }
+            ControlRequest::RegistrationInfo(challenge) => {
+                if let Some(info) = &running_info {
+                    let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup_registry.as_deref())?;
+                    let response = control::RegistrationInfoResponse { schema:1, challenge:hex::encode(challenge), conditional_add_client:true, identity:daemon_bootstrap_protocol::BusyDaemonIdentity {
+                        version:status.version, build:status.build, checksum:status.checksum, pid:status.pid, generation:Some(hex::encode(info.info.generation)),
+                    }};
+                    let line = format!("{}\n", serde_json::to_string(&response)?);
+                    write_half.write_all(line.as_bytes()).await?;
+                }
+            }
+            ControlRequest::AddClientIf { generation, build, checksum, pid, key } => {
+                let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup_registry.as_deref())?;
+                if running_info.as_ref().is_some_and(|info| info.info.generation == generation)
+                    && status.build == build && status.checksum == hex::encode(checksum) && status.pid == pid {
+                    apply_add_client(&shared_allowlist, key);
+                    write_half.write_all(status.to_line()?.as_bytes()).await?;
+                } else { write_half.write_all(b"{\"error\":\"daemon identity changed; rediscover before registering\"}\n").await?; }
+            }
             ControlRequest::Status => {
                 let response = transport_status_response(
                     &ports,
@@ -739,10 +923,9 @@ async fn handle_transport_control_connection_with_peer_check(
                 write_half.write_all(response.to_line()?.as_bytes()).await?;
             }
             ControlRequest::Stop => {
-                stop_tx
-                    .send(())
-                    .await
-                    .context("requesting transport shutdown")?;
+                if let Some(actions)=&actions { actions.administrative_shutdown(); } else {
+                    stop_tx.send(()).await.context("requesting transport shutdown")?;
+                }
                 // This acknowledges accepted work. Joined daemon completion is
                 // observed independently; owned cleanup may still be pending.
                 write_half.write_all(b"{\"stopping\":true}\n").await?;
@@ -756,6 +939,10 @@ async fn handle_transport_control_connection_with_peer_check(
 }
 
 #[cfg(test)]
+#[path = "transport_restart_tests.rs"]
+mod restart_tests;
+
+#[cfg(test)]
 #[path = "transport_shutdown_tests.rs"]
 mod shutdown_tests;
 
@@ -767,6 +954,31 @@ mod tests {
     };
     use crate::version::ReconcileAction;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn reuse_compatibility_uses_complete_serving_profiles() {
+        use super::ReuseCompatibility::*;
+        assert_eq!(super::reuse_compatibility(None), Unknown);
+        let required = [
+            transport::wire::VERSION,
+            transport::handshake_payload::HS_VERSION,
+            transport::channel::PROTOCOL_VERSION,
+        ];
+        assert_eq!(super::reuse_compatibility(Some(&[required])), Compatible);
+        for index in 0..3 {
+            let mut incompatible = required;
+            incompatible[index] = 99;
+            assert_eq!(
+                super::reuse_compatibility(Some(&[incompatible])),
+                Incompatible
+            );
+        }
+        assert_eq!(super::reuse_compatibility(Some(&[])), Incompatible);
+        assert_eq!(
+            super::reuse_compatibility(Some(&[[99; 3], required])),
+            Compatible
+        );
+    }
 
     #[test]
     fn decide_reuse_maps_reconcile_actions() {
@@ -1221,3 +1433,115 @@ mod cleanup143_tests {
 #[cfg(test)]
 #[path = "transport_control_peer_tests.rs"]
 mod peer_tests;
+
+#[cfg(test)]
+mod server_info_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn conditional_registration_rejects_changed_identity_without_mutation() {
+        let allowlist = Arc::new(std::sync::Mutex::new(vec![[2; 32]]));
+        let info = Arc::new(crate::server_info::RunningServerInfo {
+            public_key: [4; 32],
+            info: crate::server_info::current(),
+        });
+        let status = transport_status_response(&[60000], 2, None).unwrap();
+        let checksum: [u8; 32] = hex::decode(&status.checksum).unwrap().try_into().unwrap();
+        for changed in 0..5 {
+            let mut generation = info.info.generation;
+            let mut build = status.build;
+            let mut digest = checksum;
+            let mut pid = status.pid;
+            match changed {
+                0 => generation[0] ^= 1,
+                1 => build ^= 1,
+                2 => digest[0] ^= 1,
+                3 => pid ^= 1,
+                _ => {}
+            }
+            let request = ControlRequest::AddClientIf {
+                generation,
+                build,
+                checksum: digest,
+                pid,
+                key: [3; 32],
+            };
+            let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+            client
+                .write_all(control::format_request(&request).as_bytes())
+                .await
+                .unwrap();
+            let (stop, mut stop_rx) = mpsc::channel(1);
+            handle_transport_control_connection_with_info(
+                server,
+                allowlist.clone(),
+                vec![60000],
+                stop,
+                Arc::new(AtomicUsize::new(2)),
+                Arc::new(tokio::sync::RwLock::new(())),
+                None,
+                tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT,
+                Some(info.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            if changed < 4 {
+                assert!(
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"]
+                        .is_string()
+                );
+                assert_eq!(*allowlist.lock().unwrap(), vec![[2; 32]]);
+            } else {
+                assert!(StatusResponse::from_line(std::str::from_utf8(&bytes).unwrap()).is_ok());
+                assert_eq!(*allowlist.lock().unwrap(), vec![[2; 32], [3; 32]]);
+            }
+            assert!(stop_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn server_info_control_reads_running_owner_without_authorization_mutation() {
+        let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let allowlist = Arc::new(std::sync::Mutex::new(vec![[2; 32]]));
+        let (stop, mut stop_rx) = mpsc::channel(1);
+        let active = Arc::new(AtomicUsize::new(9));
+        // A newly invoked query binary can differ from the process answering it.
+        let mut info = crate::server_info::current();
+        info.core_version = "0.5.0".into();
+        let expected_generation = hex::encode(info.generation);
+        client
+            .write_all(control::format_request(&ControlRequest::ServerInfo([8; 32])).as_bytes())
+            .await
+            .unwrap();
+        handle_transport_control_connection_with_info(
+            server,
+            allowlist.clone(),
+            vec![60000],
+            stop,
+            active.clone(),
+            Arc::new(tokio::sync::RwLock::new(())),
+            None,
+            tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT,
+            Some(Arc::new(crate::server_info::RunningServerInfo {
+                public_key: [4; 32],
+                info,
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        let response: crate::server_info::Response = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response.core_version, "0.5.0");
+        assert_eq!(response.generation, expected_generation);
+        assert_eq!(response.challenge, hex::encode([8; 32]));
+        assert_eq!(response.server_pubkey, hex::encode([4; 32]));
+        assert_eq!(*allowlist.lock().unwrap(), vec![[2; 32]]);
+        assert_eq!(active.load(Ordering::SeqCst), 9);
+        assert!(stop_rx.try_recv().is_err());
+    }
+}

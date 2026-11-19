@@ -2,7 +2,7 @@
 
 use super::worker_protocol::{decode, Fault, Frame};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 pub(super) fn pair() -> io::Result<(UnixStream, UnixStream)> {
@@ -30,43 +30,24 @@ pub(super) struct Packet<const N: usize = 9> {
 }
 
 pub(super) fn read_packet<const N: usize>(socket: &UnixStream) -> io::Result<Packet<N>> {
-    use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
+    use nix::sys::socket::MsgFlags;
     let mut bytes = [0; N];
-    let mut iov = [io::IoSliceMut::new(&mut bytes)];
-    let mut control = nix::cmsg_space!([RawFd; 8], nix::libc::ucred);
-    // Both owned receiving ends enable SO_PASSCRED before any sender can run.
-    // Credentials distinguish even a zero-byte packet from actual EOF. UID may
-    // legitimately change during worker startup and is not an authority check.
-    let message = recvmsg::<()>(
-        socket.as_raw_fd(),
-        &mut iov,
-        Some(&mut control),
+    let control_bytes =
+        crate::ancillary::space::<[RawFd; 8]>() + crate::ancillary::space::<nix::libc::ucred>();
+    let packet = crate::ancillary::receive(
+        socket.as_fd(),
+        &mut bytes,
+        control_bytes,
         MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC,
     )?;
-    let len = message.bytes;
-    let truncated = message
+    let len = packet.bytes;
+    let truncated = packet
         .flags
         .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC);
-    let mut sender = None;
-    let mut ancillary = false;
-    // Close every descriptor the kernel installed, even on zero/truncated or
-    // otherwise rejected packets. On Linux excess rights beyond the control
-    // buffer are closed by the kernel; CTRUNC still rejects the entire packet.
-    for item in message.cmsgs() {
-        match item {
-            ControlMessageOwned::ScmRights(rights) => {
-                ancillary = true;
-                for fd in rights {
-                    // SAFETY: recvmsg installed this fd for this one receiver.
-                    drop(unsafe { OwnedFd::from_raw_fd(fd) });
-                }
-            }
-            ControlMessageOwned::ScmCredentials(credentials) => {
-                ancillary |= sender.replace(credentials.pid()).is_some();
-            }
-            _ => ancillary = true,
-        }
-    }
+    let sender = packet.sender;
+    let ancillary = packet.rights || packet.unsupported;
+    // All installed prefix descriptors are owned before any rejection decision.
+    drop(packet.descriptors);
     Ok(Packet {
         bytes,
         len,
@@ -222,7 +203,7 @@ mod tests {
         drop(write);
         assert!(receive(&parent).is_err());
         let mut byte = [0];
-        let closed = nix::unistd::read(read.as_raw_fd(), &mut byte);
+        let closed = nix::unistd::read(&read, &mut byte);
         // Both endpoints stay alive: dropping a queued packet must not hide a
         // receiver which failed to consume/close its newly installed rights.
         drop(parent);
@@ -291,7 +272,7 @@ mod tests {
         .unwrap();
         drop(write);
         let result = receive(&parent);
-        let closed = nix::unistd::read(read.as_raw_fd(), &mut [0]);
+        let closed = nix::unistd::read(&read, &mut [0]);
         drop(parent);
         drop(child);
         assert_eq!(result, Err(Fault::Truncated));

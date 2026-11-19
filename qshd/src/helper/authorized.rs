@@ -87,7 +87,6 @@
 
 use std::fmt;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 
 use nix::fcntl::{self, OFlag};
@@ -367,8 +366,8 @@ fn absolute_components(path: &Path) -> std::io::Result<Vec<&std::ffi::OsStr>> {
     Ok(components)
 }
 
-fn validate_object(fd: std::os::fd::RawFd, uid: Uid, kind: SFlag) -> std::io::Result<()> {
-    let metadata = stat::fstat(fd).map_err(std::io::Error::from)?;
+fn validate_object(file: &std::fs::File, uid: Uid, kind: SFlag) -> std::io::Result<()> {
+    let metadata = stat::fstat(file).map_err(std::io::Error::from)?;
     if metadata.st_mode & SFlag::S_IFMT.bits() != kind.bits() {
         let reason = if kind == SFlag::S_IFREG {
             "not a regular file"
@@ -404,10 +403,10 @@ const DIRECTORY_FLAGS: OFlag = OFlag::O_PATH
 struct TrustedDirectory(std::fs::File);
 
 impl TrustedDirectory {
-    fn from_fd(fd: std::os::fd::RawFd, uid: Uid) -> std::io::Result<Self> {
+    fn from_fd(fd: std::os::fd::OwnedFd, uid: Uid) -> std::io::Result<Self> {
         // SAFETY: the successful open transfers its sole descriptor immediately.
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        validate_object(file.as_raw_fd(), uid, SFlag::S_IFDIR)?;
+        let file = std::fs::File::from(fd);
+        validate_object(&file, uid, SFlag::S_IFDIR)?;
         Ok(Self(file))
     }
 
@@ -417,25 +416,15 @@ impl TrustedDirectory {
     }
 
     fn child(&self, name: &std::ffi::OsStr, uid: Uid) -> std::io::Result<Self> {
-        let fd = fcntl::openat(
-            Some(self.0.as_raw_fd()),
-            name,
-            DIRECTORY_FLAGS,
-            stat::Mode::empty(),
-        )?;
+        let fd = fcntl::openat(&self.0, name, DIRECTORY_FLAGS, stat::Mode::empty())?;
         Self::from_fd(fd, uid)
     }
 
     fn leaf(&self, name: &std::ffi::OsStr, uid: Uid) -> std::io::Result<std::fs::File> {
-        let fd = fcntl::openat(
-            Some(self.0.as_raw_fd()),
-            name,
-            OPEN_FLAGS,
-            stat::Mode::empty(),
-        )?;
+        let fd = fcntl::openat(&self.0, name, OPEN_FLAGS, stat::Mode::empty())?;
         // SAFETY: immediately own the new fd, including on validation failure.
-        let file = unsafe { std::fs::File::from_raw_fd(fd) };
-        validate_object(file.as_raw_fd(), uid, SFlag::S_IFREG)?;
+        let file = std::fs::File::from(fd);
+        validate_object(&file, uid, SFlag::S_IFREG)?;
         Ok(file)
     }
 }
@@ -477,12 +466,11 @@ pub(super) fn read_regular_file_bounded(path: &Path) -> std::io::Result<Option<S
         Err(error) => return Err(error.into()),
     };
     // SAFETY: this is the sole owner of the descriptor just opened above.
-    read_opened_regular_file(unsafe { std::fs::File::from_raw_fd(fd) })
+    read_opened_regular_file(std::fs::File::from(fd))
 }
 
 fn read_opened_regular_file(mut file: std::fs::File) -> std::io::Result<Option<String>> {
-    let fd = file.as_raw_fd();
-    let metadata = stat::fstat(fd).map_err(std::io::Error::from)?;
+    let metadata = stat::fstat(&file).map_err(std::io::Error::from)?;
     if metadata.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFREG.bits() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -493,7 +481,7 @@ fn read_opened_regular_file(mut file: std::fs::File) -> std::io::Result<Option<S
     // Regular-file and network-filesystem I/O can still block. The verifier
     // child timeout bounds the attempt; O_NONBLOCK only prevents FIFO open
     // from waiting for a writer before the type check above.
-    fcntl::fcntl(fd, fcntl::FcntlArg::F_SETFL(OFlag::empty())).map_err(std::io::Error::from)?;
+    fcntl::fcntl(&file, fcntl::FcntlArg::F_SETFL(OFlag::empty())).map_err(std::io::Error::from)?;
 
     let mut buf = Vec::new();
     let read = (&mut file)
@@ -751,7 +739,7 @@ mod tests {
         let opened = anchor(dir.path())
             .leaf(std::ffi::OsStr::new("keys"), Uid::effective())
             .unwrap();
-        let inode = stat::fstat(opened.as_raw_fd()).unwrap().st_ino;
+        let inode = stat::fstat(&opened).unwrap().st_ino;
         std::fs::rename(&path, dir.path().join("moved")).unwrap();
         write_safe(&path, "replacement").unwrap();
         set_mode(&path, 0o666);
@@ -760,7 +748,7 @@ mod tests {
         {
             std::os::unix::fs::chown(&path, Some(61002), Some(61002)).unwrap();
         }
-        assert_eq!(stat::fstat(opened.as_raw_fd()).unwrap().st_ino, inode);
+        assert_eq!(stat::fstat(&opened).unwrap().st_ino, inode);
         assert_eq!(
             read_opened_regular_file(opened).unwrap().as_deref(),
             Some("original")

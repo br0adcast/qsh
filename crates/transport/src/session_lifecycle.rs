@@ -192,9 +192,16 @@ impl Lifecycle {
     }
     pub(super) fn spawn_blocking(&self, work: impl FnOnce() + Send + 'static) -> WorkerReceipt {
         let receipt = WorkerReceipt::default();
-        let completed = receipt.clone();
-        // Register the supervisor before it can launch the blocking work. Its
-        // handle remains owned even if the backend runner is cancelled.
+        self.spawn_blocking_with(receipt.clone(), work);
+        receipt
+    }
+    pub(super) fn spawn_blocking_with(
+        &self,
+        completed: WorkerReceipt,
+        work: impl FnOnce() + Send + 'static,
+    ) {
+        // Retained owners bind both receipts into exact wait custody before
+        // scheduling either worker. Network owners retain the same supervisor.
         self.spawn(async move {
             let result = tokio::task::spawn_blocking(work)
                 .await
@@ -204,7 +211,6 @@ impl Lifecycle {
                 panic!("owned blocking worker failed: {error}");
             }
         });
-        receipt
     }
     pub(super) fn is_empty(&self) -> bool {
         self.owner

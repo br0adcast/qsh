@@ -20,6 +20,11 @@ A public upstream positive fixture proves interoperability with this dependency;
 it does not prove any qsh release was signed. The four shipping-target fixture
 runs and static linkage checks are in the existing native crypto workflow.
 
+The verifier dependencies are pinned together to Sigstore 0.16.0 with only
+the offline AWS-LC provider enabled. The embedded roots and interoperability
+fixtures retain their original provenance below; a library upgrade does not
+silently replace trust anchors.
+
 ## Embedded production trust
 
 `roots/production.json` is copied byte-for-byte from `src/trusted_root.json` in

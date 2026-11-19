@@ -331,13 +331,17 @@ impl Setup {
         address: &::connect::Address,
         cancel: &knock::Cancel,
     ) -> Result<bringup::Ready, SshStepError> {
-        self.bring_up_observed(address, cancel, || {})
+        self.bring_up_observed(address, cancel, None, None, || {})
     }
 
+    /// Recovery's one SSH login. `before` and `after_ready` receive the
+    /// running daemon's server info from that login (`bringup::ServerInfoProbe`).
     pub(crate) fn bring_up_observed(
         &self,
         address: &::connect::Address,
         cancel: &knock::Cancel,
+        before: Option<bringup::ServerInfoGate<'_>>,
+        after_ready: Option<bringup::ServerInfoSink<'_>>,
         started: impl FnOnce(),
     ) -> Result<bringup::Ready, SshStepError> {
         let Some(server) = self.server_identity() else {
@@ -353,18 +357,26 @@ impl Setup {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .filter(|evidence| evidence.server == server);
-        let ready = self
-            .ssh_step(true, bringup::InstallPolicy::RestartOnly)
-            .run_recovery_observed(
-                address,
-                route,
-                self.keypair.public,
-                evidence
-                    .as_ref()
-                    .map(|evidence| (&evidence.origin, evidence.host_key.as_slice())),
-                cancel,
-                started,
-            )?;
+        let server_info =
+            (before.is_some() || after_ready.is_some()).then_some(bringup::ServerInfoProbe {
+                expected_key: server.qsh_key,
+                before,
+                after_ready,
+            });
+        let ready = SshStep {
+            server_info,
+            ..self.ssh_step(true, bringup::InstallPolicy::RestartOnly)
+        }
+        .run_recovery_observed(
+            address,
+            route,
+            self.keypair.public,
+            evidence
+                .as_ref()
+                .map(|evidence| (&evidence.origin, evidence.host_key.as_slice())),
+            cancel,
+            started,
+        )?;
         let port = ready.port_for(address.qsh_port);
         trust::check_bootstrap_key(&address.host, port, server.qsh_key, ready.server_pubkey)
             .and_then(|()| {
@@ -415,6 +427,7 @@ impl Setup {
             background,
             install_policy,
             images: daemon_images(),
+            server_info: None,
         }
     }
 
@@ -506,6 +519,12 @@ impl std::fmt::Debug for Loaded {
 }
 
 pub struct Climb<'a> {
+    retained_discovery: RetainedDiscovery,
+    attempt_endpoint: Mutex<Option<SocketAddr>>,
+    provisional_evidence:
+        Mutex<std::collections::HashMap<String, crate::server_discovery::AuthenticatedServerInfo>>,
+    discovery_keys: Mutex<std::collections::HashMap<usize, [u8; 32]>>,
+    incompatible_addresses: Mutex<HashSet<usize>>,
     fresh_session: bool,
     setup: &'a Setup,
     /// The addresses as this run knows them now: a port a daemon reported
@@ -534,15 +553,45 @@ pub struct Climb<'a> {
         ::connect::recovery_gate::SweepId,
     )>,
     bootstrap: Option<SshBootstrap>,
+    selected_operation: Option<(usize, u16)>,
+}
+
+#[derive(Default)]
+struct RetainedDiscovery(
+    Mutex<std::collections::HashMap<SocketAddr, Arc<transport::driver_std::StdClient>>>,
+);
+impl Drop for RetainedDiscovery {
+    fn drop(&mut self) {
+        for (_, client) in self.0.get_mut().expect("retained discovery").drain() {
+            client.detach();
+        }
+    }
 }
 
 /// An identity grant belongs only to the route and UDP port reported by
 /// this verified SSH login; it cannot authorize another candidate endpoint.
 struct SshBootstrap {
+    /// SSH bootstrap display context only; never authenticated discovery policy.
+    serving_version: String,
+    serving_profiles: Option<Vec<[u8; 3]>>,
     addr: usize,
     port: u16,
     key: [u8; 32],
     ssh_host_key: ssh::HostKeyInfo,
+}
+
+impl SshBootstrap {
+    fn failure_diagnostic(&self, line: &str) -> String {
+        let profile = if self.serving_profiles.is_none() {
+            "; session profile unknown"
+        } else {
+            ""
+        };
+        format!(
+            "{line} (selected running qshd {}{profile})",
+            report::printable(&self.serving_version)
+        )
+    }
 }
 
 impl<'a> Climb<'a> {
@@ -559,6 +608,11 @@ impl<'a> Climb<'a> {
     ) -> Climb<'a> {
         let details = vec![report::Detail::default(); addresses.len()];
         Climb {
+            retained_discovery: Default::default(),
+            attempt_endpoint: Mutex::new(None),
+            provisional_evidence: Mutex::new(std::collections::HashMap::new()),
+            discovery_keys: Mutex::new(std::collections::HashMap::new()),
+            incompatible_addresses: Mutex::new(HashSet::new()),
             setup,
             addrs: addresses,
             first,
@@ -575,6 +629,7 @@ impl<'a> Climb<'a> {
             fresh_session: false,
             recovery_attempt: None,
             bootstrap: None,
+            selected_operation: None,
         }
     }
 }
@@ -675,22 +730,82 @@ impl<'a> Climb<'a> {
                         .expect("the ladder asks for ssh only where there is one");
                     self.progress(host);
                     self.say(&report::trying_ssh(host, route));
-                    let result = self
-                        .setup
-                        .ssh_step(
+                    if self
+                        .incompatible_addresses
+                        .lock()
+                        .expect("incompatible addresses")
+                        .contains(&addr)
+                    {
+                        action = self.advance(&mut ladder, Outcome::Ssh(SshOutcome::Failed(
+                            ::connect::SshFailure::plain("authenticated server excludes this client's session profile; no update was requested"))), None);
+                        continue;
+                    }
+                    let expected_key = self
+                        .discovery_keys
+                        .lock()
+                        .expect("discovery keys")
+                        .get(&addr)
+                        .copied();
+                    // The pinned daemon's server info comes from the bootstrap's
+                    // own login, before anything is installed or started.
+                    let refused = std::cell::RefCell::new(None);
+                    let gate = |info: Option<&ssh::VerifiedSshServerInfo>| match info {
+                        Some(proof)
+                            if crate::server_discovery::decision(Some(proof.info()))
+                                .compatibility
+                                == ::connect::upgrade::Compatibility::Incompatible =>
+                        {
+                            *refused.borrow_mut() = Some(proof.clone());
+                            false
+                        }
+                        _ => true,
+                    };
+                    let result = SshStep {
+                        server_info: expected_key.map(|expected_key| bringup::ServerInfoProbe {
+                            expected_key,
+                            before: Some(&gate),
+                            after_ready: None,
+                        }),
+                        ..self.setup.ssh_step(
                             self.background(),
                             self.setup
                                 .install_policy(self.recovery.is_some(), self.background()),
                         )
-                        .run_identified(&addrs[addr], route, self.setup.keypair.public, cancel);
+                    }
+                    .run_foreground(
+                        &addrs[addr],
+                        route,
+                        self.setup.keypair.public,
+                        cancel,
+                    );
                     if !self.background() && crate::signals::termination_requested() {
                         return Climbed::Exit(130);
                     }
+                    if let Some(proof) = refused.take() {
+                        let why = crate::server_discovery::incompatibility(proof.info());
+                        let line = report::no_answer(host, addrs[addr].qsh_port, &why);
+                        self.provisional_evidence
+                            .lock()
+                            .expect("discovery evidence")
+                            .insert(
+                                format!("ssh:{}:{}", addrs[addr].host, route.port),
+                                crate::server_discovery::AuthenticatedServerInfo::Ssh(proof),
+                            );
+                        let outcome = Outcome::Ssh(SshOutcome::Failed(
+                            ::connect::SshFailure::plain(line.clone()),
+                        ));
+                        action = self.advance(&mut ladder, outcome, Some(line));
+                        continue;
+                    }
                     match result {
-                        Ok(identified) => {
+                        Ok(result) => {
+                            let identified = result.identified;
                             let ready = identified.ready;
                             let port = ready.port_for(addrs[addr].qsh_port);
+                            self.selected_operation = result.selected.then_some((addr, port));
                             self.bootstrap = Some(SshBootstrap {
+                                serving_version: ready.version.clone(),
+                                serving_profiles: ready.serving_profiles.clone(),
                                 addr,
                                 port,
                                 key: ready.server_pubkey,
@@ -704,6 +819,21 @@ impl<'a> Climb<'a> {
                             let outcome = Outcome::Ssh(SshOutcome::Ready { port });
                             log::log(&format!("ladder: outcome {outcome:?}"));
                             ladder.on(outcome)
+                        }
+                        Err(SshStepError::BusyCancelled) => {
+                            self.end_selected_operation(cancel);
+                            self.say("qsh: connection cancelled; no restart requested");
+                            return Climbed::Exit(1);
+                        }
+                        Err(SshStepError::SelectedBusyFailed(failure)) => {
+                            self.end_selected_operation(cancel);
+                            let why = ::connect::SshFailure::plain(format!(
+                                "{} (selected running qshd {})",
+                                failure.error,
+                                report::printable(&failure.info.identity.version),
+                            ));
+                            self.say(&report::ssh_failed(host, &why));
+                            return Climbed::Exit(1);
                         }
                         Err(SshStepError::InstallDeclined) => {
                             self.say(&report::install_declined());
@@ -735,13 +865,39 @@ impl<'a> Climb<'a> {
                     }
                 }
                 Action::TryDirectAfterSsh { addr, port } => {
+                    let selected = self.selected_operation == Some((addr, port));
                     let (outcome, line) = match self.direct(addr, port, Stage::AfterSsh, cancel) {
                         Ok(v) => v,
-                        Err(code) => return Climbed::Exit(code),
+                        Err(code) => {
+                            if selected {
+                                self.end_selected_operation(cancel);
+                            }
+                            return Climbed::Exit(code);
+                        }
                     };
+                    let line = line.map(|line| {
+                        self.bootstrap
+                            .as_ref()
+                            .filter(|b| b.addr == addr && b.port == port)
+                            .map_or_else(|| line.clone(), |b| b.failure_diagnostic(&line))
+                    });
+                    if selected && outcome != DirectOutcome::Connected {
+                        let line = line.unwrap_or_else(|| {
+                            let reason =
+                                format!("qsh: selected daemon data connection failed: {outcome:?}");
+                            self.bootstrap.as_ref().map_or_else(
+                                || reason.clone(),
+                                |bootstrap| bootstrap.failure_diagnostic(&reason),
+                            )
+                        });
+                        self.end_selected_operation(cancel);
+                        self.say(&line);
+                        return Climbed::Exit(1);
+                    }
                     self.advance(&mut ladder, Outcome::Direct(outcome), line)
                 }
                 Action::Connected { addr, port } => {
+                    self.selected_operation = None;
                     let (attempt, trial, remote) = self
                         .connected
                         .take()
@@ -776,6 +932,25 @@ impl<'a> Climb<'a> {
                 Action::GiveUp(give_up) => return self.give_up(give_up, &addrs),
             };
         }
+    }
+
+    /// A chosen operation owns this attempt, including any retained discovery
+    /// workers. Detach and join without sending Close to an existing session.
+    fn end_selected_operation(&mut self, cancel: &knock::Cancel) {
+        cancel.cancel();
+        let retained = std::mem::take(
+            &mut *self
+                .retained_discovery
+                .0
+                .lock()
+                .expect("retained discovery"),
+        );
+        for client in retained.into_values() {
+            client.detach();
+        }
+        self.bootstrap = None;
+        self.selected_operation = None;
+        self.drain();
     }
 
     /// Spec §4a rule 1, at login, before the first attempt: addresses of one
@@ -830,6 +1005,7 @@ impl<'a> Climb<'a> {
                     unreachable!("a login never finds its session gone")
                 }
                 GiveUp::AllFailed(failures) => {
+                    self.finish_failed_discovery();
                     for line in report::exit_12_summary(
                         addrs,
                         &failures,
@@ -839,6 +1015,37 @@ impl<'a> Climb<'a> {
                     ) {
                         eprintln!("{line}");
                         log::shown(&line);
+                    }
+                    // Only after every route failed may a provisional incompatible
+                    // peer explain the failure. A successful alternative bypasses this.
+                    let evidence = self
+                        .provisional_evidence
+                        .lock()
+                        .expect("discovery evidence")
+                        .values()
+                        .find(|proof| {
+                            crate::server_discovery::decision(Some(proof.info())).compatibility
+                                == ::connect::upgrade::Compatibility::Incompatible
+                        })
+                        .cloned();
+                    if let Some(proof) = evidence {
+                        self.say(&format!("qsh: authenticated qshd {} does not support this client's session profile (wire {}, handshake {}, channel {})",
+                            report::printable(&proof.info().core_version), transport::wire::VERSION,
+                            transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION));
+                        let policy = crate::server_discovery::decision(Some(proof.info()));
+                        let view = crate::upgrade_offer::presentation(
+                            || {
+                                crate::client_install::update_eligibility()
+                                    .unwrap_or(crate::client_install::UpdateEligibility::Unmanaged)
+                            },
+                            true,
+                            policy.offer.as_ref().map(|offer| offer.version.as_str()),
+                        );
+                        if crate::upgrade_offer::present(&self.setup.tty, &view, || {
+                            !self.interrupted()
+                        }) {
+                            return Climbed::Exit(0);
+                        }
                     }
                     Climbed::Exit(12)
                 }
@@ -951,6 +1158,20 @@ impl<'a> Climb<'a> {
         }
         let result = self.direct_attempt(i, port, stage, cancel);
         if let Ok((outcome, _)) = &result {
+            if matches!(
+                outcome,
+                DirectOutcome::NoAnswer(
+                    NoAnswerWhy::ServerIncompatible { .. }
+                        | NoAnswerWhy::UnsupportedProtocol { .. }
+                        | NoAnswerWhy::MissingRequiredFeatures { .. }
+                        | NoAnswerWhy::InvalidProtocol
+                )
+            ) {
+                self.incompatible_addresses
+                    .lock()
+                    .expect("incompatible addresses")
+                    .insert(i);
+            }
             self.account_direct(i, outcome.clone());
         }
         result
@@ -1146,6 +1367,10 @@ impl<'a> Climb<'a> {
             }
         };
 
+        self.discovery_keys
+            .lock()
+            .expect("discovery keys")
+            .insert(i, server.key);
         let stage = if self.recovery.is_some() && self.setup.is_allowlisted(&host, port) {
             Stage::AfterSsh
         } else {
@@ -1245,6 +1470,14 @@ impl<'a> Climb<'a> {
                         None,
                     ));
                 }
+                Verdict::ServerIncompatible(info) => {
+                    self.forget(&att);
+                    let why = crate::server_discovery::incompatibility(&info);
+                    return Ok((
+                        DirectOutcome::NoAnswer(why.clone()),
+                        Some(report::no_answer(host, port, &why)),
+                    ));
+                }
                 Verdict::ProtocolFailure(failure) => {
                     self.forget(&att);
                     let why = protocol_why(failure);
@@ -1319,6 +1552,14 @@ impl<'a> Climb<'a> {
                         reason: attempt::abort_code(reason),
                     },
                     None,
+                )
+            }
+            Verdict::ServerIncompatible(info) => {
+                self.forget(&att);
+                let why = crate::server_discovery::incompatibility(&info);
+                (
+                    DirectOutcome::NoAnswer(why.clone()),
+                    Some(report::no_answer(host, port, &why)),
                 )
             }
             Verdict::ProtocolFailure(failure) => {
@@ -1522,6 +1763,38 @@ impl<'a> Climb<'a> {
     /// unreachable, and a `Close` would then tear down the very session a
     /// return is for (or, at login, the one a warm return found).
     fn forget(&self, att: &attempt::Attempt) {
+        let proofs = att.client.discovered_server_info_by_endpoint();
+        self.provisional_evidence
+            .lock()
+            .expect("discovery evidence")
+            .extend(proofs.into_iter().map(|(endpoint, proof)| {
+                (
+                    endpoint.to_string(),
+                    crate::server_discovery::AuthenticatedServerInfo::Bootstrap(proof),
+                )
+            }));
+        if !self.background()
+            && !att.client.discovery_complete()
+            && matches!(
+                att.verdict(),
+                Verdict::ProtocolFailure(_) | Verdict::AuthRefused
+            )
+        {
+            if let Some(endpoint) = *self.attempt_endpoint.lock().expect("attempt endpoint") {
+                att.retire_for_discovery();
+                if let Some(previous) = self
+                    .retained_discovery
+                    .0
+                    .lock()
+                    .expect("retained discovery")
+                    .insert(endpoint, att.client.clone())
+                {
+                    previous.detach();
+                }
+                self.drain();
+                return;
+            }
+        }
         // Before acceptance the tentative hint remains a conservative teardown
         // safeguard; it never establishes authentication or recovery success.
         let resumed = att.acceptance().map_or_else(
@@ -1547,6 +1820,20 @@ impl<'a> Climb<'a> {
         server_pub: [u8; 32],
         login: Login,
     ) -> (Verdict, attempt::Attempt, Trial) {
+        *self.attempt_endpoint.lock().expect("attempt endpoint") = Some(sockaddr);
+        if let Some(previous) = self
+            .retained_discovery
+            .0
+            .lock()
+            .expect("retained discovery")
+            .remove(&sockaddr)
+        {
+            previous.detach();
+        }
+        self.provisional_evidence
+            .lock()
+            .expect("discovery evidence")
+            .remove(&sockaddr.to_string());
         let att = attempt::Attempt::open(
             sockaddr,
             server_pub,
@@ -1561,6 +1848,60 @@ impl<'a> Climb<'a> {
             att.probe_port_refusal(sockaddr);
         }
         self.trial_for_attempt(att)
+    }
+
+    /// Only terminal failure waits for an already active bootstrap's remaining
+    /// original budget. Other routes run first; successful admission never waits.
+    fn finish_failed_discovery(&self) {
+        loop {
+            let now = std::time::Instant::now();
+            let clients: Vec<_> = self
+                .retained_discovery
+                .0
+                .lock()
+                .expect("retained discovery")
+                .iter()
+                .map(|(endpoint, client)| (*endpoint, client.clone()))
+                .collect();
+            if clients.is_empty() {
+                return;
+            }
+            for (endpoint, client) in clients {
+                if self.interrupted()
+                    || client.discovery_complete()
+                    || client
+                        .discovery_deadline()
+                        .is_none_or(|deadline| now >= deadline)
+                {
+                    let proofs = client.discovered_server_info_by_endpoint();
+                    self.provisional_evidence
+                        .lock()
+                        .expect("discovery evidence")
+                        .extend(proofs.into_iter().map(|(endpoint, proof)| {
+                            (
+                                endpoint.to_string(),
+                                crate::server_discovery::AuthenticatedServerInfo::Bootstrap(proof),
+                            )
+                        }));
+                    self.retained_discovery
+                        .0
+                        .lock()
+                        .expect("retained discovery")
+                        .remove(&endpoint);
+                    client.detach();
+                }
+            }
+            if self
+                .retained_discovery
+                .0
+                .lock()
+                .expect("retained discovery")
+                .is_empty()
+            {
+                return;
+            }
+            let _ = self.rx.recv_timeout(std::time::Duration::from_millis(20));
+        }
     }
 
     fn trial_for_attempt(&self, att: attempt::Attempt) -> (Verdict, attempt::Attempt, Trial) {
@@ -1604,15 +1945,32 @@ impl<'a> Climb<'a> {
         // and End first of all -- arrive as sequences the remote does not
         // recognize.
         let term = std::env::var("TERM").ok();
-        let (verdict, opened_ch) = settle_opening(
+        let (mut verdict, opened_ch) = settle_opening(
             &att,
             &mut channel_session,
             term.as_deref(),
             self.cols,
             self.rows,
             !self.background() || self.fresh_session,
+            self.recovery,
             || self.interrupted(),
         );
+        if !matches!(
+            verdict,
+            Verdict::Working | Verdict::LocalSendFailure(_) | Verdict::SessionAborted(_)
+        ) {
+            if let Some(proof) = att
+                .client
+                .discovered_server_info()
+                .into_iter()
+                .find(|proof| {
+                    crate::server_discovery::decision(Some(proof.info())).compatibility
+                        == ::connect::upgrade::Compatibility::Incompatible
+                })
+            {
+                verdict = Verdict::ServerIncompatible(proof.info().clone());
+            }
+        }
         (
             verdict,
             att,
@@ -1812,6 +2170,7 @@ fn let_go(resumed: bool) -> LetGo {
 /// Open a fresh shell only after explicit acceptance and existing consent.
 /// A resumed transport keeps its authoritative channel metadata; recovery probes
 /// that discover a fresh session open nothing before the owner agrees.
+#[allow(clippy::too_many_arguments)]
 fn settle_opening(
     att: &attempt::Attempt,
     channel_session: &mut ChannelSession<QshSubstrate<Sink>>,
@@ -1819,7 +2178,40 @@ fn settle_opening(
     cols: u16,
     rows: u16,
     open_fresh: bool,
+    recovery: Option<&Recovery>,
     interrupted: impl Fn() -> bool,
+) -> (Verdict, Option<ChannelId>) {
+    settle_opening_with_observation(
+        att,
+        channel_session,
+        term,
+        cols,
+        rows,
+        open_fresh,
+        interrupted,
+        || {
+            if let (Some(recovery), Some(generation)) = (recovery, att.client.server_generation()) {
+                if let Some(crate::server_discovery::AuthenticatedServerInfo::Ssh(proof)) =
+                    recovery.server_info_for_generation(generation)
+                {
+                    att.bind_ssh_server_info(proof);
+                }
+            }
+            att.authenticated_server_info()
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_opening_with_observation(
+    att: &attempt::Attempt,
+    channel_session: &mut ChannelSession<QshSubstrate<Sink>>,
+    term: Option<&str>,
+    cols: u16,
+    rows: u16,
+    open_fresh: bool,
+    interrupted: impl Fn() -> bool,
+    observation: impl Fn() -> Option<crate::server_discovery::AuthenticatedServerInfo>,
 ) -> (Verdict, Option<ChannelId>) {
     if let Some(term) = term {
         if let Err(error) = channel_session.announce_term(term) {
@@ -1828,8 +2220,17 @@ fn settle_opening(
     }
     let mut opened_ch = None;
     let mut send_error = None;
+    let mut incompatible = None;
     let verdict = att.settle_until(
         || {
+            if let Some(proof) = observation() {
+                if crate::server_discovery::decision(Some(proof.info())).compatibility
+                    == ::connect::upgrade::Compatibility::Incompatible
+                {
+                    incompatible = Some(proof.info().clone());
+                    return;
+                }
+            }
             if open_fresh
                 && att.acceptance().is_some_and(|accepted| {
                     accepted.disposition == transport::SessionDisposition::Fresh
@@ -1844,7 +2245,9 @@ fn settle_opening(
         interrupted,
     );
     (
-        send_error.map_or(verdict, Verdict::LocalSendFailure),
+        incompatible
+            .map(Verdict::ServerIncompatible)
+            .unwrap_or_else(|| send_error.map_or(verdict, Verdict::LocalSendFailure)),
         opened_ch,
     )
 }

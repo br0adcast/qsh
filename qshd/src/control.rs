@@ -24,6 +24,13 @@
 
 mod path;
 
+pub use crate::endpoint::SocketCleanup;
+#[cfg(test)]
+use crate::endpoint::{
+    bind_prepared, remove_if_stale_prepared, sweep_stale_staging, STAGED_NAME, STALE_STAGING_AFTER,
+};
+use crate::endpoint::{bind_prepared_mode, bind_with_authority};
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -35,10 +42,28 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// Control socket client request (a text line without `\n`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlRequest {
     /// Return the daemon's current state ([`StatusResponse`]).
     Status,
+    /// Read actual running process metadata with a fresh caller challenge.
+    ServerInfo([u8; 32]),
+    /// Read-only, generation-bound negotiation of conditional registration.
+    RegistrationInfo([u8; 32]),
+    DestructiveRestartInfo([u8; 32]),
+    PrepareDestructiveStop(daemon_bootstrap_protocol::DestructiveRestartConsent),
+    CommitDestructiveStop {
+        receipt: [u8; 16],
+        consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
+    },
+    /// Exact-generation executable identity guard, checked atomically with insertion.
+    AddClientIf {
+        generation: [u8; 16],
+        build: u64,
+        checksum: [u8; 32],
+        pid: u32,
+        key: [u8; 32],
+    },
     /// Start listening on one more QUIC port (without restarting the daemon).
     AddPort(u16),
     /// Add a client Noise key (32-byte X25519) to a live transport daemon's
@@ -50,6 +75,81 @@ pub enum ControlRequest {
     AddClient([u8; 32]),
     /// Shut the daemon down.
     Stop,
+}
+
+/// Separate from strict SERVER-INFO: generation is not a capability advertisement.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationInfoResponse {
+    pub schema: u8,
+    pub challenge: String,
+    pub conditional_add_client: bool,
+    pub identity: daemon_bootstrap_protocol::BusyDaemonIdentity,
+}
+
+/// Separate exact-generation destructive-operation capability; SERVER-INFO
+/// generation by itself never grants conditional STOP authority.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DestructiveRestartInfoResponse {
+    pub schema: u8,
+    pub challenge: String,
+    pub capability: String,
+    pub identity: daemon_bootstrap_protocol::BusyDaemonIdentity,
+}
+pub use crate::destructive_restart::Rejected as DestructiveRestartRefusal;
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DestructivePrepareResponse {
+    Prepared {
+        receipt: String,
+        consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
+    },
+    Refused {
+        reason: DestructiveRestartRefusal,
+    },
+}
+impl DestructivePrepareResponse {
+    pub(crate) fn from_result(
+        result: Result<[u8; 16], DestructiveRestartRefusal>,
+        consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
+    ) -> Self {
+        match result {
+            Ok(receipt) => Self::Prepared {
+                receipt: hex::encode(receipt),
+                consent,
+            },
+            Err(reason) => Self::Refused { reason },
+        }
+    }
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DestructiveCommitResponse {
+    Committed {
+        receipt: String,
+        consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
+        already_committed: bool,
+    },
+    Refused {
+        reason: DestructiveRestartRefusal,
+    },
+}
+impl DestructiveCommitResponse {
+    pub(crate) fn from_result(
+        result: Result<crate::destructive_restart::Commit, DestructiveRestartRefusal>,
+        receipt: [u8; 16],
+        consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
+    ) -> Self {
+        match result {
+            Ok(outcome) => Self::Committed {
+                receipt: hex::encode(receipt),
+                consent,
+                already_committed: outcome == crate::destructive_restart::Commit::AlreadyCommitted,
+            },
+            Err(reason) => Self::Refused { reason },
+        }
+    }
 }
 
 /// State of a single port on which the daemon accepts QUIC connections --
@@ -169,8 +269,73 @@ impl StatusResponse {
 /// Parse a control socket request line. The line arrives already stripped
 /// of its trailing `\n` (the socket's line reader removes it).
 pub fn parse_request(line: &str) -> Option<ControlRequest> {
+    if line.len() > 4096 {
+        return None;
+    }
     let mut parts = line.split(' ');
     match parts.next()? {
+        "DESTRUCTIVE-RESTART-INFO" => {
+            let challenge = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::DestructiveRestartInfo(challenge))
+        }
+        "PREPARE-DESTRUCTIVE-STOP" => {
+            let raw = BASE64.decode(parts.next()?).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::PrepareDestructiveStop(
+                serde_json::from_slice(&raw).ok()?,
+            ))
+        }
+        "COMMIT-DESTRUCTIVE-STOP" => {
+            let receipt = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+            let raw = BASE64.decode(parts.next()?).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::CommitDestructiveStop {
+                receipt,
+                consent: serde_json::from_slice(&raw).ok()?,
+            })
+        }
+        "SERVER-INFO" => {
+            let text = parts.next()?;
+            if text.len() != 64 {
+                return None;
+            }
+            let raw = hex::decode(text).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::ServerInfo(raw.try_into().ok()?))
+        }
+        "REGISTRATION-INFO" => {
+            let raw = hex::decode(parts.next()?).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::RegistrationInfo(raw.try_into().ok()?))
+        }
+        "ADD-CLIENT-IF" => {
+            let generation = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+            let build = parts.next()?.parse().ok()?;
+            let checksum = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+            let pid = parts.next()?.parse().ok()?;
+            let key = BASE64.decode(parts.next()?).ok()?.try_into().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::AddClientIf {
+                generation,
+                build,
+                checksum,
+                pid,
+                key,
+            })
+        }
         "STATUS" => {
             if parts.next().is_some() {
                 return None;
@@ -208,6 +373,36 @@ pub fn parse_request(line: &str) -> Option<ControlRequest> {
 pub fn format_request(req: &ControlRequest) -> String {
     match req {
         ControlRequest::Status => "STATUS\n".to_string(),
+        ControlRequest::DestructiveRestartInfo(challenge) => {
+            format!("DESTRUCTIVE-RESTART-INFO {}\n", hex::encode(challenge))
+        }
+        ControlRequest::PrepareDestructiveStop(consent) => format!(
+            "PREPARE-DESTRUCTIVE-STOP {}\n",
+            BASE64.encode(serde_json::to_vec(consent).expect("consent serializes"))
+        ),
+        ControlRequest::CommitDestructiveStop { receipt, consent } => format!(
+            "COMMIT-DESTRUCTIVE-STOP {} {}\n",
+            hex::encode(receipt),
+            BASE64.encode(serde_json::to_vec(consent).expect("consent serializes"))
+        ),
+        ControlRequest::ServerInfo(challenge) => {
+            format!("SERVER-INFO {}\n", hex::encode(challenge))
+        }
+        ControlRequest::RegistrationInfo(challenge) => {
+            format!("REGISTRATION-INFO {}\n", hex::encode(challenge))
+        }
+        ControlRequest::AddClientIf {
+            generation,
+            build,
+            checksum,
+            pid,
+            key,
+        } => format!(
+            "ADD-CLIENT-IF {} {build} {} {pid} {}\n",
+            hex::encode(generation),
+            hex::encode(checksum),
+            BASE64.encode(key)
+        ),
         ControlRequest::AddPort(port) => format!("ADD-PORT {port}\n"),
         ControlRequest::AddClient(key) => format!("ADD-CLIENT {}\n", BASE64.encode(key)),
         ControlRequest::Stop => "STOP\n".to_string(),
@@ -340,7 +535,30 @@ fn client_request_at(
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let reply = match reader.read_line(&mut line) {
+    let read_result = if matches!(
+        req,
+        ControlRequest::ServerInfo(_)
+            | ControlRequest::RegistrationInfo(_)
+            | ControlRequest::DestructiveRestartInfo(_)
+            | ControlRequest::PrepareDestructiveStop(_)
+            | ControlRequest::CommitDestructiveStop { .. }
+    ) {
+        std::io::Read::take(&mut reader, 4097).read_line(&mut line)
+    } else {
+        reader.read_line(&mut line)
+    };
+    if matches!(
+        req,
+        ControlRequest::ServerInfo(_)
+            | ControlRequest::RegistrationInfo(_)
+            | ControlRequest::DestructiveRestartInfo(_)
+            | ControlRequest::PrepareDestructiveStop(_)
+            | ControlRequest::CommitDestructiveStop { .. }
+    ) && line.len() > 4096
+    {
+        anyhow::bail!("server-info response exceeds limit");
+    }
+    let reply = match read_result {
         Ok(0) => Ok(ControlReply::NoDaemon), // closed with no response -- no one home
         Ok(_) => Ok(ControlReply::Answered(
             line.trim_end_matches('\n').to_string(),
@@ -485,9 +703,19 @@ fn daemon_gone(pid: u32, sock: &Path) -> bool {
 /// Drop only closes this descriptor, never LOCK_UN: a fork inherits the same
 /// open-file description, so the lock ends only after its last copy closes.
 pub struct EnsureLock {
-    authority: path::EndpointAuthority,
-    _file: std::fs::File,
+    endpoint: crate::endpoint::EndpointLock,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceStopDispatch {
+    Refused,
+    Acknowledged,
+    Uncertain,
+}
+
+#[cfg(test)]
+#[path = "control_service_tests.rs"]
+mod service_tests;
 
 impl EnsureLock {
     /// Attempt immediately, even for a zero budget, then bound contention by
@@ -502,91 +730,142 @@ impl EnsureLock {
         patience: Duration,
         opened: impl FnOnce(),
     ) -> std::io::Result<Self> {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
         let authority = path::EndpointAuthority::open(socket, true)?;
-        authority.entry()?;
-        let file = authority.open_lock()?;
-        let metadata = file.metadata()?;
-        let identity = nix::sys::stat::fstat(file.as_raw_fd())?;
-        if !metadata.is_file()
-            || metadata.uid() != nix::unistd::geteuid().as_raw()
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o7777 != 0o600
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "the ensure lock must be a private, singly linked regular file owned by this user",
-            ));
-        }
-        opened();
-        let deadline = std::time::Instant::now()
-            .checked_add(patience)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "ensure lock wait budget is too large",
-                )
-            })?;
-        let mut attempted = false;
-        loop {
-            // There is one immediate attempt, including with zero patience.
-            // Neither contention nor EINTR grants another attempt after expiry.
-            if attempted && std::time::Instant::now() >= deadline {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("timed out after {patience:?} waiting for another transport ensure transaction"),
-                ));
-            }
-            attempted = true;
-            // SAFETY: the descriptor remains owned by file throughout the call.
-            if unsafe {
-                nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB)
-            } == 0
-            {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            match error.kind() {
-                std::io::ErrorKind::Interrupted => continue,
-                std::io::ErrorKind::WouldBlock => std::thread::sleep(
-                    Duration::from_millis(25)
-                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
-                ),
-                _ => return Err(error),
-            }
-        }
-        authority.validate_route()?;
-        let current = nix::sys::stat::fstatat(
-            Some(authority.parent.as_raw_fd()),
-            authority.lock.as_os_str(),
-            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
-        )?;
-        if !path::same(&current, &identity) {
-            return Err(path::refused("the ensure lock changed while waiting"));
-        }
         Ok(Self {
-            authority,
-            _file: file,
+            endpoint: crate::endpoint::EndpointLock::acquire_prepared(authority, patience, opened)?,
         })
     }
 
     /// Reject an observed route change; never move an active transaction.
     pub fn validate_route(&self) -> std::io::Result<()> {
-        self.authority.validate_route()
+        self.endpoint.validate_route()
     }
 
     pub fn request(&self, request: &ControlRequest) -> Result<ControlReply> {
         client_request_at(
-            &self.authority,
+            self.endpoint.authority(),
             request,
             CLIENT_READ_TIMEOUT,
             check_control_peer,
         )
     }
 
+    pub fn stop_service_once(&self) -> ServiceStopDispatch {
+        self.stop_service_once_checked(CLIENT_READ_TIMEOUT, check_control_peer)
+    }
+    fn stop_service_once_checked(
+        &self,
+        timeout: Duration,
+        check: impl FnOnce(&UnixStream) -> Result<()>,
+    ) -> ServiceStopDispatch {
+        let connect = || -> Result<UnixStream> {
+            self.endpoint.authority().validate_route()?;
+            anyhow::ensure!(
+                self.endpoint.authority().entry()?.is_some(),
+                "personal service endpoint absent"
+            );
+            let stream = UnixStream::connect(&self.endpoint.authority().syscall_path)?;
+            self.endpoint.authority().validate_route()?;
+            check(&stream)?;
+            self.endpoint.authority().validate_route()?;
+            anyhow::ensure!(
+                self.endpoint.authority().entry()?.is_some(),
+                "personal service endpoint disappeared before dispatch"
+            );
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+            Ok(stream)
+        };
+        let Ok(mut stream) = connect() else {
+            return ServiceStopDispatch::Refused;
+        };
+        // Once a write is attempted, every failure is possibly committed.
+        // Never reconnect, retry STOP, or infer absence from EOF.
+        if stream.write_all(b"STOP\n").is_err() {
+            return ServiceStopDispatch::Uncertain;
+        }
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut line = String::new();
+        let mut reader = BufReader::new(stream);
+        if std::io::Read::take(&mut reader, 4097)
+            .read_line(&mut line)
+            .is_err()
+            || line.len() > 4096
+            || !line.ends_with('\n')
+            || self.endpoint.authority().validate_route().is_err()
+        {
+            return ServiceStopDispatch::Uncertain;
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Ack {
+            Legacy { stopped: bool },
+            Current { stopping: bool },
+        }
+        if serde_json::from_str::<Ack>(line.trim_end()).is_ok_and(|ack| match ack {
+            Ack::Legacy { stopped } => stopped,
+            Ack::Current { stopping } => stopping,
+        }) {
+            ServiceStopDispatch::Acknowledged
+        } else {
+            ServiceStopDispatch::Uncertain
+        }
+    }
+
+    /// The consent describes this independently derived personal route only.
+    pub fn personal_service_selector(
+        &self,
+        port: u16,
+    ) -> Option<daemon_bootstrap_protocol::PersonalServiceSelector> {
+        let uid = nix::unistd::geteuid().as_raw();
+        if uid == 0 || uid != nix::unistd::getuid().as_raw() || self.validate_route().is_err() {
+            return None;
+        }
+        let selector = daemon_bootstrap_protocol::PersonalServiceSelector {
+            profile: daemon_bootstrap_protocol::PersonalServiceProfile::PersonalTransportV1,
+            uid,
+            endpoint: self.endpoint.authority().route.to_str()?.to_owned(),
+            port,
+        };
+        selector.valid().then_some(selector)
+    }
+
+    /// Exercise the actual filesystem primitive on an operation-owned absent
+    /// name before STOP. Cleanup retains only this probe's inode.
+    pub fn preflight_absent_publication(&self) -> std::io::Result<()> {
+        use rand_core::TryRng;
+        self.validate_route()?;
+        let mut random = [0u8; 16];
+        getrandom::SysRng
+            .try_fill_bytes(&mut random)
+            .map_err(std::io::Error::other)?;
+        let route = self
+            .endpoint
+            .authority()
+            .route
+            .with_file_name(format!(".restart-probe-{}", hex::encode(random)));
+        let authority = path::EndpointAuthority::open(&route, false)?;
+        if !path::same(
+            &nix::sys::stat::fstat(&self.endpoint.authority().parent)?,
+            &nix::sys::stat::fstat(&authority.parent)?,
+        ) {
+            return Err(path::refused("the restart preflight parent changed"));
+        }
+        self.validate_route()?;
+        let (_listener, cleanup) = bind_prepared_mode(&authority, |_| {}, false)?;
+        self.validate_route()?;
+        drop(cleanup);
+        Ok(())
+    }
+
     pub fn bind_private_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
-        bind_with_authority(&self.authority)
+        bind_with_authority(self.endpoint.authority())
+    }
+    /// A confirmed destructive restart may publish only into an absent leaf.
+    /// A competing endpoint is never removed under the old consent.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn bind_private_absent_owned(&self) -> std::io::Result<(UnixListener, SocketCleanup)> {
+        bind_prepared_mode(self.endpoint.authority(), |_| {}, false)
     }
 
     /// Check the retained parent, not a pathname reopened independently.
@@ -594,7 +873,7 @@ impl EnsureLock {
     pub(crate) fn require_private_parent(&self, uid: u32) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         self.validate_route()?;
-        let m = self.authority.parent.metadata()?;
+        let m = self.endpoint.authority().parent.metadata()?;
         if m.uid() != uid || m.mode() & 0o7777 != 0o700 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -606,101 +885,9 @@ impl EnsureLock {
 
     pub fn endpoint_exists(&self) -> std::io::Result<bool> {
         self.validate_route()?;
-        Ok(self.authority.entry()?.is_some())
+        Ok(self.endpoint.authority().entry()?.is_some())
     }
 }
-
-/// Owns removal of one published socket, including startup errors. Keeping a
-/// listener reference until removal prevents another ensure from observing a
-/// refused endpoint between the serving future's drop and this cleanup.
-/// The duplicate is close-on-exec; only the original listener crosses update
-/// handover, whose resumed owner creates its own guard before serving.
-pub struct SocketCleanup {
-    parent: std::fs::File,
-    leaf: std::ffi::OsString,
-    device: nix::libc::dev_t,
-    inode: nix::libc::ino_t,
-    remove_on_drop: bool,
-    _listener: UnixListener,
-}
-
-impl SocketCleanup {
-    /// A daemonization parent cannot infer child death from a wait error.
-    /// Leave publication to the child's inherited guard (or stale recovery).
-    pub fn leave_to_child(&mut self) {
-        self.remove_on_drop = false;
-    }
-
-    /// The caller must know that this path names this listener: an owned
-    /// private staging path, or a cooperatively inherited update listener.
-    /// A live inherited listener prevents another ensure from replacing it;
-    /// arbitrary external same-UID pathname mutation is outside this contract.
-    pub fn capture(listener: &UnixListener, path: &Path) -> std::io::Result<Self> {
-        let authority = path::EndpointAuthority::open(path, false)?;
-        authority.validate_route()?;
-        let metadata = authority.entry()?.ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "the control publication is missing",
-            )
-        })?;
-        if metadata.st_mode & 0o7777 != 0o600 {
-            return Err(path::refused(
-                "the inherited control publication must be private",
-            ));
-        }
-        Self::from_authority(listener, &authority, &metadata)
-    }
-
-    fn from_authority(
-        listener: &UnixListener,
-        authority: &path::EndpointAuthority,
-        metadata: &nix::libc::stat,
-    ) -> std::io::Result<Self> {
-        let parent = authority.parent.try_clone()?;
-        Ok(Self {
-            parent,
-            leaf: authority.leaf.clone(),
-            device: metadata.st_dev,
-            inode: metadata.st_ino,
-            remove_on_drop: true,
-            _listener: listener.try_clone()?,
-        })
-    }
-}
-
-impl Drop for SocketCleanup {
-    fn drop(&mut self) {
-        if !self.remove_on_drop {
-            return;
-        }
-        use nix::fcntl::AtFlags;
-        use nix::sys::stat::{fstatat, SFlag};
-        use std::os::fd::AsRawFd;
-        if let Ok(current) = fstatat(
-            Some(self.parent.as_raw_fd()),
-            self.leaf.as_os_str(),
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-        ) {
-            if current.st_mode & SFlag::S_IFMT.bits() == SFlag::S_IFSOCK.bits()
-                && current.st_dev == self.device
-                && current.st_ino == self.inode
-            {
-                let _ = nix::unistd::unlinkat(
-                    Some(self.parent.as_raw_fd()),
-                    self.leaf.as_os_str(),
-                    nix::unistd::UnlinkatFlags::NoRemoveDir,
-                );
-            }
-        }
-    }
-}
-
-/// Name of the staged socket inside the staging directory. One byte, kept
-/// short for the same reason the directory name is (see [`bind_private`]'s
-/// doc, Minor 1 of the task 6 review): a long staging path could refuse to
-/// bind at a length a plain bind at the final name would have accepted.
-const STAGED_NAME: &str = "s";
 
 /// Low-level pathname-bind fixture for the original permission/length tests.
 /// Production binds through the verified exclusive stage in `path::Stage`.
@@ -742,198 +929,6 @@ pub fn bind_private(path: &Path) -> std::io::Result<UnixListener> {
 /// Standalone binding convenience; production ensure uses its retained lock.
 pub fn bind_private_owned(path: &Path) -> std::io::Result<(UnixListener, SocketCleanup)> {
     bind_with_authority(&path::EndpointAuthority::open(path, false)?)
-}
-
-fn bind_with_authority(
-    authority: &path::EndpointAuthority,
-) -> std::io::Result<(UnixListener, SocketCleanup)> {
-    bind_prepared(authority, |_| {})
-}
-
-fn bind_prepared(
-    authority: &path::EndpointAuthority,
-    configure: impl FnOnce(&mut path::Stage),
-) -> std::io::Result<(UnixListener, SocketCleanup)> {
-    authority.validate_route()?;
-    authority.entry()?;
-    sweep_stale_staging_at(&authority.parent, std::time::SystemTime::now());
-    let mut stage = path::Stage::create(authority)?;
-    configure(&mut stage);
-    let listener = stage.bind(authority)?;
-    // Allocate every cleanup descriptor before publication. On a later error,
-    // this guard owns only this socket in this pinned parent, never a new route.
-    let cleanup = SocketCleanup::from_authority(&listener, authority, stage.socket())?;
-    stage.publish(authority)?;
-    Ok((listener, cleanup))
-}
-
-/// Minimum staging age for conservative crash recovery. Age is a heuristic;
-/// the separate PID check also preserves every process visible to this caller.
-/// Neither check proves that an inaccessible PID namespace has no live owner.
-const STALE_STAGING_AFTER: Duration = Duration::from_secs(60);
-
-/// The pid in a staging directory's name, if the name is exactly what
-/// [`bind_private`] writes: `.c` and a positive pid in decimal, no leading
-/// zero, nothing after it.
-fn staging_pid(name: &str) -> Option<i32> {
-    let digits = name.strip_prefix(".c")?;
-    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse::<i32>().ok().filter(|&pid| pid > 0)
-}
-
-/// Whether a process with this pid exists (a zombie counts), as far as
-/// this process can tell: only `ESRCH` says it does not.
-fn process_exists(pid: i32) -> bool {
-    !matches!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-        Err(nix::errno::Errno::ESRCH)
-    )
-}
-
-/// Remove the staging directories that daemons of this user left in
-/// `parent` when they died between [`bind_private`]'s `mkdir` and its
-/// cleanup (final review of slice 5, M4): only the next run with the same
-/// pid would otherwise remove one. Best effort, and conservative: a
-/// directory is removed only if every one of these holds --
-///
-/// - its name is `.c<pid>` exactly (see [`staging_pid`]);
-/// - it is a directory, not a symlink to one: it is opened with
-///   `O_NOFOLLOW`, and what that descriptor shows is what gets emptied;
-/// - it belongs to this process's effective uid and its mode is `0700`, as
-///   `bind_private` makes it;
-/// - it has gone unchanged for [`STALE_STAGING_AFTER`] as of `now`;
-/// - no process with its pid exists (a pid in use by anyone is left alone,
-///   whatever that process is);
-/// - it is empty, or holds only the staged socket (`s`, a socket, this
-///   uid's) -- which is dead then: its pid is gone.
-///
-/// The socket is unlinked through the directory's descriptor, the
-/// directory by name with `AT_REMOVEDIR`, which removes only an empty
-/// directory and never follows a symlink. Anything else in `parent` is
-/// never touched. Returns how many directories were removed.
-#[cfg(test)]
-fn sweep_stale_staging(parent: &Path, now: std::time::SystemTime) -> usize {
-    let Ok(authority) = path::EndpointAuthority::open(&parent.join("control.sock"), false) else {
-        return 0;
-    };
-    sweep_stale_staging_at(&authority.parent, now)
-}
-
-fn sweep_stale_staging_at(parent: &std::fs::File, now: std::time::SystemTime) -> usize {
-    use nix::dir::Dir;
-    use nix::fcntl::OFlag;
-    use nix::sys::stat::Mode;
-    use std::os::fd::AsRawFd;
-    let Ok(mut entries) = Dir::openat(
-        Some(parent.as_raw_fd()),
-        ".",
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    ) else {
-        return 0;
-    };
-    let mut removed = 0;
-    for entry in entries.iter().flatten() {
-        let Ok(name) = entry.file_name().to_str() else {
-            continue;
-        };
-        let Some(pid) = staging_pid(name) else {
-            continue;
-        };
-        if remove_if_stale(parent.as_raw_fd(), name, pid, now) {
-            removed += 1;
-        }
-    }
-    removed
-}
-
-/// One directory of [`sweep_stale_staging`]: whether it was removed.
-fn remove_if_stale(
-    parent: std::os::fd::RawFd,
-    name: &str,
-    pid: i32,
-    now: std::time::SystemTime,
-) -> bool {
-    remove_if_stale_prepared(parent, name, pid, now, || {})
-}
-
-fn remove_if_stale_prepared(
-    parent: std::os::fd::RawFd,
-    name: &str,
-    pid: i32,
-    now: std::time::SystemTime,
-    before_remove: impl FnOnce(),
-) -> bool {
-    use nix::dir::Dir;
-    use nix::fcntl::{AtFlags, OFlag};
-    use nix::sys::stat::{fstat, fstatat, Mode, SFlag};
-    use nix::unistd::{geteuid, unlinkat, UnlinkatFlags};
-    use std::os::fd::AsRawFd;
-
-    let Ok(mut dir) = Dir::openat(
-        Some(parent),
-        name,
-        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    ) else {
-        return false;
-    };
-    let fd = dir.as_raw_fd();
-    let uid = geteuid().as_raw();
-    let Ok(st) = fstat(fd) else {
-        return false;
-    };
-    if st.st_uid != uid || st.st_mode & 0o7777 != 0o700 {
-        return false;
-    }
-    let (Ok(secs), Ok(nanos)) = (u64::try_from(st.st_mtime), u32::try_from(st.st_mtime_nsec))
-    else {
-        return false;
-    };
-    let changed = std::time::UNIX_EPOCH + Duration::new(secs, nanos);
-    if now
-        .duration_since(changed)
-        .map_or(true, |age| age < STALE_STAGING_AFTER)
-    {
-        return false;
-    }
-    if process_exists(pid) {
-        return false;
-    }
-    let mut socket = false;
-    for entry in dir.iter() {
-        let Ok(entry) = entry else {
-            return false;
-        };
-        let entry_name = entry.file_name().to_bytes();
-        if entry_name == b"." || entry_name == b".." {
-            continue;
-        }
-        if entry_name != STAGED_NAME.as_bytes() {
-            return false;
-        }
-        let Ok(staged) = fstatat(Some(fd), STAGED_NAME, AtFlags::AT_SYMLINK_NOFOLLOW) else {
-            return false;
-        };
-        let kind = SFlag::from_bits_truncate(staged.st_mode) & SFlag::S_IFMT;
-        if kind != SFlag::S_IFSOCK || staged.st_uid != uid {
-            return false;
-        }
-        socket = true;
-    }
-    if socket && unlinkat(Some(fd), STAGED_NAME, UnlinkatFlags::NoRemoveDir).is_err() {
-        return false;
-    }
-    before_remove();
-    let Ok(current) = fstatat(Some(parent), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
-        return false;
-    };
-    if !path::same(&current, &st) {
-        return false;
-    }
-    unlinkat(Some(parent), name, UnlinkatFlags::RemoveDir).is_ok()
 }
 
 #[cfg(test)]
@@ -986,7 +981,7 @@ mod tests {
         let dir = super::private_test_dir().unwrap();
         let socket = dir.path().join("control.sock");
         let held = EnsureLock::acquire(&socket, Duration::from_secs(1)).unwrap();
-        let inherited = held._file.try_clone().unwrap();
+        let inherited = held.endpoint.file_for_test().try_clone().unwrap();
         let contender = std::fs::OpenOptions::new()
             .write(true)
             .open(dir.path().join("control.sock.lock"))
@@ -1039,7 +1034,9 @@ mod tests {
         let path = dir.path().join("control.sock");
         let listener = bind_private(&path).unwrap();
         let cleanup = SocketCleanup::capture(&listener, &path).unwrap();
-        let flags = unsafe { nix::libc::fcntl(cleanup._listener.as_raw_fd(), nix::libc::F_GETFD) };
+        let flags = unsafe {
+            nix::libc::fcntl(cleanup.listener_for_test().as_raw_fd(), nix::libc::F_GETFD)
+        };
         assert!(
             flags >= 0 && flags & nix::libc::FD_CLOEXEC != 0,
             "the cleanup duplicate must not leak through update exec"
@@ -1100,9 +1097,345 @@ mod tests {
     }
 
     #[test]
+    fn conditional_registration_codec_is_explicit_and_bounded() {
+        let request = ControlRequest::AddClientIf {
+            generation: [1; 16],
+            build: 7,
+            checksum: [2; 32],
+            pid: 42,
+            key: [3; 32],
+        };
+        assert_eq!(
+            parse_request(format_request(&request).trim_end()),
+            Some(request)
+        );
+        for bad in [
+            "REGISTRATION-INFO bad",
+            "ADD-CLIENT-IF bad",
+            "REGISTRATION-INFO 0000 trailing",
+        ] {
+            assert!(parse_request(bad).is_none());
+        }
+        let info = ControlRequest::RegistrationInfo([8; 32]);
+        assert_eq!(parse_request(format_request(&info).trim_end()), Some(info));
+    }
+
+    #[test]
+    fn destructive_receipt_codec_binds_checked_consent_and_bounds_frames() {
+        let consent = daemon_bootstrap_protocol::DestructiveRestartConsent {
+            attempt: daemon_bootstrap_protocol::BusyAttemptId::from_bytes([1; 16]),
+            identity: daemon_bootstrap_protocol::BusyDaemonIdentity {
+                version: "0.6.0-rc1".into(),
+                build: 1,
+                checksum: "ab".repeat(32),
+                pid: 42,
+                generation: Some("cd".repeat(16)),
+            },
+            candidate: daemon_bootstrap_protocol::CandidateImageIdentity {
+                build: 2,
+                checksum: "ef".repeat(32),
+            },
+            action: daemon_bootstrap_protocol::DestructiveRestartAction::StopAndRestart,
+        };
+        for request in [
+            ControlRequest::DestructiveRestartInfo([9; 32]),
+            ControlRequest::PrepareDestructiveStop(consent.clone()),
+            ControlRequest::CommitDestructiveStop {
+                receipt: [3; 16],
+                consent,
+            },
+        ] {
+            let line = format_request(&request);
+            assert!(line.len() <= 4096);
+            assert_eq!(parse_request(line.trim_end()), Some(request));
+            assert!(parse_request(&format!("{} extra", line.trim_end())).is_none());
+        }
+        for line in [
+            "DESTRUCTIVE-RESTART-INFO bad".to_string(),
+            "COMMIT-DESTRUCTIVE-STOP 0000 e30=".to_string(),
+            format!("PREPARE-DESTRUCTIVE-STOP {}", BASE64.encode(b"{}")),
+            "x".repeat(4097),
+        ] {
+            assert!(parse_request(&line).is_none());
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn confirmed_restart_publication_never_replaces_a_new_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let transaction = EnsureLock::acquire(&path, Duration::from_secs(1)).unwrap();
+        let competitor = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let prior = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            matches!(transaction.bind_private_absent_owned(),Err(error) if error.raw_os_error()==Some(nix::libc::EEXIST))
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), prior.ino());
+        let _client = UnixStream::connect(&path).unwrap();
+        let _accepted = competitor.accept().unwrap();
+        drop(competitor);
+        std::fs::remove_file(&path).unwrap();
+        let (_listener, _cleanup) = transaction.bind_private_absent_owned().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_restart_publication_preserves_non_utf8_leaf_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = PublicationFixture::new();
+        let leaf = std::ffi::OsString::from_vec(b"control-\xff.sock".to_vec());
+        fixture
+            .probe_lock_creation(&leaf)
+            .expect("Linux must create the exact raw lock leaf");
+        let path = fixture.directory.path().join(leaf);
+        let transaction = EnsureLock::acquire(&path, Duration::from_secs(1)).unwrap();
+        let (listener, cleanup) = transaction.bind_private_absent_owned().unwrap();
+        let _client = UnixStream::connect(&path).unwrap();
+        let _accepted = listener.accept().unwrap();
+        drop(cleanup);
+        assert!(
+            !path.exists(),
+            "cleanup retains the exact non-UTF8 endpoint"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct PublicationFixture {
+        directory: tempfile::TempDir,
+        parent: std::fs::File,
+        parent_identity: (u64, u64),
+        sentinel_identity: (u64, u64, u32),
+        names: std::collections::BTreeSet<Vec<u8>>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl PublicationFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::MetadataExt;
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("sentinel"), b"unrelated sentinel").unwrap();
+            let parent = std::fs::File::open(directory.path()).unwrap();
+            let parent_metadata = parent.metadata().unwrap();
+            let sentinel = std::fs::metadata(directory.path().join("sentinel")).unwrap();
+            let mut fixture = Self {
+                directory,
+                parent,
+                parent_identity: (parent_metadata.dev(), parent_metadata.ino()),
+                sentinel_identity: (sentinel.dev(), sentinel.ino(), sentinel.mode()),
+                names: Default::default(),
+            };
+            fixture.names = fixture.current_names();
+            fixture
+        }
+
+        fn current_names(&self) -> std::collections::BTreeSet<Vec<u8>> {
+            use std::os::unix::ffi::OsStrExt;
+            std::fs::read_dir(self.directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().as_bytes().to_vec())
+                .collect()
+        }
+
+        fn assert_sentinel_and_parent(&self) {
+            use std::os::unix::fs::MetadataExt;
+            for metadata in [
+                self.parent.metadata().unwrap(),
+                std::fs::metadata(self.directory.path()).unwrap(),
+            ] {
+                assert_eq!((metadata.dev(), metadata.ino()), self.parent_identity);
+            }
+            let sentinel_path = self.directory.path().join("sentinel");
+            let sentinel = std::fs::symlink_metadata(&sentinel_path).unwrap();
+            assert_eq!(
+                (sentinel.dev(), sentinel.ino(), sentinel.mode()),
+                self.sentinel_identity
+            );
+            assert_eq!(std::fs::read(sentinel_path).unwrap(), b"unrelated sentinel");
+        }
+
+        fn assert_unchanged(&self) {
+            assert_eq!(self.current_names(), self.names);
+            self.assert_sentinel_and_parent();
+        }
+
+        fn probe_lock_creation(&self, leaf: &std::ffi::OsStr) -> std::io::Result<()> {
+            use std::os::unix::ffi::OsStrExt;
+            self.assert_unchanged();
+            let mut lock = leaf.to_owned();
+            lock.push(".lock");
+            let descriptor = nix::fcntl::openat(
+                &self.parent,
+                lock.as_os_str(),
+                nix::fcntl::OFlag::O_WRONLY
+                    | nix::fcntl::OFlag::O_CREAT
+                    | nix::fcntl::OFlag::O_EXCL
+                    | nix::fcntl::OFlag::O_NOFOLLOW
+                    | nix::fcntl::OFlag::O_CLOEXEC
+                    | nix::fcntl::OFlag::O_NONBLOCK,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )?;
+            // SAFETY: openat returned this fixture's newly owned descriptor.
+            let file = std::fs::File::from(descriptor);
+            let held = nix::sys::stat::fstat(&file).unwrap();
+            assert_eq!(held.st_mode & nix::libc::S_IFMT, nix::libc::S_IFREG);
+            assert_eq!(held.st_mode & 0o7777, 0o600);
+            assert_eq!(held.st_uid, nix::unistd::geteuid().as_raw());
+            assert_eq!(held.st_nlink, 1);
+            let mut expected = self.names.clone();
+            expected.insert(lock.as_bytes().to_vec());
+            assert_eq!(self.current_names(), expected);
+            self.assert_sentinel_and_parent();
+            let named = nix::sys::stat::fstatat(
+                &self.parent,
+                lock.as_os_str(),
+                nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+            assert!(
+                path::same(&held, &named),
+                "only unlink this probe's exact inode"
+            );
+            nix::unistd::unlinkat(
+                &self.parent,
+                lock.as_os_str(),
+                nix::unistd::UnlinkatFlags::NoRemoveDir,
+            )
+            .unwrap();
+            drop(file);
+            self.assert_unchanged();
+            Ok(())
+        }
+
+        fn assert_publication(&self, leaf: &std::ffi::OsStr) {
+            use std::os::unix::ffi::OsStrExt;
+            let endpoint = self.directory.path().join(leaf);
+            let transaction = EnsureLock::acquire(&endpoint, Duration::from_secs(1))
+                .expect("acquiring the exact leaf's ensure lock");
+            let (listener, cleanup) = transaction
+                .bind_private_absent_owned()
+                .expect("exclusively publishing the exact leaf");
+            let mut lock_name = leaf.to_owned();
+            lock_name.push(".lock");
+            let mut expected = self.names.clone();
+            expected.insert(lock_name.as_bytes().to_vec());
+            expected.insert(leaf.as_bytes().to_vec());
+            assert_eq!(self.current_names(), expected);
+            let _client = UnixStream::connect(&endpoint).expect("connecting to the exact leaf");
+            let _accepted = listener.accept().unwrap();
+            self.assert_sentinel_and_parent();
+            drop(cleanup);
+            assert!(matches!(
+                nix::sys::stat::fstatat(
+                    &self.parent,
+                    leaf,
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                ),
+                Err(nix::errno::Errno::ENOENT)
+            ));
+            expected.remove(leaf.as_bytes());
+            // Ensure locks intentionally persist after endpoint cleanup.
+            assert_eq!(self.current_names(), expected);
+            self.assert_sentinel_and_parent();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confirmed_restart_publication_obeys_native_non_utf8_leaf_contract() {
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = PublicationFixture::new();
+        let leaf = std::ffi::OsString::from_vec(b"control-\xff.sock".to_vec());
+        // An absent lookup does not establish native creation support. Probe
+        // the exact raw lock leaf, then exercise acquisition from absence.
+        match fixture.probe_lock_creation(&leaf) {
+            Err(error) if error.raw_os_error() == Some(nix::libc::EILSEQ) => {
+                fixture.assert_unchanged();
+                let endpoint = fixture.directory.path().join(&leaf);
+                let error = EnsureLock::acquire(&endpoint, Duration::from_secs(1))
+                    .err()
+                    .expect("native malformed-leaf rejection must refuse acquisition");
+                assert_eq!(error.raw_os_error(), Some(nix::libc::EILSEQ));
+                fixture.assert_unchanged();
+                println!("\nNATIVE_LEAF_CONTRACT eilseq-refusal-no-mutation");
+            }
+            Ok(()) => {
+                fixture.assert_publication(&leaf);
+                println!("\nNATIVE_LEAF_CONTRACT raw-byte-publication");
+            }
+            Err(error) => panic!("unexpected native malformed-lock creation error: {error}"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn confirmed_restart_publication_preserves_non_ascii_utf8_leaf_bytes() {
+        // These characters have stable canonical spelling, without combining marks.
+        let fixture = PublicationFixture::new();
+        fixture.assert_unchanged();
+        fixture.assert_publication(std::ffi::OsStr::new("control-東京.sock"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn confirmed_restart_publication_refuses_race_and_unsupported_primitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let authority = path::EndpointAuthority::open(&path, true).unwrap();
+        for errno in [nix::libc::ENOSYS, nix::libc::EOPNOTSUPP] {
+            let result = bind_prepared_mode(
+                &authority,
+                |stage| stage.no_replace_error = Some(errno),
+                false,
+            );
+            assert!(matches!(result,Err(error) if error.raw_os_error()==Some(errno)));
+            assert!(!path.exists());
+            assert!(!dir
+                .path()
+                .join(format!(".c{}", std::process::id()))
+                .exists());
+        }
+        let competitor = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let retained = competitor.clone();
+        let endpoint = path.clone();
+        let result = bind_prepared_mode(
+            &authority,
+            move |stage| {
+                stage.before_publish = Some(Box::new(move || {
+                    let listener = UnixListener::bind(&endpoint).unwrap();
+                    std::fs::set_permissions(
+                        &endpoint,
+                        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                    )
+                    .unwrap();
+                    *retained.lock().unwrap() = Some(listener);
+                }))
+            },
+            false,
+        );
+        assert!(result.is_err());
+        let _client = UnixStream::connect(&path).unwrap();
+        let _accepted = competitor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .accept()
+            .unwrap();
+        assert!(!dir
+            .path()
+            .join(format!(".c{}", std::process::id()))
+            .exists());
+    }
+
+    #[test]
     fn request_round_trips() {
         for req in [
             ControlRequest::Status,
+            ControlRequest::ServerInfo([5; 32]),
             ControlRequest::AddPort(60001),
             ControlRequest::AddClient([42u8; 32]),
             ControlRequest::Stop,

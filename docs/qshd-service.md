@@ -7,9 +7,26 @@ one predetermined shell per connection: the daemon opens a channel, and it
 is the client that decides what to run inside it. It isn't installed over
 SSH and doesn't update itself — unlike `transport-ensure` (which comes up
 automatically when a client connects over SSH, reinstalls itself, and runs
-as the one daemon per machine until a newer version replaces it or it's
+as this account's personal daemon until a newer version replaces it or it's
 stopped explicitly), this mode is started and restarted by the system's
 service manager: `systemd` (Linux) or `launchd` (macOS).
+
+A foreground SSH bootstrap can separately confirm an interrupting update of
+an eligible legacy personal daemon. That confirmation restarts the current
+account's unmanaged `transport-ensure` service, including a different instance
+that takes over while the warning is open. Active qsh sessions are interrupted
+and their commands may terminate. It never restarts `serve`, a managed
+system/user job, another account or a root service. Lost replies leave the
+outcome uncertain; reconnect or inspect the service before trying again.
+Established-session recovery does not offer this operation or install a daemon.
+
+Confirmed service replacement runs a verified private copy of the selected
+helper for the daemon's lifetime. Later updates target the separately checked
+installed helper path. Graceful shutdown removes its private copy; a crash or a
+later update exec may leave a private staging directory.
+
+See the [bootstrap restart contracts](protocol.md) for the scope and platform
+requirements.
 
 Whichever way the daemon comes up — `serve` or `transport-ensure` — from
 there it does the same thing: it hands out channels, and the client decides
@@ -149,7 +166,7 @@ power-loss durability of the containing directory.
 `qshd serve --system` is the other way to run this same daemon: one
 port, one process, but instead of serving only the account that started
 it, it hands a shell to any account on the machine that proves itself
-with a key in *its own* `authorized_keys` — `qsh alice@host` and
+with a key in its selected authorization source — `qsh alice@host` and
 `qsh bob@host` reach the same daemon on the same port, and each lands in
 a shell running as themselves, the way `sshd` already works. It's for a
 machine more than one person already has an account on — a shared dev
@@ -183,14 +200,35 @@ the requested account instead. `--authorized-keys-template`, in
 turn, is refused without `--system`, for the same reason in the other
 direction: the personal mode has one account and nothing to expand.
 
-A key listed in the selected source can authorize the requested account, subject
-to the remaining checks. A fixed template selects the same file
-for multiple accounts. `%h` can also select a shared file when accounts have the
-same home directory. `%u` selects a path by login name, but distinct files can
-still list the same key; the token does not guarantee unique credentials.
-Configure these sources according to which accounts each key should authorize.
-The root gate remains independent: UID 0 is refused unless `--permit-root` is
-set, including when its selected source shares keys with other accounts.
+### Authorization-source policy
+
+Shared authorization sources are supported. Configuring
+`--authorized-keys-template` is the administrator's choice of which keys may
+access which accounts. A matching key authorizes every otherwise eligible
+account whose selected source contains it, subject to signature verification,
+file-integrity checks and the remaining account/session policies. qshd does
+not detect shared sources or enforce unique credentials across accounts.
+
+| Template and account setup | Authorization effect |
+|---|---|
+| Default `%h/.ssh/authorized_keys`, distinct homes | Each account selects its own file. A key listed in several files can authorize each corresponding account. |
+| Default `%h/.ssh/authorized_keys`, shared home | Accounts sharing that home select the same file; its keys can authorize each of those accounts. |
+| `/etc/qshd/keys/%u` | Each login name selects a separate path. Separately managed contents can separate access; copying the same key into several files authorizes each corresponding account. |
+| Constant `/etc/qshd/authorized_keys` | Every account selects the same file; its keys can authorize all otherwise eligible local accounts. |
+
+For account separation, especially when homes are shared, use
+`/etc/qshd/keys/%u` with separately managed per-account contents. Separate paths
+or files alone do not imply separate keys. All sources must satisfy the
+ownership, safe-ancestor and target-account readability rules below.
+
+Keep root login disabled unless intended. The root gate is independent of the
+selected source: UID 0, including aliases with another login name, is refused
+unless `--permit-root` is set. Enabling it permits a matching key to authorize
+UID 0; it does not grant access when the selected source lacks that key. If
+shared non-root keys must not authorize root, use a separately managed source
+and key set for every UID-0 login name, for example with `%u` and distinct
+contents. A constant shared file cannot distinguish root from non-root
+recipients when root login is enabled.
 
 In system mode, the expanded key path must be absolute. The helper checks every
 opened directory from `/` to the file, and the file itself: each must be owned
@@ -217,9 +255,9 @@ Use atomic file replacement for key updates. An attempt that already opened the
 old file may still read it; this policy does not promise immediate revocation or
 protection against a malicious filesystem or privileged mount changes.
 
-There's no allowlist or denylist of accounts by name yet: as with a stock
-`sshd`, anyone with an account on the machine and a key in their own
-`authorized_keys` gets in.
+There's no allowlist or denylist of accounts by name: an account on the
+machine can be authorized by a key in its selected authorization source,
+subject to the root gate and the remaining account/session checks.
 
 ### Two packages
 
@@ -634,6 +672,30 @@ multi-account machine instead, see "System mode" above — a different
 unit entirely (`systemctl enable --now qshd`, no `--user`), shipped in
 the same `qshd` package.
 
+## macOS kernel support
+
+On macOS, `qshd` opens sessions only on kernels whose process-ownership
+behavior has been reviewed against Apple's published xnu source and qualified
+on native hardware. Apple's `distribution-macOS` source tags map the admitted
+families to these releases:
+
+| xnu source | Darwin | macOS | Admission |
+| --- | --- | --- | --- |
+| `10063.141.1` | 23 | 14.6 | Exact source base; not natively tested here |
+| `11417.140.69` | 24 | 15.6 | Exact source base |
+| `12377.*` | 25 | 26 (26.0–26.5 reviewed) | The whole source line |
+
+Other kernels, including macOS 14.0–14.5, 15.0–15.5 and any later Darwin
+major, are refused. A point update is admitted when its kernel reports an
+admitted base or line; `uname -v` shows the kernel's `xnu-` revision. For the
+`12377` line, revisions newer than the reviewed 26.5 source are admitted by
+design and are covered by native CI on GitHub's current macOS 26 runners
+rather than by a source review.
+
+On a refused kernel, `qshd serve` and `transport-ensure` exit before starting a
+daemon, naming the observed kernel and the admitted families. They do not
+start a daemon that would refuse every channel.
+
 ## macOS: launchd
 
 System mode, described above, is Linux only — macOS stays on this
@@ -907,9 +969,9 @@ for those versions needs that one edit.
   right choice for a single-user machine, where system mode's extra
   moving parts (`libpam`, a service account, a privileged helper process)
   buy nothing. See "System mode" above;
-- system mode has no allowlist or denylist of accounts by name: as with a
-  stock `sshd`, anyone with an account on the machine and a key in their
-  own `authorized_keys` can log in;
+- system mode has no allowlist or denylist of accounts by name: a key in
+  an account's selected authorization source can authorize that account,
+  subject to the root gate and the remaining account/session checks;
 - restarting `qshd` in system mode drops every session on the machine at
   once, not just one person's — and stopping it with a plain `kill` or
   `systemctl stop` does **not** bring it back up automatically after a

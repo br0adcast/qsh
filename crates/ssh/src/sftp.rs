@@ -77,7 +77,7 @@ impl Upload {
             .try_acquire_owned()
             .map_err(|_| SshError::ResourceLimit("another SFTP upload is already active".into()))?;
         // At most one request awaits a reply: WRITE <= 32,768 + 4,096
-        // handle bytes + 25 framing bytes = 36,889; OPEN <= 4,117;
+        // handle bytes + 25 framing bytes = 36,889; OPEN <= 4,121;
         // CLOSE <= 4,109; INIT = 9. Reserve 128 KiB for both the framed
         // packet and ChannelStream's outgoing copy, plus path/handle and
         // control requests. Thus the bound also covers both copies while
@@ -309,24 +309,31 @@ impl Clock<'_> {
     }
 }
 
+fn upload_attributes() -> FileAttributes {
+    FileAttributes {
+        permissions: Some(0o600),
+        ..FileAttributes::default()
+    }
+}
+
 async fn transfer(
     session: &RawSftpSession,
     path: &str,
     bytes: &[u8],
     progress: &dyn UploadProgress,
     clock: &mut Clock<'_>,
-    requests: &mut Requests<'_>,
+    requests: &mut impl RequestBarrier,
 ) -> Result<(), SshError> {
     clock
         .wait(requests.wait(9, async { session.init().await.map_err(protocol) }))
         .await?;
     let file = clock
-        .wait(requests.wait(path.len() as u64 + 21, async {
+        .wait(requests.wait(path.len() as u64 + 25, async {
             session
                 .open(
                     path,
                     OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
-                    FileAttributes::default(),
+                    upload_attributes(),
                 )
                 .await
                 .map_err(protocol)
@@ -393,7 +400,15 @@ struct Requests<'a> {
     target: u64,
 }
 
-impl Requests<'_> {
+trait RequestBarrier {
+    async fn wait<T>(
+        &mut self,
+        framed_bytes: u64,
+        reply: impl Future<Output = Result<T, SshError>>,
+    ) -> Result<T, SshError>;
+}
+
+impl RequestBarrier for Requests<'_> {
     async fn wait<T>(
         &mut self,
         framed_bytes: u64,
@@ -507,3 +522,7 @@ impl<S> Drop for Interruptible<S> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sftp_tests.rs"]
+mod tests;

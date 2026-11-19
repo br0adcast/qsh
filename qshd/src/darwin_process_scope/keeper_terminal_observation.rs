@@ -1147,6 +1147,20 @@ mod tests {
         assert!(
             actor.find("observation::publish").unwrap() < actor.find("observation::gate").unwrap()
         );
+        // #548: stdio is blocking again before the marker and the closes.
+        let terminal_actor = source
+            .split("if mode == \"terminal\" {")
+            .nth(1)
+            .unwrap()
+            .split("let report = observation::capture")
+            .next()
+            .unwrap();
+        let restored = terminal_actor
+            .find("nix::libc::fcntl(0, nix::libc::F_SETFL, flags)")
+            .unwrap();
+        assert!(terminal_actor.find("keeper-input-proof\\n\");").unwrap() < restored);
+        assert!(restored < terminal_actor.find("println!(\"KEEPER_RESIZED\")").unwrap());
+        assert!(!terminal_actor[restored..].contains("O_NONBLOCK"));
     }
     #[test]
     fn owner_slave_key_requires_complete_bound_report_and_live_deadline() {

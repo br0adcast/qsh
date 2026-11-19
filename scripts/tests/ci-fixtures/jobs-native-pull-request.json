@@ -1,0 +1,138 @@
+{
+ "jobs": [
+  {
+   "completed_at": "2026-11-16T11:56:04Z",
+   "conclusion": "success",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275455743,
+   "name": "Native system floor (rpm)",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:42Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T11:56:42Z",
+   "conclusion": "success",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275456095,
+   "name": "Native x86_64-apple-darwin",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:42Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T11:59:48Z",
+   "conclusion": "success",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275456137,
+   "name": "Native Intel Darwin process owner on macOS 26",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:42Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T11:50:51Z",
+   "conclusion": "success",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275456148,
+   "name": "Native system floor (deb)",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:42Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T11:53:54Z",
+   "conclusion": "success",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275456209,
+   "name": "Native Intel Darwin legacy service on macOS 26",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:42Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T11:48:59Z",
+   "conclusion": "success",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275456215,
+   "name": "Native aarch64-unknown-linux-musl",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:44Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T11:48:40Z",
+   "conclusion": "success",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275456267,
+   "name": "Native x86_64-unknown-linux-musl",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:42Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T12:04:39Z",
+   "conclusion": "success",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275456274,
+   "name": "Native Intel Darwin process owner",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:42Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T12:01:00Z",
+   "conclusion": "success",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275456325,
+   "name": "Native aarch64-apple-darwin",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:56:44Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T11:58:12Z",
+   "conclusion": "success",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275456417,
+   "name": "Native Intel Darwin legacy service",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:43Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T11:44:39Z",
+   "conclusion": "skipped",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275458343,
+   "name": "Validate manual mode",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:39Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-16T11:44:39Z",
+   "conclusion": "skipped",
+   "head_sha": "490ac395aabc48b93c9da733700ea6d6231ecc9e",
+   "id": 133275459233,
+   "name": "PTY EOF ${{ (((inputs.mode == 'pty-eof-build') && 'build') || 'control') }} (${{ matrix.target }})",
+   "run_attempt": 1,
+   "run_id": 43860415054,
+   "started_at": "2026-11-16T11:44:39Z",
+   "status": "completed"
+  }
+ ],
+ "source": "Native crypto run 43860415054 (PR #588), filter=latest; API head 490ac395, tested merge 329b1f48",
+ "total_count": 12
+}

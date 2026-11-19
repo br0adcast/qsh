@@ -50,6 +50,10 @@
 
 mod detach;
 
+use daemon_bootstrap_protocol::{
+    BusyAttemptId, BusyChoice, BusyDaemonIdentity, BusyDaemonInfo, BusyDecision,
+    CandidateImageIdentity, PreservationCapability,
+};
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -68,6 +72,27 @@ use qshd::{
     channel_backend, control, handover, load_or_create_transport_key, load_transport_key, log, pty,
     serve, state, transport_daemon, update, version,
 };
+
+fn candidate_identity() -> Result<CandidateImageIdentity> {
+    let own = update::OwnImage::current()?;
+    Ok(CandidateImageIdentity {
+        build: own.build,
+        checksum: own.checksum,
+    })
+}
+
+/// Read-only executable API discovery; no control socket or identity-key access.
+fn bootstrap_capabilities_line() -> String {
+    let capabilities = daemon_bootstrap_protocol::BootstrapToolCapabilities {
+        schema: 1,
+        busy_decisions: true,
+        account_service_restart_v1: cfg!(any(target_os = "linux", target_os = "macos")),
+    };
+    format!(
+        "{}\n",
+        serde_json::to_string(&capabilities).expect("static bootstrap capabilities")
+    )
+}
 
 /// Printed by `--version`. Carries the build stamp as well as the version:
 /// the stamp is what client and daemon compare when deciding which side is
@@ -117,6 +142,9 @@ fn help_text() -> String {
         "                    Long-lived daemon for a service manager (systemd/launchd); \
          see docs/qshd-service.md."
             .to_string(),
+        "  bootstrap-capabilities  Report executable bootstrap API support.".to_owned(),
+        "  server-info       --challenge <hex> [--socket <PATH>]  Query running daemon metadata."
+            .to_string(),
         "  helper-status     --socket <PATH>  Root-only local system-helper snapshot.".to_string(),
         "  self-check        Print this binary's build, architecture, protocol and handover \
          versions and transport features as JSON."
@@ -137,7 +165,32 @@ fn help_text() -> String {
 // `transport-echo`/`transport-shell` -- each subcommand brings it up
 // itself.
 fn main() -> Result<()> {
+    // Remove the reserved handoff before any parser, worker entry or child
+    // command can inherit it. Only the checked service entry consumes it.
+    let service_stage = std::env::var_os(qshd::service_stage::LAUNCH_ENV);
+    std::env::remove_var(qshd::service_stage::LAUNCH_ENV);
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().map(OsString::as_os_str) != Some(OsStr::new("transport-ensure")) {
+        anyhow::ensure!(
+            service_stage.is_none(),
+            "service stage requires transport-ensure"
+        );
+        anyhow::ensure!(
+            !args
+                .iter()
+                .any(|arg| arg == "--service-installed-helper"
+                    || arg == "--service-candidate-helper"),
+            "service staging options require checked transport-ensure"
+        );
+    }
+    // The inherited frontend must not consume or forward replacement custody.
+    // Service-stage refusal above remains ahead of every private entry.
+    if args.first().map(OsString::as_os_str) == Some(OsStr::new("__qshd-frontend-admission-v1")) {
+        std::env::remove_var(handover::HANDOVER_FD_ENV);
+        if let Some(result) = qshd::frontend_admission_entry(&args) {
+            return result.map_err(Into::into);
+        }
+    }
     #[cfg(target_os = "macos")]
     if let Some(result) = qshd::darwin_keeper_entry(&args) {
         return result.map_err(Into::into);
@@ -154,9 +207,17 @@ fn main() -> Result<()> {
     match args.first().map(|arg| argument_text(arg, 1)).transpose()? {
         Some("transport-echo") => run_transport_echo_command(&args),
         Some("transport-shell") => run_transport_shell_command(&args),
-        Some("transport-ensure") => run_transport_ensure(&args),
+        Some("transport-ensure") => run_transport_ensure(&args, service_stage),
         Some("serve") => serve::run_serve_command_os(&args),
+        Some("server-info") => qshd::server_info::run_command(&args),
         Some("helper-status") => qshd::helper_status::run_command(&args),
+        Some("bootstrap-capabilities") => {
+            if args.len() != 1 {
+                bail!("bootstrap-capabilities takes no arguments");
+            }
+            print!("{}", bootstrap_capabilities_line());
+            Ok(())
+        }
         Some("self-check") => {
             print!("{}", state::SelfCheck::current().to_line());
             Ok(())
@@ -484,6 +545,13 @@ fn parse_transport_shell_args(args: &[OsString]) -> Result<ParsedTransportShellA
 /// allowlist -- via `ADD-CLIENT` if reusing a live daemon, or seeded into
 /// [`transport_daemon::build_server_allowlist`] if becoming the daemon.
 struct ParsedTransportEnsureArgs {
+    report_busy: bool,
+    busy_attempt: Option<BusyAttemptId>,
+    busy_decision: Option<BusyDecision>,
+    destructive_consent: Option<daemon_bootstrap_protocol::DestructiveRestartConsent>,
+    service_restart_consent: Option<daemon_bootstrap_protocol::ServiceRestartConsent>,
+    service_candidate_helper: Option<PathBuf>,
+    service_installed_helper: Option<PathBuf>,
     restart_only: bool,
     name: String,
     port: u16,
@@ -509,6 +577,15 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
         bail!("expected command `transport-ensure`, got: {:?}", command);
     }
 
+    let mut report_busy = false;
+    let mut busy_attempt = None;
+    let mut busy_decision: Option<BusyDecision> = None;
+    let mut destructive_consent: Option<daemon_bootstrap_protocol::DestructiveRestartConsent> =
+        None;
+    let mut service_restart_consent: Option<daemon_bootstrap_protocol::ServiceRestartConsent> =
+        None;
+    let mut service_candidate_helper = None;
+    let mut service_installed_helper = None;
     let mut restart_only = false;
     let mut name: Option<String> = None;
     let mut port: Option<u16> = None;
@@ -518,6 +595,72 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
     let mut i = 1;
     while i < args.len() {
         match argument_text(&args[i], i + 1)? {
+            "--report-busy" if !report_busy => {
+                report_busy = true;
+                i += 1;
+            }
+            "--busy-attempt" if busy_attempt.is_none() => {
+                let value = argument_text(
+                    args.get(i + 1).context("--busy-attempt requires a value")?,
+                    i + 2,
+                )?;
+                busy_attempt =
+                    Some(BusyAttemptId::try_from(value.to_owned()).map_err(anyhow::Error::msg)?);
+                i += 2;
+            }
+            "--busy-decision" if busy_decision.is_none() => {
+                let value = argument_text(
+                    args.get(i + 1)
+                        .context("--busy-decision requires a value")?,
+                    i + 2,
+                )?;
+                if value.len() > 4096 {
+                    bail!("busy decision exceeds limit");
+                }
+                let decision: BusyDecision =
+                    serde_json::from_str(value).context("invalid busy decision")?;
+                if !decision.valid() {
+                    bail!("invalid busy identity");
+                }
+                busy_decision = Some(decision);
+                i += 2;
+            }
+            "--destructive-consent" if destructive_consent.is_none() => {
+                let value = argument_text(
+                    args.get(i + 1)
+                        .context("--destructive-consent requires a value")?,
+                    i + 2,
+                )?;
+                anyhow::ensure!(value.len() <= 4096, "destructive consent exceeds limit");
+                destructive_consent =
+                    Some(serde_json::from_str(value).context("invalid destructive consent")?);
+                i += 2;
+            }
+            "--service-restart-consent" if service_restart_consent.is_none() => {
+                let value = argument_text(
+                    args.get(i + 1)
+                        .context("--service-restart-consent requires a value")?,
+                    i + 2,
+                )?;
+                anyhow::ensure!(value.len() <= 4096, "service consent exceeds limit");
+                service_restart_consent =
+                    Some(serde_json::from_str(value).context("invalid service consent")?);
+                i += 2;
+            }
+            "--service-candidate-helper" if service_candidate_helper.is_none() => {
+                service_candidate_helper = Some(PathBuf::from(
+                    args.get(i + 1)
+                        .context("--service-candidate-helper requires a path")?,
+                ));
+                i += 2;
+            }
+            "--service-installed-helper" if service_installed_helper.is_none() => {
+                service_installed_helper = Some(PathBuf::from(
+                    args.get(i + 1)
+                        .context("--service-installed-helper requires a path")?,
+                ));
+                i += 2;
+            }
             "--restart-only" => {
                 restart_only = true;
                 i += 1;
@@ -565,6 +708,51 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
         }
     }
 
+    if report_busy != busy_attempt.is_some()
+        || (report_busy && restart_only)
+        || busy_decision
+            .as_ref()
+            .is_some_and(|d| !report_busy || Some(&d.attempt) != busy_attempt.as_ref())
+    {
+        bail!("invalid busy-daemon decision options");
+    }
+    if let Some(consent) = &destructive_consent {
+        anyhow::ensure!(
+            busy_decision
+                .as_ref()
+                .is_some_and(|decision| decision.choice == BusyChoice::ForceUpdate
+                    && decision.attempt == consent.attempt
+                    && decision.identity == consent.identity
+                    && decision.candidate == consent.candidate),
+            "destructive consent does not match a force decision"
+        );
+    }
+    anyhow::ensure!(
+        destructive_consent.is_none() || service_restart_consent.is_none(),
+        "conflicting restart consent scopes"
+    );
+    if let Some(consent) = &service_restart_consent {
+        anyhow::ensure!(
+            !restart_only
+                && consent.service.valid()
+                && busy_decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.choice == BusyChoice::ForceUpdate
+                        && decision.attempt == consent.attempt
+                        && decision.candidate == consent.candidate
+                        && decision.service_restart.as_ref() == Some(&consent.service)),
+            "service consent does not match a force decision"
+        );
+    }
+    anyhow::ensure!(
+        service_restart_consent.is_some()
+            || (service_candidate_helper.is_none() && service_installed_helper.is_none()),
+        "service helper paths require service consent"
+    );
+    anyhow::ensure!(
+        service_restart_consent.is_none() || service_candidate_helper.is_some(),
+        "service consent requires the selected trusted helper path"
+    );
     let name = name.context("--name is required")?;
     let port = port.context("--port is required")?;
     let mut ports = vec![port];
@@ -575,6 +763,13 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
     }
 
     Ok(ParsedTransportEnsureArgs {
+        report_busy,
+        busy_attempt,
+        busy_decision,
+        destructive_consent,
+        service_restart_consent,
+        service_candidate_helper,
+        service_installed_helper,
         restart_only,
         name,
         port,
@@ -597,6 +792,8 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
 /// then `warning`.
 #[derive(Serialize)]
 struct TransportReadyBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serving_profiles: Option<Vec<[u8; 3]>>,
     version: String,
     /// The ports the daemon actually listens on -- for a live daemon, from
     /// its `STATUS`, not the ones this call asked for.
@@ -609,14 +806,138 @@ struct TransportReadyBody {
 }
 
 /// The ports to put in `TRANSPORT-READY` when reusing a live daemon: the
-/// ones it says it listens on. A status that lists no ports (a daemon
-/// that reports none, or a malformed answer) falls back to the requested
-/// ones, which is what the call reported before this fix.
-fn ready_ports(status: &control::StatusResponse, requested: &[u16]) -> Vec<u16> {
-    if status.ports.is_empty() {
-        requested.to_vec()
-    } else {
-        status.ports.iter().map(|p| p.port).collect()
+/// ones it says it listens on. Missing or zero listeners cannot establish
+/// readiness; do not guess from the originally requested ports.
+fn ready_ports(status: &control::StatusResponse) -> Result<Vec<u16>> {
+    let ports: Vec<_> = status.ports.iter().map(|p| p.port).collect();
+    if ports.is_empty() || ports.contains(&0) {
+        bail!("running qshd reported no valid listeners");
+    }
+    Ok(ports)
+}
+
+fn status_identity(
+    status: &control::StatusResponse,
+    generation: Option<String>,
+) -> BusyDaemonIdentity {
+    BusyDaemonIdentity {
+        version: status.version.clone(),
+        build: status.build,
+        checksum: status.checksum.clone(),
+        pid: status.pid,
+        generation,
+    }
+}
+fn validate_add_client_reply(
+    reply: control::ControlReply,
+    prior: &control::StatusResponse,
+) -> Result<control::StatusResponse> {
+    let control::ControlReply::Answered(line) = reply else {
+        bail!(
+            "client registration was not acknowledged by running qshd {}",
+            prior.version
+        );
+    };
+    let actual = control::StatusResponse::from_line(&line)
+        .context("invalid client registration acknowledgement")?;
+    if actual.version != prior.version
+        || actual.build != prior.build
+        || actual.checksum != prior.checksum
+        || (prior.pid != 0 && actual.pid != prior.pid)
+    {
+        bail!("daemon changed during client registration; rediscover and choose again");
+    }
+    ready_ports(&actual)?;
+    Ok(actual)
+}
+
+/// This read-only request reaches the actual serving process through the same
+/// retained, same-account control authority. Legacy silence is unknown.
+type LiveProfiles = (Option<String>, Option<Vec<[u8; 3]>>);
+
+fn live_profiles(
+    transaction: &control::EnsureLock,
+    status: &control::StatusResponse,
+    key: &[u8; 32],
+) -> Result<LiveProfiles> {
+    let mut challenge = [0; 32];
+    getrandom::fill(&mut challenge).expect("operating system randomness is available");
+    match transaction.request(&control::ControlRequest::ServerInfo(challenge))? {
+        control::ControlReply::NoDaemon => Ok((None, None)),
+        control::ControlReply::TimedOut => {
+            bail!("running qshd metadata timed out; rediscover before choosing")
+        }
+        control::ControlReply::Answered(line) => {
+            let info: qshd::server_info::Response =
+                serde_json::from_str(&line).context("invalid running daemon metadata")?;
+            if info.challenge != hex::encode(challenge)
+                || info.core_version != status.version
+                || info.server_pubkey != hex::encode(key)
+            {
+                bail!("running daemon identity changed during discovery");
+            }
+            let generation: [u8; 16] = hex::decode(&info.generation)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid daemon generation"))?;
+            let checked = transport::bootstrap::ServerInfo {
+                generation,
+                core_version: info.core_version,
+                session_protocols: info
+                    .session_protocols
+                    .iter()
+                    .map(|p| transport::bootstrap::SessionProfile {
+                        wire: p[0],
+                        handshake: p[1],
+                        channel: p[2],
+                    })
+                    .collect(),
+            };
+            transport::bootstrap::encode_server_info(&checked)?;
+            Ok((Some(info.generation), Some(info.session_protocols)))
+        }
+    }
+}
+
+/// Negotiate independently of SERVER-INFO. Once advertised, any failure is fatal;
+/// it must never downgrade to unconditional registration.
+fn registration_request(
+    transaction: &control::EnsureLock,
+    status: &control::StatusResponse,
+    generation: Option<&str>,
+    key: [u8; 32],
+) -> Result<control::ControlRequest> {
+    let mut challenge = [0; 32];
+    getrandom::fill(&mut challenge).expect("operating system randomness is available");
+    match transaction.request(&control::ControlRequest::RegistrationInfo(challenge))? {
+        control::ControlReply::NoDaemon => Ok(control::ControlRequest::AddClient(key)),
+        control::ControlReply::TimedOut => {
+            bail!("registration capability query timed out; no client registered")
+        }
+        control::ControlReply::Answered(line) => {
+            let response: control::RegistrationInfoResponse =
+                serde_json::from_str(&line).context("invalid registration capability response")?;
+            let expected = status_identity(status, generation.map(str::to_owned));
+            if response.schema != 1
+                || !response.conditional_add_client
+                || response.challenge != hex::encode(challenge)
+                || response.identity != expected
+                || !response.identity.valid()
+                || generation.is_none()
+            {
+                bail!("registration capability identity changed; rediscover before registering");
+            }
+            Ok(control::ControlRequest::AddClientIf {
+                generation: hex::decode(generation.unwrap())?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid generation"))?,
+                build: status.build,
+                checksum: hex::decode(&status.checksum)?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid checksum"))?,
+                pid: status.pid,
+                key,
+            })
+        }
     }
 }
 
@@ -631,13 +952,26 @@ fn ready_ports(status: &control::StatusResponse, requested: &[u16]) -> Vec<u16> 
 /// will pass `std::io::stdout()` -- in the parent process, BEFORE the fork.
 fn write_transport_ready(
     w: &mut impl Write,
+    version: &str,
     pubkey: &[u8; 32],
     ports: &[u16],
     warning: Option<&str>,
 ) -> Result<()> {
+    write_transport_ready_profiles(w, version, pubkey, ports, warning, None)
+}
+
+fn write_transport_ready_profiles(
+    w: &mut impl Write,
+    version: &str,
+    pubkey: &[u8; 32],
+    ports: &[u16],
+    warning: Option<&str>,
+    serving_profiles: Option<Vec<[u8; 3]>>,
+) -> Result<()> {
     writeln!(w, "server-pubkey: {}", BASE64.encode(pubkey)).context("printing server-pubkey")?;
     let body = TransportReadyBody {
-        version: state::QSHD_VERSION.to_string(),
+        serving_profiles,
+        version: version.to_owned(),
         ports: ports.to_vec(),
         warning: warning.map(str::to_string),
     };
@@ -689,6 +1023,42 @@ fn absolute_cache_route(cache_dir: PathBuf) -> std::io::Result<PathBuf> {
 
 /// The `transport-ensure` subcommand: a self-installing SELF-DAEMONIZING
 /// server for the NEW transport, that survives the SSH `exec` closing.
+fn service_operation(
+    parsed: &ParsedTransportEnsureArgs,
+    helper: &qshd::service_restart::SelectedHelper,
+) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    // Recreated from the same checked fields and current trusted parent after
+    // reexec. A changed destination parent changes the bound operation bytes.
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "consent":parsed.service_restart_consent,"decision":parsed.busy_decision,
+        "name":parsed.name,"port":parsed.port,"ports":parsed.ports,"default_port":parsed.default_port,"client_pubkey":parsed.client_pubkey,
+        "installed_helper":BASE64.encode(helper.path().as_os_str().as_bytes()),
+        "installed_parent":helper.parent_identity(),
+    }))?)
+}
+fn write_service_failure(
+    attempt: &BusyAttemptId,
+    outcome: qshd::service_restart::ServiceRestartOutcome,
+) -> Result<()> {
+    use daemon_bootstrap_protocol::{DestructiveRestartDisposition, DestructiveRestartFailure};
+    let failure = DestructiveRestartFailure {
+        attempt: attempt.clone(),
+        disposition: if outcome == qshd::service_restart::ServiceRestartOutcome::Refused {
+            DestructiveRestartDisposition::Refused
+        } else {
+            DestructiveRestartDisposition::Uncertain
+        },
+    };
+    writeln!(
+        std::io::stdout(),
+        "TRANSPORT-RESTART-FAILED {}",
+        serde_json::to_string(&failure)?
+    )?;
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
 /// Mirrors the structure of the removed qsh path's
 /// `run_ensure`, but on the transport's UDP socket and with a Noise key
 /// allowlist instead of quinn/mTLS:
@@ -705,8 +1075,17 @@ fn absolute_cache_route(cache_dir: PathBuf) -> std::io::Result<PathBuf> {
 ///    `--client-pubkey` alone ([`transport_daemon::build_server_allowlist`]
 ///    -- there is no on-disk set to union with anymore), prints ready in the
 ///    parent, and daemonizes.
-fn run_transport_ensure(args: &[OsString]) -> Result<()> {
+fn run_transport_ensure(args: &[OsString], stage_context: Option<OsString>) -> Result<()> {
     let parsed = parse_transport_ensure_args(args)?;
+    // Every channel needs the reviewed Darwin runtime; refuse before reusing,
+    // replacing or starting a daemon that could not open one (#551).
+    #[cfg(target_os = "macos")]
+    qshd::darwin_runtime_admission()?;
+
+    anyhow::ensure!(
+        stage_context.is_none() || parsed.service_restart_consent.is_some(),
+        "service stage requires explicit service consent"
+    );
 
     let cache_dir = absolute_cache_route(serve::cache_dir(false)?)
         .context("resolving the personal cache directory")?;
@@ -720,11 +1099,120 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
     // daemon's key byte-for-byte (same file), so the client sees a stable
     // `server-pubkey`, like an SSH host key.
     let key_path = default_transport_key_path(&cache_dir);
-    let keypair = if parsed.restart_only {
+    let keypair = if parsed.restart_only || parsed.service_restart_consent.is_some() {
         load_transport_key(&key_path)?
     } else {
         load_or_create_transport_key(&key_path)?
     };
+
+    if let Some(consent) = &parsed.service_restart_consent {
+        use qshd::service_restart::{
+            self, SelectedHelper, SelectedStage, ServiceRestartOutcome, ValidatedCandidate,
+            ValidatedPersonalService,
+        };
+        use qshd::service_stage::StageLaunchContext;
+        let Some(service) = ValidatedPersonalService::current(&transaction, consent, parsed.port)
+        else {
+            return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+        };
+        let source = parsed
+            .service_candidate_helper
+            .as_ref()
+            .context("selected helper missing")?;
+        let mut helper = match SelectedHelper::open(source, &cache_dir) {
+            Ok(helper) => helper,
+            Err(error) => {
+                eprintln!("qshd: service candidate refused: {error}");
+                return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+            }
+        };
+        let operation = service_operation(&parsed, &helper)?;
+        let live = || matches!(ask_status(&transaction,&sock_path),Ok(control::ControlReply::Answered(line)) if control::StatusResponse::from_line(&line).is_ok());
+        let stage = if let Some(encoded) = stage_context {
+            if parsed.service_installed_helper.as_ref() != Some(source) {
+                return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+            }
+            let context = encoded
+                .to_str()
+                .ok_or(qshd::service_stage::StageError::Invalid)
+                .and_then(StageLaunchContext::parse);
+            let executable = std::env::args_os()
+                .next()
+                .map(PathBuf::from)
+                .context("staged executable route missing")?;
+            match context.and_then(|context| {
+                SelectedStage::adopt(
+                    context,
+                    &consent.candidate,
+                    &operation,
+                    &cache_dir,
+                    &executable,
+                    helper,
+                )
+            }) {
+                Ok(stage) => stage,
+                Err(error) => {
+                    eprintln!("qshd: staged service launch refused: {error}");
+                    return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+                }
+            }
+        } else {
+            if parsed.service_installed_helper.is_some() || !live() {
+                return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+            }
+            let prepared = match service_restart::prepare_selected_stage(
+                &cache_dir,
+                &mut helper,
+                &consent.candidate,
+                &operation,
+            ) {
+                Ok(stage) => stage,
+                Err(error) => {
+                    eprintln!("qshd: service candidate staging refused: {error}");
+                    return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+                }
+            };
+            let mut staged_args = args.to_vec();
+            staged_args.push("--service-installed-helper".into());
+            staged_args.push(helper.path().as_os_str().to_owned());
+            // The staged process reacquires the canonical lock and rechecks
+            // the current service. Process changes remain within this consent.
+            drop(transaction);
+            match prepared.reexec(&staged_args) {
+                Err(error) => {
+                    eprintln!("qshd: staged service exec refused: {error}");
+                    return write_service_failure(&consent.attempt, ServiceRestartOutcome::Refused);
+                }
+                Ok(never) => match never {},
+            }
+        };
+        let candidate = ValidatedCandidate::staged(&stage, &consent.candidate);
+        let outcome = match (candidate, live()) {
+            (Some(candidate), true) => service_restart::restart_personal_service(
+                &transaction,
+                consent,
+                &service,
+                &candidate,
+            ),
+            _ => ServiceRestartOutcome::Refused,
+        };
+        if outcome != ServiceRestartOutcome::Released {
+            write_service_failure(&consent.attempt, outcome)?;
+            if let Err(error) = stage.cleanup() {
+                eprintln!("qshd: private service-stage cleanup failed: {error}");
+            }
+            return Ok(());
+        }
+        return become_transport_daemon(
+            &parsed,
+            &cache_dir,
+            &sock_path,
+            keypair,
+            transport_daemon::build_server_allowlist(parsed.client_pubkey),
+            transaction,
+            Some(stage),
+        );
+    }
 
     // Try the control socket BEFORE binding our own sockets -- like
     // `run_ensure`: is a daemon already alive.
@@ -745,45 +1233,169 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
             } else {
                 version::reconcile(state::build_label(), &state::self_checksum()?, &status)
             };
-            // `KeepOldWarn` is a `Reuse` too (see `decide_reuse` below) --
-            // the reason is both logged to stderr (unchanged) and carried
-            // into `TRANSPORT-READY` so the app can surface it to the user.
-            let warning: Option<String> = match &action {
-                version::ReconcileAction::KeepOldWarn(reason) => {
-                    eprintln!("qshd: {reason}");
-                    Some(reason.clone())
-                }
-                _ => None,
-            };
-            match transport_daemon::decide_reuse(&action) {
-                transport_daemon::EnsureDecision::Reuse => {
-                    // The live daemon is up to date: live-add the client
-                    // key to its IN-MEMORY allowlist, then print
-                    // `TRANSPORT-READY` and exit -- no fork.
-                    if let Some(pubkey) = parsed.client_pubkey {
-                        transaction.request(&control::ControlRequest::AddClient(pubkey))?;
+            let (generation, profiles) = live_profiles(&transaction, &status, &keypair.public)?;
+            let identity = status_identity(&status, generation.clone());
+            let candidate = parsed.report_busy.then(candidate_identity).transpose()?;
+            let needs_choice = parsed.report_busy
+                && matches!(action, version::ReconcileAction::KeepOldWarn(_))
+                && status.total_connections > 0;
+            // Current activity decides whether to report a new BUSY record, not
+            // whether an identity-scoped Continue still selects this daemon.
+            let mut forced_exit = false;
+            let accepted = if let Some(decision) =
+                parsed.busy_decision.as_ref().filter(|decision| {
+                    Some(&decision.attempt) == parsed.busy_attempt.as_ref()
+                        && decision.identity == identity
+                        && Some(&decision.candidate) == candidate.as_ref()
+                        && decision.valid()
+                }) {
+                match decision.choice {
+                    BusyChoice::Cancel => bail!("busy daemon startup cancelled"),
+                    BusyChoice::ContinueOld => true,
+                    BusyChoice::ForceUpdate => {
+                        anyhow::ensure!(
+                            parsed.destructive_consent.is_some(),
+                            "forced update requires separate exact-instance destructive consent"
+                        );
+                        let outcome = match (&parsed.destructive_consent, &candidate) {
+                            (Some(consent), Some(candidate)) => {
+                                qshd::interrupt_selected(&transaction, consent, candidate)
+                            }
+                            _ => qshd::RestartOutcome::Refused,
+                        };
+                        if outcome != qshd::RestartOutcome::ExactExit {
+                            use daemon_bootstrap_protocol::{
+                                DestructiveRestartDisposition, DestructiveRestartFailure,
+                            };
+                            let failure = DestructiveRestartFailure {
+                                attempt: decision.attempt.clone(),
+                                disposition: if outcome == qshd::RestartOutcome::Refused {
+                                    DestructiveRestartDisposition::Refused
+                                } else {
+                                    DestructiveRestartDisposition::Uncertain
+                                },
+                            };
+                            writeln!(
+                                std::io::stdout(),
+                                "TRANSPORT-RESTART-FAILED {}",
+                                serde_json::to_string(&failure)?
+                            )?;
+                            std::io::stdout().flush()?;
+                            return Ok(());
+                        }
+                        // Exact retained exit is necessary but does not authorize
+                        // replacing a new endpoint that appeared meanwhile.
+                        anyhow::ensure!(
+                            matches!(
+                                transaction.request(&control::ControlRequest::Status)?,
+                                control::ControlReply::NoDaemon
+                            ),
+                            "daemon changed after exact exit; rediscover before starting"
+                        );
+                        forced_exit = true;
+                        true
                     }
-                    transaction.validate_route()?;
-                    write_transport_ready(
-                        &mut std::io::stdout(),
-                        &keypair.public,
-                        &ready_ports(&status, &parsed.ports),
-                        combined_warning(warning.as_deref(), status.logging_warning.as_deref())
-                            .as_deref(),
-                    )?;
-                    return Ok(());
                 }
-                transport_daemon::EnsureDecision::BecomeDaemon => {
-                    // The daemon is stale (`Replace`): ask it to stop,
-                    // wait for the socket/port to be released, and become
-                    // the daemon ourselves.
-                    transaction.request(&control::ControlRequest::Stop)?;
-                    wait_for_daemon_release(&transaction, parsed.port)?;
-                    // Falls through to the "become the daemon" branch below.
+            } else {
+                false
+            };
+            if (needs_choice || parsed.busy_decision.is_some()) && !accepted {
+                if status.total_connections == 0 {
+                    bail!("selected daemon identity changed; rediscover before choosing again");
+                }
+                let info = BusyDaemonInfo {
+                    schema: 2,
+                    attempt: parsed
+                        .busy_attempt
+                        .clone()
+                        .context("missing busy attempt")?,
+                    identity: identity.clone(),
+                    candidate: candidate.clone().context("missing selected candidate")?,
+                    active_connections: status.total_connections,
+                    serving_profiles: profiles.clone(),
+                    preservation: PreservationCapability::Unknown,
+                    service_restart: qshd::service_restart::offered_service(
+                        &transaction,
+                        parsed.port,
+                        &status.version,
+                        identity.generation.as_deref(),
+                    ),
+                };
+                if !info.valid() {
+                    bail!("invalid running daemon identity");
+                }
+                writeln!(
+                    std::io::stdout(),
+                    "TRANSPORT-BUSY {}",
+                    serde_json::to_string(&info)?
+                )?;
+                std::io::stdout().flush()?;
+                return Ok(());
+            }
+            if !forced_exit {
+                let warning = match &action {
+                    version::ReconcileAction::KeepOldWarn(reason) if !accepted => {
+                        Some(reason.as_str())
+                    }
+                    _ => None,
+                };
+                let decision = if accepted {
+                    transport_daemon::EnsureDecision::Reuse
+                } else {
+                    transport_daemon::decide_reuse(&action)
+                };
+                match decision {
+                    transport_daemon::EnsureDecision::Reuse => {
+                        if transport_daemon::reuse_compatibility(profiles.as_deref())
+                            == transport_daemon::ReuseCompatibility::Incompatible
+                        {
+                            bail!("running qshd {} serves incompatible session profiles {:?}; required profile [{}, {}, {}]. No daemon restart was requested. Use a client with a matching profile, or finish active qsh sessions before updating the daemon", status.version, profiles, transport::wire::VERSION, transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION);
+                        }
+                        let actual = if let Some(pubkey) = parsed.client_pubkey {
+                            let request = registration_request(
+                                &transaction,
+                                &status,
+                                generation.as_deref(),
+                                pubkey,
+                            )?;
+                            validate_add_client_reply(transaction.request(&request)?, &status)?
+                        } else {
+                            ready_ports(&status)?;
+                            status.clone()
+                        };
+                        let (after_generation, after_profiles) =
+                            live_profiles(&transaction, &actual, &keypair.public)?;
+                        if after_generation != generation || after_profiles != profiles {
+                            bail!(
+                                "daemon changed during registration; rediscover and choose again"
+                            );
+                        }
+                        transaction.validate_route()?;
+                        write_transport_ready_profiles(
+                            &mut std::io::stdout(),
+                            &actual.version,
+                            &keypair.public,
+                            &ready_ports(&actual)?,
+                            combined_warning(warning, actual.logging_warning.as_deref()).as_deref(),
+                            profiles,
+                        )?;
+                        return Ok(());
+                    }
+                    transport_daemon::EnsureDecision::BecomeDaemon => {
+                        // The daemon is stale (`Replace`): ask it to stop,
+                        // wait for the socket/port to be released, and become
+                        // the daemon ourselves.
+                        transaction.request(&control::ControlRequest::Stop)?;
+                        wait_for_daemon_release(&transaction, parsed.port)?;
+                        // Falls through to the "become the daemon" branch below.
+                    }
                 }
             }
         }
         control::ControlReply::NoDaemon => {
+            if parsed.busy_decision.is_some() {
+                bail!("selected daemon is gone; rediscover before choosing again");
+            }
             // No daemon -- falls through to the "become the daemon" branch below.
         }
         control::ControlReply::TimedOut => {
@@ -817,6 +1429,7 @@ fn run_transport_ensure(args: &[OsString]) -> Result<()> {
         keypair,
         allowlist,
         transaction,
+        None,
     )
 }
 
@@ -880,6 +1493,7 @@ fn become_transport_daemon(
     keypair: transport::handshake::Keypair,
     allowlist: Vec<[u8; 32]>,
     transaction: control::EnsureLock,
+    mut stage: Option<qshd::service_restart::SelectedStage>,
 ) -> Result<()> {
     // The transport's UDP socket -- synchronously, before the fork (like `become_daemon`).
     let socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, parsed.port)) {
@@ -907,9 +1521,17 @@ fn become_transport_daemon(
     // from its first instant (spec §4.16, QSH-14). By this point there is
     // definitely no live daemon (see `run_transport_ensure`), so a file at
     // the name is a stale one, and `bind_private` replaces it.
-    let (listener, mut cleanup) = transaction
-        .bind_private_owned()
-        .with_context(|| format!("binding the control socket {}", sock_path.display()))?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let bound = if parsed.destructive_consent.is_some() || parsed.service_restart_consent.is_some()
+    {
+        transaction.bind_private_absent_owned()
+    } else {
+        transaction.bind_private_owned()
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let bound = transaction.bind_private_owned();
+    let (listener, mut cleanup) =
+        bound.with_context(|| format!("binding the control socket {}", sock_path.display()))?;
     let bound_port = socket
         .local_addr()
         .context("reading the bound UDP port")?
@@ -929,6 +1551,7 @@ fn become_transport_daemon(
     }
     write_transport_ready(
         &mut std::io::stdout(),
+        state::QSHD_VERSION,
         &keypair.public,
         std::slice::from_ref(&bound_port),
         prepared_log.warning(),
@@ -946,6 +1569,9 @@ fn become_transport_daemon(
             // Even a parent wait error does not prove that its forked child
             // failed. Only the child's own guard may now unlink publication.
             cleanup.leave_to_child();
+            if let Some(stage) = stage.as_mut() {
+                stage.disarm_cleanup();
+            }
             let parent = result.context("daemonizing qshd (transport parent)")?;
             std::process::exit(parent);
         }
@@ -964,14 +1590,18 @@ fn become_transport_daemon(
         log::error("qshd", &format!("PANIC: {info}"));
     }));
 
-    let binary_path = state::own_binary_path().unwrap_or_else(|e| {
-        log::warn(
-            "qshd",
-            &format!("cannot tell where its own binary is ({e:#}); updates over qsh are off"),
-        );
-        PathBuf::new()
-    });
-    run_personal_daemon(PersonalStart {
+    let binary_path = if let Some(stage) = stage.as_ref() {
+        stage.installed_helper().to_owned()
+    } else {
+        state::own_binary_path().unwrap_or_else(|e| {
+            log::warn(
+                "qshd",
+                &format!("cannot tell where its own binary is ({e:#}); updates over qsh are off"),
+            );
+            PathBuf::new()
+        })
+    };
+    let outcome = run_personal_daemon(PersonalStart {
         socket,
         listener,
         keypair,
@@ -993,7 +1623,16 @@ fn become_transport_daemon(
             .collect(),
         name: parsed.name.clone(),
         binary_path,
-    })
+    });
+    if let Some(stage) = stage {
+        if let Err(error) = stage.cleanup() {
+            log::warn(
+                "qshd",
+                &format!("private service-stage cleanup failed: {error}"),
+            );
+        }
+    }
+    outcome
 }
 
 /// Everything the personal daemon's body starts from: a fresh daemon after
@@ -1009,9 +1648,10 @@ struct PersonalStart {
     port: u16,
     ports: Vec<u16>,
     name: String,
-    /// Where this daemon's binary lives -- read from `/proc/self/exe` by the
-    /// daemon itself (directly, or by the process it replaced), never taken
-    /// from a client. Empty when that could not be read: no updates then.
+    /// Persistent update destination: ordinary own path, checked inherited
+    /// handover path, or the trusted helper bound before a service-stage exec.
+    /// OwnImage and STATUS still inspect the actual executing artifact.
+    /// Empty when unavailable: no updates then.
     binary_path: PathBuf,
 }
 
@@ -1041,6 +1681,21 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     let active_count = Arc::new(AtomicUsize::new(0));
     let control_gate = Arc::new(tokio::sync::RwLock::new(()));
     let admission = Arc::new(update::AdmissionGate::default());
+    let identity = update::OwnImage::current()
+        .ok()
+        .map(|own| BusyDaemonIdentity {
+            version: state::QSHD_VERSION.into(),
+            build: own.build,
+            checksum: own.checksum,
+            pid: std::process::id(),
+            generation: Some(hex::encode(qshd::server_info::current().generation)),
+        });
+    let actions = Arc::new(qshd::RestartActions::new(
+        identity,
+        control_gate.clone(),
+        admission.clone(),
+        cfg!(target_os = "linux"),
+    ));
 
     // The same session backend `serve` hands its router: the daemon has no
     // startup session of its own to decide, and no tmux to drive -- it hands
@@ -1072,6 +1727,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
                 allowlist: Arc::clone(&shared_allowlist),
                 control_gate: Arc::clone(&control_gate),
                 admission: Arc::clone(&admission),
+                actions: actions.clone(),
             }),
         )));
     }
@@ -1082,7 +1738,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
         tokio::runtime::Runtime::new().context("creating the transport daemon's runtime")?;
     runtime.block_on(async {
         let mut signals = transport_daemon::PersonalSignals::register()?;
-        transport_daemon::run_transport_daemon_until_stop(
+        transport_daemon::run_transport_daemon_until_stop_with_actions(
             start.socket,
             start.keypair.private,
             personal_server_auth(shared_allowlist, start.keypair.public, admission),
@@ -1091,7 +1747,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
             start.cleanup,
             vec![start.port],
             active_count,
-            control_gate,
+            actions,
             Some(opens),
             signals.requested(),
         )
@@ -1168,7 +1824,10 @@ fn personal_server_auth(
 fn run_transport_resume_command() -> Result<()> {
     let refuse = |why: String| -> anyhow::Error {
         serve::init_log(false);
-        log::error("update", &format!("transport-resume: {why}"));
+        log::error(
+            "update",
+            &format!("{}: {why}", qshd::update::RESUME_FAILED_LOG),
+        );
         anyhow::anyhow!(why)
     };
     // SAFETY: main enters this branch before opening descriptors or starting
@@ -1195,7 +1854,10 @@ fn run_transport_resume(handover: handover::PreparedHandover) -> Result<()> {
     }));
     let result = resume_personal_daemon(handover);
     if let Err(e) = &result {
-        log::error("update", &format!("transport-resume: {e:#}"));
+        log::error(
+            "update",
+            &format!("{}: {e:#}", qshd::update::RESUME_FAILED_LOG),
+        );
     }
     result
 }
@@ -1218,7 +1880,8 @@ fn resume_personal_daemon(handover: handover::PreparedHandover) -> Result<()> {
     log::info(
         "update",
         &format!(
-            "resumed after an update: pid={} build={}",
+            "{}: pid={} build={}",
+            qshd::update::RESUMED_LOG,
             std::process::id(),
             state::build_label()
         ),
@@ -1292,7 +1955,8 @@ mod tests {
     use super::{
         ask_status_with, control, help_text, load_or_create_transport_key,
         parse_transport_echo_args, parse_transport_ensure_args, parse_transport_shell_args,
-        personal_server_auth, ready_ports, state, update, version_text, write_transport_ready,
+        personal_server_auth, ready_ports, state, update, validate_add_client_reply, version_text,
+        write_transport_ready,
     };
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
@@ -1713,37 +2377,204 @@ mod tests {
     }
 
     #[test]
-    fn ready_ports_are_the_ones_the_live_daemon_reports() {
-        let status = control::StatusResponse {
-            logging_warning: None,
-            cleanup: None,
-            version: "0.3.0".into(),
-            build: 1,
-            checksum: "x".into(),
-            ports: vec![control::PortStatus {
-                port: 60000,
-                default: true,
-                connections: 0,
-            }],
-            total_connections: 0,
-            pid: 1,
-        };
-        assert_eq!(ready_ports(&status, &[60022]), vec![60000]);
+    fn bootstrap_tool_capability_describes_flags_not_running_daemon_profiles() {
+        let value: serde_json::Value =
+            serde_json::from_str(&super::bootstrap_capabilities_line()).unwrap();
+        assert_eq!(
+            value,
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
+                serde_json::json!({"schema":1,"busy_decisions":true,"account_service_restart_v1":true})
+            } else {
+                serde_json::json!({"schema":1,"busy_decisions":true})
+            }
+        );
     }
 
     #[test]
-    fn a_status_without_ports_falls_back_to_the_requested_ones() {
-        let status = control::StatusResponse {
+    fn service_confirmation_is_explicit_and_cannot_enter_recovery_or_exact_scope() {
+        let selector = serde_json::json!({"profile":"personal_transport_v1","uid":1000,"endpoint":"/fixture/qsh/control.sock","port":60022});
+        let candidate = serde_json::json!({"build":2,"checksum":"ef".repeat(32)});
+        let decision = serde_json::json!({"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":candidate,"choice":"force_update","service_restart":selector});
+        let consent = serde_json::json!({"attempt":"12".repeat(16),"service":selector,"candidate":candidate,"action":"restart_account_service"});
+        let base = args(&[
+            "transport-ensure",
+            "--name",
+            "fixture",
+            "--port",
+            "60022",
+            "--report-busy",
+            "--busy-attempt",
+            &"12".repeat(16),
+            "--busy-decision",
+            &decision.to_string(),
+            "--service-candidate-helper",
+            "/fixture/qshd",
+            "--service-restart-consent",
+            &consent.to_string(),
+        ]);
+        assert!(
+            parse_transport_ensure_args(&base).is_ok(),
+            "separate service consent must parse"
+        );
+        let mut recovery = base.clone();
+        recovery.push("--restart-only".into());
+        assert!(parse_transport_ensure_args(&recovery).is_err());
+        let mut conflicting = base;
+        conflicting.extend(args(&["--destructive-consent", "{}"]));
+        assert!(parse_transport_ensure_args(&conflicting).is_err());
+    }
+
+    #[test]
+    fn destructive_confirmation_requires_exact_force_attempt_identity_and_candidate() {
+        let decision = serde_json::json!({"attempt":"12".repeat(16),"identity":{"version":"0.6.0-rc1","build":1,"checksum":"ab".repeat(32),"pid":42,"generation":"cd".repeat(16)},"candidate":{"build":2,"checksum":"ef".repeat(32)},"choice":"force_update"});
+        let consent = serde_json::json!({"attempt":decision["attempt"],"identity":decision["identity"],"candidate":decision["candidate"],"action":"stop_and_restart"});
+        let parse = |decision: &serde_json::Value, consent: &serde_json::Value| {
+            parse_transport_ensure_args(&args(&[
+                "transport-ensure",
+                "--name",
+                "fixture",
+                "--port",
+                "60022",
+                "--report-busy",
+                "--busy-attempt",
+                &"12".repeat(16),
+                "--busy-decision",
+                &decision.to_string(),
+                "--destructive-consent",
+                &consent.to_string(),
+            ]))
+        };
+        assert!(parse(&decision, &consent)
+            .unwrap()
+            .destructive_consent
+            .is_some());
+        for field in ["attempt", "generation", "candidate", "action"] {
+            let mut stale = consent.clone();
+            match field {
+                "attempt" => stale["attempt"] = "34".repeat(16).into(),
+                "generation" => stale["identity"]["generation"] = "aa".repeat(16).into(),
+                "candidate" => stale["candidate"]["build"] = 3.into(),
+                _ => stale["action"] = "preserve".into(),
+            }
+            assert!(parse(&decision, &stale).is_err());
+        }
+        let mut ordinary = decision;
+        ordinary["choice"] = "continue_old".into();
+        assert!(parse(&ordinary, &consent).is_err());
+    }
+
+    #[test]
+    fn busy_flags_require_explicit_report_mode_and_valid_scoped_identity() {
+        let decision = serde_json::json!({"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"choice":"continue_old"}).to_string();
+        let attempt = "12".repeat(16);
+        for suffix in [
+            vec!["--busy-decision", decision.as_str()],
+            vec!["--report-busy", "--restart-only"],
+            vec!["--report-busy", "--busy-attempt", "bad"],
+            vec![
+                "--report-busy",
+                "--busy-attempt",
+                &attempt,
+                "--busy-decision",
+                "{}",
+            ],
+        ] {
+            let mut input = vec!["transport-ensure", "--name", "main", "--port", "60022"];
+            input.extend(suffix);
+            assert!(parse_transport_ensure_args(&args(&input)).is_err());
+        }
+        let parsed = parse_transport_ensure_args(&args(&[
+            "transport-ensure",
+            "--name",
+            "main",
+            "--port",
+            "60022",
+            "--report-busy",
+            "--busy-attempt",
+            &attempt,
+            "--busy-decision",
+            &decision,
+        ]))
+        .unwrap();
+        assert!(parsed.report_busy);
+        assert_eq!(parsed.busy_decision.unwrap().identity.version, "0.5.0");
+    }
+
+    fn reusable_status() -> control::StatusResponse {
+        control::StatusResponse {
             logging_warning: None,
             cleanup: None,
-            version: "0.3.0".into(),
+            version: "0.5.99".into(),
             build: 1,
-            checksum: "x".into(),
-            ports: vec![],
-            total_connections: 0,
-            pid: 1,
-        };
-        assert_eq!(ready_ports(&status, &[60022]), vec![60022]);
+            checksum: "image".into(),
+            ports: vec![control::PortStatus {
+                port: 60000,
+                default: true,
+                connections: 1,
+            }],
+            total_connections: 1,
+            pid: 42,
+        }
+    }
+
+    #[test]
+    fn ready_ports_require_real_nonzero_listeners() {
+        let mut status = reusable_status();
+        assert_eq!(ready_ports(&status).unwrap(), vec![60000]);
+        status.ports[0].port = 0;
+        assert!(ready_ports(&status).is_err());
+        status.ports.clear();
+        assert!(ready_ports(&status).is_err());
+    }
+
+    #[test]
+    fn add_client_requires_a_valid_ack_from_the_same_compatible_daemon() {
+        let prior = reusable_status();
+        for reply in [
+            control::ControlReply::NoDaemon,
+            control::ControlReply::TimedOut,
+            control::ControlReply::Answered("not-json".into()),
+            control::ControlReply::Answered(r#"{"error":"denied"}"#.into()),
+        ] {
+            assert!(validate_add_client_reply(reply, &prior).is_err());
+        }
+        for changed in 0..6 {
+            let mut ack = prior.clone();
+            match changed {
+                0 => ack.checksum = "other".into(),
+                1 => ack.pid = 43,
+                2 => ack.version = "other".into(),
+                3 => ack.build = 2,
+                4 => ack.ports.clear(),
+                5 => ack.ports[0].port = 0,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_add_client_reply(
+                    control::ControlReply::Answered(ack.to_line().unwrap()),
+                    &prior
+                )
+                .is_err(),
+                "changed {changed}"
+            );
+        }
+        let mut ack = prior.clone();
+        ack.total_connections = 3;
+        let actual = validate_add_client_reply(
+            control::ControlReply::Answered(ack.to_line().unwrap()),
+            &prior,
+        )
+        .unwrap();
+        assert_eq!(actual.total_connections, 3);
+        // Legacy omission of PID is permitted only if the initial response
+        // itself supplied no identity to pin.
+        let mut legacy = prior.clone();
+        legacy.pid = 0;
+        assert!(validate_add_client_reply(
+            control::ControlReply::Answered(ack.to_line().unwrap()),
+            &legacy
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1818,7 +2649,7 @@ mod tests {
         assert!(warning.contains("file logging disabled: log-path"));
         assert!(warning.len() <= 1024 && !warning.contains('\x1b'));
         let mut output = Vec::new();
-        write_transport_ready(&mut output, &[7; 32], &[60000], Some(&warning)).unwrap();
+        write_transport_ready(&mut output, "0.5.99", &[7; 32], &[60000], Some(&warning)).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(output.lines().count(), 2);
         let json: serde_json::Value = serde_json::from_str(
@@ -1838,7 +2669,7 @@ mod tests {
         let pubkey = [7u8; 32];
         let mut buf: Vec<u8> = Vec::new();
 
-        write_transport_ready(&mut buf, &pubkey, &[60000, 60999], None).unwrap();
+        write_transport_ready(&mut buf, "0.5.99", &pubkey, &[60000, 60999], None).unwrap();
 
         let text = String::from_utf8(buf).unwrap();
         let mut lines = text.lines();
@@ -1854,7 +2685,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&second[prefix.len()..]).unwrap();
         assert_eq!(
             value,
-            serde_json::json!({"version": state::QSHD_VERSION, "ports": [60000, 60999], "warning": null})
+            serde_json::json!({"version": "0.5.99", "ports": [60000, 60999], "warning": null})
         );
     }
 
@@ -1862,13 +2693,13 @@ mod tests {
     fn transport_ready_carries_optional_warning() {
         let mut buf = Vec::new();
         let pk = [0u8; 32];
-        write_transport_ready(&mut buf, &pk, &[60000], Some("daemon differs")).unwrap();
+        write_transport_ready(&mut buf, "0.5.99", &pk, &[60000], Some("daemon differs")).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("server-pubkey: "));
         assert!(s.contains("\"warning\":\"daemon differs\""));
 
         let mut buf2 = Vec::new();
-        write_transport_ready(&mut buf2, &pk, &[60000], None).unwrap();
+        write_transport_ready(&mut buf2, "0.5.99", &pk, &[60000], None).unwrap();
         let s2 = String::from_utf8(buf2).unwrap();
         assert!(s2.contains("TRANSPORT-READY "));
         // No warning -> field is null (client tolerates absence/null).

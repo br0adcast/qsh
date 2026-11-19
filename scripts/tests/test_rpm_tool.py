@@ -190,7 +190,7 @@ print(json.dumps(observation))
             ('cargo-generate-rpm-0.21.0', '3187e19f0e00274b3b24f017559038722388889bd1a2ecd2281cd748e7d52ec6'),
             ('rpm-0.23.2', 'cf5c92939a06adb261d757e43f49bcdb121d62c6fe8e859b1006ce37f81e6d7f')))
         name = 'cargo-generate-rpm-0.21.0-reap-ldd.patch'
-        self.assertEqual(prepare.PATCHES[-1], name)
+        self.assertIn(name, prepare.PATCHES)
         self.assertTrue((ROOT / 'packaging/rpm-tool' / name).is_file())
 
     def test_package_floor_copy_sources_exist_in_both_actual_contexts(self):

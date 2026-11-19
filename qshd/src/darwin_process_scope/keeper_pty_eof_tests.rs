@@ -1179,8 +1179,8 @@ mod native {
             return Err(error("explicit inherited descriptor admission"));
         }
         let mut nonce = [0u8; 16];
-        use rand_core::RngCore;
-        rand_core::OsRng
+        use rand_core::TryRng;
+        getrandom::SysRng
             .try_fill_bytes(&mut nonce)
             .map_err(|_| error("nonce unavailable"))?;
         let rx = Receiver::new(nonce, label.0);

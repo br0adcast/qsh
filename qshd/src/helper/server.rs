@@ -70,6 +70,10 @@
 //! `monitor::fork_shell`'s docs. None of the calls is `std::env::set_var`, which this module
 //! deliberately avoids there -- see [`child_env`]'s docs.
 
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // No production durable monitor binding exists yet.
+pub(crate) mod durable_owner;
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -98,6 +102,39 @@ use super::protocol::{
     decode, encode, merge_cleanup_failure, AuthRequest, AuthResponse, ChannelId, CleanupFailure,
     MonitorEvent, MonitorRequest, Nonce, Request, Response,
 };
+
+// Dormant internal adapter: fork entrypoints stay private to this existing
+// single-threaded server context. This exports sealed result types, not a new
+// runtime endpoint or a callable fork API for arbitrary worker threads.
+#[path = "policy_check.rs"]
+#[allow(dead_code)]
+pub(crate) mod policy_check;
+
+#[path = "local_auth_dispatch.rs"]
+#[allow(dead_code)] // Dormant proof driver; no runtime route is activated.
+mod local_auth_dispatch;
+
+pub(super) enum VerificationDestination {
+    LegacyLogin {
+        id: super::protocol::AuthRequestId,
+        login_id: LoginId,
+        rhost: String,
+    },
+    #[cfg_attr(not(test), allow(dead_code))]
+    HostPolicy(Option<Box<policy_check::HostPolicyDestination>>),
+}
+
+enum VerificationWork<'a> {
+    Authenticate {
+        login: &'a str,
+        public_key: &'a [u8],
+        signature: &'a [u8],
+        handshake_hash: &'a [u8; 32],
+        nonce: &'a Nonce,
+    },
+    #[cfg_attr(not(test), allow(dead_code))]
+    CurrentPolicy(&'a policy_check::SystemCredential),
+}
 
 /// How long the loop waits on the socket before looking for dead children.
 /// Children are also reaped right after every message, so this only bounds
@@ -602,6 +639,10 @@ struct LoopState {
     /// away never gets that far); or found already gone, because one of
     /// those three already claimed it.
     nonces: HashMap<Nonce, Instant>,
+    /// HostPolicy nonces are not spendable/releasable by the legacy worker seam.
+    /// Both destinations share MAX_OUTSTANDING_NONCES and the same expiry rule.
+    host_nonces: HashMap<Nonce, Instant>,
+    host_auth_tickets: Vec<local_auth_dispatch::HostTicket>,
     /// Accounts a `Request::Verify` has admitted, keyed by uid -- the
     /// account exactly as the verifying child resolved and approved it
     /// ([`verify_proof_after_nonce`]), carried back whole on its report
@@ -1185,6 +1226,8 @@ fn serve_inner(
         orphans: Vec::new(),
         closing: HashMap::new(),
         nonces: HashMap::new(),
+        host_nonces: HashMap::new(),
+        host_auth_tickets: Vec::new(),
         verified: admitted
             .values()
             .map(|account| (account.uid, account.clone()))
@@ -2222,7 +2265,7 @@ fn serve_auth_seam(
     match body {
         Request::Nonce => {
             let answer = match (!state.stopping && state.required_publication.is_none())
-                .then(|| issue_nonce(&mut state.nonces))
+                .then(|| issue_scoped_nonce(state, NonceDestination::LegacyLogin))
                 .flatten()
             {
                 Some(nonce) => Response::Nonce { nonce },
@@ -2342,7 +2385,11 @@ fn serve_auth_seam(
                             answered: false,
                             #[cfg(target_os = "linux")]
                             custody: Some(Box::new(custody)),
-                            id,
+                            destination: VerificationDestination::LegacyLogin {
+                                id,
+                                login_id,
+                                rhost: sanitized_rhost(&rhost),
+                            },
                             // Bounded HERE too, and for the same reason the
                             // address below is. The name the CHILD was
                             // forked with is the one the client sent, whole
@@ -2353,12 +2400,6 @@ fn serve_auth_seam(
                             // nothing, so it is kept in the form that line
                             // may safely carry.
                             login: sanitized_login_name(&login),
-                            login_id,
-                            // Bounded HERE, on the way in, rather than
-                            // wherever it is eventually read: what the
-                            // privileged process keeps must be within its
-                            // own bounds from the moment it keeps it.
-                            rhost: sanitized_rhost(&rhost),
                         },
                     });
                 }
@@ -3465,6 +3506,7 @@ fn reap(sock: &UnixStream, state: &mut LoopState) {
     // this ever needs to -- this is what bounds the table for a nonce
     // nobody follows up on.
     sweep_expired_nonces(&mut state.nonces, now);
+    sweep_expired_nonces(&mut state.host_nonces, now);
 
     // And, on the same pass and the same timescale, logins that verified
     // and never became real: a `Request::LoginEnded` (see
@@ -3530,6 +3572,41 @@ fn log_failed_kill(result: nix::Result<()>, pid: Pid, what: &str) {
             ),
         ),
     }
+}
+
+// Independent nonce destinations share one bounded issuance budget.
+#[derive(Clone, Copy)]
+enum NonceDestination {
+    LegacyLogin,
+    #[cfg_attr(not(test), allow(dead_code))]
+    HostPolicy,
+}
+fn issue_scoped_nonce(state: &mut LoopState, destination: NonceDestination) -> Option<Nonce> {
+    if state.nonces.len().checked_add(state.host_nonces.len())? >= MAX_OUTSTANDING_NONCES {
+        return None;
+    }
+    for _ in 0..8 {
+        let nonce = match destination {
+            NonceDestination::LegacyLogin => issue_nonce(&mut state.nonces)?,
+            NonceDestination::HostPolicy => issue_nonce(&mut state.host_nonces)?,
+        };
+        let collision = match destination {
+            NonceDestination::LegacyLogin => state.host_nonces.contains_key(&nonce),
+            NonceDestination::HostPolicy => state.nonces.contains_key(&nonce),
+        };
+        if !collision {
+            return Some(nonce);
+        }
+        match destination {
+            NonceDestination::LegacyLogin => {
+                state.nonces.remove(&nonce);
+            }
+            NonceDestination::HostPolicy => {
+                state.host_nonces.remove(&nonce);
+            }
+        }
+    }
+    None
 }
 
 /// Mint a fresh, single-use nonce and remember when it was issued, or
@@ -4002,7 +4079,7 @@ fn verdict_from_pipe(report: &OwnedFd, deadline: Instant) -> Option<Verdict> {
             Err(nix::Error::EINTR) => continue,
             Err(_) => return None,
         }
-        match nix::unistd::read(report.as_raw_fd(), &mut chunk) {
+        match nix::unistd::read(report, &mut chunk) {
             Ok(0) => break,
             Ok(n) => {
                 record.extend_from_slice(&chunk[..n]);
@@ -4126,7 +4203,7 @@ struct VerificationStart {
     custody: super::verification::VerificationChild,
 }
 
-// The Linux saved mask is a separate fork-boundary value, alongside the proof fields.
+// Preserve the legacy entrypoint and its original proof/lifetime semantics.
 #[allow(clippy::too_many_arguments)]
 fn fork_verification(
     login: &str,
@@ -4138,11 +4215,38 @@ fn fork_verification(
     switches: AccountSwitches,
     #[cfg(target_os = "linux")] child_mask: Option<super::stop_signal::ChildMask>,
 ) -> anyhow::Result<VerificationStart> {
+    fork_verification_work(
+        VerificationWork::Authenticate {
+            login,
+            public_key,
+            signature,
+            handshake_hash,
+            nonce,
+        },
+        config,
+        switches,
+        #[cfg(target_os = "linux")]
+        child_mask,
+        None,
+    )
+}
+
+// The Linux saved mask is a separate fork-boundary value, alongside the proof fields.
+#[allow(clippy::too_many_arguments)]
+fn fork_verification_work(
+    work: VerificationWork<'_>,
+    config: &HelperConfig,
+    switches: AccountSwitches,
+    #[cfg(target_os = "linux")] child_mask: Option<super::stop_signal::ChildMask>,
+    policy_deadline: Option<Instant>,
+) -> anyhow::Result<VerificationStart> {
     use nix::fcntl::OFlag;
     use nix::unistd::{fork, pipe2, ForkResult};
 
     #[cfg(target_os = "linux")]
-    let deadline = Instant::now() + config.verify_timeout;
+    let deadline = policy_deadline.map_or(Instant::now() + config.verify_timeout, |policy| {
+        policy.min(Instant::now() + config.verify_timeout)
+    });
     #[cfg(target_os = "linux")]
     let view = crate::process_scope::prepare()
         .map_err(anyhow::Error::msg)
@@ -4151,7 +4255,7 @@ fn fork_verification(
         pipe2(OFlag::O_CLOEXEC).context("opening the verification report pipe")?;
     #[cfg(target_os = "linux")]
     nix::fcntl::fcntl(
-        report_read.as_raw_fd(),
+        &report_read,
         nix::fcntl::FcntlArg::F_SETFL(OFlag::O_NONBLOCK),
     )
     .context("making verification reports nonblocking before fork")?;
@@ -4189,7 +4293,10 @@ fn fork_verification(
             );
             drop(report_write);
             #[cfg(not(target_os = "linux"))]
-            let deadline = Instant::now() + config.verify_timeout;
+            let deadline = policy_deadline
+                .map_or(Instant::now() + config.verify_timeout, |policy| {
+                    policy.min(Instant::now() + config.verify_timeout)
+                });
             Ok(VerificationStart {
                 report: report_read,
                 child,
@@ -4246,16 +4353,28 @@ fn fork_verification(
                 if child_mask.is_some_and(|mask| mask.restore().is_err()) {
                     unsafe { nix::libc::_exit(127) };
                 }
-                let verdict = match verify_proof_after_nonce(
-                    login,
-                    public_key,
-                    signature,
-                    handshake_hash,
-                    nonce,
-                    config,
-                    switches,
-                    verifier_parent,
-                ) {
+                let checked = match work {
+                    VerificationWork::Authenticate {
+                        login,
+                        public_key,
+                        signature,
+                        handshake_hash,
+                        nonce,
+                    } => verify_proof_after_nonce(
+                        login,
+                        public_key,
+                        signature,
+                        handshake_hash,
+                        nonce,
+                        config,
+                        switches,
+                        verifier_parent,
+                    ),
+                    VerificationWork::CurrentPolicy(credential) => {
+                        credential.check_current(config, switches, verifier_parent)
+                    }
+                };
+                let verdict = match checked {
                     Ok((account, identity, algorithm)) => Verdict::Admitted {
                         account,
                         identity,
@@ -4623,7 +4742,7 @@ fn open_channel(
         // The account must own its own terminal (`give_terminal`): `openpty`
         // gives it to whoever opened it, and that is root here.
         give_terminal(
-            pty.slave.as_raw_fd(),
+            pty.slave.as_fd(),
             account.uid,
             config.tty_gid.unwrap_or(account.gid),
         )
@@ -4887,7 +5006,7 @@ pub(super) fn read_startup_report(report_read: &OwnedFd, deadline: Instant) -> S
             Err(nix::Error::EINTR) => continue,
             Err(_) => return StartupReport::TimedOut,
         }
-        match nix::unistd::read(report_read.as_raw_fd(), &mut buf[filled..]) {
+        match nix::unistd::read(report_read, &mut buf[filled..]) {
             Ok(0) => return StartupReport::Started,
             Ok(n) => {
                 filled += n;
@@ -4983,10 +5102,8 @@ fn finish_pending(
             answered,
             #[cfg(target_os = "linux")]
             mut custody,
-            id,
             login,
-            login_id,
-            rhost,
+            mut destination,
         } => {
             #[cfg(target_os = "linux")]
             {
@@ -5031,15 +5148,11 @@ fn finish_pending(
                             ));
                         }
                         let verdict = result.ok().and_then(|record| decode_verdict(&record));
-                        publish_verification(
+                        publish_verification_destination(
                             seams,
                             state,
-                            VerificationReply {
-                                id,
-                                login: &login,
-                                login_id,
-                                rhost: &rhost,
-                            },
+                            &mut destination,
+                            &login,
                             verdict,
                             why,
                         );
@@ -5054,10 +5167,8 @@ fn finish_pending(
                             child,
                             answered,
                             custody,
-                            id,
                             login,
-                            login_id,
-                            rhost,
+                            destination,
                         },
                     });
                 }
@@ -5102,15 +5213,11 @@ fn finish_pending(
                 };
 
                 let _ = answered;
-                publish_verification(
+                publish_verification_destination(
                     seams,
                     state,
-                    VerificationReply {
-                        id,
-                        login: &login,
-                        login_id,
-                        rhost: &rhost,
-                    },
+                    &mut destination,
+                    &login,
                     verdict,
                     why,
                 );
@@ -5124,6 +5231,44 @@ fn progress_verifications(seams: Seams<'_>, state: &mut LoopState, config: &Help
     for fd in state.pending.verification_fds() {
         if let Some(pending) = state.pending.take_ready(fd) {
             finish_pending(seams, state, config, pending, WhyFinished::Progress);
+        }
+    }
+}
+
+fn publish_verification_destination(
+    seams: Seams<'_>,
+    state: &mut LoopState,
+    destination: &mut VerificationDestination,
+    login: &str,
+    verdict: Option<Verdict>,
+    why: WhyFinished,
+) {
+    match destination {
+        VerificationDestination::LegacyLogin {
+            id,
+            login_id,
+            rhost,
+        } => publish_verification(
+            seams,
+            state,
+            VerificationReply {
+                id: *id,
+                login,
+                login_id: *login_id,
+                rhost,
+            },
+            verdict,
+            why,
+        ),
+        VerificationDestination::HostPolicy(destination) => {
+            if let Some(destination) = destination.take() {
+                let verdict = if state.stopping || state.required_publication.is_some() {
+                    None
+                } else {
+                    verdict
+                };
+                destination.publish(verdict);
+            }
         }
     }
 }
@@ -5577,7 +5722,7 @@ pub(super) fn chdir_warning_bytes(home: &[u8]) -> Vec<u8> {
 /// group may only write to it, nobody else may touch it. `gid` is the `tty`
 /// group, resolved once at startup (`HelperConfig::tty_gid`), or the
 /// account's own group on a machine without one.
-fn give_terminal(slave: std::os::fd::RawFd, uid: Uid, gid: Gid) -> nix::Result<()> {
+fn give_terminal(slave: BorrowedFd<'_>, uid: Uid, gid: Gid) -> nix::Result<()> {
     use nix::sys::stat::{fchmod, Mode};
     fchmod(slave, Mode::from_bits_truncate(0o620))?;
     nix::unistd::fchown(slave, Some(uid), Some(gid))
@@ -5864,7 +6009,7 @@ fn max_open_descriptors() -> RawFd {
 }
 
 /// `close_range(first, last, 0)`: whether the kernel closed that whole
-/// range for us. `nix` 0.28 has no wrapper for it, so the syscall is made
+/// range for us. `nix` 0.32 has no wrapper for it, so the syscall is made
 /// directly.
 ///
 /// Called in the child between `fork` and `execve`: one syscall, three
@@ -6256,7 +6401,8 @@ pub(crate) mod tests {
         // A process name holds 15 bytes; this stays under that.
         let name = format!(
             "qsh{tag}{:08x}",
-            rand_core::RngCore::next_u32(&mut rand_core::OsRng)
+            rand_core::TryRng::try_next_u32(&mut getrandom::SysRng)
+                .expect("operating system randomness is available")
         );
         let path = dir.join(&name);
         std::os::unix::fs::symlink(target, &path).expect("link a uniquely named program");
@@ -6501,7 +6647,8 @@ pub(crate) mod tests {
 
         let bait_name = format!(
             "qshd-bait-{:08x}",
-            rand_core::RngCore::next_u32(&mut rand_core::OsRng)
+            rand_core::TryRng::try_next_u32(&mut getrandom::SysRng)
+                .expect("operating system randomness is available")
         );
         let bait_path = h.dir.path().join(&bait_name);
         std::fs::write(&bait_path, b"bait").expect("write the bait file");
@@ -6516,7 +6663,7 @@ pub(crate) mod tests {
         // and the check below would pass with the sweep having done
         // nothing at all.
         let flags = nix::fcntl::FdFlag::from_bits_truncate(
-            nix::fcntl::fcntl(bait, nix::fcntl::FcntlArg::F_GETFD).expect("fcntl(F_GETFD)"),
+            nix::fcntl::fcntl(&bait, nix::fcntl::FcntlArg::F_GETFD).expect("fcntl(F_GETFD)"),
         );
         assert!(
             !flags.contains(nix::fcntl::FdFlag::FD_CLOEXEC),
@@ -6664,32 +6811,140 @@ pub(crate) mod tests {
         h.stop();
     }
 
-    /// The exec target is the account's shell FROM PASSWD -- a uniquely
-    /// named link so only IT can be what ran -- and `/bin/sh` when passwd
+    // Validate the account-shell fixture's observations independently of the
+    // system's env implementation and its handling of a renamed argv[0].
+    fn account_shell607_witness_matches(output: &str, expected_shell: &str) -> bool {
+        let expected = [
+            format!("EXECUTED={expected_shell}"),
+            format!("SHELL={expected_shell}"),
+        ];
+        output.lines().eq(expected.iter().map(String::as_str))
+    }
+
+    #[test]
+    fn shell607_witness_accepts_exact_records_and_pty_line_endings() {
+        for output in [
+            "EXECUTED=/private/selected-shell\nSHELL=/private/selected-shell\n",
+            "EXECUTED=/private/selected-shell\r\nSHELL=/private/selected-shell\r\n",
+        ] {
+            assert!(account_shell607_witness_matches(
+                output,
+                "/private/selected-shell"
+            ));
+        }
+    }
+
+    #[test]
+    fn shell607_witness_rejects_counterfeit_execution_or_shell() {
+        for (case, output) in [
+            (
+                "correct environment with wrong executable",
+                "EXECUTED=/private/other-shell\nSHELL=/private/selected-shell\n",
+            ),
+            (
+                "correct executable with wrong environment",
+                "EXECUTED=/private/selected-shell\nSHELL=/private/other-shell\n",
+            ),
+            (
+                "selected path is only a prefix",
+                "EXECUTED=/private/selected-shell-extra\nSHELL=/private/selected-shell-extra\n",
+            ),
+        ] {
+            assert!(
+                !account_shell607_witness_matches(output, "/private/selected-shell"),
+                "{case} must not prove the selected shell executed"
+            );
+        }
+    }
+
+    #[test]
+    fn shell607_witness_rejects_missing_duplicate_or_malformed_records() {
+        for (case, output) in [
+            ("missing execution", "SHELL=/private/selected-shell\n"),
+            ("missing environment", "EXECUTED=/private/selected-shell\n"),
+            (
+                "duplicate execution",
+                "EXECUTED=/private/selected-shell\nEXECUTED=/private/selected-shell\nSHELL=/private/selected-shell\n",
+            ),
+            (
+                "duplicate environment",
+                "EXECUTED=/private/selected-shell\nSHELL=/private/selected-shell\nSHELL=/private/selected-shell\n",
+            ),
+            (
+                "unexpected record",
+                "EXECUTED=/private/selected-shell\nSHELL=/private/selected-shell\nEXTRA=unexpected\n",
+            ),
+            (
+                "unexpected blank line",
+                "EXECUTED=/private/selected-shell\n\nSHELL=/private/selected-shell\n",
+            ),
+            (
+                "leading whitespace",
+                "EXECUTED=/private/selected-shell\n SHELL=/private/selected-shell\n",
+            ),
+            (
+                "trailing whitespace",
+                "EXECUTED=/private/selected-shell\nSHELL=/private/selected-shell \n",
+            ),
+            ("empty output", ""),
+        ] {
+            assert!(
+                !account_shell607_witness_matches(output, "/private/selected-shell"),
+                "{case} must not prove the selected shell executed"
+            );
+        }
+    }
+
+    /// The exec target is the account's shell FROM PASSWD -- a private
+    /// executable that reports its own path -- and `/bin/sh` when passwd
     /// leaves it empty, never the helper's own `$SHELL`.
     #[test]
     fn the_exec_target_is_the_accounts_shell_from_passwd() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
         let me = super::account::lookup(&my_login()).expect("this account resolves");
 
-        // A uniquely named link to `/usr/bin/env` as the shell: a login
-        // shell execs it directly, and `env` -- ignoring its argv0 -- prints
-        // the environment, in which SHELL is what the helper set from passwd:
-        // the link itself, nothing else on the machine has that name.
+        // The script observes its own target path independently of SHELL.
+        // A shebang interpreter supplies the script's $0; separate tests
+        // above retain the native executable's login-argv0 contract.
         let dir = tempfile::tempdir().expect("tempdir");
-        let (renamed_env, _) = uniquely_named(dir.path(), "e", "/usr/bin/env");
+        let selected_shell = dir.path().join("selected-shell");
+        std::fs::write(
+            &selected_shell,
+            "#!/bin/sh\nprintf 'EXECUTED=%s\\nSHELL=%s\\n' \"$0\" \"$SHELL\"\n",
+        )
+        .expect("write the private account-shell executable");
+        std::fs::set_permissions(&selected_shell, std::fs::Permissions::from_mode(0o700))
+            .expect("make the private account-shell executable runnable");
         let account = Account {
-            shell: renamed_env.clone(),
+            shell: selected_shell.clone(),
             ..me.clone()
         };
         let h = helper_for(account.clone(), test_config(), UNPRIVILEGED);
-        let out = output_of(&h, &open_shell(1, &account));
-        assert!(
-            out.contains(&format!("SHELL={}", renamed_env.display())),
-            "the shell channel must exec the account's shell ({}) and set SHELL to it, got \
-             {out:?}",
-            renamed_env.display()
-        );
-        h.stop();
+        let primary = catch_unwind(AssertUnwindSafe(|| {
+            let out = output_of(&h, &open_shell(1, &account));
+            assert!(
+                account_shell607_witness_matches(
+                    &out,
+                    selected_shell.to_str().expect("the fixture path is UTF-8")
+                ),
+                "the shell channel must execute the account's shell ({}) and set SHELL to it, \
+                 with exactly one record of each observation, got {out:?}",
+                selected_shell.display()
+            );
+        }));
+        let cleanup = catch_unwind(AssertUnwindSafe(|| h.stop()));
+        match (primary, cleanup) {
+            (Err(primary), cleanup) => {
+                if cleanup.is_err() {
+                    eprintln!("the selected-shell fixture's bounded cleanup also failed");
+                }
+                resume_unwind(primary)
+            }
+            (Ok(()), Err(cleanup)) => resume_unwind(cleanup),
+            (Ok(()), Ok(())) => {}
+        }
 
         // An empty passwd shell falls back to `/bin/sh`: ask the resulting
         // shell for `$SHELL` through a command channel.
@@ -6698,15 +6953,27 @@ pub(crate) mod tests {
             ..me
         };
         let h = helper_for(account.clone(), test_config(), UNPRIVILEGED);
-        let out = output_of(
-            &h,
-            &open_for(2, &account, "printf 'SHELL=%s\\n' \"$SHELL\""),
-        );
-        assert!(
-            out.contains("SHELL=/bin/sh"),
-            "an empty passwd shell must fall back to /bin/sh, got {out:?}"
-        );
-        h.stop();
+        let primary = catch_unwind(AssertUnwindSafe(|| {
+            let out = output_of(
+                &h,
+                &open_for(2, &account, "printf 'SHELL=%s\\n' \"$SHELL\""),
+            );
+            assert!(
+                out.contains("SHELL=/bin/sh"),
+                "an empty passwd shell must fall back to /bin/sh, got {out:?}"
+            );
+        }));
+        let cleanup = catch_unwind(AssertUnwindSafe(|| h.stop()));
+        match (primary, cleanup) {
+            (Err(primary), cleanup) => {
+                if cleanup.is_err() {
+                    eprintln!("the empty-shell fixture's bounded cleanup also failed");
+                }
+                resume_unwind(primary)
+            }
+            (Ok(()), Err(cleanup)) => resume_unwind(cleanup),
+            (Ok(()), Ok(())) => {}
+        }
     }
 
     /// A channel whose program exits on its own is reported exactly once,
@@ -8158,6 +8425,8 @@ pub(crate) mod tests {
             orphans: Vec::new(),
             closing: HashMap::new(),
             nonces: HashMap::new(),
+            host_nonces: HashMap::new(),
+            host_auth_tickets: Vec::new(),
             verified: HashMap::from([(account.uid, account.clone())]),
             logins,
             monitors: HashMap::new(),
@@ -8227,6 +8496,8 @@ pub(crate) mod tests {
             orphans: Vec::new(),
             closing: HashMap::new(),
             nonces: HashMap::new(),
+            host_nonces: HashMap::new(),
+            host_auth_tickets: Vec::new(),
             verified: HashMap::new(),
             logins: HashMap::new(),
             monitors: HashMap::new(),
@@ -13316,10 +13587,12 @@ pub(crate) mod tests {
                 answered: false,
                 #[cfg(target_os = "linux")]
                 custody: None,
-                id: 1,
                 login: "filler".to_string(),
-                login_id: [0u8; 16],
-                rhost: String::new(),
+                destination: VerificationDestination::LegacyLogin {
+                    id: 1,
+                    login_id: [0u8; 16],
+                    rhost: String::new(),
+                },
             },
         }
     }
@@ -13587,10 +13860,12 @@ pub(crate) mod tests {
                 answered: false,
                 #[cfg(target_os = "linux")]
                 custody: None,
-                id: 77,
                 login: "partial".to_string(),
-                login_id: [13u8; 16],
-                rhost: String::new(),
+                destination: VerificationDestination::LegacyLogin {
+                    id: 77,
+                    login_id: [13u8; 16],
+                    rhost: String::new(),
+                },
             },
         });
 
@@ -15459,7 +15734,7 @@ pub(crate) mod tests {
             ws_ypixel: 0,
         };
         let pty = nix::pty::openpty(&ws, None).expect("openpty");
-        let slave = pty.slave.as_raw_fd();
+        let slave = pty.slave.as_fd();
         fchmod(slave, Mode::from_bits_truncate(0o600)).expect("start from a non-0620 mode");
 
         give_terminal(slave, Uid::current(), Gid::current())
@@ -17044,6 +17319,94 @@ pub(crate) mod tests {
         h.stop();
     }
 
+    fn tty608_terminal_witness(output: &str, exit_code: i32) -> Option<&str> {
+        if exit_code != 0 {
+            return None;
+        }
+        let mut lines = output
+            .strip_suffix('\n')?
+            .split('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line));
+        if lines.next()? != "QSH_TTY_BEGIN" {
+            return None;
+        }
+        let terminal = lines.next()?;
+        if lines.next()? != "QSH_TTY_END"
+            || lines.next().is_some()
+            || !terminal.starts_with("/dev/")
+            || terminal.len() == "/dev/".len()
+            || terminal.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some(terminal)
+    }
+
+    #[test]
+    fn tty608_terminal_witness_requires_one_complete_exact_frame() {
+        let lf = "QSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END\n";
+        let crlf = "QSH_TTY_BEGIN\r\n/dev/pts/1\r\nQSH_TTY_END\r\n";
+        for framed in [lf, crlf] {
+            assert_eq!(tty608_terminal_witness(framed, 0), Some("/dev/pts/1"));
+            for exit_code in [1, -1, 127] {
+                assert_eq!(tty608_terminal_witness(framed, exit_code), None);
+            }
+        }
+        for malformed in [
+            "/dev/pts/1END\r\n",
+            "QSH_TTY_OTHER_BEGIN\n/dev/pts/1\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_OTHER_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END",
+            "QSH_TTY_BEGIN\n\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\nnot a tty\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\n/dev/pts/2\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\0extra\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\rextra\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\textra\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\u{1b}\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\u{7f}\nQSH_TTY_END\n",
+            "error\nQSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END\nextra\n",
+            "QSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END\nQSH_TTY_BEGIN\n/dev/pts/1\nQSH_TTY_END\n",
+        ] {
+            assert_eq!(
+                tty608_terminal_witness(malformed, 0),
+                None,
+                "malformed terminal witness accepted: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tty608_terminal_witness_does_not_repair_a_contaminated_or_wrong_value() {
+        let old_output = "/dev/pts/1END\r\n";
+        let old_expected = old_output
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("/dev/"));
+        assert_eq!(old_expected, Some("/dev/pts/1END"));
+        assert_eq!(tty608_terminal_witness(old_output, 0), None);
+
+        for (framed, value) in [
+            ("QSH_TTY_BEGIN\n/dev/pts/2\nQSH_TTY_END\n", "/dev/pts/2"),
+            (
+                "QSH_TTY_BEGIN\n/dev/pts/1END\nQSH_TTY_END\n",
+                "/dev/pts/1END",
+            ),
+            ("QSH_TTY_BEGIN\n/dev/pts/1 \nQSH_TTY_END\n", "/dev/pts/1 "),
+        ] {
+            let other = tty608_terminal_witness(framed, 0).unwrap();
+            assert_eq!(other, value);
+            assert_ne!(
+                format!("account|service|{other}|203.0.113.7"),
+                "account|service|/dev/pts/1|203.0.113.7",
+                "a different valid terminal must not become the PAM record's terminal"
+            );
+        }
+    }
+
     /// The modules see who is logging in, on what, and from where: the
     /// account's name, the service the daemon was configured for, the
     /// terminal the helper opened for the login's first channel, and the
@@ -17081,39 +17444,60 @@ pub(crate) mod tests {
         );
 
         let h = helper_with_pam_confdir(dir.path(), "qshd-test-items");
-        // The terminal of the FIRST channel is the session's, so this one
-        // has to be read back from the channel itself -- the helper names
-        // it, and nothing else here knows it.
-        let (opened, fd) = open_command_with_fd(&h.channels, 1, my_uid(), h.login, "tty; echo END");
-        assert!(
-            matches!(opened, Response::Opened { id: 1 }),
-            "got {opened:?}"
-        );
-        let seen = read_until_or_timeout(&mut std::fs::File::from(fd.expect("terminal")), "END");
-        let tty = seen
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("/dev/"))
-            .unwrap_or_else(|| panic!("the shell must name its own terminal, got {seen:?}"))
-            .to_string();
-
-        wait_until_exists(&items, TEST_RECV_TIMEOUT);
-        let recorded = recorded_lines(&items);
-
-        assert_eq!(
-            recorded.first().map(String::as_str),
-            Some(
-                format!(
-                    "{me}|qshd-test-items|{tty}|{rhost}",
-                    me = h.me,
-                    rhost = "203.0.113.7"
+        let primary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // The first channel's terminal is the session's. Capture the
+            // utility's value, then own both record boundaries independently
+            // of any trailing newline it supplied. The value is never a format.
+            let command =
+                r#"terminal=$(tty) && printf 'QSH_TTY_BEGIN\n%s\nQSH_TTY_END\n' "$terminal""#;
+            let (opened, fd) = open_command_with_fd(&h.channels, 1, my_uid(), h.login, command);
+            assert!(
+                matches!(opened, Response::Opened { id: 1 }),
+                "got {opened:?}"
+            );
+            let mut master = std::fs::File::from(fd.expect("terminal"));
+            let seen = read_to_end_within(&mut master).unwrap_or_else(|partial| {
+                let observed: String = partial.chars().take(512).collect();
+                panic!("terminal witness must reach its end before deadline, got {observed:?}")
+            });
+            let exit_code = wait_for_exited(&h.channels, 1);
+            drop(master);
+            let tty = tty608_terminal_witness(&seen, exit_code).unwrap_or_else(|| {
+                let observed: String = seen.chars().take(512).collect();
+                panic!(
+                    "successful terminal witness must be one complete frame; exit={exit_code}, \
+                     got {observed:?}"
                 )
-                .as_str()
-            ),
-            "the account, the service, the login's terminal and the address it logged in from \
-             must all reach the modules: {recorded:?}"
-        );
-        h.stop();
+            });
+
+            wait_until_exists(&items, TEST_RECV_TIMEOUT);
+            let recorded = recorded_lines(&items);
+            assert_eq!(
+                recorded.first().map(String::as_str),
+                Some(
+                    format!(
+                        "{me}|qshd-test-items|{tty}|{rhost}",
+                        me = h.me,
+                        rhost = "203.0.113.7"
+                    )
+                    .as_str()
+                ),
+                "the account, the service, the login's terminal and the address it logged in from \
+                 must all reach the modules: {recorded:?}"
+            );
+        }));
+        // The primary assertion cannot bypass the existing bounded helper
+        // cleanup. Its terminal descriptor has already dropped on either path.
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || h.stop()));
+        if let Err(failure) = primary {
+            if cleanup.is_err() {
+                eprintln!("terminal witness cleanup also failed after the primary assertion");
+            }
+            std::panic::resume_unwind(failure);
+        }
+        if let Err(failure) = cleanup {
+            std::panic::resume_unwind(failure);
+        }
     }
 
     /// The array handed to `execve` carries each environment name ONCE.
@@ -17625,6 +18009,8 @@ pub(crate) mod tests {
             "a startup verdict must not release the slot before a cleanup receipt"
         );
     }
+    include!("server_policy_tests.rs");
+    include!("local_auth_dispatch_tests.rs");
     include!("server_open_tests.rs");
     include!("server_account_binding_tests.rs");
     include!("monitor_native_integration_tests.rs");

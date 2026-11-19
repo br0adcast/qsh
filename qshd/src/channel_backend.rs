@@ -41,10 +41,16 @@ use crate::pty;
 use crate::screen_budget::ScreenBudget;
 use terminal_size::TerminalSize;
 
+#[cfg(test)]
+pub(crate) mod fixture_leader_observation;
+
 /// Opens a channel by spawning a pseudo-terminal through `portable-pty`.
 pub struct PtyChannelSpawner {
     opens: Arc<ChannelOpenRegistry>,
     budget: Arc<ScreenBudget>,
+    retained_screens: Option<Arc<crate::session_owner::screen_owner::RetainedScreenFactory>>,
+    #[cfg(all(test, target_os = "linux"))]
+    fixture_leader_observer: Option<fixture_leader_observation::FixtureLeaderObserver>,
     #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
     keeper_fixture: Option<crate::darwin_process_scope::KeeperFixture>,
 }
@@ -53,10 +59,29 @@ impl PtyChannelSpawner {
     pub fn new(budget: Arc<ScreenBudget>) -> Self {
         Self {
             budget,
+            retained_screens: None,
+            #[cfg(all(test, target_os = "linux"))]
+            fixture_leader_observer: None,
             #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
             keeper_fixture: None,
             opens: ChannelOpenRegistry::new(Default::default()),
         }
+    }
+    /// Explicit retained-owner configuration; ordinary constructors keep their pool.
+    pub fn with_retained_screens(
+        mut self,
+        factory: Arc<crate::session_owner::screen_owner::RetainedScreenFactory>,
+    ) -> Self {
+        self.retained_screens = Some(factory);
+        self
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_fixture_leader_observer(
+        mut self,
+        observer: fixture_leader_observation::FixtureLeaderObserver,
+    ) -> Self {
+        self.fixture_leader_observer = Some(observer);
+        self
     }
     #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
     pub(crate) fn with_keeper_fixture(
@@ -82,7 +107,7 @@ impl ChannelSpawner for PtyChannelSpawner {
     fn spawn(
         &self,
         owner: &Principal,
-        _login: LoginId,
+        login: LoginId,
         req: &OpenRequest,
         term: Option<&str>,
         custody: &OpenCustody,
@@ -99,14 +124,24 @@ impl ChannelSpawner for PtyChannelSpawner {
         }
         TerminalSize::new(req.cols, req.rows)
             .map_err(|e| custody.refuse_before_creation(e.to_string()))?;
+        #[cfg(all(test, target_os = "linux"))]
+        let fixture_observation = match &self.fixture_leader_observer {
+            Some(observer) => Some(observer.claim(req.stream).map_err(|_| {
+                custody.refuse_before_creation("fixture leader registration refused".into())
+            })?),
+            None => None,
+        };
         #[cfg(target_os = "linux")]
         let process_view = crate::process_scope::prepare()
             .map_err(|error| custody.refuse_before_creation(error))?;
         #[cfg(target_os = "macos")]
         let prepared = crate::darwin_process_scope::prepare_personal()
             .map_err(|error| custody.refuse_before_creation(error.to_string()))?;
-        let screen = make_screen(req, owner, Arc::clone(&self.budget))
-            .map_err(|e| custody.refuse_before_creation(e))?;
+        let screen = match &self.retained_screens {
+            Some(factory) if req.screen => factory.take(owner, login, req, custody),
+            _ => make_screen(req, owner, Arc::clone(&self.budget)),
+        }
+        .map_err(|e| custody.refuse_before_creation(e))?;
         let size = PtySize {
             rows: req.rows,
             cols: req.cols,
@@ -154,6 +189,8 @@ impl ChannelSpawner for PtyChannelSpawner {
             screen,
             #[cfg(target_os = "linux")]
             process_view,
+            #[cfg(all(test, target_os = "linux"))]
+            fixture_observation,
         )
     }
 }
@@ -167,6 +204,9 @@ fn spawn_personal_pty(
     screen: Box<dyn SessionScreen>,
     #[cfg(target_os = "linux")] process_view: crate::process_scope::QualifiedProc,
     #[cfg(target_os = "macos")] process_view: crate::darwin_process_scope::QualifiedDarwin,
+    #[cfg(all(test, target_os = "linux"))] fixture_observation: Option<
+        fixture_leader_observation::Registration,
+    >,
 ) -> Result<UninstalledChannel, SpawnFailure> {
     if custody.is_cancelled() {
         return Err(custody.refuse_before_creation("channel startup was cancelled".into()));
@@ -203,6 +243,11 @@ fn spawn_personal_pty(
     let wait = crate::darwin_process_scope::own_child(child, process_view);
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let wait: Box<dyn ChannelWait> = Box::new(ChildWait(child));
+    #[cfg(all(test, target_os = "linux"))]
+    let wait: Box<dyn ChannelWait> = match fixture_observation {
+        Some(observer) => observer.wrap(wait),
+        None => wait,
+    };
     drop(permit);
     finish_personal_spawn(master, wait, screen, custody)
 }

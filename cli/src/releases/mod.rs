@@ -1,6 +1,8 @@
 //! Official release images with bounded HTTPS downloads and a verified local cache.
 
 mod archive;
+mod client;
+pub use client::ClientImage;
 mod cache;
 mod http;
 

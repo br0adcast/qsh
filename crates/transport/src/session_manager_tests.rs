@@ -19,7 +19,7 @@ use crate::wire::{
     encode_handshake, encode_handshake_init_cookie, encode_key_request, parse, parse_cookie_reply,
     parse_key_offer, Kind, COOKIE_LEN, VERSION,
 };
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::AtomicBool;
@@ -5978,7 +5978,7 @@ struct TestNonces;
 
 impl NonceSource for TestNonces {
     fn issue(&self) -> Result<[u8; AUTH_NONCE_LEN], String> {
-        Ok(rand::thread_rng().gen())
+        Ok(rand::rng().random())
     }
     // Nothing is tracked, so there is nothing to give up.
     fn release(&self, _nonce: [u8; AUTH_NONCE_LEN]) {}
@@ -8463,7 +8463,7 @@ struct CountingNonces(Arc<AtomicUsize>);
 impl NonceSource for CountingNonces {
     fn issue(&self) -> Result<[u8; AUTH_NONCE_LEN], String> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(rand::thread_rng().gen())
+        Ok(rand::rng().random())
     }
     // This source counts ISSUES only; release accounting is
     // `TrackingNonces`'s job (below).
@@ -8744,7 +8744,7 @@ impl TrackingNonces {
 
 impl NonceSource for TrackingNonces {
     fn issue(&self) -> Result<[u8; AUTH_NONCE_LEN], String> {
-        let nonce: [u8; AUTH_NONCE_LEN] = rand::thread_rng().gen();
+        let nonce: [u8; AUTH_NONCE_LEN] = rand::rng().random();
         self.outstanding.lock().expect("not poisoned").insert(nonce);
         self.issued_order.lock().expect("not poisoned").push(nonce);
         Ok(nonce)
@@ -12524,3 +12524,5 @@ include!("session_manager_refusal_retirement_tests.rs");
 include!("session_manager_mailbox_tests.rs");
 
 include!("session_manager_intake_tests.rs");
+
+include!("session_manager_bootstrap_tests.rs");

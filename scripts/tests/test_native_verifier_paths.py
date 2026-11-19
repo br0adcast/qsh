@@ -256,24 +256,35 @@ class NativeProductWorkflowTests(unittest.TestCase):
     DARWIN = ('aarch64-apple-darwin', 'x86_64-apple-darwin')
 
     @staticmethod
-    def body(workflow, job, step):
-        # Scope both job and exact step; preserve the literal shell indentation.
+    def job(workflow, job):
+        # Stop at the next top-level job, never at a particular later job name.
         lines = (ROOT / '.github/workflows' / workflow).read_text().splitlines()
+        if lines.count('  ' + job + ':') != 1:
+            raise AssertionError('expected one workflow job: ' + job)
         start = lines.index('  ' + job + ':') + 1
         end = next((i for i in range(start, len(lines))
                     if lines[i].startswith('  ') and not lines[i].startswith('   ')
                     and lines[i].strip() and not lines[i].lstrip().startswith('#')), len(lines))
-        lines = lines[start:end]
+        return '\n'.join(lines[start:end]) + '\n'
+
+    @staticmethod
+    def body(workflow, job, step):
+        # Scope both job and exact step; preserve the literal shell indentation.
+        lines = NativeProductWorkflowTests.job(workflow, job).splitlines()
+        if lines.count('      - name: ' + step) != 1:
+            raise AssertionError('expected one workflow step: ' + step)
         start = lines.index('      - name: ' + step) + 1
         end = next((i for i in range(start, len(lines)) if lines[i].startswith('      - ')), len(lines))
         lines = lines[start:end]
+        if lines.count('        run: |') != 1:
+            raise AssertionError('expected one literal workflow shell: ' + step)
         start = lines.index('        run: |') + 1
         result = []
         for line in lines[start:]:
             if line and not line.startswith('          '):
                 break
             result.append(line[10:] if line else '')
-        if not result:
+        if not any(line.strip() for line in result):
             raise AssertionError('missing literal workflow shell')
         return '\n'.join(result) + '\n'
 
@@ -367,6 +378,33 @@ elif name == 'python3':
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
         return result, calls, records
+
+    def test_exact_step_extraction_refuses_ambiguous_empty_and_cross_job_bodies(self):
+        text = ('jobs:\n  first:\n    steps:\n      - name: first-only\n'
+                '        run: |\n          printf first\n\n'
+                '  second:\n    steps:\n      - name: second-only\n'
+                '        run: |\n          printf second\n')
+        with tempfile.TemporaryDirectory(prefix='workflow-boundary-inert-') as directory:
+            root = Path(directory)
+            workflows = root / '.github/workflows'
+            workflows.mkdir(parents=True)
+            path = workflows / 'control.yml'
+            with mock.patch.dict(globals(), ROOT=root):
+                path.write_text(text)
+                self.assertEqual(self.body('control.yml', 'first', 'first-only'), 'printf first\n\n')
+                for job, step in [('absent', 'first-only'), ('first', 'second-only')]:
+                    with self.assertRaises(AssertionError):
+                        self.body('control.yml', job, step)
+                variants = [text + '  first:\n    steps: []\n',
+                            text.replace('  second:\n', '      - name: first-only\n  second:\n'),
+                            text.replace('          printf first\n',
+                                         '          printf first\n        run: |\n          printf shadow\n'),
+                            text.replace('          printf first\n', '')]
+                for index, variant in enumerate(variants):
+                    with self.subTest(variant=index):
+                        path.write_text(variant)
+                        with self.assertRaises(AssertionError):
+                            self.body('control.yml', 'first', 'first-only')
 
     def environment(self, calls, env, targets, *, linux, deny_warnings=False):
         builds = [c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'build']
@@ -619,14 +657,35 @@ pwd() { printf called > "$GITHUB_WORKSPACE/pwd-called"; printf "%s" "$FIXTURE_PR
     def test_intel_owner_has_independent_budget_and_required_setup(self):
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
         self.assertIn('  darwin-owner-intel:\n', native, 'Intel ownership needs its independent budget')
-        job = native.split('  darwin-owner-intel:\n', 1)[1].split('\n  system-floors:', 1)[0]
-        for required in ('name: Native Intel Darwin process owner', 'runs-on: macos-15-intel',
+        job = self.job('native-crypto.yml', 'darwin-owner-intel')
+        for required in ('runs-on: ${{ matrix.runner }}',
+                         'QSH_RUNNER_LABEL: ${{ matrix.runner }}',
+                         "environ.get('QSH_RUNNER_LABEL'), r'macos-(?:15|26)-intel'",
                          'timeout-minutes: 45', 'NATIVE_TARGET: x86_64-apple-darwin',
                          'ref: ${{ github.sha }}', 'checkout_sha=$(git rev-parse HEAD)',
                          'test "$checkout_sha" = "$GITHUB_SHA"',
+                         'shim_sha=$(/usr/bin/git rev-parse HEAD)',
+                         'test "$shim_sha" = "$checkout_sha"',
                          '"$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"',
-                         'key: native-owner-x86_64-apple-darwin'):
+                         'key: native-owner-x86_64-apple-darwin${{ matrix.cache_suffix }}'):
             self.assertIn(required, job)
+        # macOS 15 keeps its check name and cache keys; macOS 26 qualifies the
+        # xnu-12377 line admission with separate caches (#551).
+        import re
+        self.assertEqual(re.findall(
+            r"          - runner: (\S+)\n            name: (.+)\n            cache_suffix: (\S+)", job), [
+            ('macos-15-intel', 'Native Intel Darwin process owner', "''"),
+            ('macos-26-intel', 'Native Intel Darwin process owner on macOS 26', '-macos-26')])
+        ci = (ROOT / '.github/workflows/ci.yml').read_text()
+        arm = ci.split('  macos:\n', 1)[1].split('\n  check:\n', 1)[0]
+        self.assertEqual(re.findall(
+            r"          - runner: (\S+)\n            name: (.+)\n            cache_suffix: (\S+)", arm), [
+            ('macos-15', 'macOS portable tests', "''"),
+            ('macos-26', 'macOS 26 portable tests', '-macos-26')])
+        for required in ('    name: ${{ matrix.name }}\n', '    runs-on: ${{ matrix.runner }}\n',
+                         '          key: ${{ matrix.cache_suffix }}\n',
+                         'key: native-${{ runner.os }}-${{ runner.arch }}${{ matrix.cache_suffix }}-'):
+            self.assertIn(required, arm)
         for forbidden in ('needs:', 'continue-on-error:', 'if: success()', 'download-artifact',
                           'Qualify offline release authentication', self.NATIVE,
                           'cargo test --locked -p sshauth'):
@@ -651,6 +710,258 @@ pwd() { printf called > "$GITHUB_WORKSPACE/pwd-called"; printf "%s" "$FIXTURE_PR
         self.assertIn('timeout-minutes: 35', portable)
         self.assertNotIn('Qualify the production Intel Darwin process owner', portable)
         self.assertNotIn('Observe the Intel Darwin runtime', portable)
+
+    def test_intel_legacy_has_independent_budget_and_required_setup(self):
+        import re
+        legacy = self.job('native-crypto.yml', 'darwin-legacy-service-intel')
+        owner = self.job('native-crypto.yml', 'darwin-owner-intel')
+        self.assertEqual(re.findall(
+            r"          - runner: (\S+)\n            name: (.+)\n            cache_suffix: (\S+)", legacy), [
+            ('macos-15-intel', 'Native Intel Darwin legacy service', "''"),
+            ('macos-26-intel', 'Native Intel Darwin legacy service on macOS 26', '-macos-26')])
+        for required in ('    name: ${{ matrix.name }}\n',
+                         '    runs-on: ${{ matrix.runner }}\n',
+                         '    timeout-minutes: 45\n', '      fail-fast: false\n',
+                         '      NATIVE_TARGET: x86_64-apple-darwin\n',
+                         '      QSH_RUNNER_LABEL: ${{ matrix.runner }}\n',
+                         'ref: ${{ github.sha }}',
+                         'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+                         'Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6',
+                         'key: native-legacy-service-x86_64-apple-darwin${{ matrix.cache_suffix }}'):
+            self.assertIn(required, legacy)
+        setup = [
+            ('Bind the Intel owner checkout', 'Bind the Intel legacy service checkout'),
+            ('Observe the Intel Darwin runtime', 'Observe the Intel Darwin runtime'),
+            ('Build and execute the pinned owner backend', 'Build and execute the pinned legacy service backend'),
+            ('Install qualified Rust for owner checks', 'Install qualified Rust for legacy service checks'),
+        ]
+        for owner_name, legacy_name in setup:
+            self.assertEqual(self.body('native-crypto.yml', 'darwin-owner-intel', owner_name),
+                             self.body('native-crypto.yml', 'darwin-legacy-service-intel', legacy_name))
+        ordered = ['actions/checkout@', setup[0][1], setup[1][1],
+                   'Install native legacy service prerequisites', setup[2][1], setup[3][1],
+                   'Swatinem/rust-cache@',
+                   'Prepare native Intel Darwin legacy account-service restart artifacts',
+                   'Native Intel Darwin legacy account-service restart acceptance',
+                   'Report native Intel Darwin legacy-service bundle lifecycle']
+        self.assertEqual(sorted(ordered, key=legacy.index), ordered)
+        self.assertIn('Install native legacy service prerequisites\n        run: brew install gnupg', legacy)
+        for forbidden in ('needs:', 'continue-on-error:', 'if: success()', 'upload-artifact',
+                          'download-artifact', 'Qualify the production Intel Darwin process owner',
+                          self.NATIVE, 'native-owner-x86_64-apple-darwin'):
+            self.assertNotIn(forbidden, legacy)
+        for step in ordered[-3:]:
+            self.assertEqual(legacy.count('      - name: ' + step + '\n'), 1)
+            self.assertNotIn('      - name: ' + step + '\n', owner)
+        self.assertEqual(sum(line.startswith('    if:') for line in legacy.splitlines()), 1)
+        self.assertEqual(sum(line.startswith('        if:') for line in legacy.splitlines()), 1)
+        self.assertIn('Report native Intel Darwin legacy-service bundle lifecycle\n        if: always()', legacy)
+        self.assertEqual(legacy.count('timeout-minutes: 12'), 1)
+
+    def legacy_orchestration(self, fault='', *, direct=False, mutate=None):
+        """Run maintained shells over inert fixture state, never native products.
+
+        This driver models Actions' success/always scheduling; the producer's
+        own tests, not this synthetic state, establish bundle custody.
+        """
+        names = ('Prepare native Intel Darwin legacy account-service restart artifacts',
+                 'Native Intel Darwin legacy account-service restart acceptance',
+                 'Report native Intel Darwin legacy-service bundle lifecycle')
+        bodies = [self.body('native-crypto.yml', 'darwin-legacy-service-intel', name)
+                  for name in names]
+        if mutate:
+            index, before, after = mutate
+            self.assertEqual(bodies[index].count(before), 1)
+            bodies[index] = bodies[index].replace(before, after)
+        with tempfile.TemporaryDirectory(prefix='legacy-orchestration-inert-') as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            for name in ('work', 'home', 'config', 'cache', 'data', 'tmp', 'cargo', 'rustup', 'tools'):
+                (root / name).mkdir(mode=0o700)
+            work, tools = root / 'work', root / 'tools'
+            shim = tools / 'fixture-tool'
+            shim.write_text('#!' + sys.executable + ' -I\n' + r'''
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if Path(sys.argv[0]).name != 'python3':
+    raise SystemExit('unexpected product/tool invocation')
+keys = ('HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'TMPDIR',
+        'CARGO_HOME', 'RUSTUP_HOME', 'CARGO_BUILD_TARGET', 'HISTFILE', 'RUSTFLAGS',
+        'AWS_LC_SYS_USE_SYSTEM', 'AWS_LC_SYS_CFLAGS', 'OPENSSL_DIR', 'OPENSSL_STATIC')
+def record(kind):
+    with open(os.environ['FIXTURE_LOG'], 'a') as stream:
+        stream.write(json.dumps(dict(kind=kind, args=args,
+                                    env={key: os.environ.get(key) for key in keys})) + '\n')
+if args[:3] == ['-I', '-B', '-'] and len(args) == 4:
+    record('report')
+    os.execv(sys.executable, [sys.executable, *args])
+fault = os.environ['FIXTURE_FAULT']
+if args == ['-m', 'unittest', 'discover', '-s', 'scripts/tests', '-p',
+            'test_released_peer_acceptance.py']:
+    record('suite')
+    raise SystemExit(7 if fault == 'suite-failure' else 0)
+if len(args) == 6 and args[:3] == ['scripts/released-peer-acceptance.py', '--service-only', '--execute-prepared']:
+    record('execute')
+    bundle, evidence = Path(args[3]), Path(args[5])
+    expected = Path(os.environ['RUNNER_TEMP']) / 'legacy-service-intel-bundle'
+    if (bundle != expected or args[4] != '--evidence'
+            or evidence != Path(os.environ['RUNNER_TEMP']) / 'legacy-service-intel-evidence'):
+        raise SystemExit('unexpected fixture runtime arguments')
+    state = dict(kind='synthetic-orchestration-only', source='inert-source-v1',
+                 bundle=str(bundle), complete=True)
+    try:
+        if json.loads((bundle / 'fixture-state.json').read_text()) != state:
+            raise ValueError('incomplete/different synthetic preparation')
+    except (OSError, ValueError):
+        raise SystemExit(11)
+    evidence.mkdir(mode=0o700)
+    marker = '2 selected tests; 2 passed; 0 skipped'
+    if fault == 'runtime-failure':
+        (evidence / 'passed.txt').write_text(marker + '\n')
+        raise SystemExit(13)
+    with (bundle / 'execution.claim').open('x') as claim:
+        claim.write('synthetic')
+    markers = {'zero-selected': '0 selected tests; 0 passed; 0 skipped',
+               'wrong-pass-count': '2 selected tests; 1 passed; 0 skipped',
+               'skipped-case': '2 selected tests; 1 passed; 1 skipped',
+               'wrong-marker': marker + ' extra'}
+    if fault != 'missing-marker':
+        (evidence / 'passed.txt').write_text(markers.get(fault, marker) + '\n')
+    if not fault:
+        for name in ('settled.json', 'payload-disposition.json'):
+            (bundle / name).write_text('{"synthetic":true}')
+    raise SystemExit(0)
+if len(args) != 7 or args[:2] != ['scripts/released-peer-acceptance.py', '--service-only']:
+    raise SystemExit('unexpected fixture arguments')
+mode, bundle_flag, bundle_arg, evidence_flag, evidence_arg = args[2:]
+expected = Path(os.environ['RUNNER_TEMP']) / 'legacy-service-intel-bundle'
+if bundle_flag not in ('--prepared-bundle', '--execute-prepared') or Path(bundle_arg) != expected:
+    raise SystemExit('unexpected fixture bundle')
+if (evidence_flag != '--evidence'
+        or Path(evidence_arg) != Path(os.environ['RUNNER_TEMP']) / 'legacy-service-intel-preparation-evidence'):
+    raise SystemExit('unexpected fixture evidence')
+bundle, evidence = Path(bundle_arg), Path(evidence_arg)
+state = dict(kind='synthetic-orchestration-only', source='inert-source-v1',
+             bundle=str(bundle), complete=True)
+if mode == '--prepare-only' and bundle_flag == '--prepared-bundle':
+    record('prepare')
+    if fault == 'missing-state':
+        raise SystemExit(0)
+    bundle.mkdir(mode=0o700)
+    if fault == 'prepare-failure':
+        (bundle / 'partial-fixture.json').write_text('{}')
+        raise SystemExit(9)
+    if fault == 'incomplete-state':
+        state['complete'] = False
+    if fault == 'wrong-source':
+        state['source'] = 'different-inert-source'
+    (bundle / 'fixture-state.json').write_text(json.dumps(state))
+    if state['complete']:
+        (bundle / 'complete.json').write_text('{"synthetic":true}')
+    raise SystemExit(0)
+raise SystemExit('unexpected fixture mode')
+''')
+            shim.chmod(0o700)
+            for name in ('python3', 'cargo', 'rustup', 'qsh', 'qshd', 'brew'):
+                (tools / name).symlink_to(shim)
+            env = dict(PATH=str(tools) + os.pathsep + os.defpath,
+                       HOME=str(root / 'home'), XDG_CONFIG_HOME=str(root / 'config'),
+                       XDG_CACHE_HOME=str(root / 'cache'), XDG_DATA_HOME=str(root / 'data'),
+                       TMPDIR=str(root / 'tmp'), RUNNER_TEMP=str(root / 'tmp'),
+                       GITHUB_WORKSPACE=str(work), NATIVE_TARGET='x86_64-apple-darwin',
+                       CARGO_HOME=str(root / 'cargo'), RUSTUP_HOME=str(root / 'rustup'),
+                       CARGO_BUILD_JOBS='2', OPENSSL_DIR=str(root / 'inert-openssl'), OPENSSL_STATIC='1',
+                       HISTFILE='/dev/null', PYTHONDONTWRITEBYTECODE='1', LC_ALL='C',
+                       FIXTURE_LOG=str(root / 'calls.jsonl'), FIXTURE_FAULT=fault)
+            def run(body):
+                return subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', body],
+                                      cwd=work, env=env, stdin=subprocess.DEVNULL,
+                                      capture_output=True, text=True, timeout=15)
+            prepared = executed = None
+            try:
+                if not direct:
+                    prepared = run(bodies[0])
+                if direct or prepared.returncode == 0:
+                    executed = run(bodies[1])
+                    if executed.returncode == 0:
+                        (work / 'qualified').write_text('synthetic orchestration only')
+            finally:
+                reported = run(bodies[2])
+            calls = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
+            self.assertEqual(reported.returncode, 0, reported.stderr)
+            prefix = 'LEGACY_SERVICE_BUNDLE '
+            self.assertTrue(reported.stdout.startswith(prefix), reported.stdout)
+            report = json.loads(reported.stdout[len(prefix):])
+            bundle = root / 'tmp/legacy-service-intel-bundle'
+            return dict(prepare=prepared, execute=executed, report=report, calls=calls,
+                        qualified=(work / 'qualified').exists(), backing_retained=bundle.exists())
+
+    def test_legacy_orchestration_positive_uses_its_own_preparation_in_order(self):
+        result = self.legacy_orchestration()
+        self.assertTrue(result['qualified'])
+        self.assertEqual([call['kind'] for call in result['calls']], ['suite', 'prepare', 'execute', 'report'])
+        prepare, execute = result['calls'][1:3]
+        self.assertEqual(prepare['args'][4], execute['args'][3])
+        self.assertEqual(prepare['env'], execute['env'])
+        self.assertEqual(result['execute'].stdout, '2 selected tests; 2 passed; 0 skipped\n')
+        self.assertEqual(result['report'], {'state': 'owned-backing-retained', 'complete.json': True,
+                                          'execution.claim': True, 'settled.json': True,
+                                          'payload-disposition.json': True})
+
+    def test_legacy_orchestration_prepare_failure_prevents_runtime_but_reports(self):
+        for fault, expected, state in [('suite-failure', ['suite', 'report'], 'not-created'),
+                                       ('prepare-failure', ['suite', 'prepare', 'report'], 'owned-backing-retained')]:
+            with self.subTest(fault=fault):
+                result = self.legacy_orchestration(fault)
+                self.assertNotEqual(result['prepare'].returncode, 0)
+                self.assertIsNone(result['execute'])
+                self.assertFalse(result['qualified'])
+                self.assertEqual([c['kind'] for c in result['calls']], expected)
+                self.assertEqual(result['report']['state'], state)
+                if fault == 'prepare-failure':
+                    self.assertTrue(result['backing_retained'])
+                    self.assertFalse(result['report']['settled.json'])
+
+    def test_legacy_orchestration_missing_or_incomplete_state_refuses_consumption(self):
+        for fault, direct in [('missing-state', False), ('incomplete-state', False),
+                              ('wrong-source', False), ('', True)]:
+            with self.subTest(fault=fault, direct=direct):
+                result = self.legacy_orchestration(fault, direct=direct)
+                self.assertNotEqual(result['execute'].returncode, 0)
+                self.assertFalse(result['qualified'])
+                self.assertEqual(result['calls'][-1]['kind'], 'report')
+                self.assertEqual(result['report']['state'],
+                                 'owned-backing-retained' if fault in ('incomplete-state', 'wrong-source') else 'not-created')
+                self.assertFalse(result['report'].get('settled.json', False))
+
+    def test_legacy_orchestration_nonzero_runtime_does_not_accept_stale_pass_marker(self):
+        result = self.legacy_orchestration('runtime-failure')
+        self.assertNotEqual(result['execute'].returncode, 0)
+        self.assertFalse(result['qualified'])
+        self.assertEqual(result['execute'].stdout, '')
+        self.assertTrue(result['backing_retained'])
+        self.assertFalse(result['report']['settled.json'])
+
+    def test_legacy_orchestration_requires_exact_positive_runtime_audit(self):
+        for fault in ('zero-selected', 'wrong-pass-count', 'skipped-case', 'missing-marker', 'wrong-marker'):
+            with self.subTest(fault=fault):
+                result = self.legacy_orchestration(fault)
+                self.assertNotEqual(result['execute'].returncode, 0)
+                self.assertFalse(result['qualified'])
+                self.assertEqual(result['calls'][-1]['kind'], 'report')
+                self.assertTrue(result['backing_retained'])
+                self.assertFalse(result['report']['settled.json'])
+
+    def test_legacy_orchestration_controls_detect_masked_failure_and_audit_mutations(self):
+        audit = "grep -Fx '2 selected tests; 2 passed; 0 skipped' \"$RUNNER_TEMP/legacy-service-intel-evidence/passed.txt\""
+        result = self.legacy_orchestration('zero-selected', mutate=(1, audit, 'true'))
+        with self.assertRaises(AssertionError):
+            self.assertFalse(result['qualified'], 'mutated audit accepted zero selection')
+        evidence = '--evidence "$RUNNER_TEMP/legacy-service-intel-preparation-evidence"'
+        result = self.legacy_orchestration('prepare-failure', mutate=(0, evidence, evidence + ' || true'))
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(result['execute'], 'mutated preparation failure reached runtime')
 
     def test_corrected_terminal_contract_literal_admission(self):
         command = 'keeper223 terminal kind=Command screen={screen} real_eof_delivered_alive=true actual_retiring_poll=Running screen_lifetime=EOF process_slot=after_IO_joins terminal=37 session=0 rescue=false'
@@ -808,8 +1119,30 @@ pwd() { printf called > "$GITHUB_WORKSPACE/pwd-called"; printf "%s" "$FIXTURE_PR
         self.assertEqual(owner.count('cargo test -p qshd --lib'), 2)
         self.assertEqual(owner.count('--no-run --message-format=json-render-diagnostics'), 2)
         self.assertEqual(owner.count('--bin qshd --profile test'), 2)
-        self.assertEqual(owner.count('verify_harness "$ordinary_harness"'), 2)
-        self.assertEqual(owner.count('verify_harness "$feature_harness"'), 2)
+        # Modern, observer and keeper runs share the ordinary harness. The
+        # post-observer verification before keeper makes three hash checks.
+        ordinary_check = 'verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"'
+        observer_assignment = ('observer_name=darwin_process_scope::observation::tests::'
+                               'native_observer_retains_unrelated_process_in_another_session\n')
+        observer_skip_gate = '! grep -F \'SKIPPED\' "$runtime/observer-results.log"'
+        for body in (owner, arm):
+            self.assertEqual(body.count('verify_harness "$ordinary_harness"'), 3)
+            self.assertEqual(body.count('verify_harness "$feature_harness"'), 2)
+            self.assertEqual(body.count(observer_assignment), 1)
+            self.assertIn(observer_skip_gate, body)
+            start = body.index(observer_assignment)
+            end = body.index(observer_skip_gate, start) + len(observer_skip_gate)
+            observer = body[start:end]
+            self.assertIn(ordinary_check + '\n' + observer + '\n' + ordinary_check, body,
+                          'observer runtime must remain between ordinary-harness hash checks')
+            self.assertIn('timed observer-runtime "$ordinary_harness" --exact "$observer_name" \\\n'
+                          '  --nocapture --test-threads=1 --color=never 2>&1 | tee "$runtime/observer-results.log"', observer)
+            self.assertIn('seen == 1 && passed == 1', observer)
+            self.assertIn('test "$(grep -Fc \'test result: ok. 1 passed; 0 failed; 0 ignored;\' '
+                          '"$runtime/observer-results.log")" -eq 1', observer)
+            self.assertNotIn('--ignored', observer)
+            self.assertLess(body.index('timed modern-runtime'), body.index('timed observer-runtime'))
+            self.assertLess(body.index('timed observer-runtime'), body.index('timed keeper-runtime'))
         for required in ('--features test-build-labels', '--features test-darwin-keeper',
                          'timed feature-check cargo check', 'timed feature-clippy cargo clippy',
                          '-- -D warnings', '--target "$NATIVE_TARGET"',
@@ -835,11 +1168,12 @@ pwd() { printf called > "$GITHUB_WORKSPACE/pwd-called"; printf "%s" "$FIXTURE_PR
         # a GitHub execution. Read the callee default rather than inventing one.
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
         called = native.split('  workflow_call:\n', 1)[1].split('\npermissions:', 1)[0]
-        fields = dict(line.strip().split(': ', 1) for line in called.splitlines()
+        mode = called.split('      mode:\n', 1)[1].split('\n      lanes:', 1)[0]
+        fields = dict(line.strip().split(': ', 1) for line in mode.splitlines()
                       if line.startswith('        ') and ': ' in line)
         release = (ROOT / '.github/workflows/release.yml').read_text()
         self.assertIn('  workflow_dispatch:\n\nenv:', release)
-        caller = release.split('  native-crypto:\n', 1)[1].split('\n  linux:', 1)[0]
+        caller = release.split('  native-crypto:\n', 1)[1].split('\n\n', 1)[0]
         self.assertEqual(caller.strip(), 'uses: ./.github/workflows/native-crypto.yml')
         validator = self.body('native-crypto.yml', 'dispatch-mode', 'Refuse unknown manual modes')
         with self.fixture('x86_64-unknown-linux-musl') as (work, env):
@@ -850,6 +1184,11 @@ pwd() { printf called > "$GITHUB_WORKSPACE/pwd-called"; printf "%s" "$FIXTURE_PR
             self.assertEqual((calls, records), ([], []))
         self.assertIn('    inputs:\n      mode:\n', called)
         self.assertEqual(fields, {'type': 'string', 'required': 'false', 'default': 'qualification'})
+        # The same mode guard; only the selected lane name differs (#609).
+        self.assertEqual(self.job('native-crypto.yml', 'darwin-legacy-service-intel').splitlines()[0]
+                         .replace("'intel-legacy'", "'<lane>'"),
+                         self.job('native-crypto.yml', 'darwin-owner-intel').splitlines()[0]
+                         .replace("'intel-owner'", "'<lane>'"))
 
     def test_native_manual_mode_contract(self):
         native = (ROOT / '.github/workflows/native-crypto.yml').read_text()
@@ -867,10 +1206,15 @@ pwd() { printf called > "$GITHUB_WORKSPACE/pwd-called"; printf "%s" "$FIXTURE_PR
                 self.assertEqual((work / 'completed').exists(), accepted)
                 self.assertEqual((calls, records), ([], []))
         selection = "github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')"
-        for job in ('portable', 'darwin-owner-intel', 'system-floors', 'pty-eof-diagnostic'):
+        # Each qualification job also needs its lane in the canonical lane array (#609).
+        lanes = {'portable': 'portable', 'darwin-owner-intel': 'intel-owner',
+                 'darwin-legacy-service-intel': 'intel-legacy', 'system-floors': 'floors'}
+        for job in ('portable', 'darwin-owner-intel', 'darwin-legacy-service-intel',
+                    'system-floors', 'pty-eof-diagnostic'):
             condition = native.split('  ' + job + ':\n', 1)[1].splitlines()
             condition = next(line for line in condition if line.startswith('    if:'))
-            expected = selection if job == 'pty-eof-diagnostic' else '!(' + selection + ')'
+            expected = selection if job == 'pty-eof-diagnostic' else (
+                '!(' + selection + ") && contains(fromJSON(inputs.lanes), '" + lanes[job] + "')")
             self.assertEqual(condition, '    if: ${{ ' + expected + ' }}')
         dispatch = native.split('  dispatch-mode:\n', 1)[1].split('  pty-eof-diagnostic:', 1)[0]
         self.assertIn("    if: github.event_name == 'workflow_dispatch'\n", dispatch)
@@ -895,16 +1239,23 @@ pwd() { printf called > "$GITHUB_WORKSPACE/pwd-called"; printf "%s" "$FIXTURE_PR
         self.assertEqual(re.findall(pairs, portable), list(self.TARGETS))
         self.assertEqual(re.findall(pairs, diagnostic), list(self.TARGETS[2:]))
         selection = "github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')"
-        for job in ('portable', 'darwin-owner-intel', 'system-floors'):
+        lanes = {'portable': 'portable', 'darwin-owner-intel': 'intel-owner',
+                 'darwin-legacy-service-intel': 'intel-legacy', 'system-floors': 'floors'}
+        for job in ('portable', 'darwin-owner-intel', 'darwin-legacy-service-intel', 'system-floors'):
             beginning = native.split('  ' + job + ':\n', 1)[1].split('\n', 1)[0]
-            self.assertEqual(beginning, "    if: ${{ !(" + selection + ") }}")
+            self.assertEqual(beginning, "    if: ${{ !(" + selection + ") && contains(fromJSON(inputs.lanes), '"
+                             + lanes[job] + "') }}")
         self.assertIn("    if: ${{ " + selection + " }}", diagnostic)
         self.assertIn('options: [qualification, pty-eof-build, pty-eof-control]', native)
         self.assertIn('ref: ${{ github.sha }}', diagnostic)
         self.assertIn('scripts/qualify-pty-eof-control.py "$PTY_EOF_MODE" "$NATIVE_TARGET"', diagnostic)
         for forbidden in ('--include-ignored', 'native_tests::', 'keeper_tests::', 'keeper_integration_tests::', 'upload-artifact'):
             self.assertNotIn(forbidden, diagnostic)
-        self.assertEqual(native.count("      - 'cli/Cargo.toml'"), 2)
+        # CI now calls this workflow per change (#609): a client manifest
+        # change selects every native lane, as the former path triggers did.
+        policy = json.loads((ROOT / 'scripts/ci-selection.json').read_text())
+        self.assertIn('**/Cargo.toml', policy['full'])
+        self.assertNotIn('  pull_request:', native.split('\npermissions:', 1)[0])
         helper = self.body('native-crypto.yml', 'portable', 'Qualify offline release authentication')
         self.assertIn('-p test_native_verifier_paths.py', helper)
         self.assertIn('scripts/check-native-verifier-paths.py', helper)

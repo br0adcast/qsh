@@ -46,13 +46,13 @@ fn mul(a: usize, b: usize) -> Result<usize, String> {
 }
 
 impl BackingSlots {
-    fn plus(self, other: Self) -> Result<Self, String> {
+    pub(crate) fn plus(self, other: Self) -> Result<Self, String> {
         Ok(Self {
             cells: add(self.cells, other.cells)?,
             rows: add(self.rows, other.rows)?,
         })
     }
-    fn delta(self, old: Self) -> Self {
+    pub(crate) fn delta(self, old: Self) -> Self {
         Self {
             cells: self
                 .cells
@@ -79,7 +79,7 @@ pub struct ScreenEnvelope {
 }
 
 impl ScreenEnvelope {
-    fn new(size: TerminalSize) -> Self {
+    pub(crate) fn new(size: TerminalSize) -> Self {
         Self {
             max_cols: size.cols(),
             max_rows: size.rows(),

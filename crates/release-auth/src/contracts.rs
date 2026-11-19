@@ -47,16 +47,24 @@ pub(crate) fn claims(version: &str, c: &FulcioCiClaims) -> Result<String, &'stat
     Ok(commit.to_owned())
 }
 
-fn products(version: &str) -> Vec<String> {
-    let deb = match version.split_once('-') {
-        Some((main, pre))
-            if pre.chars().any(|c| c.is_ascii_digit())
-                && pre.chars().any(|c| !c.is_ascii_digit()) =>
-        {
-            format!("{main}~{pre}")
-        }
-        _ => version.to_owned(),
-    };
+// GitHub rewrites other characters in uploaded asset names, and leading or
+// trailing periods, so the signed manifest could not name what is published
+// (#526). Mirrors `github_safe_name` in scripts/check-release-output.py.
+fn github_safe(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let allowed = |c: &u8| c.is_ascii_alphanumeric() || b"._-".contains(c);
+    bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(|c| *c != b'.')
+        && bytes.iter().all(allowed)
+}
+
+// The exact names release assembly signs. Package files carry the release
+// version as in the tag and archive names, then revision 1; only the metadata
+// inside a package uses the `~` prerelease spelling. Manifests that name
+// packages with the earlier `~` spelling are refused for every version: the
+// only signed release that used it is the withdrawn v0.6.0-rc1, whose client
+// predates managed installation, and stable names did not change.
+pub(crate) fn products(version: &str) -> Option<Vec<String>> {
     let mut names = Vec::with_capacity(12);
     for target in [
         "x86_64-unknown-linux-musl",
@@ -68,14 +76,14 @@ fn products(version: &str) -> Vec<String> {
     }
     for tool in ["qsh", "qshd"] {
         for arch in ["amd64", "arm64"] {
-            names.push(format!("{tool}_{deb}-1_{arch}.deb"));
+            names.push(format!("{tool}_{version}-1_{arch}.deb"));
         }
         for arch in ["x86_64", "aarch64"] {
             names.push(format!("{tool}-{version}-1.{arch}.rpm"));
         }
     }
     names.sort();
-    names
+    names.iter().all(|name| github_safe(name)).then_some(names)
 }
 pub(crate) fn manifest(
     version_value: &str,
@@ -87,7 +95,8 @@ pub(crate) fn manifest(
     }
     let text = std::str::from_utf8(bytes).map_err(|_| "invalid manifest")?;
     let lines: Vec<_> = text.split_inclusive('\n').collect();
-    let names = products(version_value);
+    let names =
+        products(version_value).ok_or("release version has no publishable product names")?;
     if lines.len() != names.len() {
         return Err("manifest must list exactly twelve products");
     }
@@ -153,7 +162,7 @@ pub(crate) fn statement(
     };
     if s.kind != "https://in-toto.io/Statement/v1"
         || subject.name != "SHA256SUMS"
-        || subject.digest.sha256 != format!("{:x}", Sha256::digest(manifest))
+        || subject.digest.sha256 != hex::encode(Sha256::digest(manifest))
         || s.predicate_type != "https://github.com/br0adcast/qsh/release-manifest/v1"
         || s.predicate.manifest_format != "qsh-sha256sums-v1"
         || s.predicate.version != version

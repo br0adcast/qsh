@@ -211,7 +211,7 @@ def metadata_assets(repo, release_id):
 
 
 def _safe(name):
-    return name if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}', name) else '<unsafe name>'
+    return name if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.+~-]{0,127}', name) else '<unsafe name>'
 
 
 def download(repo, asset):

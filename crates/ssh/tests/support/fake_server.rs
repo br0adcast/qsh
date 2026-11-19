@@ -18,6 +18,8 @@ use std::time::Duration;
 use russh::server::{Auth, ChannelOpenHandle, Msg, Response, Session};
 use russh::{Channel, MethodKind, MethodSet};
 
+pub type ExecReply = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
 #[derive(Default, Clone)]
 pub struct FakeAuth {
     /// Accept every user public key, for host-verification boundary tests.
@@ -30,6 +32,8 @@ pub struct FakeAuth {
     pub activity: Arc<ServerActivity>,
     /// Successive exec outputs, without running a shell or touching user state.
     pub exec_outputs: Vec<Vec<u8>>,
+    /// Dynamic read-only command fixtures, including nonce echo protocols.
+    pub exec_reply: Option<ExecReply>,
     /// Omit exit-status for this zero-based exec request, then close normally.
     pub exec_missing_status: Option<usize>,
     pub open_gate: Option<Arc<tokio::sync::Notify>>,
@@ -52,6 +56,7 @@ pub struct FakeAuth {
 
 #[derive(Default)]
 pub struct ServerActivity {
+    pub commands: std::sync::Mutex<Vec<Vec<u8>>>,
     pub connections: AtomicUsize,
     pub userauth: AtomicUsize,
     /// Called only after russh has verified an actual signed public-key request.
@@ -456,7 +461,7 @@ impl russh::server::Handler for Login {
     async fn auth_publickey_offered(
         &mut self,
         _user: &str,
-        key: &russh::keys::PublicKey,
+        key: russh::server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
         self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
         if self.hangs_up_on_first_auth() {
@@ -465,7 +470,7 @@ impl russh::server::Handler for Login {
         if let Some(gate) = &self.auth.publickey_offer_gate {
             gate.notified().await;
         }
-        if self.auth.accept_any_key || self.is_partial_key(key) {
+        if self.auth.accept_any_key || self.is_partial_key(key.public_key) {
             return Ok(Auth::Accept);
         }
         Ok(self.reject())
@@ -474,7 +479,7 @@ impl russh::server::Handler for Login {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        key: &russh::keys::PublicKey,
+        key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         self.auth.activity.userauth.fetch_add(1, Ordering::SeqCst);
         self.auth
@@ -485,13 +490,10 @@ impl russh::server::Handler for Login {
             self.authenticated.store(true, Ordering::SeqCst);
             return Ok(Auth::Accept);
         }
-        if !self.is_partial_key(key) {
+        if !self.is_partial_key(key.public_key) {
             return Ok(self.reject());
         }
         self.first_factor = true;
-        // russh 0.63.3 sends `partial_success` as false after a publickey
-        // (it clears the flag it just set); the remaining methods still
-        // name the second factor, which is what the client goes by.
         Ok(Auth::Reject {
             proceed_with_methods: Some(MethodSet::from(&[MethodKind::KeyboardInteractive][..])),
             partial_success: true,
@@ -537,11 +539,21 @@ impl russh::server::Handler for Login {
     async fn exec_request(
         &mut self,
         channel: russh::ChannelId,
-        _command: &[u8],
+        command: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let index = self.auth.activity.exec.fetch_add(1, Ordering::SeqCst);
-        if let Some(output) = self.auth.exec_outputs.get(index) {
+        self.auth
+            .activity
+            .commands
+            .lock()
+            .unwrap()
+            .push(command.to_vec());
+        let dynamic = self.auth.exec_reply.as_ref().map(|reply| reply(command));
+        if let Some(output) = dynamic
+            .as_ref()
+            .or_else(|| self.auth.exec_outputs.get(index))
+        {
             session.channel_success(channel)?;
             session.data(channel, output.clone())?;
             if self.auth.exec_missing_status != Some(index) {

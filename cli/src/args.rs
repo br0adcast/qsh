@@ -20,6 +20,8 @@ qsh -- a terminal over the qsh transport
 
 Usage:
     qsh [OPTIONS] ADDRESS [ADDRESS ...]
+    qsh --self-install [--version VERSION] [--prefix PATH]
+    qsh --self-update [--version VERSION]
 
     ADDRESS is [user@]host[:port][,SETTING ...], for example
         qsh alice@home.example,ssh=2222,knock=tcp:7000+udp:8000 10.8.0.1,ssh

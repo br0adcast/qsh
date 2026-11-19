@@ -132,3 +132,7 @@ Run the focused crate controls in a fresh prepared tree:
 cargo test --manifest-path /tmp/new-rpm-tool-sources/cargo-generate-rpm-0.21.0/Cargo.toml \
   --locked --bin cargo-generate-rpm ldd_child_reaping_tests
 ```
+
+Cargo SemVer hyphens map to `~` in RPM Version, so `0.6.0-rc1` becomes
+`0.6.0~rc1` with Release `1` and sorts before `0.6.0`. Stable versions and
+`+` build metadata are preserved. Explicit RPM version overrides remain literal.

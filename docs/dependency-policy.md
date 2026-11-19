@@ -66,8 +66,9 @@ required separately; Cargo policy checks do not cover that native source.
 
 `deny.toml` records the current declarations. The common set is MIT, Apache-2.0,
 BSD-3-Clause, ISC, Unicode-3.0 and Zlib. Additional rules apply only to the
-fifteen named workspace packages at 0.5.0 (AGPL-3.0-only), option-ext 0.2.0
-(MPL-2.0), and webpki-roots 1.0.10 (CDLA-Permissive-2.0). Workspace/private/path
+fifteen named workspace packages at 0.6.0-rc1 (AGPL-3.0-only), option-ext 0.2.0
+(MPL-2.0), and webpki-roots/webpki-root-certs 1.0.12
+(CDLA-Permissive-2.0). Workspace/private/path
 packages are not skipped, and no content-free license clarification is used.
 
 These rules record existing dependencies and declared licenses. They do not
@@ -89,9 +90,16 @@ exception. Remove obsolete entries rather than leaving broad ignores behind.
 
 | Exact finding | Rationale and required boundary | Follow-up/review |
 | --- | --- | --- |
-| RUSTSEC-2023-0071, rsa 0.10.0-rc.18, vulnerability | Local RSA preparation and signing use the qualified native backend without a RustCrypto private fallback, completed in #59/#121. Upstream formats/public verification and external signers remain separate boundaries. | #62; maintainer review by 2027-01-24 |
+| RUSTSEC-2026-0543, chrono 0.4.45, unmaintained | Transitive only: russh-sftp 3.0.1 uses chrono in `FileAttributes::from(&Metadata)` and `protocol::File::new`/`longname`, which the qsh SFTP upload (`RawSftpSession` init/open/write/close with explicit attributes) does not call; russh-util 0.52.0 depends on it only for wasm32. Not a vulnerability disposition; a new SFTP operation or callsite reopens it. | #618; maintainer review by 2027-02-17 |
 
-Review these entries on any related pin, callsite, startup-thread, native
+The refresh to stable `rsa 0.10.0` removes the previous exact prerelease
+exception for [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html).
+RustSec marks `>=0.10.0` as patched; the
+resolved product and fuzz graphs must contain no affected older RSA copy.
+This removes an advisory exception, while the native RSA private-operation
+boundary and its qualification requirements remain in force.
+
+Review active entries on any related pin, callsite, startup-thread, native
 backend or advisory change, even before the date. Do not remove RSA support,
 disable verification or suppress another advisory in the same dependency
 family to satisfy a scanner. Other patchable findings require their own fixes
@@ -119,7 +127,7 @@ and do not compile fixture or product crates or create Cargo target directories.
 
 ## Offline release authentication
 
-`release-auth` pins Sigstore 0.15.1 with default features disabled and only
+`release-auth` pins Sigstore 0.16.0 with default features disabled and only
 its AWS-LC crypto provider enabled. Runtime TUF, signing and online clients
 are absent from this verifier's feature graph. The embedded production roots
 and public interoperability fixtures have provenance in
@@ -132,3 +140,17 @@ Sigstore's Apache-2.0 license accompanies the roots and fixtures. These notices
 must accompany distributions containing this code. Native qualification runs
 real offline crypto fixtures on the four shipping client targets, keeps static
 musl linkage checks, and remaps native C source paths as well as Rust paths.
+
+
+Release HTTPS uses reqwest 0.13.5 with default features disabled and
+`rustls-no-provider`. Its preconfigured Rustls client selects Ring explicitly,
+uses the Mozilla trust anchors from webpki-roots 1.0.12, and advertises HTTP/1.1.
+It preserves safe TLS 1.2/1.3, SNI, ordinary WebPKI hostname/signature validation,
+no client authentication and no key logging. It installs no global provider
+and uses no platform-root fallback. The platform-verifier dependency remains
+in reqwest's feature graph but is bypassed by this explicit configuration.
+Its target-specific webpki-root-certs 1.0.12 bundle uses the same CDLA license
+text as webpki-roots; each package has its own exact-version allowance.
+Tests inject their complete fixture root store rather than adding roots after
+preconfiguration. HTTPS-only downloads, redirect limits, byte/deadline limits,
+cancellation and offline-cache failure classification remain enforced.

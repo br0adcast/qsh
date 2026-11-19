@@ -6,27 +6,29 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+daemon-bootstrap-protocol = { path = "../daemon-bootstrap-protocol" }
 ssh = { path = "../ssh" }
 knock = { path = "../knock" }
 client = { path = "../client" }
 transport = { path = "../transport" }
-base64 = "0.22"
+base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
-sha2 = "0.10"
-rand = "0.8"
+sha2 = "0.11"
+rand = "0.10"
 log = "0.4"
 
 [dev-dependencies]
 sshauth = { path = "../sshauth" }
-ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["getrandom", "std", "alloc", "p256"] }
+ssh-key = { version = "=0.7.0-rc.12", default-features = false, features = ["getrandom", "std", "alloc", "p256"] }
 # The private sshd and its helpers are shared with crates/ssh's tests
 # (included by path); these are what they need.
-russh = { version = "=0.63.3", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh = { version = "=0.65.2", default-features = false, features = ["flate2", "ring", "rsa"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
 p256 = { version = "0.14", features = ["ecdsa"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
 tempfile = "3"
 qshd = { path = "../../qshd" }
 # `pidfd_open`/`pidfd_send_signal` in the shared daemon guard (qshd/tests/daemon_guard).

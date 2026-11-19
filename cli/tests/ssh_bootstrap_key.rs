@@ -46,6 +46,7 @@ fn verify_bootstrap_key(pkcs8: bool) {
         accept_any_key: true,
         exec_outputs: vec![
             b"os Linux\narch x86_64\nhome /test\npath /test/qshd\n".to_vec(),
+            b"QSH-TRUST /test/qshd\n".to_vec(),
             b"server-pubkey: BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\nTRANSPORT-READY {\"version\":\"0.5.0\",\"ports\":[60022]}\n".to_vec(),
         ],
         ..Default::default()

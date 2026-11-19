@@ -93,6 +93,22 @@ pub(crate) use lifecycle::WorkerReceipt;
 pub(crate) mod fixture;
 pub use lifecycle::{Shutdown, ShutdownError};
 
+/// Actual join supervisors for a stable owner independent of any SessionIo.
+#[derive(Default)]
+pub(crate) struct RetainedWorkerOwner(Lifecycle);
+impl RetainedWorkerOwner {
+    pub(crate) fn spawn_blocking(
+        &self,
+        receipt: WorkerReceipt,
+        work: impl FnOnce() + Send + 'static,
+    ) {
+        self.0.spawn_blocking_with(receipt, work)
+    }
+    pub(crate) async fn drain(&self) -> Result<(), ShutdownError> {
+        self.0.drain().await
+    }
+}
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -1918,11 +1934,18 @@ struct ProbationSeat {
     /// only tells the removers of a retained session that a proof for that
     /// session's login may already be with the verifier.
     login: LoginId,
+    personal: Option<(
+        crate::personal_admission::PersonalBinding,
+        Box<dyn crate::personal_admission::PersonalAdmissionAttempt>,
+    )>,
 }
 
 /// The router's session table, owned solely by the `serve` loop (no shared
 /// lock on the datagram path).
 struct Router {
+    personal_observer: Option<Arc<dyn crate::personal_admission::PersonalAdmissionObserver>>,
+    bootstrap: Option<crate::bootstrap::BootstrapResponder>,
+    server_generation: Option<[u8; 16]>,
     revisions: BindingRevisions,
     /// `session_id` -> router->task datagram sender, for demuxing `Transport`
     /// frames to the owning session task. Holds both bound sessions and the
@@ -1958,6 +1981,9 @@ struct Router {
 impl Router {
     fn new() -> Self {
         Router {
+            personal_observer: None,
+            bootstrap: None,
+            server_generation: None,
             revisions: BindingRevisions::new(MAX_SESSIONS_TOTAL + MAX_PROBATION),
             sessions: HashMap::new(),
             backends: HashMap::new(),
@@ -2129,8 +2155,14 @@ impl Router {
             log::warn!("per-source probation cap reached, dropping an unauthenticated handshake");
             return false;
         }
-        self.probation
-            .insert(session_id, ProbationSeat { source, login });
+        self.probation.insert(
+            session_id,
+            ProbationSeat {
+                source,
+                login,
+                personal: None,
+            },
+        );
         true
     }
 
@@ -2747,6 +2779,58 @@ impl SessionManager {
         login_ends: LoginEndedReports,
         shutdown: Shutdown,
     ) -> impl Future<Output = Result<(), ShutdownError>> + Send {
+        Self::serve_with_server_info(
+            socket,
+            server_priv,
+            auth,
+            factory,
+            active_count,
+            login_ends,
+            shutdown,
+            None,
+        )
+    }
+
+    /// Enable independent authenticated metadata on this daemon listener.
+    #[allow(clippy::too_many_arguments)]
+    pub fn serve_with_server_info(
+        socket: Arc<UdpSocket>,
+        server_priv: [u8; 32],
+        auth: ServerAuth,
+        factory: BackendFactory,
+        active_count: Arc<AtomicUsize>,
+        login_ends: LoginEndedReports,
+        shutdown: Shutdown,
+        info: Option<crate::bootstrap::ServerInfo>,
+    ) -> impl Future<Output = Result<(), ShutdownError>> + Send {
+        Self::serve_with_personal_admission(
+            socket,
+            server_priv,
+            auth,
+            factory,
+            active_count,
+            login_ends,
+            shutdown,
+            info,
+            None,
+        )
+    }
+
+    /// Optional delegated possession observation for an already authenticated
+    /// personal frontend. Ordinary callers pass no observer through the legacy
+    /// entrypoints. This creates no retained-host endpoint or shell authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn serve_with_personal_admission(
+        socket: Arc<UdpSocket>,
+        server_priv: [u8; 32],
+        auth: ServerAuth,
+        factory: BackendFactory,
+        active_count: Arc<AtomicUsize>,
+        login_ends: LoginEndedReports,
+        shutdown: Shutdown,
+        info: Option<crate::bootstrap::ServerInfo>,
+        personal_observer: Option<Arc<dyn crate::personal_admission::PersonalAdmissionObserver>>,
+    ) -> impl Future<Output = Result<(), ShutdownError>> + Send {
         with_owned_secret(server_priv, move |server_priv| {
             Self::serve_with_secret(
                 socket,
@@ -2756,10 +2840,13 @@ impl SessionManager {
                 active_count,
                 login_ends,
                 shutdown,
+                info,
+                personal_observer,
             )
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn serve_with_secret(
         socket: Arc<UdpSocket>,
         server_priv: Zeroizing<[u8; 32]>,
@@ -2768,10 +2855,17 @@ impl SessionManager {
         active_count: Arc<AtomicUsize>,
         mut login_ends: LoginEndedReports,
         shutdown: Shutdown,
+        info: Option<crate::bootstrap::ServerInfo>,
+        personal_observer: Option<Arc<dyn crate::personal_admission::PersonalAdmissionObserver>>,
     ) -> Result<(), ShutdownError> {
         let lifecycle = Lifecycle::new(shutdown.clone());
         let mut buf = vec![0u8; RECV_BUF_LEN];
         let mut router = Router::new();
+        router.personal_observer = personal_observer;
+        if let Some(info) = info {
+            router.server_generation = Some(info.generation);
+            router.bootstrap = crate::bootstrap::BootstrapResponder::new(*server_priv, info).ok();
+        }
         // Per-session tasks signal their end here; the router holds `done_tx`
         // for the whole loop (cloned into each task), so `done_rx` never
         // completes with `None` and its select arm always matches `Some`.
@@ -2847,6 +2941,7 @@ impl SessionManager {
         // backends independently of transport input or a full bounded queue.
         let mut logins: std::collections::HashSet<_> = router.backends.keys().copied().collect();
         logins.extend(router.probation.values().map(|seat| seat.login));
+        router.probation.clear(); // Drops only the matching host attempt tickets.
         router.sessions.clear();
         router.backends.clear();
         let result = lifecycle.drain().await;
@@ -2877,6 +2972,14 @@ impl SessionManager {
         src: SocketAddr,
         buf: &[u8],
     ) {
+        if crate::bootstrap::is_bootstrap(&buf[..len]) {
+            if let Some(responder) = &mut router.bootstrap {
+                if let Some(reply) = responder.on_datagram(Instant::now(), src, &buf[..len]) {
+                    let _ = ctx.socket.send_to(&reply, src).await;
+                }
+            }
+            return;
+        }
         match parse(&buf[..len]) {
             Ok(Frame::Handshake {
                 kind: Kind::KeyRequest,
@@ -2981,6 +3084,7 @@ impl SessionManager {
                 // other rejection reason (bad Noise, wrong method, unknown
                 // key), which must stay silent as they always have.
                 let mut nonce_failure: Option<String> = None;
+                let server_generation = router.server_generation;
                 let mut resolve_for_msg2 = |msg1: &Msg1Payload| -> Option<Msg2Resolution> {
                     let d = router.resolve(&msg1.token, body, msg1.start_kind);
                     if matches!(d, AcceptDecision::ResendMsg2) {
@@ -3013,7 +3117,7 @@ impl SessionManager {
                 } else {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
-                    Connection::accept_resolved(
+                    Connection::accept_resolved_with_generation(
                         ConnectionConfig {
                             required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
@@ -3026,12 +3130,13 @@ impl SessionManager {
                         src,
                         body,
                         &mut resolve_for_msg2,
+                        server_generation,
                     )
                 };
                 if matches!(outcome, ResolvedAccept::Rejected) && ctx.auth.verifier.is_some() {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
-                    outcome = Connection::accept_resolved(
+                    outcome = Connection::accept_resolved_with_generation(
                         ConnectionConfig {
                             required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
@@ -3044,6 +3149,7 @@ impl SessionManager {
                         src,
                         body,
                         &mut resolve_for_msg2,
+                        server_generation,
                     );
                 }
                 match outcome {
@@ -3198,6 +3304,30 @@ impl SessionManager {
                 }
             },
         };
+        if matches!(msg1.method, AuthMethod::Allowlist) {
+            if let Some(observer) = &router.personal_observer {
+                let binding = crate::personal_admission::PersonalBinding::new(
+                    session_id,
+                    client_key,
+                    msg1.token,
+                    revision.clone(),
+                );
+                match observer.try_begin(binding.clone()) {
+                    Ok(attempt) => {
+                        router
+                            .probation
+                            .get_mut(&session_id)
+                            .expect("registered seat")
+                            .personal = Some((binding, attempt))
+                    }
+                    Err(_) => {
+                        router.probation.remove(&session_id);
+                        ctx.auth.nonces.release(nonce);
+                        return;
+                    }
+                }
+            }
+        }
         // A probation's route is small until its connection is proven
         // (spec §4.16); `cold_create` raises it.
         let (dg_tx, dg_rx) = probation_dgram_queue();
@@ -3231,7 +3361,7 @@ impl SessionManager {
     /// A probation ended: bind the connection if its peer proved itself, drop
     /// its route if it did not.
     async fn on_probation_ended(ctx: &ManagerCtx<'_>, router: &mut Router, ended: ProbationEnded) {
-        let Some(seat) = router.probation.remove(&ended.session_id) else {
+        let Some(mut seat) = router.probation.remove(&ended.session_id) else {
             // A completion owns effects only while its probation seat exists.
             // Duplicate/stale results must not remove a route, release another
             // admission's nonce, or bind a connection after retirement.
@@ -3239,7 +3369,7 @@ impl SessionManager {
         };
         let revision_guard = ended.revision.clone();
         // Bind before retirement cleanup so an adopted helper login remains live.
-        Self::apply_probation_result(ctx, router, ended).await;
+        Self::apply_probation_result(ctx, router, ended, seat.personal.take()).await;
         let still_ended = router.backends.get(&seat.login).is_some_and(|entry| {
             matches!(
                 entry.state,
@@ -3261,6 +3391,10 @@ impl SessionManager {
         ctx: &ManagerCtx<'_>,
         router: &mut Router,
         ended: ProbationEnded,
+        personal: Option<(
+            crate::personal_admission::PersonalBinding,
+            Box<dyn crate::personal_admission::PersonalAdmissionAttempt>,
+        )>,
     ) {
         // Take the provisional route out of the table but keep it: a cold
         // create adopts this very sender and its queue as the bridge's own
@@ -3279,29 +3413,16 @@ impl SessionManager {
                 return;
             }
         };
-        let ProvenSession {
-            revision,
-            conn,
-            client_key,
-            msg1,
-            msg1_body,
-            out,
-            src,
-            start,
-            nonce,
-            principal,
-            dgram_rx,
-        } = proven;
-        if matches!(msg1.method, AuthMethod::Allowlist) {
+        if matches!(proven.msg1.method, AuthMethod::Allowlist) {
             // Fresh key confirmation never consumes the signature nonce.
             // Release it even if authorization or binding later rejects us.
-            ctx.auth.nonces.release(nonce);
+            ctx.auth.nonces.release(proven.nonce);
             if !ctx
                 .auth
                 .allowlist
                 .lock()
                 .expect("allowlist mutex")
-                .contains(&client_key)
+                .contains(&proven.client_key)
             {
                 return;
             }
@@ -3310,6 +3431,9 @@ impl SessionManager {
         // it, so a proven probation always finds it. Were it missing, the
         // queue would go with `dgram_rx` below and a cold create would start
         // on an empty route: say so rather than lose it in silence.
+        if personal.is_some() && provisional.is_none() {
+            return;
+        }
         debug_assert!(
             provisional.is_some(),
             "a proven probation lost its provisional route"
@@ -3336,20 +3460,54 @@ impl SessionManager {
         // is the right answer: the client is already Live on the session that
         // entry names, so this connection adopts nothing and is dropped, and
         // the cached msg2 goes out in case that is what went missing.
-        let decision = router.resolve(&msg1.token, &msg1_body, msg1.start_kind);
-        if !revision.is_current() {
+        let decision = router.resolve(
+            &proven.msg1.token,
+            &proven.msg1_body,
+            proven.msg1.start_kind,
+        );
+        if !proven.revision.is_current() {
             // A verified retransmit twin may reconcile the helper's exact
             // login incarnation, but must never replace the current route.
             if matches!(decision, AcceptDecision::ResendMsg2)
-                && router.backends.get(&msg1.token).is_some_and(|entry| {
-                    entry.owner == principal.uid && entry.client_key == client_key
-                })
+                && router
+                    .backends
+                    .get(&proven.msg1.token)
+                    .is_some_and(|entry| {
+                        entry.owner == proven.principal.uid && entry.client_key == proven.client_key
+                    })
             {
-                router.note_incarnation(&msg1.token, principal.incarnation);
-                Self::resend_original_msg2(ctx, router, &msg1.token, src).await;
+                router.note_incarnation(&proven.msg1.token, proven.principal.incarnation);
+                Self::resend_original_msg2(ctx, router, &proven.msg1.token, proven.src).await;
             }
             return;
         }
+        if let Some((binding, attempt)) = personal {
+            // A proven retransmit twin never represents a second host attempt.
+            if matches!(decision, AcceptDecision::ResendMsg2) {
+                return;
+            }
+            let Ok(proof) = crate::personal_admission::PersonalPossessionCompletion::from_proven(
+                binding, &proven,
+            ) else {
+                return;
+            };
+            if attempt.try_complete(proof).is_err() {
+                return;
+            }
+        }
+        let ProvenSession {
+            revision,
+            conn,
+            client_key,
+            msg1,
+            msg1_body,
+            out,
+            src,
+            start,
+            nonce,
+            principal,
+            dgram_rx,
+        } = proven;
         Self::apply_decision(
             ctx,
             router,

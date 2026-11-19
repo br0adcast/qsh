@@ -1,70 +1,10 @@
 name: Native crypto prerequisite
 run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'pty-eof-build' && format('PTY EOF build · {0} · {1}', github.ref_name, github.sha) || github.event_name == 'workflow_dispatch' && inputs.mode == 'pty-eof-control' && format('PTY EOF control · {0} · {1}', github.ref_name, github.sha) || '' }}
 
+# CI selects these lanes per change and calls this workflow (#609); Release
+# and Nightly call it with every lane. Its own PR and main triggers are gone
+# so orchestration never runs it twice.
 on:
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'qshd/**'
-      - 'crates/logging/**'
-      - 'crates/transport/**'
-      - 'crates/terminal-size/**'
-      - 'crates/terminal/**'
-      - 'vendor/vte/**'
-      - 'vendor/alacritty_terminal/**'
-      - '.github/workflows/ci.yml'
-      - 'cli/Cargo.toml'
-      - 'packaging/build-server-packages.sh'
-      - 'packaging/acceptance.sh'
-      - 'scripts/check-pam-linkage.sh'
-      - 'crates/sshauth/**'
-      - 'crates/release-auth/**'
-      - 'crates/ssh/src/crypto_worker.rs'
-      - 'scripts/*openssl*'
-      - 'scripts/openssl/**'
-      - 'scripts/tests/test_build_openssl.py'
-      - 'scripts/check-native-verifier-paths.py'
-      - 'scripts/tests/test_native_verifier_paths.py'
-      - '.github/workflows/native-crypto.yml'
-      - '.github/workflows/release.yml'
-      - 'packaging/Dockerfile.build-*'
-      - 'packaging/bootstrap/**'
-      - 'packaging/rpm-tool/**'
-      - 'scripts/tests/test_rpm_tool.py'
-      - 'scripts/tests/test_bootstrap_tools.py'
-  push:
-    branches: [main]
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'qshd/**'
-      - 'crates/logging/**'
-      - 'crates/transport/**'
-      - 'crates/terminal-size/**'
-      - 'crates/terminal/**'
-      - 'vendor/vte/**'
-      - 'vendor/alacritty_terminal/**'
-      - '.github/workflows/ci.yml'
-      - 'cli/Cargo.toml'
-      - 'packaging/build-server-packages.sh'
-      - 'packaging/acceptance.sh'
-      - 'scripts/check-pam-linkage.sh'
-      - 'crates/sshauth/**'
-      - 'crates/release-auth/**'
-      - 'crates/ssh/src/crypto_worker.rs'
-      - 'scripts/*openssl*'
-      - 'scripts/openssl/**'
-      - 'scripts/tests/test_build_openssl.py'
-      - 'scripts/check-native-verifier-paths.py'
-      - 'scripts/tests/test_native_verifier_paths.py'
-      - '.github/workflows/native-crypto.yml'
-      - '.github/workflows/release.yml'
-      - 'packaging/Dockerfile.build-*'
-      - 'packaging/bootstrap/**'
-      - 'packaging/rpm-tool/**'
-      - 'scripts/tests/test_rpm_tool.py'
-      - 'scripts/tests/test_bootstrap_tools.py'
   workflow_dispatch:
     inputs:
       mode:
@@ -73,12 +13,21 @@ on:
         required: true
         default: qualification
         options: [qualification, pty-eof-build, pty-eof-control]
+      lanes:
+        description: Canonical JSON array of native lanes; [] selects none
+        type: string
+        required: false
+        default: '["floors","intel-legacy","intel-owner","portable"]'
   workflow_call:
     inputs:
       mode:
         type: string
         required: false
         default: qualification
+      lanes:
+        type: string
+        required: false
+        default: '["floors","intel-legacy","intel-owner","portable"]'
 
 permissions:
   contents: read
@@ -90,7 +39,7 @@ env:
 
 jobs:
   portable:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) && contains(fromJSON(inputs.lanes), 'portable') }}
     name: Native ${{ matrix.target }}
     strategy:
       fail-fast: false
@@ -261,12 +210,24 @@ jobs:
   # Ownership gets its own budget; measured crypto/product prerequisites used
   # almost 31 minutes of the shared 35-minute Intel job before owner compilation.
   darwin-owner-intel:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
-    name: Native Intel Darwin process owner
-    runs-on: macos-15-intel
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) && contains(fromJSON(inputs.lanes), 'intel-owner') }}
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            name: Native Intel Darwin process owner
+            cache_suffix: ''
+          # Native qualification of the xnu-12377 (macOS 26) admission (#551).
+          - runner: macos-26-intel
+            name: Native Intel Darwin process owner on macOS 26
+            cache_suffix: -macos-26
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
       NATIVE_TARGET: x86_64-apple-darwin
+      QSH_RUNNER_LABEL: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -277,6 +238,12 @@ jobs:
           set -euo pipefail
           checkout_sha=$(git rev-parse HEAD)
           test "$checkout_sha" = "$GITHUB_SHA"
+          # The preflight bounds each query to ten seconds. On a fresh macOS 26
+          # Intel image the first /usr/bin/git call (an xcrun shim) took 7.6s
+          # and a repeat 0.6s; an earlier preflight refused that first query
+          # after 12s (#551). Pay the one-time cost here, unbounded and checked.
+          shim_sha=$(/usr/bin/git rev-parse HEAD)
+          test "$shim_sha" = "$checkout_sha"
           printf 'darwin223 checkout=%s event=%s run=%s attempt=%s\n' "$checkout_sha" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
       - name: Observe the Intel Darwin runtime
         shell: bash
@@ -326,7 +293,8 @@ jobs:
               for name in ('hw_machine', 'uname_machine'):
                   token(values[name], r'x86_64', 32, name)
               return dict(schema=1, kind='darwin-intel-preflight', checkout_sha=sha, event_sha=event,
-                          run_id=int(run), attempt=int(attempt), runner_label='macos-15-intel',
+                          run_id=int(run), attempt=int(attempt),
+                          runner_label=token(environ.get('QSH_RUNNER_LABEL'), r'macos-(?:15|26)-intel', 16, 'checkout'),
                           target='x86_64-apple-darwin', kernel_version=kernel(values['kernel_version']),
                           osrelease=token(values['osrelease'], r'[0-9]+(?:\.[0-9]+)*', 32, 'osrelease'),
                           os_build=token(values['os_build'], r'[A-Za-z0-9]+', 32, 'os_build'),
@@ -385,7 +353,7 @@ jobs:
           scripts/check-qualified-rust.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          key: native-owner-x86_64-apple-darwin
+          key: native-owner-x86_64-apple-darwin${{ matrix.cache_suffix }}
       - name: Qualify the production Intel Darwin process owner
         shell: bash
         run: |
@@ -486,6 +454,21 @@ jobs:
           ! grep -F 'SKIPPED' "$runtime/results.log"
           grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$runtime/results.log"
           verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
+          observer_name=darwin_process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session
+          timed observer-runtime "$ordinary_harness" --exact "$observer_name" \
+            --nocapture --test-threads=1 --color=never 2>&1 | tee "$runtime/observer-results.log"
+          awk -v expected="test $observer_name ... " '
+            index($0, expected) == 1 {
+              seen++; pending = 1
+              if ($0 == expected "ok") { passed++; pending = 0 }
+              next
+            }
+            pending && $0 == "ok" { passed++; pending = 0 }
+            END { exit !(seen == 1 && passed == 1) }
+          ' "$runtime/observer-results.log"
+          test "$(grep -Fc 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$runtime/observer-results.log")" -eq 1
+          ! grep -F 'SKIPPED' "$runtime/observer-results.log"
+          verify_harness "$ordinary_harness" "$runtime/ordinary-harness.sha256"
           timed keeper-runtime "$ordinary_harness" darwin_process_scope::keeper_tests::keeper_native_ \
             --nocapture --test-threads=1 2>&1 | tee "$runtime/keeper-results.log"
           for name in \
@@ -575,8 +558,212 @@ jobs:
           grep -F 'wire_STOP=ack_then_actual_exit_watch_and_consumed_wait' "$runtime/keeper-integrated-results.log"
           grep -F 'keeper223 replacement_routes old_image=' "$runtime/keeper-integrated-results.log"
 
+  # Legacy preparation and acceptance retain a separate same-runner budget.
+  darwin-legacy-service-intel:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) && contains(fromJSON(inputs.lanes), 'intel-legacy') }}
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            name: Native Intel Darwin legacy service
+            cache_suffix: ''
+          # Native qualification of the xnu-12377 (macOS 26) admission (#551).
+          - runner: macos-26-intel
+            name: Native Intel Darwin legacy service on macOS 26
+            cache_suffix: -macos-26
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      NATIVE_TARGET: x86_64-apple-darwin
+      QSH_RUNNER_LABEL: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Bind the Intel legacy service checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          checkout_sha=$(git rev-parse HEAD)
+          test "$checkout_sha" = "$GITHUB_SHA"
+          # The preflight bounds each query to ten seconds. On a fresh macOS 26
+          # Intel image the first /usr/bin/git call (an xcrun shim) took 7.6s
+          # and a repeat 0.6s; an earlier preflight refused that first query
+          # after 12s (#551). Pay the one-time cost here, unbounded and checked.
+          shim_sha=$(/usr/bin/git rev-parse HEAD)
+          test "$shim_sha" = "$checkout_sha"
+          printf 'darwin223 checkout=%s event=%s run=%s attempt=%s\n' "$checkout_sha" "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+      - name: Observe the Intel Darwin runtime
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          python3 -I -B - <<'PY'
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          QUERIES = (
+              ('checkout', ('/usr/bin/git', 'rev-parse', 'HEAD')),
+              ('kernel_version', ('/usr/sbin/sysctl', '-n', 'kern.version')),
+              ('osrelease', ('/usr/sbin/sysctl', '-n', 'kern.osrelease')),
+              ('os_build', ('/usr/sbin/sysctl', '-n', 'kern.osversion')),
+              ('hw_machine', ('/usr/sbin/sysctl', '-n', 'hw.machine')),
+              ('uname_machine', ('/usr/bin/uname', '-m')),
+              ('os_version', ('/usr/bin/sw_vers', '-productVersion')),
+          )
+          class Refused(Exception):
+              def __init__(self, query):
+                  self.query = query if query in {name for name, _ in QUERIES} else 'checkout'
+
+          def token(value, pattern, limit, query):
+              if type(value) is not str or len(value) > limit or re.fullmatch(pattern, value) is None:
+                  raise Refused(query)
+              return value
+
+          def kernel(value):
+              day = r'(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)'
+              month = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+              date = day + ' ' + month + r' {1,2}(?:[1-9]|[12][0-9]|3[01]) (?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9] (?:[A-Z]{1,8}|[+-][0-9]{4}) [0-9]{4}'
+              version = r'[0-9]{1,5}(?:\.[0-9]{1,5}){1,2}'
+              revision = r'[0-9]{1,12}(?:[.~][0-9]{1,12}){0,12}'
+              return token(value, 'Darwin Kernel Version ' + version + ': ' + date + '; root:xnu-' + revision + r'/RELEASE_[A-Z0-9_]{1,96}', 512, 'kernel_version')
+
+          def build_record(values, environ):
+              if type(values) is not dict or set(values) != {name for name, _ in QUERIES}:
+                  raise Refused('checkout')
+              sha = token(values['checkout'], r'[0-9a-f]{40}', 40, 'checkout')
+              event = token(environ.get('GITHUB_SHA'), r'[0-9a-f]{40}', 40, 'checkout')
+              run = token(environ.get('GITHUB_RUN_ID'), r'[1-9][0-9]{0,19}', 20, 'checkout')
+              attempt = token(environ.get('GITHUB_RUN_ATTEMPT'), r'[1-9][0-9]{0,9}', 10, 'checkout')
+              for name in ('hw_machine', 'uname_machine'):
+                  token(values[name], r'x86_64', 32, name)
+              return dict(schema=1, kind='darwin-intel-preflight', checkout_sha=sha, event_sha=event,
+                          run_id=int(run), attempt=int(attempt),
+                          runner_label=token(environ.get('QSH_RUNNER_LABEL'), r'macos-(?:15|26)-intel', 16, 'checkout'),
+                          target='x86_64-apple-darwin', kernel_version=kernel(values['kernel_version']),
+                          osrelease=token(values['osrelease'], r'[0-9]+(?:\.[0-9]+)*', 32, 'osrelease'),
+                          os_build=token(values['os_build'], r'[A-Za-z0-9]+', 32, 'os_build'),
+                          os_version=token(values['os_version'], r'[0-9]+(?:\.[0-9]+)*', 20, 'os_version'),
+                          hw_machine=values['hw_machine'], uname_machine=values['uname_machine'])
+
+          def collect(metadata_command, environ):
+              values = {}
+              for name, argv in QUERIES:
+                  try:
+                      raw = metadata_command(list(argv), timeout=10, category='static-tool')
+                      if type(raw) is not bytes or not 0 < len(raw) <= 65536 or raw.count(b'\n') != 1 or not raw.endswith(b'\n'):
+                          raise Refused(name)
+                      values[name] = raw[:-1].decode('ascii')
+                  except Exception:
+                      raise Refused(name) from None
+              return build_record(values, environ)
+
+          def main():
+              try:
+                  path = Path('scripts/check-release-output.py')
+                  spec = importlib.util.spec_from_file_location('_qsh_release_output', path)
+                  module = importlib.util.module_from_spec(spec)
+                  spec.loader.exec_module(module)
+                  record = collect(module.metadata_command, os.environ)
+                  line = ('DARWIN_INTEL_PREFLIGHT ' + json.dumps(record, sort_keys=True, separators=(',', ':'), ensure_ascii=True) + '\n').encode('ascii')
+                  if len(line) > 2048:
+                      raise Refused('kernel_version')
+                  sys.stdout.buffer.write(line)
+                  return 0
+              except Exception as error:
+                  query = error.query if isinstance(error, Refused) else 'checkout'
+                  print('INTEL_PREFLIGHT_REFUSED query=' + query, file=sys.stderr)
+                  return 1
+
+          if __name__ == '__main__':
+              raise SystemExit(main())
+          PY
+      - name: Install native legacy service prerequisites
+        run: brew install gnupg
+      - name: Build and execute the pinned legacy service backend
+        shell: bash
+        run: |
+          bash scripts/qualify-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" \
+            --toolchain-id "$ImageOS/$ImageVersion"
+          prefix=$(bash scripts/build-openssl.sh --target "$NATIVE_TARGET" \
+            --cache "$RUNNER_TEMP/native-crypto" \
+            --toolchain-id "$ImageOS/$ImageVersion")
+          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
+          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
+      - name: Install qualified Rust for legacy service checks
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustup target add "$NATIVE_TARGET"
+          scripts/check-qualified-rust.sh
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          key: native-legacy-service-x86_64-apple-darwin${{ matrix.cache_suffix }}
+      - name: Prepare native Intel Darwin legacy account-service restart artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export CARGO_BUILD_TARGET="$NATIVE_TARGET" HISTFILE=/dev/null
+          cargo_home="$CARGO_HOME"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/ -Dwarnings"
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
+          started=$(date +%s)
+          python3 -m unittest discover -s scripts/tests -p test_released_peer_acceptance.py
+          python3 scripts/released-peer-acceptance.py --service-only --prepare-only \
+            --prepared-bundle "$RUNNER_TEMP/legacy-service-intel-bundle" \
+            --evidence "$RUNNER_TEMP/legacy-service-intel-preparation-evidence"
+          printf 'legacy-service preparation elapsed_seconds=%s\n' "$(( $(date +%s) - started ))"
+      - name: Native Intel Darwin legacy account-service restart acceptance
+        shell: bash
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          umask 077
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export CARGO_BUILD_TARGET="$NATIVE_TARGET" HISTFILE=/dev/null
+          cargo_home="$CARGO_HOME"
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build -C link-arg=-Wl,-oso_prefix,$GITHUB_WORKSPACE/ -Dwarnings"
+          export AWS_LC_SYS_USE_SYSTEM=0
+          export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
+          python3 scripts/released-peer-acceptance.py --service-only \
+            --execute-prepared "$RUNNER_TEMP/legacy-service-intel-bundle" \
+            --evidence "$RUNNER_TEMP/legacy-service-intel-evidence"
+          grep -Fx '2 selected tests; 2 passed; 0 skipped' "$RUNNER_TEMP/legacy-service-intel-evidence/passed.txt"
+      - name: Report native Intel Darwin legacy-service bundle lifecycle
+        if: always()
+        shell: bash
+        run: |
+          python3 -I -B - "$RUNNER_TEMP/legacy-service-intel-bundle" <<'PY_STATE'
+          import json, os, stat, sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          record = dict(state='not-created')
+          try:
+              info = root.lstat()
+              if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                  record = dict(state='unverified-backing-retained')
+              else:
+                  record = dict(state='owned-backing-retained')
+                  for name in ('complete.json', 'execution.claim', 'settled.json', 'payload-disposition.json'):
+                      path = root / name
+                      record[name] = path.is_file() and not path.is_symlink()
+          except FileNotFoundError:
+              pass
+          print('LEGACY_SERVICE_BUNDLE '+json.dumps(record, sort_keys=True))
+          PY_STATE
+
   system-floors:
-    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.mode == 'pty-eof-build' || inputs.mode == 'pty-eof-control')) && contains(fromJSON(inputs.lanes), 'floors') }}
     name: Native system floor (${{ matrix.format }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -640,6 +827,32 @@ jobs:
                 fi
               done
             '
+
+  # Omitted input means the documented default: every lane. A supplied value
+  # must be the canonical sorted array of known lanes; [] selects none.
+  lanes:
+    name: Validate native lanes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Refuse non-canonical lane selections
+        env:
+          QSH_NATIVE_LANES: ${{ inputs.lanes }}
+        run: |
+          python3 -I -B - <<'PY_LANES'
+          import json
+          import os
+          known = ('floors', 'intel-legacy', 'intel-owner', 'portable')
+          raw = os.environ['QSH_NATIVE_LANES']
+          try:
+              lanes = json.loads(raw)
+          except ValueError:
+              raise SystemExit('native lanes refused: not JSON')
+          if (type(lanes) is not list or any(type(lane) is not str or lane not in known for lane in lanes)
+                  or json.dumps(sorted(set(lanes)), separators=(',', ':')) != raw):
+              raise SystemExit('native lanes refused: not the canonical array')
+          print('native lanes: ' + (', '.join(lanes) if lanes else 'none'))
+          PY_LANES
 
   dispatch-mode:
     name: Validate manual mode

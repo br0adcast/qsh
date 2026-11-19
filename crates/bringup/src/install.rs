@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ensure, exec, locate, shell, BringUpError, BringUpHooks, BringUpObserver, BringUpProgress,
-    BringUpRequest, BringUpStage, DaemonImage, IdentifiedReady, ImageError, ImageRequest,
-    InstallOffer, InstallPolicy, ServerOs,
+    ensure, exec, locate, shell, trust, BringUpError, BringUpHooks, BringUpObserver,
+    BringUpProgress, BringUpRequest, BringUpStage, DaemonImage, IdentifiedReady, ImageError,
+    ImageRequest, InstallOffer, InstallPolicy, ServerOs,
 };
 
 const MAX_IMAGE: u64 = 32 * 1024 * 1024;
@@ -23,26 +23,117 @@ struct Session {
     events: exec::Events,
     stream: u8,
     temporary: Option<(String, Arc<AtomicBool>)>,
+    selected_helper: Option<String>,
 }
 
-impl Session {
+/// Private transport seam: production SSH and deterministic command fixtures
+/// share the same policy, verification and publication sequencing.
+trait Remote {
     fn command(
         &mut self,
         what: &str,
         script: &str,
         budget: Duration,
         cancel: &knock::Cancel,
-    ) -> Result<exec::Output, BringUpError> {
-        self.stream += 1;
-        exec::run(
-            &mut self.sub.with_cancel(cancel),
-            &self.events,
-            self.stream,
-            what,
-            script,
-            budget,
-            cancel,
+    ) -> Result<exec::Output, BringUpError>;
+    fn upload(
+        &mut self,
+        path: &str,
+        image: &DaemonImage,
+        hooks: &BringUpHooks,
+        owned: Arc<AtomicBool>,
+        started: Instant,
+        cancel: &knock::Cancel,
+    ) -> Result<(), BringUpError>;
+    fn temporary(&mut self, value: Option<(String, Arc<AtomicBool>)>);
+    fn selected_helper(&mut self, _: &str) {}
+
+    fn trusted_path(
+        &mut self,
+        path: &str,
+        os: ServerOs,
+        purpose: trust::Purpose,
+        hooks: &BringUpHooks,
+        cancel: &knock::Cancel,
+    ) -> Result<String, BringUpError> {
+        check_cancel(cancel)?;
+        let script = trust::command(path, os, purpose)?;
+        let output = self
+            .command("qshd path trust", &script, hooks.timing.verify, cancel)
+            .map_err(|error| stage_error(BringUpStage::Verifying, error))?;
+        check_cancel(cancel)?;
+        trust::parse(
+            output.code,
+            output.complete_stdout().map_err(BringUpError::Verify)?,
         )
+    }
+
+    fn prepare_directory(
+        &mut self,
+        path: &str,
+        os: ServerOs,
+        hooks: &BringUpHooks,
+        cancel: &knock::Cancel,
+    ) -> Result<String, BringUpError> {
+        // Validate syntax before any filesystem operation. Walk up read-only,
+        // validate the nearest existing ancestor, then create one child at a time.
+        let _ = trust::command(path, os, trust::Purpose::InstallDirectory)?;
+        let mut ancestor = path;
+        let mut missing = Vec::new();
+        loop {
+            check_cancel(cancel)?;
+            let quoted = shell::quote(ancestor);
+            let output = self.command(
+                "qshd directory lookup",
+                &format!("if [ -e {quoted} ] || [ -L {quoted} ]; then exit 0; else exit 3; fi"),
+                hooks.timing.verify,
+                cancel,
+            )?;
+            if output.code == 0 {
+                break;
+            }
+            if output.code != 3 || missing.len() >= 256 {
+                return Err(BringUpError::Verify(
+                    "cannot inspect installation directory".into(),
+                ));
+            }
+            let (parent, name) = ancestor
+                .rsplit_once('/')
+                .filter(|(_, name)| !name.is_empty() && *name != "." && *name != "..")
+                .ok_or_else(|| {
+                    BringUpError::Verify("invalid missing installation directory".into())
+                })?;
+            missing.push(name);
+            ancestor = if parent.is_empty() { "/" } else { parent };
+        }
+        let mut directory = self.trusted_path(
+            ancestor,
+            os,
+            trust::Purpose::InstallDirectory,
+            hooks,
+            cancel,
+        )?;
+        for name in missing.into_iter().rev() {
+            // Recheck immediately before each write. A shared sticky parent is
+            // refused by InstallDirectory even if it would allow safe traversal.
+            directory = self.trusted_path(
+                &directory,
+                os,
+                trust::Purpose::InstallDirectory,
+                hooks,
+                cancel,
+            )?;
+            let child = format!("{}/{name}", directory.trim_end_matches('/'));
+            self.checked(
+                BringUpStage::Uploading,
+                &format!("umask 077; /bin/mkdir {}", shell::quote(&child)),
+                hooks.timing.upload,
+                cancel,
+            )?;
+            directory =
+                self.trusted_path(&child, os, trust::Purpose::InstallDirectory, hooks, cancel)?;
+        }
+        Ok(directory)
     }
 
     fn checked(
@@ -68,9 +159,16 @@ impl Session {
         hooks: &BringUpHooks,
         cancel: &knock::Cancel,
     ) -> Result<bool, BringUpError> {
+        self.trusted_path(
+            path,
+            image.request.platform.os,
+            trust::Purpose::InstallFile,
+            hooks,
+            cancel,
+        )?;
         let hash = match image.request.platform.os {
-            ServerOs::Linux => "sha256sum",
-            ServerOs::Darwin => "shasum -a 256",
+            ServerOs::Linux => "/usr/bin/sha256sum",
+            ServerOs::Darwin => "/usr/bin/shasum -a 256",
         };
         let tool = hash.split_whitespace().next().unwrap();
         let path = shell::quote(path);
@@ -78,7 +176,7 @@ impl Session {
             "command -v {tool} >/dev/null 2>&1 || exit 127; \
              if [ ! -e {path} ] && [ ! -L {path} ]; then exit 3; fi; \
              [ -f {path} ] && [ ! -L {path} ] || exit 1; \
-             size=$(wc -c < {path}) || exit $?; \
+             size=$(/usr/bin/wc -c < {path}) || exit $?; \
              sum=$({hash} < {path}) || exit $?; \
              printf '%s\\n%s\\n' \"$size\" \"$sum\""
         );
@@ -121,54 +219,60 @@ impl Session {
         image: DaemonImage,
         hooks: &BringUpHooks,
         cancel: &knock::Cancel,
-    ) -> Result<(), BringUpError> {
+    ) -> Result<String, BringUpError> {
         progress(hooks.observer.as_ref(), BringUpStage::Verifying, false);
         check_cancel(cancel)?;
+        let (directory, name) = path
+            .rsplit_once('/')
+            .ok_or_else(|| BringUpError::Verify("installation path has no parent".into()))?;
+        let directory =
+            self.prepare_directory(directory, image.request.platform.os, hooks, cancel)?;
+        let canonical = format!("{}/{name}", directory.trim_end_matches('/'));
+        let path = canonical.as_str();
         let matches = self.matches(path, &image, hooks, cancel)?;
         progress(hooks.observer.as_ref(), BringUpStage::Verifying, true);
         check_cancel(cancel)?;
         if matches {
+            self.trusted_path(
+                &directory,
+                image.request.platform.os,
+                trust::Purpose::InstallDirectory,
+                hooks,
+                cancel,
+            )?;
+            self.trusted_path(
+                path,
+                image.request.platform.os,
+                trust::Purpose::InstallFile,
+                hooks,
+                cancel,
+            )?;
             self.checked(
                 BringUpStage::Publishing,
-                &format!("chmod 700 {}", shell::quote(path)),
+                &format!("/bin/chmod 700 {}", shell::quote(path)),
                 hooks.timing.publish,
                 cancel,
             )?;
-            return Ok(());
+            return Ok(canonical);
         }
-        let directory = path.rsplit_once('/').unwrap().0;
         let upload_started = Instant::now();
-        self.checked(
-            BringUpStage::Uploading,
-            &format!("umask 077; mkdir -p {}", shell::quote(directory)),
-            hooks.timing.upload,
-            cancel,
-        )?;
         // 128 random bits; SFTP's exclusive create refuses a collision.
         let temporary = format!("{directory}/.qshd-{}.tmp", hex(&rand::random::<[u8; 16]>()));
         let owned = Arc::new(AtomicBool::new(false));
         // An exclusive-create failure does not prove ownership. Only an
         // acknowledged write or a successful upload permits cleanup. A lost
         // first reply can leave a hidden file rather than delete a foreign one.
-        self.temporary = Some((temporary.clone(), Arc::clone(&owned)));
+        self.temporary(Some((temporary.clone(), Arc::clone(&owned))));
         progress(hooks.observer.as_ref(), BringUpStage::Uploading, false);
         check_cancel(cancel)?;
-        self.conn
-            .upload_file(
-                &temporary,
-                Arc::clone(&image.bytes),
-                ssh::TransferLimits {
-                    total: hooks.timing.upload.saturating_sub(upload_started.elapsed()),
-                    idle: hooks.timing.upload_idle,
-                    max_bytes: MAX_IMAGE,
-                },
-                Arc::new(UploadObserver {
-                    observer: Arc::clone(&hooks.observer),
-                    owned: Arc::clone(&owned),
-                }),
-                cancel,
-            )
-            .map_err(|error| stage_error(BringUpStage::Uploading, BringUpError::Ssh(error)))?;
+        self.upload(
+            &temporary,
+            &image,
+            hooks,
+            Arc::clone(&owned),
+            upload_started,
+            cancel,
+        )?;
         owned.store(true, Ordering::SeqCst);
         progress(hooks.observer.as_ref(), BringUpStage::Verifying, false);
         check_cancel(cancel)?;
@@ -182,15 +286,36 @@ impl Session {
         let already_published = self.matches(path, &image, hooks, cancel)?;
         progress(hooks.observer.as_ref(), BringUpStage::Publishing, false);
         check_cancel(cancel)?;
+        self.trusted_path(
+            &directory,
+            image.request.platform.os,
+            trust::Purpose::InstallDirectory,
+            hooks,
+            cancel,
+        )?;
+        self.trusted_path(
+            path,
+            image.request.platform.os,
+            trust::Purpose::InstallFile,
+            hooks,
+            cancel,
+        )?;
+        self.trusted_path(
+            &temporary,
+            image.request.platform.os,
+            trust::Purpose::InstallFile,
+            hooks,
+            cancel,
+        )?;
         let script = if already_published {
             format!(
-                "chmod 700 {} && rm -f {}",
+                "/bin/chmod 700 {} && /bin/rm -f {}",
                 shell::quote(path),
                 shell::quote(&temporary)
             )
         } else {
             format!(
-                "chmod 700 {} && mv -f {} {}",
+                "/bin/chmod 700 {} && /bin/mv -f {} {}",
                 shell::quote(&temporary),
                 shell::quote(&temporary),
                 shell::quote(path)
@@ -202,36 +327,96 @@ impl Session {
             hooks.timing.publish,
             cancel,
         )?;
-        self.temporary = None;
+        self.temporary(None);
         progress(hooks.observer.as_ref(), BringUpStage::Publishing, true);
-        check_cancel(cancel)
+        check_cancel(cancel)?;
+        Ok(canonical)
+    }
+}
+
+impl Remote for Session {
+    fn command(
+        &mut self,
+        what: &str,
+        script: &str,
+        budget: Duration,
+        cancel: &knock::Cancel,
+    ) -> Result<exec::Output, BringUpError> {
+        self.stream = self
+            .stream
+            .checked_add(1)
+            .ok_or_else(|| BringUpError::Verify("too many installation commands".into()))?;
+        exec::run(
+            &mut self.sub.with_cancel(cancel),
+            &self.events,
+            self.stream,
+            what,
+            script,
+            budget,
+            cancel,
+        )
+    }
+
+    fn upload(
+        &mut self,
+        path: &str,
+        image: &DaemonImage,
+        hooks: &BringUpHooks,
+        owned: Arc<AtomicBool>,
+        started: Instant,
+        cancel: &knock::Cancel,
+    ) -> Result<(), BringUpError> {
+        self.conn
+            .upload_file(
+                path,
+                Arc::clone(&image.bytes),
+                ssh::TransferLimits {
+                    total: hooks.timing.upload.saturating_sub(started.elapsed()),
+                    idle: hooks.timing.upload_idle,
+                    max_bytes: MAX_IMAGE,
+                },
+                Arc::new(UploadObserver {
+                    observer: Arc::clone(&hooks.observer),
+                    owned,
+                }),
+                cancel,
+            )
+            .map_err(|error| stage_error(BringUpStage::Uploading, BringUpError::Ssh(error)))
+    }
+    fn temporary(&mut self, value: Option<(String, Arc<AtomicBool>)>) {
+        self.temporary = value;
+    }
+    fn selected_helper(&mut self, path: &str) {
+        self.selected_helper = Some(path.to_owned());
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some((path, owned)) = self
-            .temporary
-            .take()
-            .filter(|(_, owned)| owned.load(Ordering::SeqCst))
-        {
-            drop(owned);
-            // A fresh token permits bounded cleanup even after user cancellation.
-            let _ = self.command(
-                "qshd temporary file cleanup",
-                &format!("rm -f {}", shell::quote(&path)),
-                Duration::from_secs(1),
-                &knock::Cancel::new(),
-            );
-        }
+        let temporary = self.temporary.take();
+        cleanup_temporary(self, temporary);
         self.conn.close();
     }
 }
 
+fn cleanup_temporary(remote: &mut impl Remote, temporary: Option<(String, Arc<AtomicBool>)>) {
+    if let Some((path, owned)) = temporary.filter(|(_, owned)| owned.load(Ordering::SeqCst)) {
+        drop(owned);
+        // A fresh token permits bounded cleanup even after user cancellation.
+        let _ = remote.command(
+            "qshd temporary file cleanup",
+            &format!("/bin/rm -f {}", shell::quote(&path)),
+            Duration::from_secs(1),
+            &knock::Cancel::new(),
+        );
+    }
+}
+
 pub(crate) fn bring_up(
-    req: BringUpRequest,
+    mut req: BringUpRequest,
     policy: InstallPolicy,
     hooks: BringUpHooks,
+    server_info: Option<crate::ServerInfoProbe<'_>>,
     bind: Arc<dyn knock::SocketBind>,
     cancel: &knock::Cancel,
 ) -> Result<IdentifiedReady, BringUpError> {
@@ -245,6 +430,72 @@ pub(crate) fn bring_up(
             ));
         }
     }
+    if (req.busy_decision.is_some() && !req.report_busy)
+        || (req.report_busy && matches!(policy, InstallPolicy::RestartOnly))
+        || req
+            .busy_decision
+            .as_ref()
+            .is_some_and(|decision| !decision.valid())
+    {
+        return Err(BringUpError::InvalidRequest(
+            "invalid busy-daemon decision options".into(),
+        ));
+    }
+    if req.destructive_consent.is_some() && req.service_restart_consent.is_some() {
+        return Err(BringUpError::InvalidRequest(
+            "conflicting restart consent scopes".into(),
+        ));
+    }
+    if let Some(consent) = &req.service_restart_consent {
+        if !req.busy_decision.as_ref().is_some_and(|decision| {
+            decision.choice == crate::BusyChoice::ForceUpdate
+                && decision.attempt == consent.attempt
+                && decision.candidate == consent.candidate
+                && decision.service_restart.as_ref() == Some(&consent.service)
+        }) || req.pending_busy_target.is_none()
+        {
+            return Err(BringUpError::InvalidRequest(
+                "service restart needs its observed SSH target and force decision".into(),
+            ));
+        }
+    }
+    if let Some(target) = &req.pending_busy_target {
+        if target.host != req.ssh.host
+            || target.port != req.ssh.port
+            || target.username != req.ssh.username
+        {
+            return Err(BringUpError::InvalidRequest(
+                "selected SSH target changed".into(),
+            ));
+        }
+        req.ssh.known_host_keys = vec![target.host_key.key.clone()];
+    }
+    if let Some(decision) = &req.busy_decision {
+        if decision.choice == crate::BusyChoice::Cancel {
+            return Err(BringUpError::Declined);
+        }
+        if let Some(consent) = &req.destructive_consent {
+            if decision.choice != crate::BusyChoice::ForceUpdate
+                || consent.attempt != decision.attempt
+                || consent.identity != decision.identity
+                || consent.candidate != decision.candidate
+            {
+                return Err(BringUpError::InvalidRequest(
+                    "stale destructive restart consent".into(),
+                ));
+            }
+        }
+        if decision.choice == crate::BusyChoice::ForceUpdate
+            && req.service_restart_consent.is_none()
+            && (req.destructive_consent.is_none() || decision.identity.generation.is_none())
+        {
+            return Err(BringUpError::DestructiveRestartUnavailable);
+        }
+    } else if req.destructive_consent.is_some() {
+        return Err(BringUpError::InvalidRequest(
+            "destructive consent needs a force-update decision".into(),
+        ));
+    }
     if req.name.contains('\0') || req.qsh_port == 0 {
         return Err(BringUpError::InvalidRequest(
             "the name must not contain NUL and the port must be nonzero".into(),
@@ -257,13 +508,82 @@ pub(crate) fn bring_up(
     let (collector, events) = exec::collector(Arc::clone(&hooks.observer));
     let (conn, sub) = ssh::connect(req.ssh, req.auth, bind, Arc::new(collector), cancel)
         .map_err(BringUpError::Ssh)?;
+    if req
+        .pending_busy_target
+        .as_ref()
+        .is_some_and(|target| target.host_key != conn.server_host_key())
+    {
+        conn.close();
+        return Err(BringUpError::InvalidRequest(
+            "selected SSH host key changed".into(),
+        ));
+    }
     let mut session = Session {
         conn,
         sub,
         events,
         stream: 0,
         temporary: None,
+        selected_helper: None,
     };
+    let ready = on_session(
+        &mut session,
+        req.name,
+        req.qsh_port,
+        req.client_pubkey,
+        req.report_busy,
+        req.busy_decision,
+        req.destructive_consent,
+        req.service_restart_consent,
+        req.pending_busy_target.as_ref(),
+        host.clone(),
+        username.clone(),
+        ssh_port,
+        policy,
+        hooks,
+        server_info,
+        cancel,
+    )
+    .map_err(|error| match error {
+        BringUpError::BusyDaemon(info) => {
+            BringUpError::ObservedBusy(Box::new(crate::ObservedBusy {
+                info: *info,
+                target: crate::BusySshTarget {
+                    host,
+                    port: ssh_port,
+                    username,
+                    host_key: session.conn.server_host_key(),
+                    helper_path: session.selected_helper.clone().unwrap_or_default(),
+                },
+            }))
+        }
+        other => other,
+    })?;
+    Ok(IdentifiedReady {
+        ready,
+        ssh_host_key: session.conn.server_host_key(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn on_session(
+    session: &mut impl Remote,
+    name: String,
+    qsh_port: u16,
+    client_pubkey: [u8; 32],
+    report_busy: bool,
+    busy_decision: Option<crate::BusyDecision>,
+    destructive_consent: Option<crate::DestructiveRestartConsent>,
+    service_restart_consent: Option<crate::ServiceRestartConsent>,
+    pending_busy_target: Option<&crate::BusySshTarget>,
+    host: String,
+    username: String,
+    ssh_port: u16,
+    policy: InstallPolicy,
+    hooks: BringUpHooks,
+    server_info: Option<crate::ServerInfoProbe<'_>>,
+    cancel: &knock::Cancel,
+) -> Result<crate::Ready, BringUpError> {
     progress(hooks.observer.as_ref(), BringUpStage::Connecting, true);
     progress(hooks.observer.as_ref(), BringUpStage::Locating, false);
     let output = session.command(
@@ -284,6 +604,40 @@ pub(crate) fn bring_up(
     if let locate::Located::Service(kind) = probe.located {
         return Err(BringUpError::ServiceRunning(kind));
     }
+    // Read-only and before anything is installed or started: the running
+    // daemon's server info, through the located qshd once trust.sh accepts it.
+    let mut trusted_found = None;
+    if let Some((before, expected)) =
+        server_info.and_then(|p| p.before.map(|b| (b, p.expected_key)))
+    {
+        let proof = match &probe.located {
+            locate::Located::Found(found) => match session.trusted_path(
+                found,
+                probe.platform.os,
+                trust::Purpose::Execute,
+                &hooks,
+                cancel,
+            ) {
+                Ok(trusted) => {
+                    let proof = query_server_info(session, &trusted, &expected, &hooks, cancel)?;
+                    trusted_found = Some((found.clone(), trusted));
+                    proof
+                }
+                // An unsafe lookup result is never executed for metadata; the
+                // ordinary trust check below reports it where it is used.
+                Err(_) => {
+                    check_cancel(cancel)?;
+                    None
+                }
+            },
+            _ => None,
+        };
+        if !before(proof.as_ref()) {
+            return Err(BringUpError::ServerInfoRefused);
+        }
+        check_cancel(cancel)?;
+    }
+    let mut verified_candidate_digest = None;
     let path = match (&policy, probe.located) {
         (
             InstallPolicy::ExistingOnly
@@ -327,29 +681,163 @@ pub(crate) fn bring_up(
                 .map_err(BringUpError::Image)?;
             check_cancel(cancel)?;
             validate_image(&request, &image, cancel)?;
-            session.install(&path, image, &hooks, cancel)?;
-            path
+            verified_candidate_digest = Some(hex(&image.sha256));
+            session.install(&path, image, &hooks, cancel)?
         }
     };
+    let path = match trusted_found {
+        Some((found, trusted)) if found == path => trusted,
+        _ => session.trusted_path(
+            &path,
+            probe.platform.os,
+            trust::Purpose::Execute,
+            &hooks,
+            cancel,
+        )?,
+    };
+    if pending_busy_target.is_some_and(|target| target.helper_path != path) {
+        return Err(BringUpError::Verify("selected helper path changed".into()));
+    }
+    session.selected_helper(&path);
+    if report_busy {
+        check_cancel(cancel)?;
+        let capabilities = session.command(
+            "qshd bootstrap-capabilities",
+            &format!("{} bootstrap-capabilities", shell::quote(&path)),
+            hooks.timing.verify,
+            cancel,
+        )?;
+        if service_restart_consent.is_some()
+            && !capabilities.complete_stdout().is_ok_and(|stdout| {
+                ensure::tool_supports_service_restart(capabilities.code, stdout)
+            })
+        {
+            return Err(BringUpError::DestructiveRestartUnavailable);
+        }
+        if !capabilities
+            .complete_stdout()
+            .is_ok_and(|stdout| ensure::tool_supports_busy(capabilities.code, stdout))
+        {
+            return Err(BringUpError::BusyReportingUnavailable);
+        }
+    }
     progress(hooks.observer.as_ref(), BringUpStage::Starting, false);
     check_cancel(cancel)?;
-    let output = session.command(
-        "qshd transport-ensure",
-        &ensure::command_for_policy(&path, &req.name, req.qsh_port, &req.client_pubkey, &policy),
-        hooks.timing.ensure,
-        cancel,
-    )?;
+    let attempt = report_busy.then(|| {
+        busy_decision
+            .as_ref()
+            .map(|d| d.attempt.clone())
+            .unwrap_or_else(|| crate::BusyAttemptId::from_bytes(rand::random()))
+    });
+    let output = session
+        .command(
+            "qshd transport-ensure",
+            &ensure::command_for_policy(
+                &path,
+                &name,
+                qsh_port,
+                &client_pubkey,
+                &policy,
+                ensure::BusyCommand {
+                    attempt: attempt.as_ref(),
+                    decision: busy_decision.as_ref(),
+                    destructive_consent: destructive_consent.as_ref(),
+                    service_restart_consent: service_restart_consent.as_ref(),
+                },
+            )?,
+            hooks.timing.ensure,
+            cancel,
+        )
+        .map_err(|error| {
+            if destructive_consent.is_some() || service_restart_consent.is_some() {
+                BringUpError::DestructiveRestartUncertain {
+                    cause: Some(Box::new(error)),
+                }
+            } else {
+                error
+            }
+        })?;
     if output.code != 0 {
-        return Err(output.failure("qshd transport-ensure"));
+        return Err(
+            if destructive_consent.is_some() || service_restart_consent.is_some() {
+                BringUpError::DestructiveRestartUncertain {
+                    cause: Some(Box::new(output.failure("qshd transport-ensure"))),
+                }
+            } else {
+                output.failure("qshd transport-ensure")
+            },
+        );
     }
-    let stdout = output.complete_stdout().map_err(BringUpError::BadReady)?;
-    let ready = ensure::parse(output.code, stdout)?;
+    let stdout = output.complete_stdout().map_err(|error| {
+        if destructive_consent.is_some() || service_restart_consent.is_some() {
+            BringUpError::DestructiveRestartUncertain {
+                cause: Some(Box::new(BringUpError::BadReady(error))),
+            }
+        } else {
+            BringUpError::BadReady(error)
+        }
+    })?;
+    let ready = match ensure::parse_for_attempt(output.code, stdout, attempt.as_ref()) {
+        Err(BringUpError::BusyDaemon(info))
+            if verified_candidate_digest
+                .as_ref()
+                .is_some_and(|digest| digest != &info.candidate.checksum) =>
+        {
+            return Err(BringUpError::Verify(
+                "reported candidate differs from verified provider bytes".into(),
+            ));
+        }
+        Err(error @ BringUpError::BadReady(_))
+            if (destructive_consent.is_some() || service_restart_consent.is_some()) =>
+        {
+            return Err(BringUpError::DestructiveRestartUncertain {
+                cause: Some(Box::new(error)),
+            })
+        }
+        result => result?,
+    };
     progress(hooks.observer.as_ref(), BringUpStage::Starting, true);
     check_cancel(cancel)?;
-    Ok(IdentifiedReady {
-        ready,
-        ssh_host_key: session.conn.server_host_key(),
-    })
+    if let Some(probe) = server_info {
+        if let Some(after) = probe.after_ready {
+            let proof = query_server_info(session, &path, &probe.expected_key, &hooks, cancel)?;
+            after(proof.as_ref());
+        }
+    }
+    Ok(ready)
+}
+
+/// One `server-info` exchange with the trusted `path`. An older helper, a
+/// missing control endpoint or an unverifiable reply is unknown metadata,
+/// never a failed bring-up; only cancellation ends it.
+fn query_server_info(
+    session: &mut impl Remote,
+    path: &str,
+    expected: &[u8; 32],
+    hooks: &BringUpHooks,
+    cancel: &knock::Cancel,
+) -> Result<Option<ssh::VerifiedSshServerInfo>, BringUpError> {
+    check_cancel(cancel)?;
+    let challenge = ssh::server_info::challenge();
+    let output = session.command(
+        "qshd server-info",
+        &format!(
+            "{} {}",
+            shell::quote(path),
+            ssh::server_info::arguments(&challenge)
+        ),
+        hooks.timing.verify,
+        cancel,
+    );
+    check_cancel(cancel)?;
+    Ok(output
+        .ok()
+        .filter(|output| output.code == 0)
+        .and_then(|output| {
+            output.complete_stdout().ok().and_then(|stdout| {
+                ssh::server_info::verify(stdout.as_bytes(), &challenge, expected)
+            })
+        }))
 }
 
 fn validate_image(
@@ -439,3 +927,7 @@ fn stage_error(stage: BringUpStage, error: BringUpError) -> BringUpError {
         _ => BringUpError::Verify(error.to_string()),
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "install_tests.rs"]
+mod tests;

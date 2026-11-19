@@ -268,6 +268,114 @@ Encryption does not conceal network addresses, volume, or timing. It cannot
 protect either endpoint after that machine is compromised. The full threat model
 and wire format are in [the protocol specification](protocol.md).
 
+## Client installation and updates
+
+These commands describe `main` and require a later installer-capable release.
+No published release has `--self-install` or `--self-update`, and neither did
+the withdrawn `0.6.0-rc1`; the bootstrap refuses an older executable rather than
+falling back to another release.
+
+The [README installer instructions](../README.md#installing) download
+`scripts/install.sh` directly from official GitHub HTTPS. The script selects the
+latest stable release by default. `--version VERSION` selects an exact version,
+including an RC such as `0.6.0-rc.2`; this example is syntax, not an availability
+claim. It downloads only a temporary bootstrap client and invokes:
+
+```sh
+qsh --self-install [--version VERSION] [--prefix PATH]
+```
+
+The default prefix is `$HOME/.local`; the client is `<prefix>/bin/qsh`. The
+prefix must be inside the user's home. Installation needs no sudo and installs
+no daemon. The engine authenticates the final selected release with compiled
+release roots before publishing a complete generation and its active link.
+The [bootstrap trust boundary](release-security.md#client-bootstrap-trust)
+explains why this does not authenticate the temporary executable before execution.
+
+A different `qsh` on PATH causes the default installation to refuse. An explicit
+`--prefix` acknowledges a separate installation and reports both paths; it does
+not edit PATH. An existing unregistered destination is never overwritten.
+Manual copies and package-owned clients cannot acquire managed status merely by
+being in a particular directory. Keep DEB/RPM installations under their package
+manager, using local release packages; qsh provides no apt/dnf repository,
+Homebrew formula, or `cargo install qsh` channel.
+
+For a registered managed installation:
+
+```sh
+qsh --self-update
+qsh --self-update --version VERSION
+```
+
+The default selects a newer stable release. Exact selection allows an RC but
+never downgrades the installed client. Update validates the actual running
+executable, its receipt and binary digest before downloading. Running from a
+checkout does not change an installed client's provenance; copying a developer
+binary elsewhere does not make it eligible. Source builds, including release
+profile builds, never download, install, or switch console clients. Manual,
+package-owned, modified and unregistered copies refuse self-update.
+
+On connection and reconnect, qsh independently asks the pinned server for its
+running daemon version and supported session protocols. This authenticated
+discovery runs alongside ordinary admission. A legacy daemon that does not
+answer remains unknown and adds no admission delay. On an attached connection,
+the discovery process generation must match the authenticated session reply.
+
+A newer eligible server release can offer a managed client update. Enter or
+Escape postpones; choose the explicit update option to consent. A compatible
+connection can continue after postponement. An authenticated incompatible server
+cannot open a shell. Source builds only show manual rebuild guidance for
+incompatibility, and package-owned copies use their package manager. The offer
+requests the exact eligible server release from the official release source;
+it never uses a server-supplied download location. After installation, relaunch
+qsh explicitly. Updating does not promise to preserve the remote terminal.
+Termination during an approved update cancels its network work and is checked
+again before atomic activation. Cancellation observed before activation leaves
+the previous active client in place. A signal after activation commits does not
+undo the installation; relaunch is still explicit.
+
+If UDP discovery is unavailable for a pinned daemon, the SSH bootstrap reads
+its server info on the same SSH login, so an agent or FIDO key signs once per
+attempt. After the lookup and the `trust.sh` checks accept the located `qshd`,
+and before anything is installed or started, that login runs read-only
+`<qshd> server-info --challenge HEX64`. Background recovery reads it again on
+the same login after readiness. The response must echo the fresh challenge and
+match the pinned qsh key; it is authenticated only by the SSH account that
+returned it. The query never prompts, installs a daemon, or authorizes a
+client. Its host key is the one that login verified. A lookup that `trust.sh`
+refuses is never executed. Unsupported legacy commands and daemon modes
+without an available local control socket remain unknown. The executable's
+`--version` is not running-server evidence.
+
+Release authentication, destination validation or cancellation failures before
+publication leave the prior active generation in place. A successful update
+keeps the generation it replaced, removes older generations and any left by
+interrupted attempts, and reports the exact executable path to run next. A
+client still running from a removed generation keeps running. If removal fails,
+the update stays installed and the message says so. Updates never replace
+the running process, restart a session, or run automatically after a connection
+failure. Different client/server versions alone do not establish incompatibility;
+compatible peers remain usable. Unsupported protocol or capability combinations
+produce a diagnostic and require an explicit update through the client's normal
+installation channel.
+
+### Removing a managed installation
+
+There is no uninstall command. For the default prefix, check that `~/.local/bin/qsh`
+is the managed link, then remove the link before the store:
+
+```sh
+readlink ~/.local/bin/qsh   # ../lib/qsh/generations/generation-.../qsh
+rm ~/.local/bin/qsh
+rm -rf ~/.local/lib/qsh
+```
+
+With `--prefix PATH`, use `PATH/bin/qsh` and `PATH/lib/qsh`. A link left behind
+without its store blocks a later `--self-install`, which never overwrites an
+existing destination. Settings, host keys, session tokens, logs and the release
+cache under `~/.config/qsh` and `~/.cache/qsh` (or their XDG locations) are
+separate and stay in place.
+
 ## SSH startup and installation
 
 Use `,ssh` for port 22, `,ssh=N` for a specific SSH port, or `--ssh[=N]` to enable
@@ -284,6 +392,37 @@ host trust or installation on the user's behalf.
 
 qsh searches the remote `PATH`, `~/.local/bin`, and the supported user-cache
 locations. An existing managed service is reported and reused instead of launching a competing daemon.
+
+Before executing a discovered daemon, qsh checks ownership and Unix permissions
+from `/` through its canonical path, including symlink inodes and targets. Every
+object must belong to root or the SSH command's effective account. The executable
+must be a regular executable file without group/other write or setuid/setgid bits.
+Reachable directories must deny group/other write. A trusted private directory
+that denies group/other search permits writable inner directories; this exemption
+does not carry across symlinks or exempt executable permissions. Trusted sticky
+directories such as `/tmp` permit traversal through existing trusted-owned
+children, but are not installation destinations. Symlink and path traversal are
+bounded; missing metadata tools or malformed responses cause refusal.
+
+An unsafe selected daemon stops startup with a verification error. qsh does not
+try a lower-priority candidate, request installation approval, or download a
+replacement. Correct the reported ownership/permissions or install qshd in a
+private directory owned by your account. Custom builds do not need a published
+release hash or a matching filename version: cache filenames only rank candidates,
+and the running command reports its actual version. Protocol and capability
+negotiation still determine compatibility.
+
+Managed installation separately checks its destination before reading, changing,
+or replacing files, creates missing cache directories with private permissions,
+and refuses an existing final symlink or unsafe file without repairing it. A safe
+cache-directory symlink is supported. Callers that explicitly request a bundled
+image verify and install that image at their own trusted destination instead of
+executing a discovered candidate.
+
+These checks assume the server, root, account, shell and OS tools are trusted,
+Unix permissions are enforced, and ACLs do not grant additional access. Rechecks
+narrow races but do not atomically bind pathname execution or protect against
+concurrent changes by trusted writers.
 
 If no daemon is found during an interactive connection:
 
@@ -629,6 +768,10 @@ configured roads if needed.
 
 | Option | Meaning |
 | --- | --- |
+| `--self-install` | Install an official client under a home prefix; requires an installer-capable release. |
+| `--self-update` | Explicitly update the registered running client; requires an installer-capable release. |
+| `--version VERSION` | Exact release selection with either self-installation flag. |
+| `--prefix PATH` | Installation prefix with `--self-install`; default `$HOME/.local`. |
 | `-l USER` | Account to claim unless supplied as `user@`. |
 | `-p, --port N` | Default qsh UDP port; an explicit `host:port` takes precedence. |
 | `-i, --identity PATH` | The only identity for direct qsh authentication; first choice for SSH. |

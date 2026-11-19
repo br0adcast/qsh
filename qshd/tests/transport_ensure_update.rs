@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use qshd::control::{client_request, ControlReply, ControlRequest, StatusResponse};
@@ -749,7 +748,7 @@ fn an_image_that_fails_its_self_check_leaves_the_running_daemon_as_it_was() {
 
     let (client, events) = connect(home.path(), port, server_pub, key.private, [1; 16]);
     let mut garbage = vec![0u8; 4096];
-    OsRng.fill_bytes(&mut garbage);
+    getrandom::fill(&mut garbage).expect("operating system randomness is available");
     offer(&client, &garbage, old_build + 1);
     assert!(
         wait_for(Duration::from_secs(15), || events
