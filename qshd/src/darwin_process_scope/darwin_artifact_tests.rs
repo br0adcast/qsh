@@ -1325,7 +1325,12 @@ mod native {
                     Err(_) => io_ok = false,
                 }
             }
-            if !daemon_term && custody.actor_exit {
+            // The daemon reports the session end to the client only after the
+            // client acknowledges the exit status; a shutdown before that ends
+            // the bridge without a Close and leaves the client waiting for a
+            // reattach. Stop the daemon only once both ends have exited.
+            let client_exited = client_index.is_none_or(|i| children[i].status.is_some());
+            if !daemon_term && custody.actor_exit && client_exited {
                 if let Some(bound) = daemon_bound.as_mut() {
                     daemon_term = true;
                     if term(&mut bound.token).is_err() {
@@ -1343,7 +1348,6 @@ mod native {
                     }
                 }
             }
-            let client_exited = client_index.is_none_or(|i| children[i].status.is_some());
             for pump in &mut pumps {
                 if pump.drain(client_exited).is_err() {
                     io_ok = false;
