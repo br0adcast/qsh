@@ -1,0 +1,116 @@
+{
+ "jobs": [
+  {
+   "completed_at": "2026-11-18T09:00:27Z",
+   "conclusion": "success",
+   "head_sha": "75ab8f2805dd5da08a5ee36dbb34e76f74cf4f23",
+   "id": 134689071532,
+   "name": "Selection policy controls",
+   "run_attempt": 1,
+   "run_id": 44271528690,
+   "started_at": "2026-11-18T08:58:04Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-18T08:58:15Z",
+   "conclusion": "success",
+   "head_sha": "75ab8f2805dd5da08a5ee36dbb34e76f74cf4f23",
+   "id": 134689072011,
+   "name": "Select CI lanes",
+   "run_attempt": 1,
+   "run_id": 44271528690,
+   "started_at": "2026-11-18T08:58:03Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-18T09:00:05Z",
+   "conclusion": "success",
+   "head_sha": "75ab8f2805dd5da08a5ee36dbb34e76f74cf4f23",
+   "id": 134689192725,
+   "name": "Documentation controls",
+   "run_attempt": 1,
+   "run_id": 44271528690,
+   "started_at": "2026-11-18T08:58:18Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-18T09:20:25Z",
+   "conclusion": "success",
+   "head_sha": "75ab8f2805dd5da08a5ee36dbb34e76f74cf4f23",
+   "id": 134689192781,
+   "name": "check",
+   "run_attempt": 1,
+   "run_id": 44271528690,
+   "started_at": "2026-11-18T08:58:18Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-18T09:12:25Z",
+   "conclusion": "success",
+   "head_sha": "75ab8f2805dd5da08a5ee36dbb34e76f74cf4f23",
+   "id": 134689192804,
+   "name": "container",
+   "run_attempt": 1,
+   "run_id": 44271528690,
+   "started_at": "2026-11-18T08:58:18Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-18T08:58:15Z",
+   "conclusion": "skipped",
+   "head_sha": "75ab8f2805dd5da08a5ee36dbb34e76f74cf4f23",
+   "id": 134689194694,
+   "name": "matrix.name",
+   "run_attempt": 1,
+   "run_id": 44271528690,
+   "started_at": "2026-11-18T08:58:16Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-18T08:58:15Z",
+   "conclusion": "skipped",
+   "head_sha": "75ab8f2805dd5da08a5ee36dbb34e76f74cf4f23",
+   "id": 134689194995,
+   "name": "released-peer-acceptance",
+   "run_attempt": 1,
+   "run_id": 44271528690,
+   "started_at": "2026-11-18T08:58:16Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-18T08:58:15Z",
+   "conclusion": "skipped",
+   "head_sha": "75ab8f2805dd5da08a5ee36dbb34e76f74cf4f23",
+   "id": 134689195566,
+   "name": "fuzz",
+   "run_attempt": 1,
+   "run_id": 44271528690,
+   "started_at": "2026-11-18T08:58:16Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-18T08:58:15Z",
+   "conclusion": "skipped",
+   "head_sha": "75ab8f2805dd5da08a5ee36dbb34e76f74cf4f23",
+   "id": 134689195895,
+   "name": "native-crypto",
+   "run_attempt": 1,
+   "run_id": 44271528690,
+   "started_at": "2026-11-18T08:58:16Z",
+   "status": "completed"
+  },
+  {
+   "completed_at": "2026-11-18T09:20:36Z",
+   "conclusion": "failure",
+   "head_sha": "75ab8f2805dd5da08a5ee36dbb34e76f74cf4f23",
+   "id": 134700711039,
+   "name": "CI gate",
+   "run_attempt": 1,
+   "run_id": 44271528690,
+   "started_at": "2026-11-18T09:20:28Z",
+   "status": "completed"
+  }
+ ],
+ "source": "CI run 44271528690 (push to main 75ab8f2, smoke selection), filter=latest",
+ "total_count": 10
+}

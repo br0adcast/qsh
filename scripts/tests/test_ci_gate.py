@@ -110,7 +110,9 @@ class GateHarness(unittest.TestCase):
         if 'macos' in lanes:
             jobs += [job(cell) for cell in POLICY['lanes']['macos']['cells']]
         else:
-            jobs.append(job('${{ matrix.name }}', 'skipped'))
+            # GitHub reports a skipped job named by one whole expression by
+            # that bare expression (CI run 44271528690).
+            jobs.append(job('matrix.name', 'skipped'))
         native = [lane for lane in lanes if POLICY['lanes'][lane]['workflow'] == gate.CALLERS['native-crypto']]
         if native:
             jobs += [job('native-crypto / Validate native lanes'), job('native-crypto / Validate manual mode', 'skipped'),
@@ -121,7 +123,7 @@ class GateHarness(unittest.TestCase):
                     jobs += [job('native-crypto / ' + cell) for cell in POLICY['lanes'][lane]['cells']]
                 else:
                     template = {'native': 'Native ${{ matrix.target }}', 'floors':
-                                'Native system floor (${{ matrix.format }})'}.get(lane, '${{ matrix.name }}')
+                                'Native system floor (${{ matrix.format }})'}.get(lane, 'matrix.name')
                     jobs.append(job('native-crypto / ' + template, 'skipped'))
         else:
             jobs.append(job('native-crypto', 'skipped'))
@@ -373,6 +375,46 @@ class RecordedNamingTests(GateHarness):
         self.assertEqual(failures, [])
         self.assertEqual(pending, [])
         self.assertEqual(len(cells), 10)
+
+    def test_recorded_main_smoke_accounts_for_the_bare_skipped_macos_matrix(self):
+        recorded = fixture('jobs-ci-main-smoke.json')['jobs']
+        self.assertIn(('matrix.name', 'skipped'), [(item['name'], item['conclusion']) for item in recorded])
+        source, run_id = recorded[0]['head_sha'], recorded[0]['run_id']
+        jobs = [dict(item, status='in_progress', conclusion=None, completed_at=None)
+                if item['name'] == 'CI gate' else item for item in recorded]
+        smoke = {'check', 'container', 'docs'}
+        record = self.record(smoke, mode='smoke', source=source, api_head=source, base=None,
+                             deferred=sorted(set(POLICY['lanes']) - smoke))
+        env = dict(self.env, GITHUB_EVENT_NAME='push', GITHUB_SHA=source, GITHUB_RUN_ID=str(run_id),
+                   QSH_JOB_WORKFLOW_REF=REPO + '/.github/workflows/ci.yml@refs/heads/main',
+                   QSH_GATE_RECORD=record, QSH_GATE_NEEDS=self.needs(smoke))
+        run = dict(self.run_payload(event='push', head=source), id=run_id)
+        result = gate.Gate('ci', env, FakeApi(run, jobs), sleep=lambda s: None, source=(source, [B])).run()
+        self.assertEqual(result['result'], 'PASS', result['failures'])
+        self.assertEqual(result['lanes']['macos'], 'DEFERRED_TO_NIGHTLY')
+        self.assertEqual({cell['name'] for cell in result['cells']}, {'check', 'container', 'Documentation controls'})
+
+    def test_whole_expression_templates_accept_only_skipped_bare_records_of_their_group(self):
+        lanes = {'check', 'container', 'native'}
+        jobs = self.pr_jobs(lanes)
+        self.assertEqual([item['name'] for item in jobs].count('native-crypto / matrix.name'), 2)
+        result = self.gate_run('ci', FakeApi(self.run_payload(), jobs), self.record(lanes), self.needs(lanes))
+        self.assertEqual(result['result'], 'PASS', result['failures'])
+        braced = [dict(item, name='native-crypto / ${{ matrix.name }}') if item['name'] == 'native-crypto / matrix.name'
+                  else item for item in jobs]
+        result = self.gate_run('ci', FakeApi(self.run_payload(), braced), self.record(lanes), self.needs(lanes))
+        self.assertEqual(result['result'], 'PASS', result['failures'])
+        cases = (
+            (jobs + [job('native-crypto / matrix.name', 'skipped')], 'DUPLICATE_TEMPLATE native-crypto / …'),
+            (self.pr_jobs(lanes, {'native-crypto / matrix.name': {'conclusion': 'success'}}),
+             'TEMPLATE_NOT_SKIPPED native-crypto / …'),
+            (jobs + [job('native-crypto / matrix.other', 'skipped')], 'UNKNOWN_JOB native-crypto / matrix.other'),
+            (jobs + [job('fuzz / matrix.name', 'skipped')], 'UNKNOWN_JOB fuzz / matrix.name'),
+        )
+        for changed, failure in cases:
+            with self.subTest(failure=failure):
+                result = self.gate_run('ci', FakeApi(self.run_payload(), changed), self.record(lanes), self.needs(lanes))
+                self.assertIn(failure, result['failures'])
 
     def test_recorded_release_dispatch_skips_the_ordinary_ci_call_by_name(self):
         jobs = fixture('jobs-release-branch-dispatch.json')['jobs']

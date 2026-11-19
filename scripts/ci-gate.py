@@ -45,6 +45,9 @@ TRUSTED_EVIDENCE = {'.github/workflows/nightly.yml': ('nightly', ('schedule', 'w
                     '.github/workflows/release.yml': ('release', ('push',))}
 MAX_ARTIFACT = 1024 * 1024
 SHAPE = re.compile(r'\$\{\{.*?\}\}')
+# A skipped job whose whole name is one expression is reported by its bare
+# expression text: `${{ matrix.name }}` arrives as `matrix.name`.
+WHOLE = re.compile(r'\$\{\{\s*(.*?)\s*\}\}')
 
 
 class GateError(Exception):
@@ -53,6 +56,12 @@ class GateError(Exception):
 
 def shape(name):
     return SHAPE.sub('\0', name)
+
+
+def bare(name):
+    """The reported name of a skipped job named by one whole expression, or None."""
+    found = WHOLE.fullmatch(name)
+    return found.group(1) if found else None
 
 
 class Api:
@@ -145,7 +154,7 @@ class Expectation:
 
     def __init__(self, policy, workflow, texts, required, call_ids=()):
         self.workflow = workflow
-        self.cells, self.templates, self.admin = {}, {}, {}
+        self.cells, self.templates, self.admin, self.bare = {}, {}, {}, {}
         for lane, spec in policy['lanes'].items():
             if spec['workflow'] != workflow:
                 continue
@@ -154,6 +163,8 @@ class Expectation:
             name = job_name(texts[workflow], spec['job'])
             if '${{' in name:
                 self.templates.setdefault(shape(name), []).append(lane)
+                if bare(name) is not None:
+                    self.bare[bare(name)] = shape(name)
         for job, spec in policy['administrative'].get(workflow, {}).items():
             self.admin[shape(spec['name']) if '${{' in spec['name'] else spec['name']] = (job, spec['accept'])
         self.calls = set(call_ids)
@@ -185,11 +196,11 @@ def evaluate(groups, latest, history, attempt, own, required_admin, strict):
                 failures.append('UNKNOWN_JOB ' + job['name'])
             continue
         expected = groups[prefix]
-        key = local if '${{' not in local else shape(local)
+        key = shape(local) if '${{' in local else expected.bare.get(local, local)
         seen.setdefault((prefix, key), []).append(job)
         if local in expected.cells:
             continue
-        if '${{' in local and shape(local) in expected.templates:
+        if key in expected.templates and key != local:
             continue
         if key in expected.admin or local in expected.calls:
             continue
