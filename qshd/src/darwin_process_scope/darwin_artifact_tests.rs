@@ -178,7 +178,8 @@ fn darwin515_failure_custody_projects_each_predicate_and_masks_the_body() {
     };
     assert!(settled().settled());
     // Each case breaks exactly one settlement predicate, or none (an unreached fault).
-    let cases: [(&str, fn(&mut Custody)); 8] = [
+    type Break = fn(&mut Custody);
+    let cases: [(&str, Break); 8] = [
         ("none", |_| {}),
         ("started", |c| {
             c.started.clear();
@@ -231,8 +232,10 @@ fn darwin515_failure_custody_projects_each_predicate_and_masks_the_body() {
 
 #[test]
 fn darwin515_failure_custody_is_failure_only_and_bounded() {
-    let mut custody = Custody::default();
-    custody.daemon_exit = Some(4096);
+    let custody = Custody {
+        daemon_exit: Some(4096),
+        ..Custody::default()
+    };
     let unknown = FailureCustody::observe(Err("synthetic-private-canary"), false, &custody);
     let raw = execute_outcome(true, Err("FAILURE_CUSTODY"), Some(&unknown));
     let text = String::from_utf8(raw).unwrap();
@@ -581,7 +584,7 @@ mod native {
         "darwin_process_scope::darwin_artifact_tests::native::darwin185_archive_actor";
     type Result<T> = std::result::Result<T, &'static str>;
     fn sha(raw: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(raw))
+        hex::encode(Sha256::digest(raw))
     }
     fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         value[key].as_str().ok_or("INPUT")
