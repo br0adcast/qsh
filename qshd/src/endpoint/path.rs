@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -138,7 +138,7 @@ impl EndpointAuthority {
 
     pub fn entry(&self) -> io::Result<Option<nix::libc::stat>> {
         match stat::fstatat(
-            Some(self.parent.as_raw_fd()),
+            &self.parent,
             self.leaf.as_os_str(),
             AtFlags::AT_SYMLINK_NOFOLLOW,
         ) {
@@ -159,7 +159,7 @@ impl EndpointAuthority {
 
     pub fn open_lock(&self) -> io::Result<File> {
         let fd = fcntl::openat(
-            Some(self.parent.as_raw_fd()),
+            &self.parent,
             self.lock.as_os_str(),
             OFlag::O_WRONLY
                 | OFlag::O_CREAT
@@ -169,7 +169,7 @@ impl EndpointAuthority {
             Mode::S_IRUSR | Mode::S_IWUSR,
         )?;
         // SAFETY: openat returned a newly owned descriptor.
-        Ok(unsafe { File::from_raw_fd(fd) })
+        Ok(File::from(fd))
     }
 }
 
@@ -198,20 +198,16 @@ impl Stage {
         authority.validate_route()?;
         let parent = authority.parent.try_clone()?;
         let name = OsString::from(format!(".c{}", std::process::id()));
-        stat::mkdirat(
-            Some(authority.parent.as_raw_fd()),
-            name.as_os_str(),
-            Mode::S_IRWXU,
-        )?;
+        stat::mkdirat(&authority.parent, name.as_os_str(), Mode::S_IRWXU)?;
         let fd = fcntl::openat(
-            Some(authority.parent.as_raw_fd()),
+            &authority.parent,
             name.as_os_str(),
             OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
         )?;
         // SAFETY: openat returned a new uniquely owned descriptor.
-        let directory = unsafe { File::from_raw_fd(fd) };
-        let identity = stat::fstat(directory.as_raw_fd())?;
+        let directory = File::from(fd);
+        let identity = stat::fstat(&directory)?;
         if identity.st_uid != nix::unistd::geteuid().as_raw() || identity.st_mode & 0o7777 != 0o700
         {
             return Err(refused(
@@ -240,11 +236,11 @@ impl Stage {
     pub fn validate(&self, authority: &EndpointAuthority) -> io::Result<()> {
         authority.validate_route()?;
         let current = stat::fstatat(
-            Some(self.parent.as_raw_fd()),
+            &self.parent,
             self.name.as_os_str(),
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )?;
-        let held = stat::fstat(self.directory.as_raw_fd())?;
+        let held = stat::fstat(&self.directory)?;
         if !same(&current, &self.identity)
             || !same(&held, &self.identity)
             || held.st_uid != nix::unistd::geteuid().as_raw()
@@ -273,7 +269,7 @@ impl Stage {
             parent.join(&self.name).join(super::STAGED_NAME),
         )?;
         let socket = stat::fstatat(
-            Some(self.directory.as_raw_fd()),
+            &self.directory,
             super::STAGED_NAME,
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )?;
@@ -292,13 +288,13 @@ impl Stage {
         // cannot replace this leaf inside the exclusive 0700 stage; this is not
         // atomic conditional chmod against a malicious same-account owner.
         stat::fchmodat(
-            Some(self.directory.as_raw_fd()),
+            &self.directory,
             super::STAGED_NAME,
             Mode::S_IRUSR | Mode::S_IWUSR,
             stat::FchmodatFlags::FollowSymlink,
         )?;
         let checked = stat::fstatat(
-            Some(self.directory.as_raw_fd()),
+            &self.directory,
             super::STAGED_NAME,
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )?;
@@ -326,7 +322,7 @@ impl Stage {
         self.validate(authority)?;
         authority.entry()?;
         let current = stat::fstatat(
-            Some(self.directory.as_raw_fd()),
+            &self.directory,
             super::STAGED_NAME,
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )?;
@@ -348,9 +344,9 @@ impl Stage {
         }
         if replace {
             fcntl::renameat(
-                Some(self.directory.as_raw_fd()),
+                &self.directory,
                 super::STAGED_NAME,
-                Some(authority.parent.as_raw_fd()),
+                &authority.parent,
                 authority.leaf.as_os_str(),
             )?;
         } else {
@@ -381,13 +377,13 @@ impl Drop for Stage {
     fn drop(&mut self) {
         if let Some(owned) = &self.socket {
             if let Ok(current) = stat::fstatat(
-                Some(self.directory.as_raw_fd()),
+                &self.directory,
                 super::STAGED_NAME,
                 AtFlags::AT_SYMLINK_NOFOLLOW,
             ) {
                 if same(&current, owned) {
                     let _ = nix::unistd::unlinkat(
-                        Some(self.directory.as_raw_fd()),
+                        &self.directory,
                         super::STAGED_NAME,
                         nix::unistd::UnlinkatFlags::NoRemoveDir,
                     );
@@ -395,13 +391,13 @@ impl Drop for Stage {
             }
         }
         if let Ok(current) = stat::fstatat(
-            Some(self.parent.as_raw_fd()),
+            &self.parent,
             self.name.as_os_str(),
             AtFlags::AT_SYMLINK_NOFOLLOW,
         ) {
             if same(&current, &self.identity) {
                 let _ = nix::unistd::unlinkat(
-                    Some(self.parent.as_raw_fd()),
+                    &self.parent,
                     self.name.as_os_str(),
                     nix::unistd::UnlinkatFlags::RemoveDir,
                 );

@@ -8,8 +8,9 @@
 use crate::state::SelfCheck;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use daemon_bootstrap_protocol::CandidateImageIdentity;
+use getrandom::SysRng;
 use nix::libc;
-use rand_core::{OsRng, RngCore};
+use rand_core::TryRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::convert::Infallible;
@@ -670,7 +671,7 @@ fn set_cloexec(file: &File, enabled: bool) -> Result<(), StageError> {
 fn create_stage(root: &StageRoot) -> Result<(String, File), StageError> {
     for _ in 0..32 {
         let mut nonce = [0; 16];
-        OsRng
+        SysRng
             .try_fill_bytes(&mut nonce)
             .map_err(|_| StageError::Invalid)?;
         let name = format!("stage-{}", hex::encode(nonce));

@@ -1,13 +1,14 @@
 //! Private staging and exclusive rename in one verified directory.
+use getrandom::SysRng;
+use rand_core::TryRng;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 
 use nix::fcntl::{openat, OFlag};
 use nix::sys::stat::Mode;
-use rand_core::{OsRng, RngCore};
 
 pub(super) struct Stage {
     pub file: File,
@@ -17,7 +18,7 @@ pub(super) struct Stage {
 pub(super) fn create(parent: &File) -> io::Result<Stage> {
     create_with(parent, || {
         let mut random = [0u8; 16];
-        OsRng
+        SysRng
             .try_fill_bytes(&mut random)
             .map_err(io::Error::other)?;
         Ok(CString::new(format!(
@@ -32,7 +33,7 @@ fn create_with(parent: &File, mut name: impl FnMut() -> io::Result<CString>) -> 
     for _ in 0..32 {
         let name = name()?;
         match openat(
-            Some(parent.as_raw_fd()),
+            parent,
             name.as_c_str(),
             OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
             Mode::S_IRUSR | Mode::S_IWUSR,
@@ -40,7 +41,7 @@ fn create_with(parent: &File, mut name: impl FnMut() -> io::Result<CString>) -> 
             // SAFETY: openat returned a new, uniquely owned descriptor.
             Ok(fd) => {
                 return Ok(Stage {
-                    file: unsafe { File::from_raw_fd(fd) },
+                    file: File::from(fd),
                     name,
                 })
             }

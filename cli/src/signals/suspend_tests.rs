@@ -17,7 +17,11 @@ static FAIL_RAW: AtomicBool = AtomicBool::new(false);
 static CLOSE_RAW: AtomicI32 = AtomicI32::new(-1);
 
 pub(crate) fn before_action(handler: SigHandler) -> Result<(), nix::Error> {
-    let code = if handler == SigHandler::SigDfl { 1 } else { 2 };
+    let code = if matches!(handler, SigHandler::SigDfl) {
+        1
+    } else {
+        2
+    };
     if FAIL_ACTION
         .compare_exchange(code, 0, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()

@@ -33,6 +33,17 @@ def synthetic_maintenance_exception():
     }}
 
 
+def synthetic_vulnerability_exception():
+    # Exercise exception mechanics without depending on a live production waiver.
+    identity = ('vulnerability', 'RUSTSEC-2026-9005', 'owned-vulnerable', '1.0.0')
+    return {identity: {
+        'kind': identity[0], 'id': identity[1], 'package': identity[2], 'version': identity[3],
+        'owner': 'Owned fixture', 'review_by': '2027-01-24',
+        'tracking': 'https://example.invalid/vulnerability',
+        'reason': 'Synthetic local disposition for exact exception scope controls.',
+    }}
+
+
 def receipt(lock, database, count=2, extra=''):
     return ("    Fetching advisory database from `https://github.com/RustSec/advisory-db.git`\n"
             + f"      Loaded 1 security advisories (from {database})\n"
@@ -47,17 +58,22 @@ class AdvisoryGateTests(unittest.TestCase):
 
     def setUp(self):
         self.today = datetime.date(2026, 10, 24)
-        self.exceptions = self.gate.load_exceptions(ROOT / 'scripts/dependency-exceptions.json', self.today)
+        directory = tempfile.TemporaryDirectory(prefix='qsh-exception-fixture-')
+        self.addCleanup(directory.cleanup)
+        self.exception_path = Path(directory.name) / 'exceptions.json'
+        entries = {**synthetic_vulnerability_exception(), **synthetic_maintenance_exception()}
+        self.exception_path.write_text(json.dumps(list(entries.values())))
+        self.exceptions = self.gate.load_exceptions(self.exception_path, self.today)
         self.lock, self.database = Path('/owned/Cargo.lock'), Path('/owned/advisories')
 
     def test_review_date_is_inclusive_and_expired_exceptions_fail(self):
-        path = ROOT / 'scripts/dependency-exceptions.json'
+        path = self.exception_path
         self.gate.load_exceptions(path, datetime.date(2027, 1, 24))
         with self.assertRaisesRegex(ValueError, 'expired'):
             self.gate.load_exceptions(path, datetime.date(2027, 1, 25))
 
     def test_missing_metadata_duplicate_or_ranged_exception_is_rejected(self):
-        entries = json.loads((ROOT / 'scripts/dependency-exceptions.json').read_text())
+        entries = json.loads(self.exception_path.read_text())
         for mutate in ['owner', 'duplicate', 'range']:
             changed = copy.deepcopy(entries)
             if mutate == 'owner':
@@ -73,10 +89,11 @@ class AdvisoryGateTests(unittest.TestCase):
                     self.gate.load_exceptions(path, self.today)
 
     def test_ignore_scope_requires_every_locked_version_to_match(self):
-        packages = [{'name': 'rsa', 'version': '0.10.0-rc.18'}, {'name': 'chrono', 'version': '0.4.45'}]
+        packages = [{'name': entry['package'], 'version': entry['version']}
+                    for entry in self.exceptions.values()]
         self.gate.validate_exception_versions(self.exceptions, packages)
-        for changed in [packages[1:], packages + [{'name': 'rsa', 'version': '0.10.0-rc.19'}],
-                        [dict(packages[0], version='0.10.0-rc.19')]]:
+        for changed in [packages[1:], packages + [dict(packages[0], version='1.0.1')],
+                        [dict(packages[0], version='1.0.1'), packages[1]]]:
             with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'locked'):
                 self.gate.validate_exception_versions(self.exceptions, changed)
 
@@ -332,14 +349,16 @@ class RealToolPolicyTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn('banned', codes)
 
-    def local_advisory_result(self, identifier, package, version, kind=None, exceptions=None, index=False):
+    def local_advisory_result(self, identifier, package, version, kind=None, exceptions=None, index=False,
+                              patched=None):
         database = self.root / 'advisories'
         advisory = database / 'crates' / package / (identifier + '.md')
         advisory.parent.mkdir(parents=True, exist_ok=True)
         text = f'```toml\n[advisory]\nid="{identifier}"\npackage="{package}"\ndate="2026-10-24"\n'
         if kind:
             text += f'informational="{kind}"\n'
-        text += '[versions]\npatched=[]\n```\n\n# Owned fixture advisory\n\nSynthetic local test data.\n'
+        text += ('[versions]\npatched=' + json.dumps(patched or [])
+                 + '\n```\n\n# Owned fixture advisory\n\nSynthetic local test data.\n')
         advisory.write_text(text)
         if not (database / '.git').exists():
             self.assertEqual(self.run_owned(['git', 'init', '-q', database]).returncode, 0)
@@ -361,22 +380,33 @@ class RealToolPolicyTests(unittest.TestCase):
                                                datetime.date(2026, 10, 24))
         return {identity: entry for identity, entry in exceptions.items() if identity[2] == name}
 
-    def test_real_audit_accepts_reviewed_rsa_and_rejects_new_id_or_wrong_version(self):
-        exceptions = self.reviewed('rsa')
-        result = self.local_advisory_result('RUSTSEC-2023-0071', 'rsa', '0.10.0-rc.18',
+    def test_real_audit_accepts_only_the_synthetic_exact_exception(self):
+        exceptions = synthetic_vulnerability_exception()
+        result = self.local_advisory_result('RUSTSEC-2026-9005', 'owned-vulnerable', '1.0.0',
                                             exceptions=exceptions)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, '')
         self.gate.validate_exception_advisories(exceptions, self.root / 'advisories')
         with self.assertRaises(ValueError):
-            self.gate.validate_exception_versions(exceptions, [{'name': 'rsa', 'version': '0.10.0-rc.19'}])
-        result = self.local_advisory_result('RUSTSEC-2023-0071', 'rsa', '0.10.0-rc.19')
+            self.gate.validate_exception_versions(exceptions, [{'name': 'owned-vulnerable', 'version': '1.0.1'}])
+        result = self.local_advisory_result('RUSTSEC-2026-9005', 'owned-vulnerable', '1.0.1')
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn('RUSTSEC-2023-0071', result.stdout)
+        self.assertIn('RUSTSEC-2026-9005', result.stdout)
         result = self.local_advisory_result('RUSTSEC-2026-9001', 'owned-fixture', '1.0.0',
                                             exceptions=exceptions)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn('RUSTSEC-2026-9001', result.stdout)
+
+    def test_real_audit_accepts_patched_stable_rsa_without_an_exception(self):
+        self.assertEqual(self.reviewed('rsa'), {})
+        result = self.local_advisory_result('RUSTSEC-2023-0071', 'rsa', '0.10.0',
+                                            patched=['>=0.10.0'])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '')
+        result = self.local_advisory_result('RUSTSEC-2023-0071', 'rsa', '0.10.0-rc.18',
+                                            patched=['>=0.10.0'])
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('RUSTSEC-2023-0071', result.stdout)
 
     def test_real_maintenance_exception_cannot_hide_new_kind_or_unrelated_warning(self):
         exceptions = synthetic_maintenance_exception()
@@ -396,8 +426,8 @@ class RealToolPolicyTests(unittest.TestCase):
         cargo_home = self.root / 'unusable-cargo-home'
         cargo_home.write_text('Owned failure fixture: CARGO_HOME must be a directory.')
         self.env['CARGO_HOME'] = str(cargo_home)
-        result = self.local_advisory_result('RUSTSEC-2023-0071', 'rsa', '0.10.0-rc.18',
-                                            exceptions=self.reviewed('rsa'), index=True)
+        result = self.local_advisory_result('RUSTSEC-2026-9005', 'owned-vulnerable', '1.0.0',
+                                            exceptions=synthetic_vulnerability_exception(), index=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("warning: couldn't open crates.io index", result.stderr)
         with self.assertRaises(ValueError):

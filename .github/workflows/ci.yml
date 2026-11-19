@@ -60,7 +60,10 @@ jobs:
             name: macOS 26 portable tests
             cache_suffix: -macos-26
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    # A warm macOS 15 run takes about 40 minutes; a lockfile change misses the
+    # Rust cache and adds about a third (#622). The cache is saved only after a
+    # completed run, so a timed-out cold run cannot warm the next attempt.
+    timeout-minutes: 75
     env:
       RUSTUP_TOOLCHAIN: "1.98.1"
       HISTFILE: /dev/null

@@ -2,7 +2,7 @@
 
 use std::io::{self, Read};
 use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::time::Instant;
 
 use super::shell_owner::ShellOwner as SessionChildOwner;
@@ -12,7 +12,7 @@ use crate::process_scope::{scope::Progress, QualifiedProc};
 struct Report<'a>(&'a OwnedFd);
 impl Read for Report<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        nix::unistd::read(self.0.as_raw_fd(), bytes).map_err(io::Error::from)
+        nix::unistd::read(self.0, bytes).map_err(io::Error::from)
     }
 }
 

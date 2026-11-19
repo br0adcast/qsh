@@ -1343,10 +1343,7 @@ fn legacy_service_fixture(force: bool, changed_during_dialog: bool) {
     );
     use sha2::Digest as _;
     assert_eq!(
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(std::fs::read(&executing).unwrap())
-        ),
+        hex::encode(sha2::Sha256::digest(std::fs::read(&executing).unwrap())),
         info.candidate.checksum
     );
     owned.pids.push(after.pid);
@@ -1417,19 +1414,13 @@ fn legacy_service_fixture(force: bool, changed_during_dialog: bool) {
         .unwrap()
         .success());
     assert_ne!(
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(std::fs::read(&replacement).unwrap())
-        ),
+        hex::encode(sha2::Sha256::digest(std::fs::read(&replacement).unwrap())),
         info.candidate.checksum
     );
     std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o500)).unwrap();
     std::fs::rename(&replacement, &current).unwrap();
     assert_ne!(
-        format!(
-            "{:x}",
-            sha2::Sha256::digest(std::fs::read(&current).unwrap())
-        ),
+        hex::encode(sha2::Sha256::digest(std::fs::read(&current).unwrap())),
         info.candidate.checksum
     );
     assert_eq!(

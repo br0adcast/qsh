@@ -28,22 +28,17 @@ impl HostEndpoint {
     }
 
     pub(crate) fn refuse_unprovisioned(&self) -> io::Result<bool> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
         self.lock.validate_route()?;
         // These wrappers make one syscall and return EINTR without retrying.
         #[cfg(target_os = "linux")]
-        let accepted = nix::sys::socket::accept4(
-            self.listener.as_raw_fd(),
-            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
-        );
+        let accepted =
+            nix::sys::socket::accept4(&self.listener, nix::sys::socket::SockFlag::SOCK_CLOEXEC);
         #[cfg(not(target_os = "linux"))]
-        let accepted = nix::sys::socket::accept(self.listener.as_raw_fd());
+        let accepted = nix::sys::socket::accept(&self.listener);
         match accepted.map_err(io::Error::from) {
             Ok(fd) => {
-                // SAFETY: accept returned this newly owned descriptor. It is
-                // closed once immediately, without reading or granting authority.
-                drop(unsafe { OwnedFd::from_raw_fd(fd) });
+                // Drop the newly owned descriptor once, without granting authority.
+                drop(fd);
                 Ok(true)
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),

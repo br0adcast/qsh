@@ -28,7 +28,7 @@ terminal = { path = "../crates/terminal" }
 terminal-size = { path = "../crates/terminal-size" }
 # The same exact upstream parser sshauth passes to key_is_listed; this edge
 # only names the fixed public key type in the harness.
-ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "ed25519"] }
+ssh-key = { version = "=0.7.0-rc.12", default-features = false, features = ["std", "ed25519"] }
 
 [[bin]]
 name = "channel_codec"

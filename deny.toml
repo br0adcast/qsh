@@ -27,7 +27,8 @@ exceptions = [
     { crate = "terminal-size@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
     { crate = "transport@0.6.0-rc1", allow = ["AGPL-3.0-only"] },
     { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
-    { crate = "webpki-roots@1.0.10", allow = ["CDLA-Permissive-2.0"] },
+    { crate = "webpki-roots@1.0.12", allow = ["CDLA-Permissive-2.0"] },
+    { crate = "webpki-root-certs@1.0.12", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [licenses.private]

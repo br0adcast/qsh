@@ -279,7 +279,7 @@ impl russh::server::Handler for Handler {
     async fn auth_publickey_offered(
         &mut self,
         _: &str,
-        _: &russh::keys::PublicKey,
+        _: russh::server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
         self.activity.auth.fetch_add(1, Ordering::SeqCst);
         Ok(Auth::Accept)
@@ -287,7 +287,7 @@ impl russh::server::Handler for Handler {
     async fn auth_publickey(
         &mut self,
         _: &str,
-        _: &russh::keys::PublicKey,
+        _: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         self.activity.sign.fetch_add(1, Ordering::SeqCst);
         Ok(Auth::Accept)

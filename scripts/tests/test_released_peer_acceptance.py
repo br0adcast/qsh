@@ -3045,8 +3045,9 @@ class WorkflowSplitTests(unittest.TestCase):
         return '\n'.join(lines[start:end]) + '\n'
 
     def test_both_native_service_lanes_prepare_before_bounded_direct_execution(self):
-        for path, job, platform in [('.github/workflows/native-crypto.yml', 'darwin-legacy-service-intel', 'Intel Darwin'),
-                                    ('.github/workflows/ci.yml', 'macos', 'Darwin')]:
+        for path, job, platform, timeout in [
+                ('.github/workflows/native-crypto.yml', 'darwin-legacy-service-intel', 'Intel Darwin', 45),
+                ('.github/workflows/ci.yml', 'macos', 'Darwin', 75)]:
             with self.subTest(path=path):
                 workflow = (SCRIPT.parents[1] / path).read_text()
                 text = self.job(workflow, job)
@@ -3074,6 +3075,6 @@ class WorkflowSplitTests(unittest.TestCase):
                 exports = lambda block: [line.strip() for line in block.splitlines()
                                          if line.strip().startswith(('export ', 'cargo_home='))]
                 self.assertEqual(exports(preparation), exports(execution))
-                self.assertIn('timeout-minutes: 45', text)
+                self.assertIn('    timeout-minutes: %d\n' % timeout, text)
                 self.assertIn('if: always()', text[end:end + 300])
                 self.assertTrue(text[end:].startswith('      - name: ' + report_name + '\n'))

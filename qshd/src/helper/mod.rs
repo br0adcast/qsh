@@ -272,7 +272,7 @@ pub fn drop_worker_privileges(user: &str) -> anyhow::Result<()> {
 /// This process's own `CapPrm`/`CapEff`/`CapAmb` capability sets, each a
 /// 64-bit bitmask, parsed from `/proc/self/status` (format documented in
 /// `capabilities(7)`/`proc(5)`) rather than through a `capget(2)` binding
-/// -- `nix` 0.28 has none, and a dedicated `caps`-style crate would be a
+/// -- `nix` 0.32 has none, and a dedicated `caps`-style crate would be a
 /// heavier dependency than three lines of one file this process already
 /// has open by the time this runs.
 struct CapabilitySets {
@@ -334,11 +334,13 @@ fn parse_capability_sets(status: &str) -> anyhow::Result<CapabilitySets> {
 /// here, where the property is needed, rather than leaning on a runtime
 /// detail nothing in this crate controls.
 pub fn ensure_standard_descriptors() -> anyhow::Result<()> {
-    use nix::fcntl::{fcntl, open, FcntlArg, OFlag};
+    use nix::fcntl::{open, OFlag};
     use nix::sys::stat::Mode;
+    use std::os::fd::{AsRawFd, IntoRawFd};
 
     for fd in 0..=2 {
-        match fcntl(fd, FcntlArg::F_GETFD) {
+        // SAFETY: F_GETFD validates a possibly closed standard descriptor number.
+        match nix::errno::Errno::result(unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) }) {
             Ok(_) => continue,
             Err(nix::errno::Errno::EBADF) => {}
             Err(e) => anyhow::bail!("checking descriptor {fd}: {e}"),
@@ -351,10 +353,13 @@ pub fn ensure_standard_descriptors() -> anyhow::Result<()> {
         // The lowest free number: `fd` itself, since everything below it is
         // taken by the time this reaches it. Moved there explicitly all the
         // same, rather than assumed.
-        if null != fd {
-            nix::unistd::dup2(null, fd)
+        if null.as_raw_fd() != fd {
+            // SAFETY: deliberately replace this closed standard descriptor.
+            nix::errno::Errno::result(unsafe { nix::libc::dup2(null.as_raw_fd(), fd) })
                 .with_context(|| format!("moving /dev/null onto descriptor {fd}"))?;
-            let _ = nix::unistd::close(null);
+        } else {
+            // Standard descriptors must outlive this local guard.
+            let _ = null.into_raw_fd();
         }
     }
     Ok(())
@@ -1046,18 +1051,27 @@ mod tests {
     #[ignore = "runs only via a_closed_standard_descriptor_is_pointed_at_dev_null, in a process \
                 of its own"]
     fn a_closed_standard_descriptor_is_pointed_at_dev_null_body() {
-        use nix::sys::stat::{fstat, stat};
+        use nix::sys::stat::stat;
+        use std::os::fd::AsRawFd;
 
-        let identity = |fd| fstat(fd).map(|st| (st.st_dev, st.st_ino));
+        let identity = |fd| {
+            let mut st = std::mem::MaybeUninit::<nix::libc::stat>::uninit();
+            // SAFETY: fstat accepts a possibly closed number and initializes st on success.
+            nix::errno::Errno::result(unsafe { nix::libc::fstat(fd, st.as_mut_ptr()) })?;
+            let st = unsafe { st.assume_init() };
+            Ok::<_, nix::errno::Errno>((st.st_dev, st.st_ino))
+        };
         let before = [identity(1).expect("fd 1"), identity(2).expect("fd 2")];
-        let saved = nix::unistd::dup(0).expect("keep descriptor 0");
+        let saved = nix::unistd::dup(std::io::stdin()).expect("keep descriptor 0");
         nix::unistd::close(0).expect("close descriptor 0");
 
         let result = ensure_standard_descriptors();
         let reopened = identity(0);
         // The real descriptor 0 goes back before any assertion can end this
         // function early.
-        nix::unistd::dup2(saved, 0).expect("restore descriptor 0");
+        // SAFETY: restore this isolated test process's deliberately closed fd 0.
+        nix::errno::Errno::result(unsafe { nix::libc::dup2(saved.as_raw_fd(), 0) })
+            .expect("restore descriptor 0");
         let _ = nix::unistd::close(saved);
 
         result.expect("ensure_standard_descriptors must succeed");

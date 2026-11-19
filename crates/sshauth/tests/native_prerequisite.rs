@@ -24,7 +24,7 @@ impl Fixture {
             std::fs::write(full, b"generated guard fixture").unwrap();
             artifacts.insert(
                 path.into(),
-                format!("{:x}", Sha256::digest(b"generated guard fixture")).into(),
+                hex::encode(Sha256::digest(b"generated guard fixture")).into(),
             );
         }
         Self {

@@ -18,13 +18,17 @@ No bundled C++ implementation is copied into this repository. The fuzz-local
 license exceptions apply only to this graph; product license policy is unchanged.
 
 The tool's official shipped lock contains `RUSTSEC-2026-0190`
-(`anyhow 1.0.102`) and `RUSTSEC-2026-0204` (`crossbeam-epoch 0.9.18`).
-These are development-tool findings, not demonstrated product defects. The
-reviewed tool-only lock at `tools/cargo-fuzz-0.13.2.Cargo.lock` changes exactly
-those packages to `anyhow 1.0.103` and `crossbeam-epoch 0.9.20`. The other
-99 package records are unchanged. Both complete graphs passed strict advisory,
-yank, license, source and ban checks at the local qualification checkpoint;
-these checks are time-sensitive and do not replace future validation.
+(`anyhow 1.0.102`), `RUSTSEC-2026-0204` (`crossbeam-epoch 0.9.18`), and
+`RUSTSEC-2026-0486` (`rustix 1.1.4`). These are development-tool findings,
+not demonstrated product defects. The reviewed tool-only lock at
+`tools/cargo-fuzz-0.13.2.Cargo.lock` changes exactly those packages to
+`anyhow 1.0.103`, `crossbeam-epoch 0.9.20`, and `rustix 1.1.6`.
+The other 98 complete package records and their dependency edges remain
+unchanged from the verified release archive. This preserves the release-based
+installation graph instead of broadly refreshing it. The rustix repair follows
+the advisory's patched range without an exception; no vulnerability reproducer
+is run. Fresh strict advisory, yank, license, source and ban checks qualify the
+current reviewed lock; they remain time-sensitive.
 
 Reproduce installation only from the verified official 0.13.2 crate archive
 (SHA-256 `5acfd01930e49823e58c30dd8012d3338a620377d7c7d4cc140ca4b2169400e2`),
@@ -32,9 +36,9 @@ with that reviewed lock copied over its shipped Cargo.lock. Use
 `cargo install --path OWNED_SOURCE --locked --root OWNED_TOOL_ROOT` with owned
 HOME/CARGO_HOME and the selected toolchain. Registry installation with
 `--version 0.13.2 --locked` would restore the affected shipped lock and is not
-the reviewed procedure. This source-and-reviewed-lock installation completed
-locally in 31.86 seconds, offline with cached dependencies, using the privately
-installed `nightly-2026-10-24` (`rustc 1.101.0-nightly`, commit `48f4b0553`,
+the reviewed procedure. The current source-and-reviewed-lock installation and
+version check use pinned `nightly-2026-10-24`
+(`rustc 1.101.0-nightly`, commit `48f4b0553`,
 LLVM 23.1.4). Use `rustup toolchain install nightly-2026-10-24 --profile minimal
 --no-self-update` with owned `RUSTUP_HOME` and `CARGO_HOME`; this does not require
 installing or updating rustup globally.
@@ -44,19 +48,22 @@ the exact product-lock version and source. Its root `[patch.crates-io]` mirrors
 the product's local `vte`, `alacritty_terminal` and `ssh-key` maintenance sources;
 patches are not inherited from a dependency's workspace root. Relative to the
 product lock, the fuzz graph adds only
-`arbitrary 1.5.0`, `jobserver 0.1.35`, `libfuzzer-sys 0.4.13` and the local
+`arbitrary 1.5.0`, `libfuzzer-sys 0.4.13` and the local
 `qsh-channel-fuzz` package. `libfuzzer-sys` builds bundled C++17 through
 `cc`/`ar`. The graph now links `sshauth` and `terminal`, so the pinned native
 OpenSSL prefix from `scripts/build-openssl.sh` is required for the
 `authorized_keys` target; the target calls only the in-memory listing parser
-with a fixed public key and never performs a private RSA operation. Ordinary
+with a fixed public key and never performs a private RSA operation.
+
+Historical qualification, before the 2026-11-17 dependency refresh: ordinary
 library tests compiled the C++ dependency using GCC 13.3 and GNU ar 2.42. The
 six ASAN targets used Rust address-sanitizer and coverage instrumentation. All
 101 fixed seeds replayed successfully, and six bounded mutation smoke runs
 completed without a reported failure. A temporary harness-only fault control
 produced a retained reproducer and was minimized without reducing it. See
 `README.md` for the measured build, replay, mutation and control results and
-their limits.
+their limits. Current graph, security and build checks are recorded separately
+for the refreshed dependencies.
 
 `cargo-fuzz 0.13.2` does not forward `--locked` to its internal Cargo commands.
 The approved procedure uses locked metadata preflight, committed lock hashes
@@ -65,35 +72,35 @@ level locked enforcement. Advisory audits still require a fresh official
 RustSec database/index and never use offline/stale fallback.
 
 The reviewed tool lock SHA-256 is
-`cecadcdcb501fe5ac3bc979aede8b0dc7b48648dbb8cf1ede2c23e938e32d85c`.
+`656496a435dc3df885bf60ad416fa989bf427465c4359abb95ea7b8b528e7f59`.
 The standalone fuzz lock SHA-256 is
-`33b9a0edaa4ac8d247d18f3a8a11f218381500e7dbdfe781a994b8b52cb9200a`.
-At this checkpoint these graphs contain 101 and 185 package records respectively.
+`fd25eba2062c9ca270a182f566c3fa9e50a3b9e39f3b91b022d6afcbdf046288`.
+The preserved tool lock and refreshed fuzz lock contain 101 and 189 package
+records respectively (2026-11-18).
 
 Repeat security checks using the repository's pinned `cargo-audit 0.22.2` and
 `cargo-deny 0.20.2`, normal network index updates and the official advisory DB:
 
 ```sh
-cargo audit --file fuzz/Cargo.lock --ignore RUSTSEC-2023-0071 \
+cargo audit --file fuzz/Cargo.lock \
   --deny unmaintained --deny unsound --deny yanked
 cargo audit --file fuzz/tools/cargo-fuzz-0.13.2.Cargo.lock \
   --deny unmaintained --deny unsound --deny yanked
 cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml --locked check licenses sources bans
 ```
 
-The fuzz graph contains exactly `rsa 0.10.0-rc.18`, the version covered by the
-repository's reviewed RUSTSEC-2023-0071 disposition in
-`scripts/dependency-exceptions.json`. The same narrow advisory is ignored only
-after the checker or reviewer confirms that no other `rsa` version is locked.
-The fuzz targets use no private RSA operation and no real key. Do not carry
-this ignore to a changed `rsa` version or to another advisory.
+The refreshed fuzz graph contains exactly `rsa 0.10.0`. RustSec marks this
+stable release as patched for RUSTSEC-2023-0071, so the previous prerelease
+exception and audit ignore are removed. The targets still perform no private
+RSA operation and use no real key. A different advisory or affected version
+requires its own review.
 
 Also run the license/source/ban check against the verified cargo-fuzz source
 manifest with its reviewed lock substituted, using the same fuzz-local config.
 Inspect the full diagnostics: an exit code alone is insufficient if registry
-checks report incomplete requests. The recorded advisory checkpoint used
-RustSec DB commit `21d909e4c8bd4e14c7aea58bf980c881a0053ab1`; a future check
-must fetch current data, rather than force that snapshot or disable yank checks.
+checks report incomplete requests. The 2026-11-18 refresh qualification fetched RustSec DB commit
+`233155b4025b854c68a4b199c0e32d7fd53291a2`; a future check must fetch current
+data, rather than force that snapshot or disable yank checks.
 
 ## LLVM exception attribution
 

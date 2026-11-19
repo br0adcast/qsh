@@ -273,13 +273,13 @@ mod open24_receipts {
         });
         // Every partially prepared descriptor must close on the failure path.
         nix::fcntl::fcntl(
-            read_end.as_raw_fd(),
+            &read_end,
             nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
         )
         .unwrap();
         let mut byte = [0];
         assert_eq!(
-            nix::unistd::read(read_end.as_raw_fd(), &mut byte).unwrap(),
+            nix::unistd::read(&read_end, &mut byte).unwrap(),
             0
         );
         assert!(matches!(job.cleanup(), CleanupStatus::Unknown));

@@ -1,6 +1,5 @@
 //! Read-only actual-running-daemon discovery for verified SSH callers.
 use anyhow::{bail, Context, Result};
-use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use transport::bootstrap::{ServerInfo, SessionProfile};
@@ -12,7 +11,7 @@ pub fn current() -> ServerInfo {
     let mut generation = PROCESS_GENERATION.lock().expect("process generation mutex");
     if generation.as_ref().is_none_or(|(owner, _)| *owner != pid) {
         let mut value = [0; 16];
-        rand_core::OsRng.fill_bytes(&mut value);
+        getrandom::fill(&mut value).expect("operating system randomness is available");
         *generation = Some((pid, value));
     }
     ServerInfo {

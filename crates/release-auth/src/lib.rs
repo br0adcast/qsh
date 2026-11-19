@@ -119,7 +119,7 @@ fn verify_crypto(
     let cert = x509_cert::Certificate::from_der(cert.as_bytes())
         .map_err(|_| "invalid verified certificate")?;
     let mut oids = BTreeSet::new();
-    for ext in cert.tbs_certificate.extensions.iter().flatten() {
+    for ext in cert.tbs_certificate().extensions().into_iter().flatten() {
         if !oids.insert(ext.extn_id) {
             return Err("conflicting certificate extensions");
         }

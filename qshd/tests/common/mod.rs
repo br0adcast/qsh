@@ -35,7 +35,6 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use nix::unistd::{Gid, Uid, User};
-use rand_core::{OsRng, RngCore};
 use ssh_key::{Algorithm, PrivateKey};
 use sshauth::sign_file::FileSigner;
 
@@ -711,7 +710,7 @@ impl Session {
         login: &str,
     ) -> Session {
         let mut token = [0u8; 16];
-        OsRng.fill_bytes(&mut token);
+        getrandom::fill(&mut token).expect("operating system randomness is available");
         Self::connect_with_token(port, server_pub, key, login, token, StartKind::Cold)
     }
 
@@ -912,7 +911,11 @@ impl Session {
     /// enough for bash). Unset, the history goes nowhere.
     pub(crate) fn run_in_shell(&self, command: &str) -> String {
         // A resumed channel can replay earlier output; only this command's marker counts.
-        let marker = format!("QSHD_SYSTEM_MODE_SHELL_DONE_{:016x}", OsRng.next_u64());
+        let marker = format!(
+            "QSHD_SYSTEM_MODE_SHELL_DONE_{:016x}",
+            rand_core::TryRng::try_next_u64(&mut getrandom::SysRng)
+                .expect("operating system randomness is available")
+        );
         let seen_before = self.output().matches(&marker).count();
         self.client
             .send_bytes(

@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::ffi::{CString, OsString};
 use std::fs::{File, Metadata, Permissions};
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -18,8 +18,7 @@ const MAX_ALIAS_BYTES: usize = 4096;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const DIRECTORY_ACCESS: OFlag = OFlag::O_PATH;
 #[cfg(target_vendor = "apple")]
-// nix 0.28 omits Apple's search-only flag; retain libc's exact bits.
-const DIRECTORY_ACCESS: OFlag = OFlag::from_bits_retain(nix::libc::O_SEARCH);
+const DIRECTORY_ACCESS: OFlag = OFlag::O_SEARCH;
 #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
 const DIRECTORY_ACCESS: OFlag = OFlag::O_RDONLY;
 const DIRECTORY_FLAGS: OFlag = DIRECTORY_ACCESS
@@ -63,9 +62,9 @@ fn directory(file: File, uid: Uid) -> io::Result<File> {
     Ok(file)
 }
 
-fn owned(fd: std::os::fd::RawFd) -> File {
-    // SAFETY: callers pass a newly opened, uniquely owned descriptor.
-    unsafe { File::from_raw_fd(fd) }
+fn owned(fd: std::os::fd::OwnedFd) -> File {
+    // The open operation already returned unique descriptor ownership.
+    File::from(fd)
 }
 
 fn parts(path: &Path) -> VecDeque<OsString> {
@@ -81,7 +80,7 @@ fn parts(path: &Path) -> VecDeque<OsString> {
 }
 
 fn alias_target(parent: &File, name: &std::ffi::OsStr, uid: Uid) -> io::Result<OsString> {
-    let metadata = stat::fstatat(Some(parent.as_raw_fd()), name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
+    let metadata = stat::fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW)?;
     if metadata.st_mode & SFlag::S_IFMT.bits() != SFlag::S_IFLNK.bits() {
         return Err(refused(
             "host key parent is not a directory or trusted alias",
@@ -161,12 +160,7 @@ pub(super) fn resolve_parent(path: &Path, uid: Uid, create: bool) -> io::Result<
         }
         let component = resolved.join(&name);
         let current = stack.last().expect("root stays pinned");
-        match fcntl::openat(
-            Some(current.as_raw_fd()),
-            name.as_os_str(),
-            DIRECTORY_FLAGS,
-            Mode::empty(),
-        ) {
+        match fcntl::openat(current, name.as_os_str(), DIRECTORY_FLAGS, Mode::empty()) {
             Ok(fd) => {
                 stack.push(directory(owned(fd), uid).map_err(|e| {
                     logging::path_error(&component, "checking host key ancestor", e)
@@ -174,7 +168,7 @@ pub(super) fn resolve_parent(path: &Path, uid: Uid, create: bool) -> io::Result<
                 resolved = component;
             }
             Err(nix::errno::Errno::ENOENT) if create => {
-                match stat::mkdirat(Some(current.as_raw_fd()), name.as_os_str(), Mode::S_IRWXU) {
+                match stat::mkdirat(current, name.as_os_str(), Mode::S_IRWXU) {
                     Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
                     Err(error) => {
                         return Err(logging::path_error(
@@ -184,13 +178,8 @@ pub(super) fn resolve_parent(path: &Path, uid: Uid, create: bool) -> io::Result<
                         ))
                     }
                 }
-                let fd = fcntl::openat(
-                    Some(current.as_raw_fd()),
-                    name.as_os_str(),
-                    DIRECTORY_FLAGS,
-                    Mode::empty(),
-                )
-                .map_err(|e| {
+                let fd = fcntl::openat(current, name.as_os_str(), DIRECTORY_FLAGS, Mode::empty())
+                    .map_err(|e| {
                     logging::path_error(&component, "opening host key ancestor", e.into())
                 })?;
                 stack.push(directory(owned(fd), uid).map_err(|e| {
@@ -334,12 +323,7 @@ pub(super) fn read_at(
     uid: Uid,
     io: &mut impl ReadIo,
 ) -> io::Result<Loaded> {
-    let file = owned(fcntl::openat(
-        Some(parent.as_raw_fd()),
-        leaf,
-        LEAF_FLAGS,
-        Mode::empty(),
-    )?);
+    let file = owned(fcntl::openat(parent, leaf, LEAF_FLAGS, Mode::empty())?);
     read_opened(file, uid, io)
 }
 

@@ -72,17 +72,14 @@ pub const AUTH_LOGIN_MAX: usize = 255;
 /// [`AUTH_NONCE_LEN`] fresh bytes for a handshake's msg2, straight from the
 /// operating system's own randomness (`getrandom`).
 ///
-/// `OsRng`, never `thread_rng()`: a thread-local generator is seeded once
-/// and then carried across every `fork` this process makes, so its state in
-/// a child is a copy of its state in the parent. `rand` 0.8 registers a fork
-/// handler that reseeds the child, and nothing in this workspace draws from
-/// `thread_rng` before the system mode's split -- but both of those are
-/// facts about other code, and the whole replay defence rests on these 16
-/// bytes being unguessable and never repeated. `OsRng` asks the kernel every
-/// time and has no state to inherit, so it needs neither fact to hold.
+/// Ask the operating system directly instead of using a thread-local PRNG:
+/// fork can copy a generator's state into a child, and rand 0.10's thread
+/// generator is not reseeded there. The replay defence rests on these bytes
+/// staying fresh and unguessable. `getrandom` asks the kernel each time and
+/// carries no userspace generator state across the fork.
 pub fn random_nonce() -> [u8; AUTH_NONCE_LEN] {
     let mut nonce = [0u8; AUTH_NONCE_LEN];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    getrandom::fill(&mut nonce).expect("operating system randomness is available");
     nonce
 }
 

@@ -1,6 +1,6 @@
 //! Exact-image, bounded one-use authority for explicit interrupting restart.
 use daemon_bootstrap_protocol::{BusyDaemonIdentity, DestructiveRestartConsent};
-use rand_core::RngCore;
+use rand_core::TryRng;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -213,7 +213,7 @@ impl Actions {
             return Err(Rejected::Unavailable);
         }
         let mut id = [0; 16];
-        rand_core::OsRng
+        getrandom::SysRng
             .try_fill_bytes(&mut id)
             .map_err(|_| Rejected::Unavailable)?;
         self.state

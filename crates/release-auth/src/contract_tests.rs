@@ -40,7 +40,7 @@ fn sums(version: &str) -> Vec<u8> {
         .into_bytes()
 }
 fn stmt() -> Value {
-    json!({"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"SHA256SUMS","digest":{"sha256":format!("{:x}",Sha256::digest(sums("0.6.0")))}}],"predicateType":"https://github.com/br0adcast/qsh/release-manifest/v1","predicate":{"manifest_format":"qsh-sha256sums-v1","version":"0.6.0","tag":"v0.6.0","source_commit":COMMIT}})
+    json!({"_type":"https://in-toto.io/Statement/v1","subject":[{"name":"SHA256SUMS","digest":{"sha256":hex::encode(Sha256::digest(sums("0.6.0")))}}],"predicateType":"https://github.com/br0adcast/qsh/release-manifest/v1","predicate":{"manifest_format":"qsh-sha256sums-v1","version":"0.6.0","tag":"v0.6.0","source_commit":COMMIT}})
 }
 #[test]
 fn required_production_claims_accept_exact_repository() {

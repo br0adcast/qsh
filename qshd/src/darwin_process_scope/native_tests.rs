@@ -6227,9 +6227,8 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
     // Installed before Open enqueue; leader retains its real child until the
     // controller binds both watches, and observes abort even before Opened.
     let _actor_abort = AbortActor(actor_directory.path());
-    use rand_core::RngCore;
     let mut nonce_bytes = [0u8; 16];
-    rand_core::OsRng.fill_bytes(&mut nonce_bytes);
+    getrandom::fill(&mut nonce_bytes).expect("operating system randomness is available");
     let actor_nonce = hex::encode(nonce_bytes);
     let progress = std::cell::Cell::new(ReplacementProgress::default());
     let daemon_cache = home.path().join("qsh");

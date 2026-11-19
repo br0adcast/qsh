@@ -66,7 +66,7 @@ fn check_openssh_control(key: &PrivateKey) {
 fn rsa_pkcs1_file_signs_as_the_same_openssh_identity() {
     let key = rsa_key();
     check_openssh_control(&key);
-    let private = rsa::RsaPrivateKey::try_from(key.key_data().rsa().unwrap()).unwrap();
+    let private = rsa::PrivateKey::try_from(key.key_data().rsa().unwrap()).unwrap();
     check_format(&key, &private.to_pkcs1_pem(LineEnding::LF).unwrap());
 }
 
@@ -74,7 +74,7 @@ fn rsa_pkcs1_file_signs_as_the_same_openssh_identity() {
 fn rsa_pkcs8_file_signs_as_the_same_openssh_identity() {
     let key = rsa_key();
     check_openssh_control(&key);
-    let private = rsa::RsaPrivateKey::try_from(key.key_data().rsa().unwrap()).unwrap();
+    let private = rsa::PrivateKey::try_from(key.key_data().rsa().unwrap()).unwrap();
     check_format(&key, &private.to_pkcs8_pem(LineEnding::LF).unwrap());
 }
 
@@ -183,7 +183,7 @@ fn ppk_with_private_blob(
     private_blob: &[u8],
 ) -> String {
     use base64::Engine;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Digest;
     let public = key.public_key().to_bytes().unwrap();
 

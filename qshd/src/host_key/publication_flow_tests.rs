@@ -1,5 +1,4 @@
 use super::*;
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
 fn private_dir() -> tempfile::TempDir {
@@ -12,13 +11,13 @@ fn private_dir() -> tempfile::TempDir {
 
 fn winner(parent: &File, leaf: &OsStr, bytes: &[u8]) -> io::Result<()> {
     let fd = nix::fcntl::openat(
-        Some(parent.as_raw_fd()),
+        parent,
         leaf,
         nix::fcntl::OFlag::O_CREAT | nix::fcntl::OFlag::O_EXCL | nix::fcntl::OFlag::O_WRONLY,
         nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
     )?;
     // SAFETY: openat returned a new, uniquely owned descriptor.
-    unsafe { File::from_raw_fd(fd) }.write_all(bytes)
+    File::from(fd).write_all(bytes)
 }
 
 #[test]

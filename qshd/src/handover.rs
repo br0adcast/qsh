@@ -28,9 +28,9 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use nix::fcntl::FdFlag;
 #[cfg(target_os = "linux")]
-use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
+use nix::sys::memfd::{memfd_create, MFdFlags};
 use serde::{Deserialize, Serialize};
 
 mod validation;
@@ -89,7 +89,7 @@ pub fn decode_allowlist(keys: &[String]) -> Result<Vec<[u8; 32]>> {
 fn handover_file() -> Result<File> {
     #[cfg(target_os = "linux")]
     {
-        let fd = memfd_create(c"qshd-handover", MemFdCreateFlag::MFD_CLOEXEC)
+        let fd = memfd_create(c"qshd-handover", MFdFlags::MFD_CLOEXEC)
             .context("creating the handover memory file")?;
         Ok(File::from(fd))
     }
@@ -197,11 +197,11 @@ pub unsafe fn take_from_env() -> Result<Option<PreparedHandover>> {
         .and_then(|s| s.parse().ok())
         .with_context(|| format!("{HANDOVER_FD_ENV} is not a descriptor number"))?;
     validate_number(fd)?;
-    let stat = nix::sys::stat::fstat(fd).context("inspecting the handover file")?;
+    let stat = raw_stat(fd).context("inspecting the handover file")?;
     if stat.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG || stat.st_nlink != 0 {
         bail!("handover descriptor is not an anonymous regular file");
     }
-    if fcntl(fd, FcntlArg::F_GETFL)? & nix::libc::O_ACCMODE == nix::libc::O_WRONLY {
+    if raw_fcntl(fd, nix::libc::F_GETFL, 0)? & nix::libc::O_ACCMODE == nix::libc::O_WRONLY {
         bail!("handover file is not readable");
     }
     // SAFETY: startup is single-threaded; kernel checks established a live
@@ -234,19 +234,38 @@ pub unsafe fn take_from_env() -> Result<Option<PreparedHandover>> {
     }))
 }
 
+// These APIs intentionally accept raw numbers, including descriptors closed
+// during directory enumeration. Validation must not fabricate a borrowed owner.
+fn raw_fcntl(
+    fd: RawFd,
+    command: nix::libc::c_int,
+    value: nix::libc::c_int,
+) -> nix::Result<nix::libc::c_int> {
+    nix::errno::Errno::result(unsafe { nix::libc::fcntl(fd, command, value) })
+}
+fn raw_stat(fd: RawFd) -> nix::Result<nix::libc::stat> {
+    let mut stat = std::mem::MaybeUninit::uninit();
+    nix::errno::Errno::result(unsafe { nix::libc::fstat(fd, stat.as_mut_ptr()) })?;
+    // SAFETY: successful fstat initialized its correctly sized output.
+    Ok(unsafe { stat.assume_init() })
+}
+
 pub fn set_cloexec(fd: RawFd, on: bool) -> nix::Result<()> {
-    let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?);
+    let flags = FdFlag::from_bits_truncate(raw_fcntl(fd, nix::libc::F_GETFD, 0)?);
     let flags = if on {
         flags | FdFlag::FD_CLOEXEC
     } else {
         flags - FdFlag::FD_CLOEXEC
     };
-    fcntl(fd, FcntlArg::F_SETFD(flags))?;
+    raw_fcntl(fd, nix::libc::F_SETFD, flags.bits())?;
     Ok(())
 }
 
 pub fn is_cloexec(fd: RawFd) -> nix::Result<bool> {
-    Ok(FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?).contains(FdFlag::FD_CLOEXEC))
+    Ok(
+        FdFlag::from_bits_truncate(raw_fcntl(fd, nix::libc::F_GETFD, 0)?)
+            .contains(FdFlag::FD_CLOEXEC),
+    )
 }
 
 /// Mark every open descriptor above stderr close-on-exec, except `keep`.

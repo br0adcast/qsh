@@ -85,12 +85,12 @@ pub(crate) struct NativeObserved {
 #[cfg(target_os = "macos")]
 impl NativeObserved {
     pub(crate) fn acquire(pid: u32) -> Result<Self, super::native::AdmissionError> {
-        use rand_core::RngCore;
+        use rand_core::TryRng;
         let qualified = super::native::prepare_observation()?;
         let pid = i32::try_from(pid)
             .map_err(|_| super::native::AdmissionError::Native(Failure::Invalid))?;
         let mut bytes = [0; 8];
-        rand_core::OsRng
+        getrandom::SysRng
             .try_fill_bytes(&mut bytes)
             .map_err(|_| super::native::AdmissionError::Native(Failure::Invalid))?;
         let mut ops = super::native::NativeOps;

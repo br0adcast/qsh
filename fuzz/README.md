@@ -177,7 +177,7 @@ versions must occur in the product graph; extra product packages or versions
 are allowed. Equal version numbers alone do not establish source parity.
 
 The intentional fuzz-only packages are `qsh-channel-fuzz`, `libfuzzer-sys`, and
-its `arbitrary` and `jobserver` support dependencies. Features intentionally
+its `arbitrary` support dependency. `jobserver` is now also in the product graph. Features intentionally
 differ: the isolated parser harness does not enable product runtime/platform
 features, and its `ssh-key` edge names the public key type used by the harness.
 The check therefore does not require whole-graph or feature-set equality.

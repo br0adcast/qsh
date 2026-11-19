@@ -178,6 +178,7 @@ fn single_threaded_helper_reexec_adopts_and_transfers_cleanup_across_fork() {
         "qshd",
         "daemon_bootstrap_protocol",
         "base64",
+        "getrandom",
         "rand_core",
         "serde",
         "serde_json",
