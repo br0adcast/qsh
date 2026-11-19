@@ -27,9 +27,7 @@ addresses intentionally supplied by the owner are not private credentials.
 Review the exact outgoing files and commit range for secrets and private data.
 Use a local secret scanner with redacted output, then manually inspect fixtures,
 configuration, logs, generated files, archives, personal paths, addresses,
-author/committer identities, and commit messages. Before first publication or
-making the repository public, scan every branch/tag intended for publication and its history.
-Scan release artifacts separately before uploading them.
+author/committer identities, and commit messages.
 
 Follow [the privacy-check procedure](docs/private-data-check.md). Resolve every
 finding; do not suppress entire test directories or treat a nonzero scan as
@@ -39,8 +37,7 @@ reviewed provenance and must never grant access to a real account or service.
 
 Stop publication for unexplained findings. Real credentials require revocation
 or rotation; deleting a file does not remove its historical copies. Do not
-rewrite shared history or change repository visibility without explicit user
-authorization. Running a scan does not authorize a push or release.
+rewrite shared history. Running a scan does not authorize a push.
 
 ## Fix causes with explicit semantics
 
@@ -59,9 +56,9 @@ weaken authentication or hide an unsupported operation.
 
 Open an issue for bugs, features and work that needs discussion or tracking,
 after checking open and closed issues for duplicates and related work. A small
-self-contained documentation fix may use a pull request without an issue.
-Keep each pull request focused on one task and link its issue with
-`Fixes #N` when merging it should close the issue.
+self-contained documentation fix may go straight to a pull request. Keep each
+pull request focused on one task and link its issue with `Fixes #N` when
+merging it should close the issue.
 
 Write issues and pull requests in readable Markdown with short paragraphs and
 descriptive headings: Problem, Expected behavior and Acceptance criteria for an
@@ -71,26 +68,6 @@ examples. State priority, evidence status and dependencies when relevant. Keep
 pending CI visibly separate from completed checks, scale the structure to the
 change and avoid empty template sections. Keep the title and description in
 line with the final scope.
-
-Apply the repository's existing labels whenever they fit: `bug` for confirmed
-defects, `enhancement` for planned improvements, `documentation`, `question`
-for investigations or open decisions, and `tracking` for aggregate trackers.
-Create a new label only for a real classification gap, and check the labels
-after the change. Collect the selected scope of a release in a milestone named
-after it, such as `0.6.0`. Use an epic issue for a larger initiative with a
-shared goal; it may span releases and does not replace the milestone.
-
-## Merging pull requests
-
-Merge only after the final head passes CI and has been reviewed, and only within
-the scope the user authorized. Use squash merge so each pull request becomes
-one commit. Before merging, check the commit title and message for private data
-and assistant trailers. After merging, verify the resulting commit's author,
-committer, message and integrated tree. Then delete the remote and local branch
-and any worktree created for it, after preserving unique local files.
-
-Do not move a published release tag or replace its assets unless the user
-explicitly asks. Ship later product fixes in a new version.
 
 ## Preserve the working environment
 
