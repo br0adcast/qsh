@@ -293,6 +293,7 @@ pub(crate) enum ToOwner {
     },
     Unconfirmed {
         stream: u8,
+        instance: u64,
         unconfirmed: bool,
     },
     MarkerDelivered {
@@ -307,6 +308,9 @@ pub(crate) enum ToOwner {
         last_client_recv: u64,
     },
     End(EndKind),
+    /// This link ends in order and another replaces it: every report before
+    /// this one is exact, and nothing follows it. The session goes on.
+    Retire,
 }
 
 /// Owner to frontend. Only `Terminal` travels on the priority lane.
@@ -330,8 +334,27 @@ pub(crate) enum ToFrontend {
         origin: Ctx,
         disposition: u8,
     },
-    /// Rebuild after a frontend death: journal items in position order, then
-    /// the retained state, then `ReplayDone`.
+    /// The first frame of a link that replaces an earlier one: the rebuild
+    /// of the frontend's bridge follows. `last_generation` is the highest
+    /// attachment generation the owner has seen, `live_seen` whether its
+    /// backend ever heard `Live`, and `observed` the owner's queue position
+    /// of the last typed record it took (snapshot prefixes count from it).
+    ReplayStart {
+        last_generation: u64,
+        live_seen: bool,
+        observed: u64,
+    },
+    /// A stream instance the earlier bridge held: its gap reserve (a custody
+    /// id) and the gate its charges count on.
+    ReplayStream {
+        stream: u8,
+        instance: u64,
+        reserve: u64,
+        gate: GateWire,
+    },
+    /// The rebuild: declarations and tombstones, the stream instances, the
+    /// journal items in position order, then the retained state, then
+    /// `ReplayDone`.
     ReplayItem(OutRecord),
     ReplayFrontier {
         stream: u8,
@@ -342,13 +365,16 @@ pub(crate) enum ToFrontend {
         stream: u8,
         unconfirmed: bool,
     },
+    /// The stream's replayed final marker or terminal gap was past its
+    /// admission when the earlier link ended.
     ReplayRetained {
-        id: u64,
+        stream: u8,
         kind: RetainedKind,
     },
-    ReplayDone {
-        observed: u64,
-    },
+    ReplayDone,
+    /// The backend finished and everything it sent is ahead of this frame:
+    /// the end of input that follows is the session's end, not a lost link.
+    Finished,
 }
 
 // Kind numbers. The frontend-to-owner kinds are 1..=0x3f, the owner-to-
@@ -373,6 +399,7 @@ const K_LIVENESS: u8 = 16;
 const K_END: u8 = 17;
 const K_REPAINT: u8 = 18;
 const K_DATA_PART_IN: u8 = 19;
+const K_RETIRE: u8 = 20;
 const K_GRANT: u8 = 0x40;
 const K_RECORD: u8 = 0x41;
 const K_SNAPSHOT: u8 = 0x44;
@@ -383,6 +410,9 @@ const K_REPLAY_UNCONFIRMED: u8 = 0x48;
 const K_REPLAY_RETAINED: u8 = 0x49;
 const K_REPLAY_DONE: u8 = 0x4a;
 const K_DATA_PART: u8 = 0x4b;
+const K_REPLAY_START: u8 = 0x4c;
+const K_REPLAY_STREAM: u8 = 0x4d;
+const K_FINISHED: u8 = 0x4e;
 
 const R_RETIREMENT_READY: u8 = 0x80;
 const R_RESERVED_CONTROL: u8 = 0x81;
@@ -406,7 +436,7 @@ const R_CHANNEL_REFUSED: u8 = 0x91;
 fn known_kind(kind: u8) -> bool {
     matches!(
         kind,
-        K_DATA..=K_DATA_PART_IN | K_GRANT | K_RECORD | K_SNAPSHOT..=K_DATA_PART
+        K_DATA..=K_RETIRE | K_GRANT | K_RECORD | K_SNAPSHOT..=K_FINISHED
     )
 }
 
@@ -1208,9 +1238,12 @@ impl LinkMessage for ToOwner {
             }
             Self::Unconfirmed {
                 stream,
+                instance,
                 unconfirmed,
             } => {
-                out.extend_from_slice(&[*stream, u8::from(*unconfirmed)]);
+                out.push(*stream);
+                put_u64(out, *instance);
+                out.push(u8::from(*unconfirmed));
                 K_UNCONFIRMED
             }
             Self::MarkerDelivered {
@@ -1238,6 +1271,7 @@ impl LinkMessage for ToOwner {
                 });
                 K_END
             }
+            Self::Retire => K_RETIRE,
         })
     }
 
@@ -1311,6 +1345,7 @@ impl LinkMessage for ToOwner {
             },
             K_UNCONFIRMED => Self::Unconfirmed {
                 stream: r.u8()?,
+                instance: r.u64()?,
                 unconfirmed: r.bool()?,
             },
             K_MARKER_DELIVERED => Self::MarkerDelivered {
@@ -1327,6 +1362,7 @@ impl LinkMessage for ToOwner {
                 1 => EndKind::Destroy,
                 _ => return Err(LinkError::BadValue),
             }),
+            K_RETIRE => Self::Retire,
             _ => return Err(LinkError::UnknownKind),
         };
         r.finish()?;
@@ -1390,15 +1426,35 @@ impl LinkMessage for ToFrontend {
                 out.extend_from_slice(&[*stream, u8::from(*unconfirmed)]);
                 K_REPLAY_UNCONFIRMED
             }
-            Self::ReplayRetained { id, kind } => {
-                put_u64(out, *id);
+            Self::ReplayRetained { stream, kind } => {
+                out.push(*stream);
                 put_retained(out, *kind);
                 K_REPLAY_RETAINED
             }
-            Self::ReplayDone { observed } => {
+            Self::ReplayDone => K_REPLAY_DONE,
+            Self::ReplayStart {
+                last_generation,
+                live_seen,
+                observed,
+            } => {
+                put_u64(out, *last_generation);
+                out.push(u8::from(*live_seen));
                 put_u64(out, *observed);
-                K_REPLAY_DONE
+                K_REPLAY_START
             }
+            Self::ReplayStream {
+                stream,
+                instance,
+                reserve,
+                gate,
+            } => {
+                out.push(*stream);
+                put_u64(out, *instance);
+                put_u64(out, *reserve);
+                put_gate(out, *gate);
+                K_REPLAY_STREAM
+            }
+            Self::Finished => K_FINISHED,
         })
     }
 
@@ -1430,10 +1486,22 @@ impl LinkMessage for ToFrontend {
                 unconfirmed: r.bool()?,
             },
             K_REPLAY_RETAINED => Self::ReplayRetained {
-                id: r.u64()?,
+                stream: r.u8()?,
                 kind: r.retained()?,
             },
-            K_REPLAY_DONE => Self::ReplayDone { observed: r.u64()? },
+            K_REPLAY_DONE => Self::ReplayDone,
+            K_REPLAY_START => Self::ReplayStart {
+                last_generation: r.u64()?,
+                live_seen: r.bool()?,
+                observed: r.u64()?,
+            },
+            K_REPLAY_STREAM => Self::ReplayStream {
+                stream: r.u8()?,
+                instance: r.u64()?,
+                reserve: r.u64()?,
+                gate: r.gate()?,
+            },
+            K_FINISHED => Self::Finished,
             _ => return Err(LinkError::UnknownKind),
         };
         r.finish()?;

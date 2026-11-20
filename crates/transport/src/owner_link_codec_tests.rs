@@ -251,6 +251,7 @@ fn all_to_owner() -> Vec<ToOwner> {
         },
         ToOwner::Unconfirmed {
             stream: 4,
+            instance: 1,
             unconfirmed: true,
         },
         ToOwner::MarkerDelivered {
@@ -264,6 +265,7 @@ fn all_to_owner() -> Vec<ToOwner> {
         },
         ToOwner::End(EndKind::Graceful),
         ToOwner::End(EndKind::Destroy),
+        ToOwner::Retire,
     ]
 }
 
@@ -291,10 +293,22 @@ fn all_to_frontend() -> Vec<ToFrontend> {
             unconfirmed: false,
         },
         ToFrontend::ReplayRetained {
-            id: 3,
+            stream: 3,
             kind: RetainedKind::Gap,
         },
-        ToFrontend::ReplayDone { observed: 42 },
+        ToFrontend::ReplayDone,
+        ToFrontend::ReplayStart {
+            last_generation: 7,
+            live_seen: true,
+            observed: 42,
+        },
+        ToFrontend::ReplayStream {
+            stream: 4,
+            instance: 8,
+            reserve: 14,
+            gate: GateWire { id: 2, kind: 1 },
+        },
+        ToFrontend::Finished,
     ];
     for r in all_records() {
         v.push(ToFrontend::Record(r.clone()));

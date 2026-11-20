@@ -429,6 +429,15 @@ fn a_warm_return_stays_with_the_shell_and_its_session_owner() {
         daemon.output_text()
     );
     assert_eq!(parent_of(shell), Some(owner), "the shell keeps its owner");
+    // Every warm return gives the owner a new link and rebuilds the
+    // frontend's bridge from the owner's replay.
+    assert!(
+        wait_until(|| daemon
+            .output_text()
+            .contains("the frontend replaced the session's link")),
+        "the warm return replaced the owner's link; daemon: {}",
+        daemon.output_text()
+    );
 
     exit_cleanly(&mut client, &screen, &daemon);
     assert!(

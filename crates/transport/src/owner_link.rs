@@ -49,16 +49,38 @@
 //! bounds. An owner that dies fails the next write, and the failed link
 //! clears the queue.
 //!
-//! Not yet here (Task 5): the custody journal and the rebuild of a new
-//! frontend's bridge. The owner records the frontend's `Retained`, `Frontier`
-//! and `Unconfirmed` reports but does not act on them, and a link lost
-//! without an explicit `End` parks the backend for good.
+//! **A replaced link.** A link ends without ending the session when the
+//! frontend retires it in order (`Retire`, at every warm reattach) or when
+//! it is lost (end of input or a write failure with no `End`: the frontend
+//! died, or the socket did). The owner then keeps the backend running and
+//! everything it sends, with its custody, in its *journal* (`Journal`), and
+//! a link that replaces the old one ([`OwnerRelink`]) starts with a replay
+//! from which the frontend builds a fresh bridge: declarations and
+//! tombstones, the stream instances the earlier bridge held, the journal's
+//! items in position order, then each stream's frontier, confirmation flag
+//! and retained marker or gap. The attachment generation continues from the
+//! highest one the owner has seen.
+//!
+//! What a lost link costs, and never more: inbound events the dead frontend
+//! had not written (see above), and output bytes that had crossed it. The
+//! link's last reports may be missing, so the owner cannot tell which of
+//! those bytes the old connection carried: it gives them all up rather than
+//! send one twice, and every stream that had sent or was sent anything owes
+//! its next client the gap warning (`PreviousConnectionOutputUnconfirmed`),
+//! spuriously if nothing was in fact missing. Output produced while no link
+//! was up never crossed, and follows. A retired link reports exactly --
+//! the owner reads it to its `Retire` even when its own writes to it fail,
+//! since the frontend closes it right behind that frame -- and then nothing
+//! is given up and nothing replayed twice. Input is never replayed at all.
 
 #[path = "owner_link_codec.rs"]
 pub(crate) mod codec;
 #[cfg(test)]
 #[path = "owner_link_codec_tests.rs"]
 mod codec_tests;
+#[cfg(test)]
+#[path = "owner_link_journal_tests.rs"]
+mod journal_tests;
 #[cfg(test)]
 #[path = "owner_link_tests.rs"]
 mod tests;
@@ -93,6 +115,8 @@ const SLOT_GAP_RESERVE: u64 = SLOT_PART;
 /// The largest charge a frontend may admit on its own (a slice header, a gap
 /// or a bootstrap geometry record); anything larger is a protocol error.
 const MAX_LINK_ADMIT: u64 = 64;
+/// The framed size of an output gap record.
+const GAP_RECORD_BYTES: u64 = 14;
 /// Inbound slots the owner keeps back for events it makes itself
 /// (`Writable`, `OutputReady`), so a frontend holding every granted credit
 /// can never starve them.
@@ -133,7 +157,81 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> LinkIo for T {}
 /// reads it waits in the link's own buffer. An error ends the session as a
 /// backend that stopped at once.
 pub trait OwnerStarter: Send + Sync + 'static {
-    fn start(&self, init: OwnerInit) -> std::io::Result<Box<dyn LinkIo>>;
+    fn start(&self, init: OwnerInit) -> std::io::Result<StartedOwner>;
+}
+
+/// A started owner, as its frontend holds it.
+pub struct StartedOwner {
+    /// The frontend's end of the owner's first link.
+    pub link: Box<dyn LinkIo>,
+    /// Replaces the link, at every warm reattach and after a lost one.
+    pub relink: Arc<dyn FrontendRelink>,
+}
+
+/// The frontend's way to give a running owner a new link.
+pub trait FrontendRelink: Send + Sync + 'static {
+    /// Asked once a link was lost: whether the owner is gone, and the
+    /// session with it (it then ends, as with a backend that stopped). An
+    /// owner that dies takes its link down a moment before its exit can be
+    /// observed, so an implementation waits for that exit, for a short
+    /// bounded time, before it answers `false`.
+    fn exited(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+    /// Hand the owner one end of a new link and return the other. The
+    /// owner ends its current link first (it reads it to its `Retire` or
+    /// to its end), then replays its custody on the new one.
+    fn relink(&self) -> std::io::Result<Box<dyn LinkIo>>;
+}
+
+/// Hands a session owner the link that replaces its current one
+/// ([`OwnerInit::relinks`]). A link given while an earlier one still waits
+/// takes its place.
+#[derive(Clone, Default)]
+pub struct OwnerRelink(Arc<LinkSlot>);
+
+#[derive(Default)]
+struct LinkSlot {
+    next: Mutex<Option<Box<dyn LinkIo>>>,
+    ready: tokio::sync::Notify,
+}
+
+impl OwnerRelink {
+    /// Replace the owner's link with `link`.
+    pub fn relink(&self, link: impl LinkIo) {
+        *self.0.next.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(link));
+        self.0.ready.notify_one();
+    }
+
+    /// The next link handed over. Cancel-safe.
+    async fn next(&self) -> Box<dyn LinkIo> {
+        loop {
+            let notified = self.0.ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(link) = self.0.next.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                return link;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// An in-process owner's relink: the other end goes straight to its slot.
+struct LoopbackRelink {
+    owner: OwnerRelink,
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+impl FrontendRelink for LoopbackRelink {
+    fn exited(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(std::future::ready(self.done.load(Ordering::SeqCst)))
+    }
+    fn relink(&self) -> std::io::Result<Box<dyn LinkIo>> {
+        if self.done.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("the session owner is gone"));
+        }
+        let (front, owner) = loopback();
+        self.owner.relink(owner);
+        Ok(Box::new(front))
+    }
 }
 
 // ---- wire conversions ------------------------------------------------------
@@ -277,6 +375,24 @@ impl<R: AsyncRead + Unpin> LinkReader<R> {
     }
 }
 
+/// Read a retired link to its end and drop what arrives: the owner closes
+/// its side once it has read the link's `Retire` (or at once, if the link
+/// was lost).
+async fn drain_retired<R: AsyncRead + Unpin>(mut read: R, lifecycle: Arc<Lifecycle>) {
+    let mut buf = vec![0; READ_CHUNK].into_boxed_slice();
+    loop {
+        tokio::select! {
+            biased;
+            _ = lifecycle.shutdown.requested() => return,
+            got = read.read(&mut buf) => {
+                if !matches!(got, Ok(n) if n > 0) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// A link that failed on its writing side: both ends must see it.
 #[derive(Default)]
 struct LinkFailure {
@@ -322,9 +438,15 @@ async fn encode_failed<W: AsyncWrite + Unpin>(write: &mut W, failure: &LinkFailu
     let _ = write.shutdown().await;
 }
 
+/// How long a stopping owner's writer may take to say `Finished`.
+const FAREWELL_WITHIN: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// The owner's writer: `priority` first, until both senders are gone (then
 /// the write half is shut, an orderly end of input), a write fails, or the
-/// session's lifecycle stops.
+/// session's lifecycle stops. A stop ends the session: the writer says so
+/// (`Finished`, between whole frames) if the link takes it at once, so a
+/// frontend that lives on ends the session instead of taking the link for
+/// lost.
 async fn owner_write_loop<W: AsyncWrite + Unpin>(
     mut write: W,
     mut data: mpsc::UnboundedReceiver<ToFrontend>,
@@ -336,7 +458,18 @@ async fn owner_write_loop<W: AsyncWrite + Unpin>(
     loop {
         let first = tokio::select! {
             biased;
-            _ = lifecycle.shutdown.requested() => return,
+            _ = lifecycle.shutdown.requested() => {
+                out.clear();
+                if encode(&ToFrontend::Finished, &mut out).is_ok() {
+                    let _ = tokio::time::timeout(FAREWELL_WITHIN, async {
+                        if write.write_all(&out).await.is_ok() {
+                            let _ = write.shutdown().await;
+                        }
+                    })
+                    .await;
+                }
+                return;
+            }
             Some(m) = priority.recv() => m,
             m = data.recv() => match m {
                 Some(m) => m,
@@ -478,6 +611,8 @@ struct QueueState {
     live: usize,
     /// The link failed: nothing more reaches the owner, which parks.
     failed: bool,
+    /// The link was retired in order: `Retire` is its last message.
+    retired: bool,
 }
 
 enum Batch {
@@ -496,7 +631,7 @@ struct LinkQueue {
 impl LinkQueue {
     fn push(&self, mut group: Vec<ToOwner>) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.failed {
+        if st.failed || st.retired {
             return;
         }
         let key = match group.as_slice() {
@@ -537,6 +672,25 @@ impl LinkQueue {
         self.ready.notify_one();
     }
 
+    fn failed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).failed
+    }
+
+    /// End this link in order: `Retire` goes last, and whatever a token of
+    /// this link reports afterwards is dropped -- the owner's journal
+    /// decides about everything the link's bridge still held.
+    fn retire(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.failed || st.retired {
+            return;
+        }
+        st.entries.push_back(Some(vec![ToOwner::Retire]));
+        st.live += 1;
+        st.retired = true;
+        drop(st);
+        self.ready.notify_one();
+    }
+
     #[cfg(test)]
     fn len(&self) -> (usize, usize) {
         let st = self.state.lock().unwrap();
@@ -573,7 +727,7 @@ impl LinkQueue {
                 if !batch.is_empty() {
                     return Batch::Messages;
                 }
-                if self.senders.load(Ordering::SeqCst) == 0 {
+                if st.retired || self.senders.load(Ordering::SeqCst) == 0 {
                     return Batch::End;
                 }
             }
@@ -719,9 +873,10 @@ impl RemoteTimeline for StreamTimeline {
             geometry: geometry_wire(geometry),
         });
     }
-    fn unconfirmed(&self, unconfirmed: bool) {
+    fn unconfirmed(&self, instance: ChannelInstance, unconfirmed: bool) {
         self.link.send(ToOwner::Unconfirmed {
             stream: self.stream,
+            instance: instance.get(),
             unconfirmed,
         });
     }
@@ -930,18 +1085,139 @@ impl Drop for CreditSender {
     }
 }
 
+/// One link of a frontend to its owner, from its setup until the next one
+/// replaces it.
+struct Epoch {
+    read: tokio::io::ReadHalf<Box<dyn LinkIo>>,
+    link: LinkTx,
+    queue: Arc<LinkQueue>,
+    credits: Arc<Credits>,
+    failure: Arc<LinkFailure>,
+    /// A link that replaced an earlier one starts with the owner's replay.
+    replaces: bool,
+}
+
+/// The writing side of a new link: its queue, credits and writer task.
+fn open_epoch(
+    link: Box<dyn LinkIo>,
+    lifecycle: &Arc<Lifecycle>,
+    replaces: bool,
+) -> (Epoch, CreditSender) {
+    let (read, write) = tokio::io::split(link);
+    let (tx, queue) = LinkTx::new();
+    let failure = Arc::new(LinkFailure::default());
+    let credits = Arc::new(Credits::default());
+    lifecycle.spawn(frontend_write_loop(
+        write,
+        queue.clone(),
+        failure.clone(),
+        lifecycle.clone(),
+    ));
+    let sender = CreditSender {
+        credits: credits.clone(),
+        link: tx.clone(),
+    };
+    (
+        Epoch {
+            read,
+            link: tx,
+            queue,
+            credits,
+            failure,
+            replaces,
+        },
+        sender,
+    )
+}
+
+struct RemoteState {
+    /// The current link's queue.
+    link: LinkTx,
+    queue: Arc<LinkQueue>,
+    /// The first link's inbound sender, until the bridge takes it.
+    inbound: Option<CreditSender>,
+    /// A link the bridge set up that the reader has not taken over yet.
+    next: Option<Epoch>,
+    /// The current link was lost and no other has replaced it.
+    lost: bool,
+}
+
 /// What the frontend's session control holds for its owner link.
 pub(super) struct RemoteControl {
-    pub(super) link: LinkTx,
-    inbound: Mutex<Option<CreditSender>>,
+    state: Mutex<RemoteState>,
+    next_ready: tokio::sync::Notify,
+    relinker: Option<Arc<dyn FrontendRelink>>,
+    lifecycle: Arc<Lifecycle>,
 }
 impl RemoteControl {
+    fn state(&self) -> std::sync::MutexGuard<'_, RemoteState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The bridge's inbound sender, taken once by the bridge.
     pub(super) fn take_inbound(&self) -> Option<CreditSender> {
-        self.inbound
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        self.state().inbound.take()
+    }
+
+    /// A message of the bridge's own on the current link.
+    pub(super) fn send(&self, msg: ToOwner) {
+        let link = self.state().link.clone();
+        link.send(msg);
+    }
+
+    /// Whether this owner's link can be replaced: then every warm reattach
+    /// rebuilds the bridge from the owner's custody over a new link.
+    pub(super) fn can_relink(&self) -> bool {
+        self.relinker.is_some()
+    }
+
+    /// The link was lost, and the bridge waits for a warm reattach to
+    /// replace it.
+    pub(super) fn lost(&self) -> bool {
+        self.state().lost
+    }
+
+    /// Replace the current link: hand the owner a new one, end the current
+    /// one in order behind everything its bridge reported (a lost one has
+    /// ended already), and return the new link's inbound sender. The
+    /// owner's replay arrives in the bridge's queue behind a `Start` step;
+    /// whatever is ahead of that belongs to the replaced link, and its
+    /// tokens report nothing any more.
+    ///
+    /// Also says whether the replaced link was lost, as known once the new
+    /// one is in place: a loss the reader has seen but not announced yet
+    /// (it is still asking whether the owner exited) counts.
+    pub(super) fn relink(&self) -> std::io::Result<(CreditSender, bool)> {
+        let relinker = self
+            .relinker
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("this owner link cannot be replaced"))?;
+        let link = relinker.relink()?;
+        let (epoch, sender) = open_epoch(link, &self.lifecycle, true);
+        let (old, lost) = {
+            let mut state = self.state();
+            let old = std::mem::replace(&mut state.queue, epoch.queue.clone());
+            state.link = epoch.link.clone();
+            state.next = Some(epoch);
+            let lost = std::mem::take(&mut state.lost) || old.failed();
+            (old, lost)
+        };
+        old.retire();
+        self.next_ready.notify_one();
+        Ok((sender, lost))
+    }
+
+    /// The next link the bridge set up. Cancel-safe.
+    async fn next_epoch(&self) -> Epoch {
+        loop {
+            let notified = self.next_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(epoch) = self.state().next.take() {
+                return epoch;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -988,18 +1264,22 @@ impl SessionBackend for RemoteBackend {
     fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         if let Some(starter) = &self.starter {
             let init = OwnerInit::new(io.principal().clone(), io.login());
-            let link: Box<dyn LinkIo> = match starter.start(init) {
-                Ok(link) => link,
+            return match starter.start(init) {
+                Ok(started) => Box::pin(start_frontend(
+                    io,
+                    started.link,
+                    Some(started.relink),
+                    false,
+                )),
                 Err(error) => {
                     log::error!("cannot start a session owner: {error}");
                     // A link whose owner end is gone: the frontend reads end
                     // of input at once, and the session ends as with a
                     // backend that stopped.
                     let (front, _owner) = loopback();
-                    Box::new(front)
+                    Box::pin(start_frontend(io, Box::new(front), None, false))
                 }
             };
-            return Box::pin(start_frontend(io, link));
         }
         let (front, owner) = loopback();
         let init = OwnerInit {
@@ -1007,15 +1287,22 @@ impl SessionBackend for RemoteBackend {
             login: io.login(),
             last_generation: 0,
             lifecycle: Some(io.lifecycle.clone()),
+            relinks: OwnerRelink::default(),
         };
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let relink = Arc::new(LoopbackRelink {
+            owner: init.relinks(),
+            done: done.clone(),
+        });
         let inner = self.inner.clone();
         io.lifecycle.spawn(async move {
             let exit = OwnerLink::run(owner, inner, init).await;
+            done.store(true, Ordering::SeqCst);
             if exit == OwnerExit::LinkLost {
                 log::warn!("session owner lost its frontend link");
             }
         });
-        Box::pin(start_frontend(io, front))
+        Box::pin(start_frontend(io, Box::new(front), Some(relink), false))
     }
 
     fn consumption(&self) -> Consumption {
@@ -1023,69 +1310,166 @@ impl SessionBackend for RemoteBackend {
     }
 }
 
-struct Frontend {
-    io: SessionIo,
+struct Frontend<'a> {
+    io: &'a SessionIo,
     link: LinkTx,
     credits: Arc<Credits>,
     mirrors: HashMap<u64, Weak<SendGate>>,
     mirrors_pruned_at: usize,
     /// Leading pieces of the next data record's body.
     data_parts: Vec<u8>,
+    /// A replacing link has not started its replay yet.
+    awaits_replay: bool,
+    /// Between the owner's `ReplayStart` and `ReplayDone`.
+    replaying: bool,
+    /// The owner said its backend finished.
+    finished: bool,
+}
+
+/// How one link's reading ended.
+enum ReadEnd {
+    /// The session is over: the backend finished, the frontend refused the
+    /// link, or the lifecycle stopped.
+    Over,
+    /// The link died under a running session.
+    Lost,
+    /// The bridge replaced the link.
+    Replaced(Epoch),
 }
 
 /// Set up the frontend end of `link` for the bridge that owns `io` (its
 /// writer, and the inbound sender the bridge takes from the session
 /// control), and return the reader that feeds the owner's records into the
-/// bridge's queue. The reader returns when the owner closes the link (the
-/// backend is done), on a link error (the session then ends as with a
-/// backend that stopped), or on shutdown.
-pub(super) fn start_frontend<L>(io: SessionIo, link: L) -> impl Future<Output = ()> + Send
-where
-    L: AsyncRead + AsyncWrite + Send + 'static,
-{
-    let (read, write) = tokio::io::split(link);
-    let (tx, queue) = LinkTx::new();
+/// bridge's queue. The reader returns when the owner closes the link behind
+/// `Finished` (the backend is done), on a link error (the session then ends
+/// as with a backend that stopped), or on shutdown. A link that is lost
+/// under an owner that `relink` says still runs does not end it: the bridge
+/// hears `Lost`, and the reader goes on with the link the bridge replaces
+/// it with (`RemoteControl::relink`), as it does at every replacement.
+///
+/// `replaces` says `link` itself replaces a link an earlier frontend held to
+/// a running owner (a new frontend process): the owner's replay comes first
+/// on it, and the bridge starts from `rebuild_from_owner`.
+pub(super) fn start_frontend(
+    io: SessionIo,
+    link: Box<dyn LinkIo>,
+    relink: Option<Arc<dyn FrontendRelink>>,
+    replaces: bool,
+) -> impl Future<Output = ()> + Send {
     let lifecycle = io.lifecycle.clone();
-    let failure = Arc::new(LinkFailure::default());
-    let credits = Arc::new(Credits::default());
+    let (epoch, sender) = open_epoch(link, &lifecycle, replaces);
     let _ = io.control().remote.set(RemoteControl {
-        link: tx.clone(),
-        inbound: Mutex::new(Some(CreditSender {
-            credits: credits.clone(),
-            link: tx.clone(),
-        })),
+        state: Mutex::new(RemoteState {
+            link: epoch.link.clone(),
+            queue: epoch.queue.clone(),
+            inbound: Some(sender),
+            next: None,
+            lost: false,
+        }),
+        next_ready: tokio::sync::Notify::new(),
+        relinker: relink,
+        lifecycle: lifecycle.clone(),
     });
-    lifecycle.spawn(frontend_write_loop(
-        write,
-        queue,
-        failure.clone(),
-        lifecycle.clone(),
-    ));
-    let front = Frontend {
-        io,
-        link: tx,
-        credits,
-        mirrors: HashMap::new(),
-        mirrors_pruned_at: 0,
-        data_parts: Vec::new(),
-    };
-    front.read(LinkReader::new(read), failure, lifecycle)
+    run_epochs(io, epoch, lifecycle)
 }
 
-impl Frontend {
-    async fn read<R: AsyncRead + Unpin>(
-        mut self,
+async fn run_epochs(io: SessionIo, mut epoch: Epoch, lifecycle: Arc<Lifecycle>) {
+    let control = io.control().clone();
+    let Some(remote) = control.remote.get() else {
+        return;
+    };
+    loop {
+        let Epoch {
+            read,
+            link,
+            queue,
+            credits,
+            failure,
+            replaces,
+        } = epoch;
+        let mut front = Frontend {
+            io: &io,
+            link,
+            credits: credits.clone(),
+            mirrors: HashMap::new(),
+            mirrors_pruned_at: 0,
+            data_parts: Vec::new(),
+            awaits_replay: replaces,
+            replaying: false,
+            finished: false,
+        };
+        let end = front
+            .read(LinkReader::new(read), failure, &lifecycle, remote)
+            .await;
+        drop(front);
+        match end {
+            ReadEnd::Replaced(next) => epoch = next,
+            ReadEnd::Over => {
+                // The backend is gone: what still waits for it goes with it.
+                credits.close();
+                return;
+            }
+            ReadEnd::Lost => {
+                // Nothing reaches the owner over this link any more.
+                credits.close();
+                queue.fail();
+                let Some(relinker) = remote.relinker.as_ref() else {
+                    return;
+                };
+                let exited = tokio::select! {
+                    biased;
+                    _ = lifecycle.shutdown.requested() => return,
+                    exited = relinker.exited() => exited,
+                };
+                if exited {
+                    return;
+                }
+                // Unless the bridge replaced the link meanwhile: then this
+                // loss is the replaced link's, and nobody's concern.
+                let lost = {
+                    let mut state = remote.state();
+                    state.lost = state.next.is_none();
+                    state.lost
+                };
+                if lost {
+                    log::warn!("owner link: the link was lost; waiting for a warm reattach");
+                    let _ = io
+                        .outbound
+                        .send(SessionOutbound::Replay(ReplayStep::new(Replay::Lost)));
+                }
+                epoch = tokio::select! {
+                    biased;
+                    _ = lifecycle.shutdown.requested() => return,
+                    next = remote.next_epoch() => next,
+                };
+            }
+        }
+    }
+}
+
+impl Frontend<'_> {
+    async fn read<R: AsyncRead + Unpin + Send + 'static>(
+        &mut self,
         mut reader: LinkReader<R>,
         failure: Arc<LinkFailure>,
-        lifecycle: Arc<Lifecycle>,
-    ) {
+        lifecycle: &Arc<Lifecycle>,
+        remote: &RemoteControl,
+    ) -> ReadEnd {
         loop {
             let frame = tokio::select! {
                 biased;
-                _ = lifecycle.shutdown.requested() => break,
+                _ = lifecycle.shutdown.requested() => return ReadEnd::Over,
+                // The bridge replaced this link: what it still carries
+                // belongs to the bridge that is gone. It stays open until
+                // the owner has read its `Retire` and closed its side, so
+                // the owner never finds it broken under its own writes.
+                next = remote.next_epoch() => {
+                    lifecycle.spawn(drain_retired(reader.read, lifecycle.clone()));
+                    return ReadEnd::Replaced(next);
+                }
                 _ = failure.failed() => {
                     log::error!("owner link: frontend write failed");
-                    break;
+                    return ReadEnd::Lost;
                 }
                 frame = reader.next() => frame,
             };
@@ -1094,24 +1478,26 @@ impl Frontend {
                     if let Err(error) = self.on_frame(&frame) {
                         log::error!("owner link: frontend refused a frame ({error:?})");
                         self.link.send(ToOwner::End(EndKind::Destroy));
-                        break;
+                        return ReadEnd::Over;
                     }
                 }
                 // The owner forwarded everything its backend sent.
-                Ok(None) => break,
+                Ok(None) if self.finished => return ReadEnd::Over,
+                // No `Finished`, or a frame cut short: the link died.
+                Ok(None) | Err(LinkError::Truncated) => return ReadEnd::Lost,
                 Err(error) => {
                     log::error!("owner link: frontend read failed ({error:?})");
                     self.link.send(ToOwner::End(EndKind::Destroy));
-                    break;
+                    return ReadEnd::Over;
                 }
             }
         }
-        // The backend is gone: what still waits for it goes with it.
-        self.credits.close();
     }
 
     fn on_frame(&mut self, frame: &Frame) -> Result<(), LinkError> {
-        match ToFrontend::decode(frame)? {
+        let message = ToFrontend::decode(frame)?;
+        let replay = matches!(message, ToFrontend::ReplayItem(_));
+        match message {
             ToFrontend::Grant { slots } => self.credits.grant(slots)?,
             ToFrontend::DataPart(part) => {
                 if self.data_parts.len() + part.len() > MAX_DATA_RECORD {
@@ -1119,7 +1505,10 @@ impl Frontend {
                 }
                 self.data_parts.extend_from_slice(&part);
             }
-            ToFrontend::Record(mut record) => {
+            ToFrontend::Record(mut record) | ToFrontend::ReplayItem(mut record) => {
+                if self.awaits_replay || replay != self.replaying {
+                    return Err(LinkError::BadValue);
+                }
                 if !self.data_parts.is_empty() {
                     let (OutRecord::ChannelOutput {
                         output: OutputBody::Data(data),
@@ -1162,14 +1551,88 @@ impl Frontend {
                 origin: ctx_from(origin),
                 disposition: disposition_from(disposition)?,
             }),
-            // The rebuild after a frontend death arrives with the journal.
-            ToFrontend::ReplayItem(_)
-            | ToFrontend::ReplayFrontier { .. }
-            | ToFrontend::ReplayUnconfirmed { .. }
-            | ToFrontend::ReplayRetained { .. }
-            | ToFrontend::ReplayDone { .. } => return Err(LinkError::UnknownKind),
+            ToFrontend::ReplayStart {
+                last_generation,
+                live_seen,
+                observed,
+            } => {
+                if !std::mem::take(&mut self.awaits_replay) {
+                    return Err(LinkError::BadValue);
+                }
+                self.replaying = true;
+                // Typed records behind the replay continue the owner's
+                // numbering; the replayed ones carry no queue prefix.
+                self.io.resume_snapshots.rebase(observed);
+                self.step(Replay::Start {
+                    last_generation,
+                    live_seen,
+                });
+            }
+            ToFrontend::ReplayStream {
+                stream,
+                instance,
+                reserve,
+                gate,
+            } => {
+                self.in_replay()?;
+                let instance = instance_from(instance)?;
+                let gate = self.mirror(gate)?;
+                let reserve = self.permit(reserve, stream);
+                self.step(Replay::Stream {
+                    stream,
+                    instance,
+                    gate,
+                    reserve,
+                });
+            }
+            ToFrontend::ReplayFrontier {
+                stream,
+                instance,
+                geometry,
+            } => {
+                self.in_replay()?;
+                let geometry = geometry_from(geometry)?;
+                if geometry.instance.get() != instance {
+                    return Err(LinkError::BadValue);
+                }
+                self.step(Replay::Frontier { stream, geometry });
+            }
+            ToFrontend::ReplayUnconfirmed {
+                stream,
+                unconfirmed,
+            } => {
+                self.in_replay()?;
+                if unconfirmed {
+                    self.step(Replay::Unconfirmed { stream });
+                }
+            }
+            ToFrontend::ReplayRetained { stream, kind } => {
+                self.in_replay()?;
+                self.step(Replay::Retained {
+                    stream,
+                    marker: kind == RetainedKind::Marker,
+                });
+            }
+            ToFrontend::ReplayDone => {
+                self.in_replay()?;
+                self.replaying = false;
+                self.step(Replay::Done);
+            }
+            ToFrontend::Finished => self.finished = true,
         }
         Ok(())
+    }
+
+    fn in_replay(&self) -> Result<(), LinkError> {
+        if self.replaying {
+            Ok(())
+        } else {
+            Err(LinkError::BadValue)
+        }
+    }
+
+    fn step(&self, step: Replay) {
+        self.send(SessionOutbound::Replay(ReplayStep::new(step)));
     }
 
     fn release(&self, id: u64) -> Box<ReleaseToken> {
@@ -1240,7 +1703,12 @@ impl Frontend {
     }
 
     fn send_ordered(&self, message: SessionOutbound) {
-        // Positions restart in the frontend's own mailbox, in the owner's
+        if self.replaying {
+            // A replayed record keeps position 0: it satisfied its queue
+            // prefix under the link that is gone.
+            return self.send(message);
+        }
+        // Positions follow the frontend's own mailbox, in the owner's
         // order, so the owner's snapshot prefixes keep their meaning.
         let _ = self
             .io
@@ -1478,11 +1946,12 @@ pub struct OwnerInit {
     pub principal: Principal,
     pub login: LoginId,
     /// The highest attachment generation an earlier frontend used (0 for a
-    /// fresh session). Carried for the bridge rebuild; nothing reads it yet.
+    /// fresh session): the owner's count continues from it.
     pub last_generation: u64,
     /// The lifecycle the owner's backend joins: the frontend's own one for an
     /// in-process owner, a fresh one otherwise.
     lifecycle: Option<Arc<Lifecycle>>,
+    relinks: OwnerRelink,
 }
 
 impl OwnerInit {
@@ -1493,7 +1962,13 @@ impl OwnerInit {
             login,
             last_generation: 0,
             lifecycle: None,
+            relinks: OwnerRelink::default(),
         }
+    }
+
+    /// The handle that gives this owner a link in place of its current one.
+    pub fn relinks(&self) -> OwnerRelink {
+        self.relinks.clone()
     }
 }
 
@@ -1539,15 +2014,320 @@ struct OwnedGate {
     gate: Weak<SendGate>,
 }
 
-/// What the frontend reported about retained bridge state, kept for the
-/// rebuild after a frontend death.
+/// One journaled record: what it takes to send it again.
+struct JournalItem {
+    record: OutRecord,
+    /// The bridge kept it past its admission (a delivered final marker, a
+    /// terminal gap): a rebuilt bridge puts it back there.
+    retained: Option<RetainedKind>,
+    /// It crossed a link: that link's bridge may have sent it on, whatever
+    /// reports of it arrived.
+    forwarded: bool,
+}
+
+/// A stream instance the frontend's bridge holds state for: it took the
+/// instance's gap reserve with the instance's first record, and has not
+/// released it.
+struct JournalStream {
+    instance: u64,
+    /// The custody id of the gap reserve.
+    reserve: u64,
+    gate: GateWire,
+}
+
+/// What a session owner keeps so that a new frontend's bridge can be built
+/// from nothing (the bridge-held state a frontend death would lose).
+///
+/// - **J1, output.** Every typed record (`ChannelOutput`, `ChannelExit`) and
+///   every `ReservedSessionControl` the frontend has neither released nor
+///   reported admitted, by owner queue position, with its body. A record's
+///   custody stays in `Owner::custody`; the item goes when the frontend
+///   reports it admitted, transferred, withdrawn or released. An item the
+///   frontend reported `Retained`, and a terminal gap whose charge it
+///   transferred, stays until its permit is released. A data record loses
+///   the bytes the frontend reports sent slice by slice, so a rebuild never
+///   sends them twice.
+/// - **Stream instances.** The gap reserve of each instance the bridge
+///   holds (one per stream): a rebuilt bridge needs the instance's state
+///   even when nothing of it is queued.
+/// - **J2, frontier** and **J3, the confirmation flag**, per stream, as the
+///   frontend last reported them.
+/// - **J4, declarations**: the latest recoverability and class per stream,
+///   and the highest closed or exited instance per stream (tombstones).
+/// - **J5, consumption**: per stream, bytes handed to the backend that it
+///   has not reported (`unreported`), and the part of them a replaced link
+///   handed over (`owed`): later reports pay that first and are not
+///   forwarded, so a new connection is never credited another's bytes.
+/// - **J6**: the highest attachment generation seen, and whether the
+///   backend heard `Live`.
+///
+/// Bounds: items and their bodies by the gates, timeline budgets and reply
+/// budgets that bound the bridge's own queue (the custody is the same);
+/// everything else by the stream number space.
 #[derive(Default)]
-struct Reports {
-    admitted: std::collections::BTreeSet<u64>,
-    retained: BTreeMap<u64, RetainedKind>,
+struct Journal {
+    items: BTreeMap<u64, JournalItem>,
+    streams: BTreeMap<u8, JournalStream>,
     frontier: BTreeMap<u8, GeometryRecord>,
-    unconfirmed: BTreeMap<u8, bool>,
-    last_client_recv: u64,
+    /// The instance the flag was reported for, and the flag.
+    unconfirmed: BTreeMap<u8, (u64, bool)>,
+    resyncable: BTreeMap<u8, bool>,
+    bulk: std::collections::BTreeSet<u8>,
+    tombstones: BTreeMap<u8, u64>,
+    unreported: BTreeMap<u8, u64>,
+    owed: BTreeMap<u8, u64>,
+    last_generation: u64,
+    live_seen: bool,
+    /// The backend's queue position of the last typed record taken from it.
+    last_typed: u64,
+}
+
+impl Journal {
+    fn tombstone(&mut self, stream: u8, instance: u64) {
+        let old = self.tombstones.entry(stream).or_insert(instance);
+        *old = (*old).max(instance);
+    }
+
+    /// A record the backend sent: keep what a rebuild needs of it.
+    fn record(&mut self, record: &OutRecord) {
+        match record {
+            OutRecord::ChannelOutput {
+                id,
+                stream,
+                instance,
+                gate,
+                gap_reserve,
+                ..
+            } => {
+                if *gap_reserve {
+                    if self
+                        .streams
+                        .get(stream)
+                        .is_none_or(|held| held.instance != *instance)
+                    {
+                        self.frontier.remove(stream);
+                        self.unconfirmed.remove(stream);
+                    }
+                    self.streams.insert(
+                        *stream,
+                        JournalStream {
+                            instance: *instance,
+                            reserve: id | SLOT_GAP_RESERVE,
+                            gate: *gate,
+                        },
+                    );
+                }
+                let mut record = record.clone();
+                // A rebuild hands the reserve over with the stream instance.
+                if let OutRecord::ChannelOutput { gap_reserve, .. } = &mut record {
+                    *gap_reserve = false;
+                }
+                self.items.insert(
+                    id >> 2,
+                    JournalItem {
+                        record,
+                        retained: None,
+                        forwarded: false,
+                    },
+                );
+            }
+            OutRecord::ChannelExit { id, .. } | OutRecord::ReservedSessionControl { id, .. } => {
+                self.items.insert(
+                    id >> 2,
+                    JournalItem {
+                        record: record.clone(),
+                        retained: None,
+                        forwarded: false,
+                    },
+                );
+            }
+            OutRecord::ChannelClosed {
+                stream, instance, ..
+            } => self.tombstone(*stream, *instance),
+            OutRecord::Resyncable { stream, resyncable } => {
+                self.resyncable.insert(*stream, *resyncable);
+            }
+            OutRecord::StreamClass { stream, bulk } => {
+                if *bulk {
+                    self.bulk.insert(*stream);
+                } else {
+                    self.bulk.remove(stream);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `record` went onto a link.
+    fn forwarded(&mut self, record: &OutRecord) {
+        if let OutRecord::ChannelOutput { id, .. } = record {
+            if let Some(item) = self.items.get_mut(&(id >> 2)) {
+                item.forwarded = true;
+            }
+        }
+    }
+
+    /// A link was lost, and its last reports with it: output bytes that had
+    /// crossed it may have reached the client, or not. They are not sent
+    /// again -- a byte stream must never carry a byte twice -- and their
+    /// stream owes its next client the gap warning instead. Output that
+    /// never crossed (sent while no link was up) stays.
+    fn forget_forwarded_data(&mut self) {
+        let mut gone = Vec::new();
+        for (&position, item) in &self.items {
+            if let OutRecord::ChannelOutput {
+                stream,
+                instance,
+                output: OutputBody::Data(_),
+                ..
+            } = &item.record
+            {
+                if item.forwarded {
+                    gone.push((position, *stream, *instance));
+                }
+            }
+        }
+        for (position, stream, instance) in gone {
+            self.items.remove(&position);
+            if self
+                .streams
+                .get(&stream)
+                .is_some_and(|held| held.instance == instance)
+            {
+                self.unconfirmed.insert(stream, (instance, true));
+            }
+        }
+    }
+
+    /// The frontend transferred (`sent`) or withdrew a record's charge.
+    fn charge_settled(&mut self, id: u64, sent: bool) {
+        let position = id >> 2;
+        let Some(item) = self.items.get_mut(&position) else {
+            return;
+        };
+        let OutRecord::ChannelOutput { output, .. } = &item.record else {
+            // An exit's or a control record's part decides.
+            return;
+        };
+        let gap = matches!(output, OutputBody::OutputGap(_));
+        if sent && gap {
+            // The bridge keeps an admitted terminal gap for the next
+            // attachment (its `Retained` report follows).
+            item.retained = Some(RetainedKind::Gap);
+        } else if !sent && item.retained == Some(RetainedKind::Gap) {
+            // The charge a rebuild gave the gap again, back in its place.
+        } else {
+            self.items.remove(&position);
+        }
+    }
+
+    /// `payload` leading bytes of a data record went out in slices.
+    fn sliced(&mut self, id: u64, payload: u64) {
+        if let Some(JournalItem {
+            record:
+                OutRecord::ChannelOutput {
+                    output: OutputBody::Data(data),
+                    ..
+                },
+            ..
+        }) = self.items.get_mut(&(id >> 2))
+        {
+            let sent = usize::try_from(payload)
+                .unwrap_or(usize::MAX)
+                .min(data.len());
+            data.drain(..sent);
+        }
+    }
+
+    /// The frontend released the custody object `id`.
+    fn released(&mut self, id: u64) {
+        let (position, slot) = (id >> 2, id & 3);
+        if slot == SLOT_GAP_RESERVE {
+            let held = self
+                .streams
+                .iter()
+                .find(|(_, held)| held.reserve == id)
+                .map(|(stream, _)| *stream);
+            if let Some(stream) = held {
+                self.streams.remove(&stream);
+                self.frontier.remove(&stream);
+                self.unconfirmed.remove(&stream);
+            }
+        }
+        let gone = match self.items.get(&position).map(|item| &item.record) {
+            Some(OutRecord::ChannelOutput { .. }) => slot == SLOT_PERMIT,
+            Some(OutRecord::ChannelExit { .. }) => slot == SLOT_PERMIT || slot == SLOT_PART,
+            Some(OutRecord::ReservedSessionControl { .. }) => slot == SLOT_PART,
+            _ => false,
+        };
+        if gone {
+            self.items.remove(&position);
+        }
+    }
+
+    /// The frontend enqueued the reply part `id` whole on its connection.
+    fn admitted(&mut self, id: u64) {
+        let position = id >> 2;
+        match self.items.get(&position).map(|item| &item.record) {
+            Some(OutRecord::ChannelExit {
+                stream, instance, ..
+            }) => {
+                // The bridge forgets an instance whose exit it sent.
+                let (stream, instance) = (*stream, *instance);
+                self.tombstone(stream, instance);
+                self.items.remove(&position);
+            }
+            Some(OutRecord::ReservedSessionControl { .. }) => {
+                self.items.remove(&position);
+            }
+            _ => {}
+        }
+    }
+
+    /// `n` stream bytes entered the backend's queue.
+    fn received(&mut self, stream: u8, n: usize) {
+        if n > 0 {
+            *self.unreported.entry(stream).or_insert(0) += n as u64;
+        }
+    }
+
+    /// The backend reported `n` bytes of `stream` taken: what is left of
+    /// the report once a replaced link's bytes are paid.
+    fn reported(&mut self, stream: u8, n: u64) -> u64 {
+        if let Some(left) = self.unreported.get_mut(&stream) {
+            *left = left.saturating_sub(n);
+            if *left == 0 {
+                self.unreported.remove(&stream);
+            }
+        }
+        let Some(owed) = self.owed.get_mut(&stream) else {
+            return n;
+        };
+        let paid = (*owed).min(n);
+        *owed -= paid;
+        if *owed == 0 {
+            self.owed.remove(&stream);
+        }
+        n - paid
+    }
+
+    /// Whether custody object `id` belongs to something a rebuild replays.
+    fn holds(&self, id: u64, reserves: &std::collections::HashSet<u64>) -> bool {
+        if reserves.contains(&id) {
+            return true;
+        }
+        let slot = id & 3;
+        match self.items.get(&(id >> 2)).map(|item| &item.record) {
+            Some(OutRecord::ChannelOutput { .. }) => slot == SLOT_CHARGE || slot == SLOT_PERMIT,
+            Some(OutRecord::ChannelExit { .. }) => {
+                slot == SLOT_CHARGE || slot == SLOT_PERMIT || slot == SLOT_PART
+            }
+            Some(OutRecord::ReservedSessionControl { .. }) => {
+                slot == SLOT_CHARGE || slot == SLOT_PART
+            }
+            _ => false,
+        }
+    }
 }
 
 struct Owner {
@@ -1568,16 +2348,33 @@ struct Owner {
     next_gate: u64,
     gates_pruned_at: usize,
     budgets: BTreeMap<(u8, u64), TimelineBudget>,
-    reports: Reports,
-    /// `None` once the backend finished: the frontend then sees end of input.
+    journal: Journal,
+    /// Reply parts the current link's connection holds (enqueued, awaiting
+    /// acknowledgement): they go with the link.
+    admitted: std::collections::BTreeSet<u64>,
+    /// Bytes the current link's bridge charged on its own (gap, bootstrap
+    /// and rearmed records) and has not settled, per gate.
+    bridge_admits: HashMap<u64, u64>,
+    last_client_recv: u64,
+    /// The current link's writer queues: `None` while there is no link, and
+    /// once the backend finished (the frontend then sees end of input).
     data: Option<mpsc::UnboundedSender<ToFrontend>>,
     priority: Option<mpsc::UnboundedSender<ToFrontend>>,
-    /// Messages kept after the link died, with their custody (bounded as the
-    /// bridge's own FIFO is: by gates, timeline and reply budgets).
-    parked: Vec<SessionOutbound>,
+    failure: Arc<LinkFailure>,
     /// Leading pieces of the next inbound data event.
     data_parts: Vec<u8>,
 }
+
+/// What a frame did beyond its own effect.
+enum FrameEffect {
+    None,
+    /// The frontend ended the session.
+    Ended,
+    /// The frontend ended this link in order; another replaces it.
+    Retired,
+}
+
+type OwnerReader = LinkReader<tokio::io::ReadHalf<Box<dyn LinkIo>>>;
 
 impl OwnerLink {
     /// [`OwnerLink::run`] on a lifecycle of its own that `shutdown` stops,
@@ -1596,7 +2393,7 @@ impl OwnerLink {
         drain_within: std::time::Duration,
     ) -> OwnerRun
     where
-        L: AsyncRead + AsyncWrite + Send + 'static,
+        L: LinkIo,
     {
         // One session envelope of the daemon's control budget: the host
         // leases one to each owner process it starts, so owners together
@@ -1626,18 +2423,22 @@ impl OwnerLink {
     }
 
     /// Run `backend` for one session behind `link` until the session ends.
-    /// A link that dies without an explicit end parks the backend: it keeps
-    /// running, its custody stays charged, and only shutdown (or the backend
-    /// finishing) ends the owner.
+    ///
+    /// A link that ends without ending the session -- retired in order by
+    /// its frontend, or lost -- leaves the backend running: what it sends
+    /// stays here with its custody (`Journal`), and the next link handed
+    /// over through [`OwnerInit::relinks`] starts with a replay of it. Only
+    /// an explicit `End`, shutdown, or the backend finishing ends the owner.
     pub async fn run<L>(link: L, backend: Arc<dyn SessionBackend>, init: OwnerInit) -> OwnerExit
     where
-        L: AsyncRead + AsyncWrite + Send + 'static,
+        L: LinkIo,
     {
         let OwnerInit {
             principal,
             login,
-            last_generation: _,
+            last_generation,
             lifecycle,
+            relinks,
         } = init;
         let lifecycle = lifecycle.unwrap_or_else(|| Lifecycle::new(Shutdown::default()));
         let (in_tx, in_rx) = mpsc::channel::<SessionInbound>(INBOUND_CAP);
@@ -1657,18 +2458,6 @@ impl OwnerLink {
         let mailbox = io.resume_snapshots.clone();
         lifecycle.spawn(async move { backend.run(io).await });
 
-        let (read, write) = tokio::io::split(link);
-        let (data, data_rx) = mpsc::unbounded_channel();
-        let (priority, priority_rx) = mpsc::unbounded_channel();
-        let failure = Arc::new(LinkFailure::default());
-        lifecycle.spawn(owner_write_loop(
-            write,
-            data_rx,
-            priority_rx,
-            failure.clone(),
-            lifecycle.clone(),
-        ));
-        let mut reader = LinkReader::new(read);
         let mut owner = Owner {
             control,
             mailbox,
@@ -1684,13 +2473,22 @@ impl OwnerLink {
             next_gate: 0,
             gates_pruned_at: 0,
             budgets: BTreeMap::new(),
-            reports: Reports::default(),
-            data: Some(data),
-            priority: Some(priority),
-            parked: Vec::new(),
+            journal: Journal {
+                last_generation,
+                ..Journal::default()
+            },
+            admitted: Default::default(),
+            bridge_admits: HashMap::new(),
+            last_client_recv: 0,
+            data: None,
+            priority: None,
+            failure: Arc::new(LinkFailure::default()),
             data_parts: Vec::new(),
         };
-        let mut linked = true;
+        // The link being read, if any.
+        let mut reader = Some(owner.open(Box::new(link), &lifecycle));
+        // A link handed over while the current one has not ended yet.
+        let mut waiting: Option<Box<dyn LinkIo>> = None;
         let mut ended = false;
         // The backend finished and everything it sent went out; the frontend
         // still holds custody until it closes the link.
@@ -1702,6 +2500,11 @@ impl OwnerLink {
                 .filter(|_| owner.pool.len() + owner.granted.len() < INBOUND_CAP)
                 .cloned();
             let control = owner.control.clone();
+            let failure = owner.failure.clone();
+            let linked = reader.is_some();
+            // Its writes failed, but what the frontend wrote is still read.
+            let writable = linked && (owner.data.is_some() || backend_done);
+            let relinkable = waiting.is_none() && !ended && !backend_done;
             let wake = tokio::select! {
                 biased;
                 _ = lifecycle.shutdown.requested() => {
@@ -1710,11 +2513,16 @@ impl OwnerLink {
                 }
                 // Not fenced by anything: the frontend's priority lane.
                 _ = control.terminal_ready.notified() => OwnerWake::Terminal,
-                _ = failure.failed(), if linked => OwnerWake::WriteFailed,
+                _ = failure.failed(), if writable => OwnerWake::WriteFailed,
                 // Neither a frame flood nor a busy backend starves the other.
                 wake = async {
                     tokio::select! {
-                        frame = reader.next(), if linked => OwnerWake::Frame(frame),
+                        frame = async {
+                            match reader.as_mut() {
+                                Some(reader) => reader.next().await,
+                                None => std::future::pending().await,
+                            }
+                        } => OwnerWake::Frame(frame),
                         message = out_rx.recv(), if !backend_done => OwnerWake::Backend(message),
                         permit = async {
                             match reserve {
@@ -1722,50 +2530,64 @@ impl OwnerLink {
                                 None => std::future::pending().await,
                             }
                         } => OwnerWake::Slot(permit),
+                        link = relinks.next(), if relinkable => OwnerWake::Relink(link),
                     }
                 } => wake,
             };
+            // `Some(orderly)` once the current link is over.
+            let mut link_over = None;
             match wake {
                 OwnerWake::Terminal => {
                     if let Some(request) = control.take_priority_abort() {
-                        owner.to_frontend_priority(ToFrontend::Terminal {
-                            origin: ctx_wire(request.origin),
-                            disposition: disposition_wire(request.disposition),
-                        });
+                        if owner.data.is_some() {
+                            owner.to_frontend_priority(ToFrontend::Terminal {
+                                origin: ctx_wire(request.origin),
+                                disposition: disposition_wire(request.disposition),
+                            });
+                        } else {
+                            owner.terminal_unlinked(request);
+                        }
                     }
                 }
                 OwnerWake::WriteFailed if backend_done => return OwnerExit::Finished,
+                // The frontend's end no longer takes anything -- at a warm
+                // reattach it closes right behind its `Retire`. What it
+                // wrote before is still in the link and still counts: its
+                // last reports, input it sent on credit, the `Retire`
+                // itself. Stop writing, and read the link to its end.
                 OwnerWake::WriteFailed => {
-                    log::error!("owner link: owner write failed; parking");
-                    linked = false;
+                    log::debug!("owner link: owner write failed; reading the link to its end");
+                    owner.data = None;
+                    owner.priority = None;
                 }
-                OwnerWake::Frame(frame) => match frame.and_then(|frame| {
-                    frame
-                        .map(|frame| owner.on_frame(&frame, &mut ended))
-                        .transpose()
-                }) {
-                    Ok(Some(())) => {}
+                OwnerWake::Frame(frame) => match frame
+                    .and_then(|frame| frame.map(|frame| owner.on_frame(&frame)).transpose())
+                {
+                    Ok(Some(FrameEffect::None)) => {}
+                    Ok(Some(FrameEffect::Ended)) => ended = true,
+                    Ok(Some(FrameEffect::Retired)) => link_over = Some(true),
                     // Every frontend token is gone: custody may go too.
                     Ok(None) | Err(_) if backend_done => return OwnerExit::Finished,
-                    Ok(None) | Err(_) if ended => linked = false,
+                    Ok(None) | Err(_) if ended => link_over = Some(false),
                     Ok(None) => {
                         log::warn!(
                             "owner link: the frontend closed without ending the session; parking"
                         );
-                        linked = false;
+                        link_over = Some(false);
                     }
                     Err(error) => {
                         log::error!("owner link: owner refused the link ({error:?}); parking");
-                        linked = false;
+                        link_over = Some(false);
                     }
                 },
-                OwnerWake::Backend(Some(message)) if linked => {
+                OwnerWake::Backend(Some(message)) => {
                     if let Err(error) = owner.forward(message) {
                         log::error!("owner link: a record cannot cross ({error:?}); parking");
-                        linked = false;
+                        if linked {
+                            link_over = Some(false);
+                        }
                     }
                 }
-                OwnerWake::Backend(Some(message)) => owner.parked.push(message),
                 OwnerWake::Backend(None) if !linked => {
                     return if ended {
                         OwnerExit::Finished
@@ -1779,6 +2601,7 @@ impl OwnerLink {
                 OwnerWake::Backend(None) => {
                     backend_done = true;
                     owner.end_inbound();
+                    owner.to_frontend(ToFrontend::Finished);
                     owner.data = None;
                     owner.priority = None;
                 }
@@ -1789,6 +2612,19 @@ impl OwnerLink {
                 }
                 // The backend's queue closed: nothing more can be handed over.
                 OwnerWake::Slot(None) => owner.end_inbound(),
+                OwnerWake::Relink(link) if linked => waiting = Some(link),
+                OwnerWake::Relink(link) => {
+                    reader = Some(owner.open(link, &lifecycle));
+                    owner.replay();
+                }
+            }
+            if let Some(orderly) = link_over {
+                reader = None;
+                owner.unlink(orderly);
+                if let Some(link) = waiting.take().filter(|_| !ended) {
+                    reader = Some(owner.open(link, &lifecycle));
+                    owner.replay();
+                }
             }
         }
     }
@@ -1800,6 +2636,7 @@ enum OwnerWake {
     Frame(Result<Option<Frame>, LinkError>),
     Backend(Option<SessionOutbound>),
     Slot(Option<mpsc::OwnedPermit<SessionInbound>>),
+    Relink(Box<dyn LinkIo>),
 }
 
 impl Owner {
@@ -1816,6 +2653,9 @@ impl Owner {
 
     /// Grant reserved slots to the frontend, keeping `SYNTH_RESERVE` back.
     fn grant(&mut self) {
+        if self.data.is_none() {
+            return;
+        }
         let room = MAX_GRANT.saturating_sub(self.granted.len());
         let spare = self.pool.len().saturating_sub(SYNTH_RESERVE);
         let n = room.min(spare);
@@ -1874,8 +2714,219 @@ impl Owner {
             return Ok(());
         }
         let permit = self.granted.pop_front().ok_or(LinkError::BadValue)?;
+        match &ev {
+            SessionInbound::Data(data) => self.journal.received(data.stream_id, data.data.len()),
+            SessionInbound::Live(context) => {
+                self.journal.live_seen = true;
+                self.journal.last_generation = self.journal.last_generation.max(context.generation);
+            }
+            SessionInbound::ResumeReset(context) => {
+                self.journal.last_generation = self.journal.last_generation.max(context.generation);
+            }
+            _ => {}
+        }
         permit.send(ev);
         Ok(())
+    }
+
+    /// Start `link`: its writer, and the reader the owner's loop drives.
+    fn open(&mut self, link: Box<dyn LinkIo>, lifecycle: &Arc<Lifecycle>) -> OwnerReader {
+        let (read, write) = tokio::io::split(link);
+        let (data, data_rx) = mpsc::unbounded_channel();
+        let (priority, priority_rx) = mpsc::unbounded_channel();
+        let failure = Arc::new(LinkFailure::default());
+        lifecycle.spawn(owner_write_loop(
+            write,
+            data_rx,
+            priority_rx,
+            failure.clone(),
+            lifecycle.clone(),
+        ));
+        self.data = Some(data);
+        self.priority = Some(priority);
+        self.failure = failure;
+        LinkReader::new(read)
+    }
+
+    /// The current link is over, in order (`Retire`: every report of its
+    /// bridge arrived) or not. What its connection and its bridge held goes
+    /// with it, as when a warm reattach destroys the old connection; what a
+    /// rebuilt bridge needs stays (`Journal`).
+    fn unlink(&mut self, orderly: bool) {
+        // The old writer sends what is queued and closes its half.
+        self.data = None;
+        self.priority = None;
+        self.data_parts.clear();
+        // Credits the link held: the events they were for never come.
+        self.pool.extend(self.granted.drain(..));
+        self.serve_synth();
+        let journal = &mut self.journal;
+        // Every byte the backend holds unreported came over a link that is
+        // gone: its reports credit no later connection.
+        journal.owed = journal.unreported.clone();
+        if !orderly {
+            // The last reports of a lost link may never have arrived: a
+            // record the journal still holds may have gone out, and sent
+            // output may be unacknowledged. Output bytes that crossed the
+            // link are given up (never sent twice), and whatever stream
+            // sent anything owes its next client the gap warning.
+            journal.forget_forwarded_data();
+            for (stream, held) in &journal.streams {
+                if journal
+                    .frontier
+                    .get(stream)
+                    .is_some_and(|g| g.instance.get() == held.instance)
+                {
+                    journal.unconfirmed.insert(*stream, (held.instance, true));
+                }
+            }
+        }
+        // Custody of the old connection's reliable copies (admitted reply
+        // parts), of its attachment's replies and offers (dropped unaccepted),
+        // of a published snapshot, and of records that were past the queue.
+        let reserves: std::collections::HashSet<u64> =
+            journal.streams.values().map(|held| held.reserve).collect();
+        self.custody.retain(|id, _| journal.holds(*id, &reserves));
+        self.admitted.clear();
+        for (gate, n) in std::mem::take(&mut self.bridge_admits) {
+            if let Some(gate) = self.gates_by_id.get(&gate).and_then(|g| g.gate.upgrade()) {
+                gate.withdraw(n);
+            }
+        }
+        drop(self.mailbox.take_for_link());
+    }
+
+    /// The first frames of a link that replaces an earlier one: everything
+    /// a fresh bridge is built from, in the order it applies it.
+    fn replay(&mut self) {
+        // The connection whose tails the gates carried is gone, as at a
+        // warm reattach; charges of journaled records stay.
+        let gates: Vec<(u8, Arc<SendGate>)> = self
+            .gates_by_id
+            .values()
+            .filter_map(|owned| Some((owned.stream, owned.gate.upgrade()?)))
+            .collect();
+        for (stream, gate) in gates {
+            if gate.update(0) && gate.kind() == GateKind::Screen {
+                self.synthesize(SessionInbound::Writable { stream });
+            }
+        }
+        // The next attachment's snapshot is the one a rebuilt bridge takes.
+        self.mailbox
+            .discard_before(self.journal.last_generation.saturating_add(1));
+        self.to_frontend(ToFrontend::ReplayStart {
+            last_generation: self.journal.last_generation,
+            live_seen: self.journal.live_seen,
+            observed: self.journal.last_typed,
+        });
+        let journal = std::mem::take(&mut self.journal);
+        for (&stream, &resyncable) in &journal.resyncable {
+            self.to_frontend(ToFrontend::ReplayItem(OutRecord::Resyncable {
+                stream,
+                resyncable,
+            }));
+        }
+        for &stream in &journal.bulk {
+            self.to_frontend(ToFrontend::ReplayItem(OutRecord::StreamClass {
+                stream,
+                bulk: true,
+            }));
+        }
+        let nobody = Ctx {
+            generation: 0,
+            session_id: 0,
+            features: 0,
+        };
+        for (&stream, &instance) in &journal.tombstones {
+            self.to_frontend(ToFrontend::ReplayItem(OutRecord::ChannelClosed {
+                id: 0,
+                stream,
+                instance,
+                origin: nobody,
+            }));
+        }
+        for (&stream, held) in &journal.streams {
+            self.to_frontend(ToFrontend::ReplayStream {
+                stream,
+                instance: held.instance,
+                reserve: held.reserve,
+                gate: held.gate,
+            });
+        }
+        let mut retained = Vec::new();
+        for item in journal.items.values() {
+            let record = item.record.clone();
+            if let (
+                Some(kind),
+                OutRecord::ChannelOutput {
+                    id, stream, gate, ..
+                },
+            ) = (item.retained, &record)
+            {
+                retained.push((*stream, kind));
+                if kind == RetainedKind::Gap {
+                    // Its admission transferred the charge. The record
+                    // crosses with one again, which the rebuilt bridge
+                    // gives back when it puts the gap in its place.
+                    let gate = self
+                        .gates_by_id
+                        .get(&gate.id)
+                        .and_then(|owned| owned.gate.upgrade())
+                        .unwrap_or_else(|| Arc::new(SendGate::new(GateKind::Pipe)));
+                    gate.admit(GAP_RECORD_BYTES);
+                    self.custody.insert(
+                        id | SLOT_CHARGE,
+                        Custody::Charge(OutputCharge::admitted(gate, GAP_RECORD_BYTES)),
+                    );
+                }
+            }
+            let record = self.split_data(record);
+            self.to_frontend(ToFrontend::ReplayItem(record));
+        }
+        let mut journal = journal;
+        for item in journal.items.values_mut() {
+            item.forwarded = true;
+        }
+        for (&stream, held) in &journal.streams {
+            if let Some(geometry) = journal
+                .frontier
+                .get(&stream)
+                .filter(|g| g.instance.get() == held.instance)
+            {
+                self.to_frontend(ToFrontend::ReplayFrontier {
+                    stream,
+                    instance: held.instance,
+                    geometry: geometry_wire(*geometry),
+                });
+            }
+            if journal.unconfirmed.get(&stream) == Some(&(held.instance, true)) {
+                self.to_frontend(ToFrontend::ReplayUnconfirmed {
+                    stream,
+                    unconfirmed: true,
+                });
+            }
+        }
+        for (stream, kind) in retained {
+            self.to_frontend(ToFrontend::ReplayRetained { stream, kind });
+        }
+        self.to_frontend(ToFrontend::ReplayDone);
+        self.journal = journal;
+        self.grant();
+    }
+
+    /// A terminal request while no frontend is linked. A bridge parked on a
+    /// dead connection applies a request of its own attachment by retiring
+    /// the session's reply budget; nobody is there to hear more than that.
+    fn terminal_unlinked(&self, request: TerminalRequest) {
+        let attachment = self
+            .control
+            .origin
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attachment;
+        if attachment == request.origin {
+            self.control.budget.retire();
+        }
     }
 
     fn end_inbound(&mut self) {
@@ -1885,7 +2936,7 @@ impl Owner {
         self.synth.clear();
     }
 
-    fn on_frame(&mut self, frame: &Frame, ended: &mut bool) -> Result<(), LinkError> {
+    fn on_frame(&mut self, frame: &Frame) -> Result<FrameEffect, LinkError> {
         match ToOwner::decode(frame)? {
             ToOwner::DataPart(part) => {
                 if self.data_parts.len() + part.len() > MAX_DATA_RECORD {
@@ -1933,6 +2984,7 @@ impl Owner {
                         if let Some(Custody::Charge(charge)) = self.custody.remove(&id) {
                             charge.transfer(tail);
                         }
+                        self.journal.charge_settled(id, true);
                     }
                     // Every slice moves a 5-byte header and at least one
                     // payload byte, and gives back one header for the next;
@@ -1955,8 +3007,12 @@ impl Owner {
                         charge.gate.admit(admit);
                         charge.gate.transfer(n, tail);
                         charge.bytes = charge.bytes + admit - n;
+                        self.journal.sliced(id, n - admit);
                     }
-                    ChargeOp::Withdraw => drop(self.custody.remove(&id)),
+                    ChargeOp::Withdraw => {
+                        drop(self.custody.remove(&id));
+                        self.journal.charge_settled(id, false);
+                    }
                 }
             }
             ToOwner::Progress {
@@ -1974,20 +3030,23 @@ impl Owner {
                 ) {
                     return Err(LinkError::BadValue);
                 }
-                self.reports.admitted.insert(id);
+                self.admitted.insert(id);
+                self.journal.admitted(id);
             }
             ToOwner::Released { id } => {
                 // Dropping the owner's object refunds and wakes as it does
                 // in-process; an uncommitted receipt means "not accepted".
                 self.custody.remove(&id).ok_or(LinkError::BadValue)?;
-                self.reports.admitted.remove(&id);
-                self.reports.retained.remove(&id);
+                self.admitted.remove(&id);
+                self.journal.released(id);
             }
             ToOwner::Retained { id, kind } => {
                 if !matches!(self.custody.get(&id), Some(Custody::Permit { .. })) {
                     return Err(LinkError::BadValue);
                 }
-                self.reports.retained.insert(id, kind);
+                if let Some(item) = self.journal.items.get_mut(&(id >> 2)) {
+                    item.retained = Some(kind);
+                }
             }
             ToOwner::Committed { id } => {
                 if !matches!(self.custody.get(&id), Some(Custody::Commit(_))) {
@@ -2006,13 +3065,31 @@ impl Owner {
                 if geometry.instance.get() != instance {
                     return Err(LinkError::BadValue);
                 }
-                self.reports.frontier.insert(stream, geometry);
+                // Only for the instance the bridge holds now.
+                if self
+                    .journal
+                    .streams
+                    .get(&stream)
+                    .is_some_and(|held| held.instance == instance)
+                {
+                    self.journal.frontier.insert(stream, geometry);
+                }
             }
             ToOwner::Unconfirmed {
                 stream,
+                instance,
                 unconfirmed,
             } => {
-                self.reports.unconfirmed.insert(stream, unconfirmed);
+                if self
+                    .journal
+                    .streams
+                    .get(&stream)
+                    .is_some_and(|held| held.instance == instance)
+                {
+                    self.journal
+                        .unconfirmed
+                        .insert(stream, (instance, unconfirmed));
+                }
             }
             ToOwner::BudgetRetired { origin } => {
                 let attachment = self
@@ -2026,14 +3103,15 @@ impl Owner {
                 }
             }
             ToOwner::Liveness { last_client_recv } => {
-                self.reports.last_client_recv = last_client_recv;
+                self.last_client_recv = last_client_recv;
             }
             ToOwner::End(_) => {
-                *ended = true;
                 self.end_inbound();
+                return Ok(FrameEffect::Ended);
             }
+            ToOwner::Retire => return Ok(FrameEffect::Retired),
         }
-        Ok(())
+        Ok(FrameEffect::None)
     }
 
     fn on_gate(&mut self, id: u64, op: GateOpWire) -> Result<(), LinkError> {
@@ -2051,12 +3129,20 @@ impl Owner {
         match op {
             // A bridge charges its own gap and bootstrap records only.
             GateOpWire::Admit(n) if n > MAX_LINK_ADMIT => return Err(LinkError::BadValue),
-            GateOpWire::Admit(n) => gate.admit(n),
-            GateOpWire::Withdraw(n) => gate.withdraw(n),
+            GateOpWire::Admit(n) => {
+                gate.admit(n);
+                let held = self.bridge_admits.entry(id).or_insert(0);
+                *held = held.saturating_add(n);
+            }
+            GateOpWire::Withdraw(n) => {
+                gate.withdraw(n);
+                self.bridge_settled(id, n);
+            }
             GateOpWire::Transfer { n, tail } => {
                 // As in-process: an opening by charge transfer wakes only the
                 // gate's own waiters.
                 gate.transfer(n, tail);
+                self.bridge_settled(id, n);
             }
             GateOpWire::Update { tail, ready } => {
                 if gate.update(tail) {
@@ -2070,6 +3156,16 @@ impl Owner {
             }
         }
         Ok(())
+    }
+
+    /// The bridge settled `n` bytes it had charged on gate `id` on its own.
+    fn bridge_settled(&mut self, id: u64, n: u64) {
+        if let Some(held) = self.bridge_admits.get_mut(&id) {
+            *held = held.saturating_sub(n);
+            if *held == 0 {
+                self.bridge_admits.remove(&id);
+            }
+        }
     }
 
     /// The bridge's coalesced metadata wake, latched on the owner's budget.
@@ -2173,8 +3269,14 @@ impl Owner {
         }
     }
 
-    /// One message the backend sent, onto the link with its custody kept here.
+    /// One message the backend sent: its custody is kept here, what a
+    /// rebuild needs of it goes into the journal, and it goes onto the link
+    /// if there is one.
     fn forward(&mut self, message: SessionOutbound) -> Result<(), LinkError> {
+        if let Some(position) = message.channel_position().filter(|p| *p != 0) {
+            self.journal.last_typed = position;
+        }
+        let linked = self.data.is_some();
         let record = match message {
             SessionOutbound::RetirementReady {
                 origin,
@@ -2236,6 +3338,10 @@ impl Owner {
                 // The owner's control takes the bridge's part: consuming the
                 // alias rearms `request_terminal` for a later attachment.
                 let request = self.control.take_abort(fallback);
+                if !linked {
+                    self.terminal_unlinked(request);
+                    return Ok(());
+                }
                 let origin = ctx_wire(request.origin);
                 match request.disposition {
                     TerminalDisposition::Close => OutRecord::CloseSession { origin },
@@ -2367,6 +3473,11 @@ impl Owner {
                 let Some((generation, reserved)) = self.mailbox.take_for_link() else {
                     return Ok(());
                 };
+                if !linked {
+                    // Its attachment's bridge is gone; the next attachment
+                    // gets a snapshot of its own.
+                    return Ok(());
+                }
                 let (snapshot, prefix, [source, merged, wire]) = reserved.into_link_parts();
                 let mut dto = snapshot.encode_record();
                 dto.drain(..5);
@@ -2415,11 +3526,36 @@ impl Owner {
                 stream: stream_id,
                 token,
             },
-            SessionOutbound::Consumed { stream_id, n } => OutRecord::Consumed {
-                stream: stream_id,
-                n: n as u64,
-            },
+            SessionOutbound::Consumed { stream_id, n } => {
+                // A replaced link's bytes are paid first, and credit nobody.
+                let n = self.journal.reported(stream_id, n as u64);
+                if n == 0 {
+                    return Ok(());
+                }
+                OutRecord::Consumed {
+                    stream: stream_id,
+                    n,
+                }
+            }
+            // Only an owner link's frontend makes these, for its bridge.
+            SessionOutbound::Replay(_) => return Ok(()),
         };
+        self.journal.record(&record);
+        if linked {
+            self.journal.forwarded(&record);
+        }
+        if !linked {
+            // A reply or an offer of an attachment whose bridge is gone is
+            // stale for every later one: it is dropped, the offer unaccepted.
+            if let OutRecord::ReservedControl { id, .. } | OutRecord::UpdateAccept { id, .. } =
+                &record
+            {
+                for slot in [SLOT_CHARGE, SLOT_PART, SLOT_COMMIT] {
+                    self.custody.remove(&(id | slot));
+                }
+            }
+            return Ok(());
+        }
         self.to_frontend(ToFrontend::Record(self.split_data(record)));
         Ok(())
     }

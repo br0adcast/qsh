@@ -37,7 +37,7 @@ async fn auth17_warm_control_waits_for_manager_commit_before_any_effect() {
     let classes = BTreeMap::new();
     let control = BridgeControl::Attach(Box::new(new_conn), vec![], vec![], commit_rx);
     {
-        let work = apply_control(
+        let work = apply_local_control(
             &mut conn,
             &mut parked,
             &mut link,
@@ -81,7 +81,7 @@ async fn auth17_cancelled_commit_preserves_old_connection_and_backend() {
     let old_generation = link.ledger.generation();
     let mut parked = true;
     let mut out = Vec::new();
-    apply_control(
+    apply_local_control(
         &mut conn,
         &mut parked,
         &mut link,

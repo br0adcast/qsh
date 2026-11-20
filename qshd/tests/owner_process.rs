@@ -7,7 +7,9 @@
 //! whose parent, that ending a session or stopping the daemon leaves no
 //! owner and no shell behind, that owners run the daemon's own image even
 //! after the file on disk was replaced, and that an owner whose frontend
-//! link dies parks its session instead of ending it.
+//! link dies keeps its session, which the client's warm return takes up
+//! again over a new link: what the session sent meanwhile arrives, and no
+//! input is ever delivered twice.
 //!
 //! The helpers follow `serve_channels.rs` (signed connection, free port
 //! under a file-local lock, a shell channel and marker output).
@@ -331,7 +333,11 @@ impl Binder for NoopBinder {
 struct Collected {
     control: Vec<ServerRecord>,
     shell: Vec<u8>,
+    /// The highest input offset the server acknowledged as consumed.
+    acked: u64,
     live: bool,
+    /// The connection ended (the server closed it, or it died).
+    closed: bool,
 }
 
 struct Events {
@@ -362,15 +368,19 @@ impl ClientEvents for Events {
             }
         } else if stream_id == FIRST_CHANNEL_STREAM {
             for rec in self.shell.lock().unwrap().push(&data) {
-                if let ShellRecord::Data(bytes) = rec {
-                    collected.shell.extend(bytes);
+                match rec {
+                    ShellRecord::Data(bytes) => collected.shell.extend(bytes),
+                    ShellRecord::EchoAck(n) => collected.acked = collected.acked.max(n),
+                    _ => {}
                 }
             }
         }
     }
     fn on_state(&self, state: LinkState) {
-        if state == LinkState::Live {
-            self.collected.lock().unwrap().live = true;
+        match state {
+            LinkState::Live => self.collected.lock().unwrap().live = true,
+            LinkState::Closed => self.collected.lock().unwrap().closed = true,
+            _ => {}
         }
     }
     fn on_stats(&self, _stats: Stats) {}
@@ -384,6 +394,15 @@ struct Session {
 
 impl Session {
     fn connect(daemon: &Daemon, token: [u8; 16]) -> Session {
+        Self::connect_as(daemon, token, StartKind::Cold)
+    }
+
+    /// A client's warm return to the session of `token`.
+    fn come_back(daemon: &Daemon, token: [u8; 16]) -> Session {
+        Self::connect_as(daemon, token, StartKind::Warm)
+    }
+
+    fn connect_as(daemon: &Daemon, token: [u8; 16], start: StartKind) -> Session {
         let events = Arc::new(Events::default());
         let client = StdClient::connect(
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), daemon.port),
@@ -396,7 +415,7 @@ impl Session {
                 auth: AuthPolicy::SshSignature,
             },
             token,
-            StartKind::Cold,
+            start,
             Arc::new(NoopBinder),
             events.clone(),
             Some(Arc::new(
@@ -505,6 +524,10 @@ impl Session {
             "the channel's process must say its pid"
         );
         pid.unwrap()
+    }
+
+    fn shell_text(&self) -> String {
+        String::from_utf8_lossy(&self.events.collected.lock().unwrap().shell).into_owned()
     }
 
     /// The shell answers a computed marker: it is alive and reachable.
@@ -779,7 +802,7 @@ fn owner_link_eof_parks_instead_of_ending() {
     );
     assert_eq!(ppid(shell), Some(owner), "the shell keeps its owner");
 
-    // Only an explicit stop ends a parked session.
+    // Without a returning client, only an explicit stop ends the session.
     let status = daemon.stop();
     assert!(status.success(), "{status:?}");
     assert!(
@@ -794,6 +817,236 @@ fn owner_link_eof_parks_instead_of_ending() {
         daemon.log()
     );
     drop(session);
+}
+
+/// Kill the link between the frontend and `owner`, both ways, at the socket
+/// itself (descriptor 3 is the owner's end of the session's first link):
+/// neither side ever says the session ended. Returns once the frontend has
+/// noticed.
+fn sever_first_link(owner: u32, daemon: &Daemon) {
+    let link = steal_fd(owner, 3);
+    assert_eq!(
+        unsafe { libc::shutdown(link.as_raw_fd(), libc::SHUT_RDWR) },
+        0
+    );
+    drop(link);
+    assert!(
+        wait_until(Duration::from_secs(10), || daemon
+            .log()
+            .contains("the link was lost")),
+        "the frontend notices its lost link; log: {}",
+        daemon.log()
+    );
+}
+
+/// [RF 2] The shell prints its last output and exits while the link between
+/// the frontend and its owner is dead. The owner keeps both; the client's
+/// warm return brings a new link, and over it the client sees that output
+/// and then the exit, from the same owner.
+#[test]
+fn exit_after_frontend_death_is_delivered_after_relink() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let token = [41; 16];
+    let session = Session::connect(&daemon, token);
+    let shell = session.open_shell();
+    let owner = owner_of(shell, &daemon);
+
+    // The shell's last words come in a moment, and then it exits.
+    session
+        .client
+        .send_bytes(
+            FIRST_CHANNEL_STREAM,
+            b"sleep 2; echo LA'ST'-$((6*7))-; exit 7\n".to_vec(),
+        )
+        .expect("input admitted");
+    assert!(
+        wait_until(Duration::from_secs(10), || session
+            .shell_text()
+            .contains("exit 7")),
+        "the shell took the line (its echo); saw {:?}",
+        session.shell_text()
+    );
+    sever_first_link(owner, &daemon);
+    assert!(
+        wait_until(Duration::from_secs(15), || reaped(shell)),
+        "the shell exits while nobody is linked"
+    );
+    assert!(running(owner), "its owner keeps the session");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !session.shell_text().contains("LAST-42-"),
+        "nothing reached the client over the dead link: {:?}",
+        session.shell_text()
+    );
+    assert!(!session
+        .events
+        .collected
+        .lock()
+        .unwrap()
+        .control
+        .iter()
+        .any(|record| matches!(record, ServerRecord::Exit { .. })));
+    drop(session);
+
+    let back = Session::come_back(&daemon, token);
+    let exit = ServerRecord::Exit {
+        stream: FIRST_CHANNEL_STREAM,
+        code: 7,
+    };
+    let mut output_first = false;
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            let collected = back.events.collected.lock().unwrap();
+            let output = String::from_utf8_lossy(&collected.shell).contains("LAST-42-");
+            let exited = collected.control.contains(&exit);
+            // The exit never overtakes the channel's output.
+            output_first |= output && !exited;
+            assert!(output || !exited, "the exit arrived before the last output");
+            output && exited
+        }),
+        "the returning client sees the last output and the exit; saw {:?} and {:?}; log: {}",
+        back.shell_text(),
+        back.events.collected.lock().unwrap().control,
+        daemon.log()
+    );
+    let seen = back.shell_text();
+    assert_eq!(
+        seen.matches("LAST-42-").count(),
+        1,
+        "the last output arrives once: {seen:?}"
+    );
+    let exits = back
+        .events
+        .collected
+        .lock()
+        .unwrap()
+        .control
+        .iter()
+        .filter(|record| **record == exit)
+        .count();
+    assert_eq!(exits, 1, "the exit arrives once");
+    assert!(
+        daemon.log().contains("replaced the session's link"),
+        "the owner took a new link; log: {}",
+        daemon.log()
+    );
+    assert!(running(owner), "the same owner served the return");
+
+    back.client.close();
+    assert!(
+        wait_until(Duration::from_secs(20), || reaped(owner)),
+        "closing the session ends its owner; log: {}",
+        daemon.log()
+    );
+    let status = daemon.stop();
+    assert!(status.success(), "{status:?}; log: {}", daemon.log());
+}
+
+/// The numbered input line `n` of a paste.
+fn paste_line(n: u32) -> Vec<u8> {
+    format!("{n:08}\n").into_bytes()
+}
+
+/// [RF 3] The link dies in the middle of a paste into a program that
+/// records every byte the terminal gives it. Whatever the dead link lost
+/// stays lost; nothing is delivered twice. What the program received is
+/// exactly a leading part of what the first client sent -- at least
+/// everything that client saw acknowledged -- followed by exactly what the
+/// returning client sent.
+#[test]
+fn severed_link_mid_paste_never_duplicates_input() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let token = [42; 16];
+    let session = Session::connect(&daemon, token);
+    let record = daemon.dir.path().join("pasted");
+    let shell = session.open_command(&format!(
+        "echo PID$$-; stty raw -echo; exec cat > {}",
+        record.display()
+    ));
+    let owner = owner_of(shell, &daemon);
+    let received = || std::fs::read(&record).unwrap_or_default();
+
+    // The first client pastes numbered lines; the link dies under it once
+    // the program has taken a good part, and the client goes on a little.
+    let mut sent = Vec::new();
+    let mut cut_at = None;
+    for n in 0..4000u32 {
+        let line = paste_line(n);
+        if session
+            .client
+            .send_bytes(FIRST_CHANNEL_STREAM, line.clone())
+            .is_err()
+        {
+            break;
+        }
+        sent.extend(line);
+        if cut_at.is_none() && received().len() >= 4096 {
+            sever_first_link(owner, &daemon);
+            cut_at = Some(n);
+        }
+        if cut_at.is_some_and(|at| n >= at + 200) {
+            break;
+        }
+        if n % 64 == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        cut_at.is_some(),
+        "the program takes the paste: {} bytes of {} sent; log: {}",
+        received().len(),
+        sent.len(),
+        daemon.log()
+    );
+    let acked = session.events.collected.lock().unwrap().acked;
+    assert!(running(shell) && running(owner), "the session lives on");
+    drop(session);
+
+    // The returning client pastes lines of its own.
+    let back = Session::come_back(&daemon, token);
+    let mut later = Vec::new();
+    for n in 0..300u32 {
+        let line = paste_line(900_000 + n);
+        back.client
+            .send_bytes(FIRST_CHANNEL_STREAM, line.clone())
+            .expect("input admitted on the new connection");
+        later.extend(line);
+    }
+    assert!(
+        wait_until(Duration::from_secs(20), || received().ends_with(&later)),
+        "the returning client's paste arrives whole; the program has {} bytes; log: {}",
+        received().len(),
+        daemon.log()
+    );
+    // Nothing trails in later.
+    std::thread::sleep(Duration::from_millis(500));
+    let got = received();
+    assert!(got.ends_with(&later));
+    let first = &got[..got.len() - later.len()];
+    assert!(
+        sent.starts_with(first),
+        "what arrived of the first paste is a leading part of it, each byte once: \
+         {} bytes arrived, {} sent",
+        first.len(),
+        sent.len()
+    );
+    assert!(
+        first.len() as u64 >= acked,
+        "everything the first client saw acknowledged ({acked} bytes) arrived ({})",
+        first.len()
+    );
+    assert!(
+        daemon.log().contains("replaced the session's link"),
+        "log: {}",
+        daemon.log()
+    );
+    assert_eq!(ppid(shell), Some(owner), "the same program, the same owner");
+
+    back.client.close();
+    let status = daemon.stop();
+    assert!(status.success(), "{status:?}; log: {}", daemon.log());
 }
 
 /// An owner whose host dies -- the daemon SIGKILLed -- ends its session
@@ -848,6 +1101,18 @@ fn sigterm_to_an_owner_is_a_stop() {
             "session owner {owner} exited (exit 0); drained"
         ))),
         "log: {}",
+        daemon.log()
+    );
+    // A stopped owner says its session is over: its client hears the end
+    // at once, not the silence of a lost link.
+    assert!(
+        wait_until(Duration::from_secs(5), || session
+            .events
+            .collected
+            .lock()
+            .unwrap()
+            .closed),
+        "the client of the stopped session is told it ended; log: {}",
         daemon.log()
     );
     let next = Session::connect(&daemon, [32; 16]);

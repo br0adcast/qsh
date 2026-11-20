@@ -46,6 +46,7 @@ async fn rig() -> Rig {
         login: front.login(),
         last_generation: 0,
         lifecycle: Some(lifecycle.clone()),
+        relinks: OwnerRelink::default(),
     };
     let backend = Arc::new(Capture(Mutex::new(Some(tx))));
     lifecycle.spawn(async move {
@@ -58,7 +59,7 @@ async fn rig() -> Rig {
         stalled: stalled.clone(),
         waker: waker.clone(),
     };
-    lifecycle.spawn(start_frontend(front, front_end));
+    lifecycle.spawn(start_frontend(front, Box::new(front_end), None, false));
     let front_in = front_control.remote.get().and_then(|r| r.take_inbound());
     assert!(front_in.is_some(), "the link installs the bridge's sender");
     let owner = rx.await.expect("owner io");
@@ -460,12 +461,15 @@ async fn remote_records_with_invalid_values_are_link_errors() {
     let (io, _in, _out) = SessionIo::test_pair();
     let (link, _queue) = LinkTx::new();
     let mut front = Frontend {
-        io,
+        io: &io,
         link,
         credits: Arc::new(Credits::default()),
         mirrors: HashMap::new(),
         mirrors_pruned_at: 0,
         data_parts: Vec::new(),
+        awaits_replay: false,
+        replaying: false,
+        finished: false,
     };
     let origin = Ctx {
         generation: 0,
@@ -649,7 +653,6 @@ async fn remote_oversized_admit_is_a_link_error_and_the_gate_survives() {
                 .remote
                 .get()
                 .unwrap()
-                .link
                 .send(ToOwner::Charge {
                     id,
                     op: ChargeOp::Slice {
@@ -660,18 +663,26 @@ async fn remote_oversized_admit_is_a_link_error_and_the_gate_survives() {
                 });
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        // Nothing was added, the gate's lock is intact.
-        assert_eq!(gate.pending_for_test(), 15);
+        // Nothing was added, the gate's lock is intact. The refused link is
+        // a lost one: the output record that had crossed it is given up
+        // (never sent twice), and its charge with it.
+        assert_eq!(gate.pending_for_test(), 0);
         assert!(gate.is_open());
         // The owner refused the link and parked: later output stays with it.
         send_output(&rig, &gate, &budget, ChannelOutput::Data(vec![2; 10]));
+        // (The frontend sees the refused link end; no record crosses.)
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), rig.front_out.recv())
-                .await
-                .is_err(),
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(100), rig.front_out.recv()).await,
+                Ok(Some(_))
+            ),
             "via_gate={via_gate}"
         );
-        assert_eq!(gate.pending_for_test(), 30, "parked custody stays charged");
+        assert_eq!(
+            gate.pending_for_test(),
+            15,
+            "output sent with no link up stays charged"
+        );
         drop(charge);
     }
 }
@@ -692,6 +703,7 @@ async fn remote_link_queue_stays_bounded_when_the_owner_stalls() {
         });
         tx.send(ToOwner::Unconfirmed {
             stream: 16,
+            instance: 1,
             unconfirmed: tail % 2 == 0,
         });
         tx.send(ToOwner::Charge {
@@ -816,12 +828,13 @@ async fn remote_mass_release_behind_a_stalled_writer_refunds_everything_and_ends
         login: front.login(),
         last_generation: 0,
         lifecycle: Some(lifecycle.clone()),
+        relinks: OwnerRelink::default(),
     };
     let backend = Arc::new(Capture(Mutex::new(Some(tx))));
     lifecycle.spawn(async move {
         OwnerLink::run(owner_end, backend, init).await;
     });
-    lifecycle.spawn(start_frontend(front, front_end));
+    lifecycle.spawn(start_frontend(front, Box::new(front_end), None, false));
     let sender = front_control.remote.get().unwrap().take_inbound().unwrap();
     let mut owner = rx.await.unwrap();
     let gate = owner.send_gate(16, GateKind::Pipe);
@@ -913,8 +926,32 @@ async fn remote_commit_for_another_custody_keeps_it() {
     let mut rig = rig().await;
     let gate = rig.owner.send_gate(16, GateKind::Pipe);
     let budget = TimelineBudget::new(instance(1), 0, |_| {});
-    send_output(&rig, &gate, &budget, ChannelOutput::Data(vec![1; 10]));
-    let SessionOutbound::ChannelOutput { charge, .. } = next_out(&mut rig).await else {
+    // A geometry record: unlike output bytes, it stays the owner's after
+    // the link the bad frame costs.
+    let permit = budget
+        .try_reserve(EntryClass::Ordinary, GEOMETRY_BYTES)
+        .unwrap();
+    let geometry = GeometryRecord {
+        instance: instance(1),
+        request_id: 0,
+        outcome: GeometryOutcome::Established,
+        cols: 80,
+        rows: 24,
+    };
+    send_output(
+        &rig,
+        &gate,
+        &budget,
+        ChannelOutput::Geometry(geometry, permit),
+    );
+    // The record's permits stay held: the bridge has not retired it.
+    let SessionOutbound::ChannelOutput {
+        charge,
+        output: _output,
+        gap_reserve: _reserve,
+        ..
+    } = next_out(&mut rig).await
+    else {
         panic!("typed output");
     };
     let id = charge.remote.as_ref().unwrap().id;
@@ -922,10 +959,9 @@ async fn remote_commit_for_another_custody_keeps_it() {
         .remote
         .get()
         .unwrap()
-        .link
         .send(ToOwner::Committed { id });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(gate.pending_for_test(), 15, "the charge was not dropped");
+    assert_eq!(gate.pending_for_test(), 27, "the charge was not dropped");
     drop(charge);
 }
 
@@ -1017,7 +1053,6 @@ async fn stall_writer(rig: &Rig) {
         .remote
         .get()
         .unwrap()
-        .link
         .send(ToOwner::Liveness {
             last_client_recv: 1,
         });
@@ -1070,7 +1105,7 @@ async fn remote_inflating_slices_are_link_errors_and_the_gate_survives() {
             panic!("typed output");
         };
         let id = charge.remote.as_ref().unwrap().id;
-        let link = rig.front_control.remote.get().unwrap().link.clone();
+        let link = rig.front_control.remote.get().unwrap().state().link.clone();
         // Repeated, an inflating slice would multiply the charge.
         for _ in 0..3 {
             link.send(ToOwner::Charge {
@@ -1083,16 +1118,19 @@ async fn remote_inflating_slices_are_link_errors_and_the_gate_survives() {
             });
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+        // Nothing was multiplied: the record that crossed the refused
+        // (lost) link is given up, and its whole charge returns.
         assert_eq!(
             gate.pending_for_test(),
-            25,
+            0,
             "Slice{{n: {n}, headers: {headers}}}"
         );
         send_output(&rig, &gate, &budget, ChannelOutput::Data(vec![2; 10]));
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), rig.front_out.recv())
-                .await
-                .is_err(),
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(100), rig.front_out.recv()).await,
+                Ok(Some(_))
+            ),
             "the owner parked on Slice{{n: {n}, headers: {headers}}}"
         );
         drop(charge);

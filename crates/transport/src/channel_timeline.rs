@@ -66,7 +66,7 @@ pub(crate) trait RemoteTimeline: Send + Sync {
     /// The stream's last admitted geometry checkpoint.
     fn frontier(&self, geometry: crate::channel_geometry::GeometryRecord);
     /// Whether output admitted to the current connection is still unacknowledged.
-    fn unconfirmed(&self, unconfirmed: bool);
+    fn unconfirmed(&self, instance: ChannelInstance, unconfirmed: bool);
 }
 
 /// One permit the session owner holds for a frontend: dropping this releases
@@ -178,9 +178,9 @@ impl TimelineBudget {
 
     #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
     /// Report whether admitted output is unacknowledged to a remote owner.
-    pub(crate) fn report_unconfirmed(&self, unconfirmed: bool) {
+    pub(crate) fn report_unconfirmed(&self, instance: ChannelInstance, unconfirmed: bool) {
         if let BudgetRef::Remote(remote) = &self.inner {
-            remote.unconfirmed(unconfirmed);
+            remote.unconfirmed(instance, unconfirmed);
         }
     }
 

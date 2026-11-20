@@ -267,7 +267,7 @@ async fn ready_intake_held_attach_keeps_original_permit_position_and_snapshot_pr
     );
     let mut out = Vec::new();
     assert!(matches!(
-        apply_control(
+        apply_local_control(
             &mut conn,
             &mut false,
             &mut link,

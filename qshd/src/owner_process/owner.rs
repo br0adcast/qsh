@@ -14,11 +14,13 @@ use tokio::sync::{mpsc, watch};
 use transport::channel::{About, RejectCode, UpdateAnswer, UpdateOffer, UpdateResult};
 use transport::channel_open::{ChannelOpenRegistry, OpenAdmission, RestartOpenFence};
 use transport::channel_server::{DaemonUpdates, RestartPhase, RestartSignal, UpdateTransfer};
-use transport::session_manager::{OwnerExit, OwnerInit, OwnerLink, SessionBackend, Shutdown};
+use transport::session_manager::{
+    OwnerExit, OwnerInit, OwnerLink, OwnerRelink, SessionBackend, Shutdown,
+};
 use transport::Principal;
 
 use super::wire::{self, HostInit, ToHost, ToOwner, WRITE_CHUNK};
-use super::{HOST_FD, LINK_FD, OWNER_ROLE};
+use super::{HOST_FD, LINK_FD, OWNER_ROLE, RELINK_FD};
 use crate::host_services::HOST_SERVICE_TIMEOUT;
 use crate::screen_budget::{BackingSlots, ScreenPool};
 
@@ -40,8 +42,9 @@ pub(crate) const ABANDONED_MAX: usize = 16;
 
 /// The owner role, if `args` asks for it: dispatched before every other
 /// command. Refused unless this process was started the way a daemon starts
-/// an owner -- exactly the role argument, and descriptors 3 and 4 Unix
-/// stream sockets whose peer is the parent process of the same account.
+/// an owner -- exactly the role argument, descriptors 3 and 4 Unix stream
+/// sockets and descriptor 5 a Unix sequenced-packet socket, each with the
+/// parent process of the same account as its peer.
 pub fn owner_entry(args: &[OsString]) -> Option<Result<()>> {
     if args.first().map(OsString::as_os_str) != Some(OsStr::new(OWNER_ROLE)) {
         return None;
@@ -61,8 +64,11 @@ fn run_entry() -> Result<()> {
     }
     let parent = std::os::unix::process::parent_id();
     let uid = unsafe { libc::geteuid() };
-    let link = claim(LINK_FD, parent, uid).context("claiming the owner link")?;
-    let host = claim(HOST_FD, parent, uid).context("claiming the host channel")?;
+    let link = claim(LINK_FD, libc::SOCK_STREAM, parent, uid).context("claiming the owner link")?;
+    let host =
+        claim(HOST_FD, libc::SOCK_STREAM, parent, uid).context("claiming the host channel")?;
+    let relink = claim(RELINK_FD, libc::SOCK_SEQPACKET, parent, uid)
+        .context("claiming the relink channel")?;
     let (mut a, mut b): (libc::stat, libc::stat) = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(link.as_raw_fd(), &mut a) } != 0
         || unsafe { libc::fstat(host.as_raw_fd(), &mut b) } != 0
@@ -87,7 +93,7 @@ fn run_entry() -> Result<()> {
         .enable_all()
         .build()
         .context("creating the session owner's runtime")?;
-    let result = runtime.block_on(run_owner(link, host));
+    let result = runtime.block_on(run_owner(link, host, relink, parent, uid));
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
@@ -110,8 +116,9 @@ fn int_option(fd: i32, level: i32, name: i32) -> io::Result<i32> {
     Ok(value)
 }
 
-/// Take descriptor `fd` as one end of a socket pair the parent made.
-fn claim(fd: i32, parent: u32, uid: u32) -> Result<OwnedFd> {
+/// Take descriptor `fd` as one end of a socket pair of type `kind` the
+/// parent made.
+fn claim(fd: i32, kind: i32, parent: u32, uid: u32) -> Result<OwnedFd> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
         bail!("descriptor {fd} is not open");
@@ -120,10 +127,18 @@ fn claim(fd: i32, parent: u32, uid: u32) -> Result<OwnedFd> {
     if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
         bail!("descriptor {fd}: {}", io::Error::last_os_error());
     }
+    from_parent(&owned, kind, parent, uid)?;
+    Ok(owned)
+}
+
+/// Check that `socket` is one end of a Unix socket pair of type `kind`
+/// whose other end the parent daemon made.
+fn from_parent(socket: &OwnedFd, kind: i32, parent: u32, uid: u32) -> Result<()> {
+    let fd = socket.as_raw_fd();
     if int_option(fd, libc::SOL_SOCKET, libc::SO_DOMAIN)? != libc::AF_UNIX
-        || int_option(fd, libc::SOL_SOCKET, libc::SO_TYPE)? != libc::SOCK_STREAM
+        || int_option(fd, libc::SOL_SOCKET, libc::SO_TYPE)? != kind
     {
-        bail!("descriptor {fd} is not a Unix stream socket");
+        bail!("descriptor {fd} is not a Unix socket of the expected type");
     }
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -142,7 +157,116 @@ fn claim(fd: i32, parent: u32, uid: u32) -> Result<OwnedFd> {
     if cred.pid as u32 != parent || cred.uid != uid {
         bail!("descriptor {fd} does not lead to the parent daemon");
     }
-    Ok(owned)
+    Ok(())
+}
+
+/// One packet off the relink channel: the descriptor it carries, `None`
+/// for a packet without exactly one (whatever it carried is closed), and an
+/// error at the end of input or when nothing is waiting.
+fn receive_descriptor(channel: &OwnedFd) -> io::Result<Option<OwnedFd>> {
+    let mut byte = [0u8; 1];
+    let mut vector = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    // Aligned for a control header; room for a few descriptors, so that a
+    // packet carrying more than one is seen whole and refused.
+    let mut control = [0u64; 8];
+    // SAFETY: an all-zero `msghdr` has no address and no control data.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = size_of_val(&control) as _;
+    // SAFETY: every pointer in `message` refers to a live local of the
+    // length given with it.
+    let got = unsafe {
+        libc::recvmsg(
+            channel.as_raw_fd(),
+            &mut message,
+            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    if got < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if got == 0 {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    let mut descriptors = Vec::new();
+    // SAFETY: the kernel filled `msg_controllen` bytes of `control`; the
+    // header macros walk only inside them, and every integer of an
+    // `SCM_RIGHTS` record is a descriptor this process now owns, adopted
+    // here exactly once.
+    unsafe {
+        let mut header = libc::CMSG_FIRSTHDR(&message);
+        while !header.is_null() {
+            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+                let bytes = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
+                for i in 0..bytes / size_of::<libc::c_int>() {
+                    descriptors.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
+                }
+            }
+            header = libc::CMSG_NXTHDR(&message, header);
+        }
+    }
+    if message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 || descriptors.len() != 1 {
+        return Ok(None);
+    }
+    Ok(descriptors.pop())
+}
+
+/// Take the links the daemon passes over the relink channel, and hand each
+/// to the session's owner link in place of its current one. Only a stream
+/// socket pair end the parent daemon made is accepted. Ends when the
+/// channel closes (the daemon is gone).
+async fn receive_links(channel: OwnedFd, relinks: OwnerRelink, parent: u32, uid: u32) {
+    // SAFETY: the channel is owned by the `AsyncFd` and stays open for as
+    // long as it is registered.
+    let registered = unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(channel, tokio::io::Interest::READABLE)
+    };
+    let channel = match registered {
+        Ok(channel) => channel,
+        Err(error) => {
+            crate::log::error(
+                "owner",
+                &format!("cannot watch the relink channel: {error}"),
+            );
+            return;
+        }
+    };
+    loop {
+        let Ok(mut ready) = channel.readable().await else {
+            return;
+        };
+        let link = match receive_descriptor(channel.get_ref()) {
+            Ok(link) => link,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                ready.clear_ready();
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // The daemon closed its end, or the channel broke.
+            Err(_) => return,
+        };
+        let link = link
+            .ok_or_else(|| anyhow::anyhow!("a packet without exactly one descriptor"))
+            .and_then(|link| {
+                from_parent(&link, libc::SOCK_STREAM, parent, uid)?;
+                Ok(stream(link)?)
+            });
+        match link {
+            Ok(link) => {
+                crate::log::info("owner", "the frontend replaced the session's link");
+                relinks.relink(link);
+            }
+            Err(error) => {
+                crate::log::error("owner", &format!("refused a replacement link: {error:#}"))
+            }
+        }
+    }
 }
 
 fn stream(fd: OwnedFd) -> io::Result<tokio::net::UnixStream> {
@@ -151,7 +275,13 @@ fn stream(fd: OwnedFd) -> io::Result<tokio::net::UnixStream> {
     tokio::net::UnixStream::from_std(stream)
 }
 
-async fn run_owner(link: OwnedFd, host: OwnedFd) -> Result<()> {
+async fn run_owner(
+    link: OwnedFd,
+    host: OwnedFd,
+    relink: OwnedFd,
+    parent: u32,
+    uid: u32,
+) -> Result<()> {
     let (mut read, write) = stream(host)?.into_split();
     let init = match tokio::time::timeout(INIT_TIMEOUT, wire::read_frame(&mut read)).await {
         Ok(Ok(Some(body))) => match ToOwner::decode(&body) {
@@ -210,6 +340,7 @@ async fn run_owner(link: OwnedFd, host: OwnedFd) -> Result<()> {
 
     let mut owner_init = OwnerInit::new(principal.clone(), login);
     owner_init.last_generation = last_generation;
+    let links = tokio::spawn(receive_links(relink, owner_init.relinks(), parent, uid));
     let run =
         OwnerLink::run_and_drain(stream(link)?, backend, owner_init, shutdown, DRAIN_TIMEOUT).await;
     if run.exit != OwnerExit::Shutdown {
@@ -238,6 +369,7 @@ async fn run_owner(link: OwnedFd, host: OwnedFd) -> Result<()> {
     let _ = tokio::time::timeout(FAREWELL_TIMEOUT, writer).await;
     reader.abort();
     signals.abort();
+    links.abort();
     // Nothing reaches the host any more: whatever was dropped since the
     // last report, and every later record, goes to standard error.
     relay.close();

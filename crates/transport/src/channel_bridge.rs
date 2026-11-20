@@ -161,6 +161,19 @@ impl SnapshotMailbox {
         drop(rejected);
         !overflow
     }
+    /// Frontend side of a link that replaced an earlier one: the owner's
+    /// typed records continue from its queue position `position`, and
+    /// whatever the slot held was published to the bridge that is gone.
+    pub(super) fn rebase(&self, position: u64) {
+        let old = {
+            let mut slot = self.0.lock().expect("resume snapshot");
+            slot.produced = position;
+            slot.observed = position;
+            slot.notification_pending = false;
+            slot.value.take()
+        };
+        drop(old);
+    }
     pub(super) fn observed(&self, position: u64) {
         if position == 0 {
             return;
@@ -314,6 +327,15 @@ struct Stream {
     // The last `data_end`/`gap_end` confirmation state reported to a remote owner.
     unconfirmed_reported: bool,
 }
+/// One stream's bridge state past its queue, as a session owner kept it for
+/// a rebuild (`ChannelBridge::restore`).
+#[derive(Default)]
+pub(super) struct Restored {
+    pub(super) frontier: Option<GeometryRecord>,
+    pub(super) unconfirmed: bool,
+    pub(super) marker: bool,
+    pub(super) gap: bool,
+}
 #[derive(Default)]
 pub(super) struct ChannelBridge {
     pub(super) snapshots: SnapshotMailbox,
@@ -349,6 +371,119 @@ impl ChannelBridge {
             ..Self::default()
         }
     }
+    /// Rebuild after a link to a session owner was replaced: stream
+    /// `instance` existed in the earlier bridge. Its state starts here with
+    /// the instance's gap reserve and gate, as the first record of the
+    /// instance started it there; the replayed items of the stream follow
+    /// through `push`.
+    pub(super) fn restore_stream(
+        &mut self,
+        stream: u8,
+        instance: ChannelInstance,
+        gate: Arc<SendGate>,
+        reserve: TimelinePermit,
+    ) {
+        if self
+            .retired
+            .get(&stream)
+            .is_some_and(|old| *old >= instance.get())
+            || self
+                .streams
+                .get(&stream)
+                .is_some_and(|old| old.instance.get() >= instance.get())
+        {
+            return; // The reserve goes back to its owner.
+        }
+        self.ready.remove(&stream);
+        self.delivered.remove(&stream);
+        self.streams.insert(
+            stream,
+            Stream {
+                instance,
+                gate,
+                budget: reserve.budget(),
+                _gap_reserve: reserve,
+                gap_charge: None,
+                bootstrap_charge: None,
+                fifo: VecDeque::new(),
+                delivered_marker: None,
+                terminal_gap: None,
+                terminal_gap_seen: false,
+                frontier: None,
+                data_end: 0,
+                gap_end: 0,
+                bootstrap: self.target.is_some(),
+                abandoned_data: false,
+                screened: self.declarations.get(&stream).copied().unwrap_or(false),
+                ended: false,
+                waiting_geometry: false,
+                hot_blocked: false,
+                unconfirmed_reported: false,
+            },
+        );
+    }
+
+    /// Rebuild, after the replayed items went through `push`: what the
+    /// earlier bridge had recorded about `stream` past its queue. `frontier`
+    /// is its last admitted geometry; `unconfirmed` says output it admitted
+    /// was not acknowledged (or a gap for such output was still owed), so
+    /// the next attachment owes the gap; a `marker` or `gap` that was past
+    /// its admission goes back to its retained place, from where `attach`
+    /// rearms it as it does in a bridge that lived on. Followed by `attach`.
+    pub(super) fn restore(&mut self, stream: u8, restored: Restored) {
+        let Some(state) = self.streams.get_mut(&stream) else {
+            return;
+        };
+        if let Some(frontier) = restored.frontier.filter(|g| g.instance == state.instance) {
+            state.frontier = Some(frontier);
+        }
+        if restored.unconfirmed {
+            state.abandoned_data = true;
+            // The owner still holds the flag: the first refresh that finds
+            // the debt settled reports it.
+            state.unconfirmed_reported = true;
+        }
+        if restored.marker && state.delivered_marker.is_none() {
+            if let Some(at) = state
+                .fifo
+                .iter()
+                .position(|q| matches!(q.output, Item::Record(ChannelOutput::DeliveryMarker(..))))
+            {
+                state.delivered_marker = state.fifo.remove(at);
+            }
+        }
+        if restored.gap && state.terminal_gap.is_none() {
+            if let Some(at) = state
+                .fifo
+                .iter()
+                .position(|q| matches!(q.output, Item::Record(ChannelOutput::OutputGap(..))))
+            {
+                let mut gap = state.fifo.remove(at).expect("found above");
+                // Its admission transferred the charge; `attach` charges
+                // the rearmed record anew.
+                gap.charge = None;
+                state.terminal_gap = Some(gap);
+            }
+        }
+    }
+
+    /// Before an orderly handoff to a new bridge: tell a remote owner, per
+    /// stream, exactly whether the connection being replaced leaves output
+    /// unacknowledged, as `attach` would have found it.
+    pub(super) fn report_unconfirmed(&mut self, conn: &Connection) {
+        for (&stream, state) in &mut self.streams {
+            let progress = conn.stream_progress(stream);
+            let acknowledged = progress.queued.saturating_sub(progress.unacked);
+            let unconfirmed = state.abandoned_data
+                || state.data_end > acknowledged
+                || state.gap_end > acknowledged;
+            if unconfirmed != state.unconfirmed_reported {
+                state.unconfirmed_reported = unconfirmed;
+                state.budget.report_unconfirmed(state.instance, unconfirmed);
+            }
+        }
+    }
+
     pub(super) fn observe_discards(&mut self, conn: &mut Connection) {
         for (stream, instance) in conn.take_discarded_output() {
             if let Some(state) = self
@@ -819,10 +954,15 @@ impl ChannelBridge {
             if state.gap_end <= acknowledged {
                 state.gap_end = 0;
             }
-            let unconfirmed = state.data_end > acknowledged || state.gap_end > acknowledged;
+            // What the next attachment would owe a gap for: output this
+            // connection has not acknowledged, or a gap still owed for an
+            // earlier one's.
+            let unconfirmed = state.abandoned_data
+                || state.data_end > acknowledged
+                || state.gap_end > acknowledged;
             if unconfirmed != state.unconfirmed_reported {
                 state.unconfirmed_reported = unconfirmed;
-                state.budget.report_unconfirmed(unconfirmed);
+                state.budget.report_unconfirmed(state.instance, unconfirmed);
             }
             // Parked tails are frozen, not artificially opened. Attach removes
             // their charge; pending bytes and metadata holds remain authoritative.

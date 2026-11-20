@@ -3382,7 +3382,7 @@ async fn a_warm_attach_keeps_the_declared_stream_classes() {
     let mut classes = BTreeMap::new();
     classes.insert(14u8, StreamClass::Bulk);
     let mut out = Vec::new();
-    apply_control(
+    apply_local_control(
         &mut conn,
         &mut parked,
         &mut link,
@@ -3411,7 +3411,7 @@ async fn a_class_the_backend_declares_reaches_this_connection_and_the_next() {
     let mut link = BackendLink::new(tx, Consumption::OnDelivery);
     let mut parked = false;
     let mut out = Vec::new();
-    apply_control(
+    apply_local_control(
         &mut conn,
         &mut parked,
         &mut link,
@@ -4433,7 +4433,7 @@ async fn a_credit_freed_by_a_long_wait_for_the_backend_repeats_an_rto_after_it_w
         let now = Instant::now();
         let mut out = Vec::new();
         for dg in to_server.drain(..) {
-            on_routed_datagram(
+            on_local_routed_datagram(
                 &mut conn,
                 &mut parked,
                 &mut ctl_rx,
@@ -4546,7 +4546,7 @@ async fn a_turn_answers_acks_and_pings_while_the_backend_is_full() {
 
     let mut out = Vec::new();
     for dg in &to_server {
-        on_routed_datagram(
+        on_local_routed_datagram(
             &mut conn,
             &mut parked,
             &mut ctl_rx,
@@ -4632,7 +4632,7 @@ async fn bytes_waiting_at_a_reattach_are_owed_to_the_connection_that_delivered_t
     // A warm reattach brings B, which delivers 2000 bytes of its own:
     // they wait behind A's.
     let (mut client_b, conn_b) = explicit_pair(&server_kp, 20, peer, now);
-    apply_control(
+    apply_local_control(
         &mut conn,
         &mut parked,
         &mut link,
@@ -4721,7 +4721,7 @@ async fn bytes_waiting_at_a_reattach_credit_the_new_connection_nothing_on_delive
     );
 
     let (mut client_b, conn_b) = explicit_pair(&server_kp, 22, peer, now);
-    apply_control(
+    apply_local_control(
         &mut conn,
         &mut parked,
         &mut link,
@@ -5825,7 +5825,7 @@ async fn a_class_reset_to_interactive_is_not_brought_back_by_a_reattach() {
     let mut link = BackendLink::new(tx, Consumption::OnDelivery);
     let mut parked = false;
     let mut out = Vec::new();
-    apply_control(
+    apply_local_control(
         &mut conn,
         &mut parked,
         &mut link,
@@ -11989,7 +11989,7 @@ async fn the_datagram_arm_takes_a_pending_attach_first() {
     let mut out = Vec::new();
     let mut classes = BTreeMap::new();
     classes.insert(14u8, StreamClass::Bulk);
-    on_routed_datagram(
+    on_local_routed_datagram(
         &mut conn,
         &mut parked,
         &mut ctl_rx,
@@ -12092,7 +12092,7 @@ async fn two_attaches_taken_back_to_back_do_not_carry_bytes_the_backend_never_sa
     let mut parked = true;
     let mut out = Vec::new();
     let now = Instant::now();
-    on_routed_datagram(
+    on_local_routed_datagram(
         &mut conn,
         &mut parked,
         &mut ctl_rx,
@@ -12129,7 +12129,7 @@ async fn two_attaches_taken_back_to_back_do_not_carry_bytes_the_backend_never_sa
         .map_err(|_| "the receiver is here")
         .unwrap();
     let now = Instant::now();
-    on_routed_datagram(
+    on_local_routed_datagram(
         &mut conn,
         &mut parked,
         &mut ctl_rx,
@@ -12427,7 +12427,7 @@ async fn a_warm_attach_lifts_probations_cap_before_its_queued_datagrams() {
     let (tx, _rx) = mpsc::channel::<SessionInbound>(4);
     let mut link = BackendLink::new(tx, Consumption::OnDelivery);
     let mut out = Vec::new();
-    apply_control(
+    apply_local_control(
         &mut conn,
         &mut parked,
         &mut link,
