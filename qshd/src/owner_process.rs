@@ -2,30 +2,34 @@
 //! session's channel backend in an owner process of its own, the direct
 //! parent of that session's shells and their PTYs.
 //!
-//! The daemon (the host and, for now, also the network frontend) starts one
-//! owner per cold-created session, from the image it holds since its own
-//! start ([`SelfImage`]), never from the path on disk: a package or update
-//! that replaces the file cannot give a session another build. It starts it
-//! by `posix_spawn` only -- no Rust code runs between the fork and the exec
-//! -- with exactly three descriptors besides the standard ones:
+//! The daemon -- the host ([`crate::host`]), whose network frontend is a
+//! process of its own -- starts one owner per cold-created session, from
+//! the image it holds since its own start ([`SelfImage`]), never from the
+//! path on disk: a package or update that replaces the file cannot give a
+//! session another build. It starts it by `posix_spawn` only -- no Rust code
+//! runs between the fork and the exec -- with exactly three descriptors
+//! besides the standard ones:
 //!
 //! - **3**, the owner's end of the frontend/owner link
-//!   (`transport::session_manager::OwnerLink`);
+//!   (`transport::session_manager::OwnerLink`); the host passes the other
+//!   end to its frontend process;
 //! - **4**, the host channel ([`wire`]): `Init` first, then `Stop` and the
 //!   restart signal from the host, update requests, `End` and the final
 //!   `Drained` receipt from the owner;
 //! - **5**, the relink channel: a sequenced-packet socket over which the
-//!   daemon passes the owner, one descriptor per packet, the owner's end of
+//!   host passes the owner, one descriptor per packet, the owner's end of
 //!   each link that replaces its current one.
 //!
 //! **Replaced links.** A link carries one attachment of the frontend's
 //! bridge. At every warm reattach the frontend retires the session's link
-//! in order and passes its owner a new one ([`OwnerRelinker`]); the owner
-//! replays its custody on it, and the frontend builds the new connection's
-//! bridge from that replay. A link that is lost -- the socket died, or its
-//! frontend did -- is replaced the same way at the client's next warm
-//! return: until then the owner keeps the session's backend and shells
-//! running, and everything they send. An owner ends when its session ends
+//! in order and asks the host for a new one: the host makes the socket
+//! pair, passes the owner its end over the relink channel and the frontend
+//! the other. The owner replays its custody on it, and the frontend builds
+//! the new connection's bridge from that replay. A link that is lost -- the
+//! socket died, or its frontend process did -- is replaced the same way at
+//! the client's next warm return, also through a frontend process that did
+//! not exist when the session began: until then the owner keeps the
+//! session's backend and shells running, and everything they send. An owner ends when its session ends
 //! (the backend finished), on `Stop`, on `SIGTERM`/`SIGINT`, or when the
 //! host channel closes (the host died: its sessions are lost, as when a
 //! single-process daemon dies). Then it drains every task and worker of its session and
@@ -101,7 +105,7 @@ use nix::libc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use transport::channel_server::{DaemonUpdates, RestartSignal, UpdateTransfer};
-use transport::session_manager::{LinkIo, OwnerInit, OwnerStarter, StartedOwner};
+use transport::session_manager::OwnerInit;
 use transport::Principal;
 
 use crate::host_services::{HostServices, OwnerAccount};
@@ -128,7 +132,7 @@ fn last_error() -> io::Error {
 
 /// A duplicate of `fd` numbered 10 or above, close-on-exec: never one of
 /// the numbers a spawn's file actions write to.
-fn dup_high(fd: &OwnedFd) -> io::Result<OwnedFd> {
+pub(crate) fn dup_high(fd: &impl AsRawFd) -> io::Result<OwnedFd> {
     let raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
     if raw < 0 {
         return Err(last_error());
@@ -206,28 +210,13 @@ fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
 }
 
-fn socket_pair_of(kind: nix::sys::socket::SockType) -> io::Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn socket_pair_of(kind: nix::sys::socket::SockType) -> io::Result<(OwnedFd, OwnedFd)> {
     use nix::sys::socket::{socketpair, AddressFamily, SockFlag};
     socketpair(AddressFamily::Unix, kind, None, SockFlag::SOCK_CLOEXEC).map_err(io::Error::from)
 }
 
-fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
+pub(crate) fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
     socket_pair_of(nix::sys::socket::SockType::Stream)
-}
-
-/// The frontend's handle on one running owner: it replaces the owner's
-/// link (`transport::session_manager::FrontendRelink`).
-///
-/// A replacement is one new stream socket pair. The owner's end crosses the
-/// relink channel as a descriptor, in one packet of one byte; the send never
-/// waits (an owner that has stopped taking links fails it, and the session
-/// then ends). At most one packet per warm reattach of the session is ever
-/// queued there.
-pub struct OwnerRelinker {
-    /// The daemon's end of the relink channel.
-    channel: OwnedFd,
-    /// Refers to exactly this owner, reaped or not.
-    pidfd: OwnedFd,
 }
 
 /// How long a frontend that lost a link waits to see its owner's exit
@@ -235,42 +224,28 @@ pub struct OwnerRelinker {
 /// a moment before its exit shows.
 const OWNER_EXIT_GRACE: Duration = Duration::from_millis(500);
 
-impl transport::session_manager::FrontendRelink for OwnerRelinker {
-    fn exited(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
-        Box::pin(async move {
-            let Ok(pidfd) = self.pidfd.try_clone() else {
-                return false;
-            };
-            // SAFETY: the duplicate is owned by the `AsyncFd` and stays
-            // open for as long as it is registered.
-            let registered = unsafe {
-                tokio::io::unix::AsyncFd::register_with_interest(
-                    pidfd,
-                    tokio::io::Interest::READABLE,
-                )
-            };
-            let Ok(pidfd) = registered else {
-                return false;
-            };
-            // A pidfd reads as ready once its process has exited.
-            tokio::time::timeout(OWNER_EXIT_GRACE, pidfd.readable())
-                .await
-                .is_ok()
-        })
-    }
-
-    fn relink(&self) -> io::Result<Box<dyn LinkIo>> {
-        let (front, owner) = socket_pair()?;
-        // Fails at once when the owner has closed its end (it is gone).
-        send_descriptor(&self.channel, &owner)?;
-        let front = UnixStream::from(front);
-        front.set_nonblocking(true)?;
-        Ok(Box::new(tokio::net::UnixStream::from_std(front)?))
-    }
+/// Whether the owner `pidfd` refers to has exited, waiting at most
+/// [`OWNER_EXIT_GRACE`] for an exit that is under way to show.
+pub(crate) async fn owner_exited(pidfd: &OwnedFd) -> bool {
+    let Ok(pidfd) = pidfd.try_clone() else {
+        return false;
+    };
+    // SAFETY: the duplicate is owned by the `AsyncFd` and stays open for as
+    // long as it is registered.
+    let registered = unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(pidfd, tokio::io::Interest::READABLE)
+    };
+    let Ok(pidfd) = registered else {
+        return false;
+    };
+    // A pidfd reads as ready once its process has exited.
+    tokio::time::timeout(OWNER_EXIT_GRACE, pidfd.readable())
+        .await
+        .is_ok()
 }
 
 /// Pass `descriptor` over `channel` in one packet, without waiting.
-fn send_descriptor(channel: &OwnedFd, descriptor: &OwnedFd) -> io::Result<()> {
+pub(crate) fn send_descriptor(channel: &OwnedFd, descriptor: &OwnedFd) -> io::Result<()> {
     let byte = [0u8; 1];
     let mut vector = libc::iovec {
         iov_base: byte.as_ptr() as *mut libc::c_void,
@@ -313,42 +288,28 @@ fn send_descriptor(channel: &OwnedFd, descriptor: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Start one session owner from `image`.
-///
-/// Everything the child needs is prepared here, in the parent: the
-/// arguments, the environment (without the reserved launch and handover
-/// variables), the file actions that put the two channel ends on 3 and 4
-/// and `/dev/null` on standard input and output, default dispositions for
-/// every signal (so `SIGCHLD` does not auto-reap) and an empty signal mask,
-/// and a process group of its own (a terminal's `^C` meant for a foreground
-/// `serve` goes to the daemon, which stops the owners itself). Then one
-/// `posix_spawn`, under the daemon's spawn permit (which the caller holds,
-/// proven by `_permit`) so no exec window is open meanwhile.
-pub(crate) fn spawn_owner(
+/// Start this daemon's image in `role` (its only argument), with each of
+/// `descriptors` on the number given with it -- every source numbered 10 or
+/// above (`dup_high`), so no action overwrites one -- `/dev/null` on
+/// standard input and output, the daemon's environment without the
+/// reserved launch and handover variables, default dispositions for every
+/// signal (so `SIGCHLD` does not auto-reap), an empty signal mask, and a
+/// process group of its own. One `posix_spawn`, under the daemon's spawn
+/// permit (`_permit`), so no exec window is open meanwhile. Returns the
+/// unreaped child's pid and a descriptor that refers to exactly it.
+pub(crate) fn spawn_role(
     image: &SelfImage,
-    init: &HostInit,
+    role: &str,
+    descriptors: &[(&OwnedFd, i32)],
     _permit: &std::sync::RwLockReadGuard<'static, ()>,
-) -> io::Result<OwnerChild> {
+) -> io::Result<(u32, OwnedFd)> {
     use std::os::unix::ffi::OsStrExt;
-    let (link_front, link_owner) = socket_pair()?;
-    let (host_host, host_owner) = socket_pair()?;
-    let (relink_host, relink_owner) = socket_pair_of(nix::sys::socket::SockType::SeqPacket)?;
-    let link_owner = dup_high(&link_owner)?;
-    let host_owner = dup_high(&host_owner)?;
-    let relink_owner = dup_high(&relink_owner)?;
-    let mut host = UnixStream::from(host_host);
-    // Small, into an empty socket buffer: it waits for the owner there.
-    host.write_all(
-        &ToOwner::Init(init.clone())
-            .encode()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
-    )?;
-
+    debug_assert!(descriptors.iter().all(|(fd, _)| fd.as_raw_fd() >= 10));
     let to_c = |bytes: &[u8]| {
         CString::new(bytes).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
     };
     let program = to_c(format!("/proc/self/fd/{}", image.fd.as_raw_fd()).as_bytes())?;
-    let args = [to_c(b"qshd")?, to_c(OWNER_ROLE.as_bytes())?];
+    let args = [to_c(b"qshd")?, to_c(role.as_bytes())?];
     let mut env = Vec::new();
     for (name, value) in std::env::vars_os() {
         if name == crate::service_stage::LAUNCH_ENV || name == crate::handover::HANDOVER_FD_ENV {
@@ -375,15 +336,11 @@ pub(crate) fn spawn_owner(
 
     let mut actions = SpawnActions(unsafe { std::mem::zeroed() });
     check(unsafe { libc::posix_spawn_file_actions_init(&mut actions.0) })?;
-    check(unsafe {
-        libc::posix_spawn_file_actions_adddup2(&mut actions.0, link_owner.as_raw_fd(), LINK_FD)
-    })?;
-    check(unsafe {
-        libc::posix_spawn_file_actions_adddup2(&mut actions.0, host_owner.as_raw_fd(), HOST_FD)
-    })?;
-    check(unsafe {
-        libc::posix_spawn_file_actions_adddup2(&mut actions.0, relink_owner.as_raw_fd(), RELINK_FD)
-    })?;
+    for (descriptor, number) in descriptors {
+        check(unsafe {
+            libc::posix_spawn_file_actions_adddup2(&mut actions.0, descriptor.as_raw_fd(), *number)
+        })?;
+    }
     check(unsafe {
         libc::posix_spawn_file_actions_addopen(&mut actions.0, 0, null.as_ptr(), libc::O_RDONLY, 0)
     })?;
@@ -435,9 +392,52 @@ pub(crate) fn spawn_owner(
             return Err(error);
         }
     };
+    Ok((pid as u32, pidfd))
+}
+
+/// Start one session owner from `image`.
+///
+/// Everything the child needs is prepared here, in the parent: the
+/// arguments, the environment (without the reserved launch and handover
+/// variables), the file actions that put the two channel ends on 3 and 4
+/// and `/dev/null` on standard input and output, default dispositions for
+/// every signal (so `SIGCHLD` does not auto-reap) and an empty signal mask,
+/// and a process group of its own (a terminal's `^C` meant for a foreground
+/// `serve` goes to the daemon, which stops the owners itself). Then one
+/// `posix_spawn`, under the daemon's spawn permit (which the caller holds,
+/// proven by `_permit`) so no exec window is open meanwhile.
+pub(crate) fn spawn_owner(
+    image: &SelfImage,
+    init: &HostInit,
+    _permit: &std::sync::RwLockReadGuard<'static, ()>,
+) -> io::Result<OwnerChild> {
+    let (link_front, link_owner) = socket_pair()?;
+    let (host_host, host_owner) = socket_pair()?;
+    let (relink_host, relink_owner) = socket_pair_of(nix::sys::socket::SockType::SeqPacket)?;
+    let link_owner = dup_high(&link_owner)?;
+    let host_owner = dup_high(&host_owner)?;
+    let relink_owner = dup_high(&relink_owner)?;
+    let mut host = UnixStream::from(host_host);
+    // Small, into an empty socket buffer: it waits for the owner there.
+    host.write_all(
+        &ToOwner::Init(init.clone())
+            .encode()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+    )?;
+
+    let (pid, pidfd) = spawn_role(
+        image,
+        OWNER_ROLE,
+        &[
+            (&link_owner, LINK_FD),
+            (&host_owner, HOST_FD),
+            (&relink_owner, RELINK_FD),
+        ],
+        _permit,
+    )?;
     drop((link_owner, host_owner, relink_owner));
     Ok(OwnerChild {
-        pid: pid as u32,
+        pid,
         pidfd,
         link: UnixStream::from(link_front),
         host,
@@ -551,6 +551,14 @@ impl OwnerFleet {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Ask owner `pid` to stop, if it still runs: its session ends, it
+    /// drains and is reaped as at a stop of the daemon.
+    pub(crate) fn stop_owner(&self, pid: u32) {
+        if let Some(slot) = self.lock().owners.get(&pid) {
+            slot.request_stop();
+        }
     }
 
     /// Count `slot`'s owner as unproved, once whatever happens later.
@@ -722,13 +730,31 @@ impl crate::update::OwnerStop for OwnerFleet {
 }
 
 /// The host side of a personal daemon's owners: it starts one per session
-/// (as the frontend's [`OwnerStarter`]) and serves each one's host channel.
+/// ([`OwnerHost::start_raw`], when the frontend asks the host for one) and
+/// serves each one's host channel.
 pub struct OwnerHost {
     image: SelfImage,
     log_dir: Option<PathBuf>,
     daemon: Option<Arc<dyn DaemonUpdates>>,
     fleet: Arc<OwnerFleet>,
     services: Arc<HostServices>,
+    /// Told the pid of an owner whose session ended, and again when the
+    /// owner has been reaped (the host's catalog).
+    ended: Option<OwnerEnded>,
+}
+
+/// See [`OwnerHost::on_ended`].
+pub(crate) type OwnerEnded = Arc<dyn Fn(u32) + Send + Sync>;
+
+/// A started owner as the host holds it, before any frontend has its link.
+pub(crate) struct RawOwner {
+    pub(crate) pid: u32,
+    /// Refers to exactly this owner, reaped or not.
+    pub(crate) pidfd: OwnedFd,
+    /// The frontend's end of the owner's first link.
+    pub(crate) link: OwnedFd,
+    /// The host's end of the relink channel.
+    pub(crate) relink: OwnedFd,
 }
 
 impl OwnerHost {
@@ -745,12 +771,27 @@ impl OwnerHost {
             daemon,
             fleet,
             services,
+            ended: None,
         }
+    }
+
+    /// `ended` hears the pid of every owner whose session ended, and again
+    /// once that owner has been reaped.
+    pub(crate) fn on_ended(mut self, ended: OwnerEnded) -> OwnerHost {
+        self.ended = Some(ended);
+        self
+    }
+
+    pub(crate) fn fleet(&self) -> &Arc<OwnerFleet> {
+        &self.fleet
     }
 }
 
-impl OwnerStarter for OwnerHost {
-    fn start(&self, init: OwnerInit) -> io::Result<StartedOwner> {
+impl OwnerHost {
+    /// Start one owner for `init`'s session and supervise it: its envelope
+    /// lease, its host channel, its reaping. The caller gets the ends a
+    /// frontend needs, and hands them on to its frontend process.
+    pub(crate) fn start_raw(&self, init: OwnerInit) -> io::Result<RawOwner> {
         let host_init = HostInit {
             principal: init.principal.clone(),
             login: init.login,
@@ -817,10 +858,7 @@ impl OwnerStarter for OwnerHost {
             relink,
         } = child;
         // The frontend's own reference to exactly this owner.
-        let relinker = pidfd.try_clone().map(|pidfd| OwnerRelinker {
-            channel: relink,
-            pidfd,
-        });
+        let front_pidfd = pidfd.try_clone();
         tokio::spawn(supervise(Supervised {
             fleet: self.fleet.clone(),
             slot: slot.clone(),
@@ -830,16 +868,16 @@ impl OwnerStarter for OwnerHost {
             daemon: self.daemon.clone(),
             principal: init.principal,
             account,
+            ended: self.ended.clone(),
         }));
-        let link = link
-            .set_nonblocking(true)
-            .and_then(|()| tokio::net::UnixStream::from_std(link));
-        match (link, relinker) {
-            (Ok(link), Ok(relinker)) => Ok(StartedOwner {
-                link: Box::new(link),
-                relink: Arc::new(relinker),
+        match front_pidfd {
+            Ok(pidfd) => Ok(RawOwner {
+                pid,
+                pidfd,
+                link: OwnedFd::from(link),
+                relink,
             }),
-            (Err(error), _) | (_, Err(error)) => {
+            Err(error) => {
                 slot.request_stop();
                 Err(error)
             }
@@ -860,6 +898,7 @@ struct Supervised {
     /// What the owner holds of the daemon-wide limits; freed when it has
     /// been reaped.
     account: OwnerAccount,
+    ended: Option<OwnerEnded>,
 }
 
 type Transfers = Arc<Mutex<HashMap<u64, Box<dyn UpdateTransfer>>>>;
@@ -937,6 +976,7 @@ async fn supervise(s: Supervised) {
         daemon,
         principal,
         account,
+        ended,
     } = s;
     let host = host
         .set_nonblocking(true)
@@ -1107,6 +1147,9 @@ async fn supervise(s: Supervised) {
                 crate::log::info("qshd", &format!("session owner {pid}: session ended"));
                 // No longer a session that a restart waits for.
                 signal = None;
+                if let Some(ended) = &ended {
+                    ended(pid);
+                }
             }
             ToHost::Drained(result) => receipt = Some(result),
             ToHost::Log {
@@ -1144,6 +1187,9 @@ async fn supervise(s: Supervised) {
     }
     // Reaped: whatever it still held of the daemon-wide limits is free.
     drop(account);
+    if let Some(ended) = &ended {
+        ended(pid);
+    }
     fleet.remove(pid, &slot, if proved { Ok(()) } else { Err(text) });
 }
 
@@ -1204,7 +1250,7 @@ fn with_transfer<T>(
 
 /// Wait for exactly this child to exit, then reap it: how it ended, and
 /// whether that was exit status 0.
-async fn reap(pid: u32, pidfd: OwnedFd) -> (String, bool) {
+pub(crate) async fn reap(pid: u32, pidfd: OwnedFd) -> (String, bool) {
     // SAFETY: the pidfd is owned by the `AsyncFd` and stays open for as
     // long as it is registered.
     match unsafe {
@@ -1366,7 +1412,7 @@ mod tests {
             identity: "fixture".into(),
             incarnation: 0,
         };
-        let refused = host.start(OwnerInit::new(principal, [0; 16])).err();
+        let refused = host.start_raw(OwnerInit::new(principal, [0; 16])).err();
         let refused = refused.expect("no envelope: no owner");
         assert!(refused.to_string().contains("envelope"), "{refused}");
         assert!(fleet.is_empty(), "nothing was spawned");

@@ -317,6 +317,7 @@ impl Rig {
             last_generation: 0,
             lifecycle: Some(lifecycle.clone()),
             relinks: OwnerRelink::default(),
+            abandon: Shutdown::default(),
         };
         let relink = Arc::new(TestRelink {
             owner: init.relinks(),
@@ -1266,6 +1267,7 @@ async fn an_owner_whose_writes_fail_still_reads_the_link_to_its_retire() {
         last_generation: 0,
         lifecycle: Some(lifecycle.clone()),
         relinks: OwnerRelink::default(),
+        abandon: Shutdown::default(),
     };
     let relinks = init.relinks();
     let (front_end, owner_end) = loopback();
@@ -1347,4 +1349,258 @@ async fn an_owner_whose_writes_fail_still_reads_the_link_to_its_retire() {
         }
     }
     assert_eq!(replayed, [b"crossed".to_vec()]);
+}
+
+/// An owner whose io the test holds, behind a link the test drives by hand:
+/// the frontend's end of the first link, the handle that gives the owner
+/// its next ones, and how the owner's run ended.
+async fn hand_driven_owner() -> (
+    SessionIo,
+    LinkEnd,
+    OwnerRelink,
+    oneshot::Receiver<OwnerExit>,
+) {
+    let lifecycle = Lifecycle::new(Shutdown::default());
+    let (tx, rx) = oneshot::channel();
+    let init = OwnerInit {
+        principal: Principal {
+            uid: 0,
+            name: "test".to_string(),
+            identity: "test".to_string(),
+            incarnation: 0,
+        },
+        login: [0; 16],
+        last_generation: 0,
+        lifecycle: Some(lifecycle.clone()),
+        relinks: OwnerRelink::default(),
+        abandon: Shutdown::default(),
+    };
+    let relinks = init.relinks();
+    let (front_end, owner_end) = loopback();
+    let backend = Arc::new(Capture(Mutex::new(Some(tx))));
+    let (exit_tx, exit_rx) = oneshot::channel();
+    lifecycle.spawn(async move {
+        let _ = exit_tx.send(OwnerLink::run(owner_end, backend, init).await);
+    });
+    (rx.await.expect("owner io"), front_end, relinks, exit_rx)
+}
+
+/// The backend ends while a frontend is handing its session over to a new
+/// link: `Finished` goes out on the old link, which the frontend no longer
+/// reads -- it retires that link behind the new one. The new link must
+/// still hear the end (after the replay of what is left), and the owner
+/// must exit once that link closes, instead of idling until the daemon
+/// stops with a new bridge waiting for a replay that never comes.
+#[tokio::test]
+async fn a_backend_that_ends_during_a_handoff_is_heard_on_the_next_link() {
+    let (owner, front_end, relinks, exit) = hand_driven_owner().await;
+    let (read, mut write) = tokio::io::split(front_end);
+    let mut reader = LinkReader::new(read);
+
+    // The backend finishes: the owner says so on the link it has.
+    drop(owner);
+    while !matches!(next_frame(&mut reader).await, ToFrontend::Finished) {}
+
+    // The frontend, already replacing the link, never read that: it hands
+    // over the next link and retires this one.
+    let (next_front, next_owner) = loopback();
+    relinks.relink(next_owner);
+    let mut frames = Vec::new();
+    encode(&ToOwner::Retire, &mut frames).unwrap();
+    write.write_all(&frames).await.unwrap();
+
+    let (read, write) = tokio::io::split(next_front);
+    let mut reader = LinkReader::new(read);
+    assert!(matches!(
+        next_frame(&mut reader).await,
+        ToFrontend::ReplayStart { .. }
+    ));
+    while !matches!(next_frame(&mut reader).await, ToFrontend::ReplayDone) {}
+    assert!(
+        matches!(next_frame(&mut reader).await, ToFrontend::Finished),
+        "the new link hears that the session ended"
+    );
+    // Its frontend closes it: nothing is left for the owner to do.
+    drop((reader, write));
+    let exit = tokio::time::timeout(Duration::from_secs(2), exit)
+        .await
+        .expect("the owner exits")
+        .unwrap();
+    assert_eq!(exit, OwnerExit::Finished);
+}
+
+/// The same end, but no link follows the retired one (its frontend died
+/// right behind the `Retire`): the owner waits for the successor a retired
+/// link always has, for a bounded time, and then exits on its own.
+#[tokio::test(start_paused = true)]
+async fn a_finished_owner_whose_retired_link_has_no_successor_exits() {
+    let (owner, front_end, _relinks, exit) = hand_driven_owner().await;
+    let (read, mut write) = tokio::io::split(front_end);
+    let mut reader = LinkReader::new(read);
+    drop(owner);
+    while !matches!(next_frame(&mut reader).await, ToFrontend::Finished) {}
+    let mut frames = Vec::new();
+    encode(&ToOwner::Retire, &mut frames).unwrap();
+    write.write_all(&frames).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let exit = tokio::time::timeout(RETIRE_WITHIN * 2, exit)
+        .await
+        .expect("the owner exits without a successor link")
+        .unwrap();
+    assert_eq!(exit, OwnerExit::LinkLost);
+    assert!(started.elapsed() >= RETIRE_WITHIN, "it waited for one");
+}
+
+/// A link handed over while the current one is still up waits for that
+/// one's `Retire` -- but not for good: a frontend that hangs with its link
+/// open must not hold the session's next link. After `RETIRE_WITHIN` the
+/// owner takes the old link for lost and replays on the new one, in time
+/// for a frontend that waits `REBUILD_TIMEOUT` for the replay.
+#[tokio::test(start_paused = true)]
+async fn a_replaced_link_that_never_ends_is_taken_for_lost_after_a_deadline() {
+    let mut rig = Rig::new().await;
+    rig.open(80);
+    rig.data(b"before");
+    rig.drain().await;
+
+    // The next link arrives; the old frontend neither retires its link nor
+    // closes it.
+    let started = tokio::time::Instant::now();
+    let link = rig.relink.link();
+    let mut front = frontend(link, &rig.relink, true);
+    let rebuilt = tokio::time::timeout(
+        REBUILD_TIMEOUT,
+        rebuild_from_owner(&mut front.out, front.mailbox.clone(), 0),
+    )
+    .await
+    .expect("the owner replays on the new link before the frontend gives up");
+    assert!(rebuilt.is_some(), "a rebuilt bridge");
+    let waited = started.elapsed();
+    assert!(
+        waited >= RETIRE_WITHIN,
+        "the old link had its time ({waited:?})"
+    );
+    // The old link was closed under its frontend: it hears a lost link.
+    rig.intake().await;
+    assert!(rig.front.lost, "the hung frontend's link is over");
+}
+
+/// A frontend that stops in order writes out what its bridge had handed
+/// over and was still queued (it is booked as handed over), and does not
+/// end the session: the `End` its bridge's sender says when it drops stays
+/// behind, so the owner parks as after a lost link.
+#[tokio::test]
+async fn a_stopping_frontend_flushes_queued_input_and_does_not_end_the_session() {
+    let mut rig = Rig::new().await;
+    let sender = rig.front.inbound.take().unwrap();
+    assert!(
+        sender
+            .try_send(SessionInbound::Data(StreamData {
+                stream_id: STREAM,
+                data: b"typed".to_vec(),
+            }))
+            .is_ok(),
+        "credit for the input"
+    );
+    // The frontend stops before its writer ran, and its bridge goes.
+    drop(sender);
+    rig.front.lifecycle.shutdown.request();
+    match next_in(&mut rig.owner).await {
+        SessionInbound::Data(data) => assert_eq!(data.data, b"typed"),
+        _ => panic!("the queued input reaches the backend"),
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rig.owner.recv())
+            .await
+            .is_err(),
+        "the session is parked, not ended"
+    );
+}
+
+/// A replaced link stays read on the frontend's side until the owner closes
+/// it: at an orderly handoff the owner never finds the link broken under
+/// what it still had on its way (more here than the link buffers hold).
+#[tokio::test]
+async fn a_replaced_link_is_read_until_its_owner_closes_it() {
+    let (front_end, owner_end) = loopback();
+    let relink = Arc::new(TestRelink {
+        owner: OwnerRelink::default(),
+        ends: Mutex::new(Vec::new()),
+        withhold: std::sync::atomic::AtomicBool::new(true),
+        withheld: Mutex::new(Vec::new()),
+    });
+    let front = frontend(Cut::new(front_end), &relink, false);
+    let remote = front.control.remote.get().unwrap();
+    let _sender = remote.relink().expect("a new link");
+
+    let (read, mut write) = tokio::io::split(owner_end);
+    let mut reader = LinkReader::new(read);
+    // The frontend ends the replaced link in order and closes its half...
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), reader.next())
+            .await
+            .expect("the frontend's last frames")
+            .expect("a readable link")
+            .expect("`Retire` comes before the end");
+        if matches!(ToOwner::decode(&frame), Ok(ToOwner::Retire)) {
+            break;
+        }
+    }
+    // ...and still takes what the owner sends meanwhile.
+    let chunk = vec![0u8; 64 * 1024];
+    for _ in 0..16 {
+        tokio::time::timeout(Duration::from_secs(2), write.write_all(&chunk))
+            .await
+            .expect("the replaced link is still read")
+            .expect("the replaced link is not broken");
+    }
+}
+
+/// The owner's host died: its session is lost, not ended. The owner stops
+/// without saying `Finished` on its link, so a frontend process that still
+/// reads the link for a moment cannot end the client's session as if its
+/// shell had ended -- the client finds the session gone instead, as when a
+/// single-process daemon dies. A stop that is not an abandon still says it.
+#[tokio::test]
+async fn an_abandoned_owner_closes_its_link_without_finished() {
+    for abandoned in [true, false] {
+        let lifecycle = Lifecycle::new(Shutdown::default());
+        let (tx, rx) = oneshot::channel();
+        let init = OwnerInit::new(
+            Principal {
+                uid: 0,
+                name: "test".to_string(),
+                identity: "test".to_string(),
+                incarnation: 0,
+            },
+            [0; 16],
+        );
+        let abandon = init.abandon();
+        let init = OwnerInit {
+            lifecycle: Some(lifecycle.clone()),
+            ..init
+        };
+        let (front_end, owner_end) = loopback();
+        let backend = Arc::new(Capture(Mutex::new(Some(tx))));
+        let run = tokio::spawn(OwnerLink::run(owner_end, backend, init));
+        let _io = rx.await.expect("owner io");
+        let (read, _write) = tokio::io::split(front_end);
+        let mut reader = LinkReader::new(read);
+
+        if abandoned {
+            abandon.request();
+        }
+        lifecycle.shutdown.request();
+        assert_eq!(run.await.unwrap(), OwnerExit::Shutdown);
+        let mut finished = false;
+        while let Ok(Ok(Some(frame))) =
+            tokio::time::timeout(Duration::from_secs(2), reader.next()).await
+        {
+            finished |= matches!(ToFrontend::decode(&frame), Ok(ToFrontend::Finished));
+        }
+        assert_eq!(
+            finished, !abandoned,
+            "`Finished` on the link only when the session is not abandoned"
+        );
+    }
 }

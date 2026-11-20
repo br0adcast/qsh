@@ -64,7 +64,7 @@ pub(crate) const CLIENT_DEATH_AFTER: Duration = Duration::from_secs(45);
 /// token) finds it without a slow SSH reconnect. One day -- a phone can be idle
 /// or asleep for a long time; the session and its retained tmux backend should
 /// outlive that. Bounded by the session cap on the server side.
-const SERVER_DEATH_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const SERVER_DEATH_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Default retransmit timeout (RTO) until RTT has been measured.
 const DEFAULT_RTO: Duration = Duration::from_millis(500);

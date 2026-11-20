@@ -51,6 +51,13 @@
 //! makes a repaint after a long absence possible) for the channels that
 //! asked for one.
 //!
+//! [`host`], [`frontend`], [`owner_process`] -- the three roles of a
+//! personal daemon on Linux (#529): the daemon process is the host of its
+//! sessions, each of which runs in an owner process, and it runs its
+//! session router in a frontend process that it replaces when it dies,
+//! without ending a session. macOS and the system mode run the router and
+//! the channel backend in one process, as before.
+//!
 //! [`handover`] -- handing a personal daemon's state to the binary that
 //! replaces it in the same process.
 //!
@@ -78,6 +85,10 @@ pub mod log;
 mod modern_restart;
 #[doc(hidden)]
 pub use modern_restart::{interrupt_selected, RestartOutcome};
+#[cfg(target_os = "linux")]
+pub mod frontend;
+#[cfg(target_os = "linux")]
+pub mod host;
 #[cfg(target_os = "linux")]
 pub(crate) mod host_services;
 #[cfg(feature = "system")]

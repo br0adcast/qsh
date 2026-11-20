@@ -47,6 +47,7 @@ async fn rig() -> Rig {
         last_generation: 0,
         lifecycle: Some(lifecycle.clone()),
         relinks: OwnerRelink::default(),
+        abandon: Shutdown::default(),
     };
     let backend = Arc::new(Capture(Mutex::new(Some(tx))));
     lifecycle.spawn(async move {
@@ -829,6 +830,7 @@ async fn remote_mass_release_behind_a_stalled_writer_refunds_everything_and_ends
         last_generation: 0,
         lifecycle: Some(lifecycle.clone()),
         relinks: OwnerRelink::default(),
+        abandon: Shutdown::default(),
     };
     let backend = Arc::new(Capture(Mutex::new(Some(tx))));
     lifecycle.spawn(async move {
@@ -1018,6 +1020,7 @@ async fn remote_write_failure_is_seen_and_ends_the_link() {
         priority_rx,
         failure.clone(),
         lifecycle,
+        Shutdown::default(),
     )
     .await;
     tokio::time::timeout(Duration::from_secs(1), failure.failed())

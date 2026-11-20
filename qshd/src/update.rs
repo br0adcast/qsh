@@ -306,6 +306,16 @@ pub fn spawn_permit() -> RwLockReadGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// [`spawn_permit`] without waiting: `None` while an exec window is open.
+#[cfg(target_os = "linux")]
+pub(crate) fn try_spawn_permit() -> Option<RwLockReadGuard<'static, ()>> {
+    match SPAWN_GATE.try_read() {
+        Ok(permit) => Some(permit),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// Holds an exec window open, for tests of what waits for one.
 #[cfg(test)]
 pub(crate) fn exec_window_for_test() -> std::sync::RwLockWriteGuard<'static, ()> {
@@ -321,16 +331,27 @@ pub struct AdmissionGate {
     // Temporary replacement closure and irreversible shutdown share one
     // atomic word: clearing the former can never clear the latter.
     state: AtomicU8,
+    /// Woken at every change: the host mirrors the gate to its frontend
+    /// process, whose router is the one that admits (#529).
+    changed: tokio::sync::Notify,
 }
 impl AdmissionGate {
     pub fn close(&self) {
         self.state.fetch_or(1, Ordering::SeqCst);
+        self.changed.notify_one();
     }
     pub fn open(&self) {
         self.state.fetch_and(!1, Ordering::SeqCst);
+        self.changed.notify_one();
     }
     pub(crate) fn seal_shutdown(&self) {
         self.state.fetch_or(2, Ordering::SeqCst);
+        self.changed.notify_one();
+    }
+    /// The gate closed or opened since this was last awaited (one waiter).
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn changed(&self) {
+        self.changed.notified().await
     }
     pub fn is_closed(&self) -> bool {
         self.state.load(Ordering::SeqCst) != 0

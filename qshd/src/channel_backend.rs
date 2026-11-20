@@ -562,10 +562,12 @@ impl ChannelSessionBackend {
 /// How a personal-mode daemon runs its sessions. On Linux each session's
 /// channel backend runs in an owner process of its own (#529,
 /// [`crate::owner_process`]), started from the image this daemon held when
-/// it started; the router talks to it through the owner link, holding only
-/// mirrors and custody tokens. Elsewhere -- and on Linux if the running
-/// image cannot be held -- the router drives the channel backend in this
-/// process, as the system mode always does.
+/// it started, and the router runs in a frontend process that the daemon
+/// -- the host ([`crate::host`]) -- starts from the same image and replaces
+/// when it dies, without a session noticing more than a lost connection.
+/// Elsewhere -- and on Linux if the running image cannot be held -- the
+/// router drives the channel backend in this process, as the system mode
+/// always does.
 pub struct PersonalSessions {
     #[cfg(target_os = "linux")]
     owners: Option<(
@@ -577,6 +579,9 @@ pub struct PersonalSessions {
     services: Arc<crate::host_services::HostServices>,
     #[cfg(target_os = "linux")]
     log_dir: Option<std::path::PathBuf>,
+    /// Stops the frontend process around a replacement of the daemon.
+    #[cfg(target_os = "linux")]
+    frontend: Arc<crate::host::FrontendControl>,
 }
 
 #[cfg(target_os = "linux")]
@@ -601,28 +606,38 @@ impl PersonalSessions {
             owners,
             services: crate::host_services::HostServices::new(Default::default()),
             log_dir,
+            frontend: Arc::default(),
         }
     }
 
-    /// What an in-place replacement must stop before it execs.
+    /// What an in-place replacement must stop before it execs: every
+    /// session's owner, and the frontend process.
     pub fn owner_stop(&self) -> Option<Arc<dyn crate::update::OwnerStop>> {
-        self.owners
-            .as_ref()
-            .map(|(_, fleet)| fleet.clone() as Arc<dyn crate::update::OwnerStop>)
+        self.owners.as_ref().map(|(_, fleet)| {
+            Arc::new(crate::host::HostStop {
+                owners: fleet.clone(),
+                frontend: self.frontend.clone(),
+            }) as Arc<dyn crate::update::OwnerStop>
+        })
     }
 
-    /// The backend the router runs every session with: `backend` speaking
-    /// for `daemon`, each session in an owner process of its own.
-    pub fn backend(
+    /// This daemon as the host of its sessions: their owners speak for
+    /// `daemon`, the router runs in a frontend process started with `start`,
+    /// and `active` is kept as the count of sessions whose client is there.
+    /// `None` if the running image cannot be held: the router then runs in
+    /// this process ([`PersonalSessions::backend`]).
+    pub fn host(
         &self,
-        backend: ChannelSessionBackend,
         daemon: Option<Arc<dyn DaemonUpdates>>,
-    ) -> Arc<dyn SessionBackend> {
-        let Some((image, fleet)) = &self.owners else {
-            return direct_backend(backend, daemon);
-        };
-        let image = match image.try_clone() {
-            Ok(image) => image,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        start: crate::host::HostStart,
+    ) -> Option<Arc<crate::host::Host>> {
+        let (image, fleet) = self.owners.as_ref()?;
+        let images = image
+            .try_clone()
+            .and_then(|a| image.try_clone().map(|b| (a, b)));
+        let (for_owners, for_frontends) = match images {
+            Ok(images) => images,
             Err(error) => {
                 crate::log::warn(
                     "qshd",
@@ -630,22 +645,47 @@ impl PersonalSessions {
                         "cannot hold the running image ({error}); sessions run in this process"
                     ),
                 );
-                return direct_backend(backend, daemon);
+                return None;
             }
         };
-        let host = crate::owner_process::OwnerHost::new(
-            image,
+        let catalog = crate::host::Catalog::new(active);
+        let ended = {
+            let catalog = catalog.clone();
+            let allowlist = start.allowlist.clone();
+            Arc::new(move |pid| {
+                // The keys of the sessions that end here, unless their
+                // clients were added again since.
+                for (key, seq) in catalog.owner_ended(pid) {
+                    allowlist.scrub(&key, seq);
+                }
+            })
+        };
+        let owners = crate::owner_process::OwnerHost::new(
+            for_owners,
             self.log_dir.clone(),
             daemon,
             fleet.clone(),
             self.services.clone(),
-        );
-        // `backend` only answers for the features and the consumption model
-        // of the sessions the owners run.
-        Arc::new(transport::session_manager::RemoteBackend::with_owners(
-            Arc::new(backend),
-            Arc::new(host),
+        )
+        .on_ended(ended);
+        Some(crate::host::Host::new(
+            for_frontends,
+            owners,
+            catalog,
+            self.frontend.clone(),
+            start,
         ))
+    }
+
+    /// The backend a router in this process runs every session with, when
+    /// this daemon is no host ([`PersonalSessions::host`] gave `None`):
+    /// `backend` speaking for `daemon`, driven here.
+    pub fn backend(
+        &self,
+        backend: ChannelSessionBackend,
+        daemon: Option<Arc<dyn DaemonUpdates>>,
+    ) -> Arc<dyn SessionBackend> {
+        direct_backend(backend, daemon)
     }
 
     /// Stop every owner and wait until each one is reaped: the end of a

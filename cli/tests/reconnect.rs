@@ -1673,3 +1673,240 @@ fn recovery206_live_ingress_byte_limit_keeps_the_daemon_shell() {
     );
     exit_cleanly(&mut resumed, &resumed_screen, &daemon);
 }
+
+// ---- the daemon's network frontend dies (#529) -------------------------------
+
+/// The daemon's frontend process: the child of `host` in the frontend role,
+/// waited for. `not` is a frontend that is gone or going.
+#[cfg(target_os = "linux")]
+fn frontend_of(host: u32, not: Option<u32>) -> u32 {
+    let find = || {
+        std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .find(|pid| {
+                Some(*pid) != not
+                    && parent_of(*pid) == Some(host)
+                    && std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                        cmdline.split(|&b| b == 0).nth(1) == Some(b"__qshd-frontend-v1".as_slice())
+                    })
+                    && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                        stat.rfind(')')
+                            .and_then(|at| stat[at + 1..].split_whitespace().next())
+                            .is_some_and(|state| state != "Z" && state != "X")
+                    })
+            })
+    };
+    let mut found = None;
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            found = find();
+            found.is_some()
+        }),
+        "the daemon runs a frontend process"
+    );
+    found.expect("checked above")
+}
+
+/// Kill the frontend `pid` of `host`, and wait for the one that replaces it.
+#[cfg(target_os = "linux")]
+fn kill_the_frontend(host: u32, pid: u32) -> u32 {
+    assert_eq!(parent_of(pid), Some(host), "the daemon's own frontend");
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+    frontend_of(host, Some(pid))
+}
+
+/// The daemon's network frontend is killed under a running `qsh`. Nobody
+/// tells the client: its packets go unanswered until its own death timer
+/// (45 s) ends the link, and the round it then starts by itself -- a fresh
+/// signed handshake with a frontend that never heard of it -- is back in
+/// the SAME shell: same pid, same variable, same owner, and no question
+/// about a new session.
+#[cfg(target_os = "linux")]
+#[test]
+fn killing_the_frontend_keeps_the_same_shell() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut client = spawn_client_with(
+        &daemon,
+        &key_path,
+        config.path(),
+        &["--verbose", "--status", "off"],
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    let pid = mark_with_pid(&mut client, &screen);
+    let shell: u32 = pid.parse().expect("a pid");
+    let owner = parent_of(shell).expect("the shell is alive");
+    let host = daemon.child.id();
+    assert_eq!(
+        parent_of(owner),
+        Some(host),
+        "the owner is the host's child"
+    );
+
+    let frontend = frontend_of(host, None);
+    let killed = Instant::now();
+    let next = kill_the_frontend(host, frontend);
+    assert_ne!(next, frontend);
+    assert!(
+        !verbose_log(config.path()).contains("reconnected at address"),
+        "the client has not reconnected yet: {}",
+        verbose_log(config.path())
+    );
+
+    // The death timer, a round, and the shell's answer.
+    assert!(
+        wait_for(Duration::from_secs(100), || verbose_log(config.path())
+            .contains("reconnected at address 0")),
+        "the client must reconnect by itself once its link is dead; the verbose log: {}\n\
+         daemon: {}",
+        verbose_log(config.path()),
+        daemon.output_text()
+    );
+    let reconnected = killed.elapsed();
+    assert!(
+        the_marked_shell_answers(&mut client, &screen, &pid, Duration::from_secs(30)),
+        "after the frontend died the run must be back in the SAME shell; client saw: {}\n\
+         daemon: {}",
+        screen.text(),
+        daemon.output_text()
+    );
+    assert!(
+        reconnected >= Duration::from_secs(40) && reconnected < Duration::from_secs(90),
+        "the client came back by its death timer (45 s), not sooner and not much later: \
+         {reconnected:?}"
+    );
+    assert_eq!(parent_of(shell), Some(owner), "the shell keeps its owner");
+    assert_eq!(parent_of(owner), Some(host));
+    assert!(!screen.has("Start a new session?"));
+
+    exit_cleanly(&mut client, &screen, &daemon);
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            !std::path::Path::new(&format!("/proc/{owner}")).exists()
+                && !std::path::Path::new(&format!("/proc/{shell}")).exists()
+        }),
+        "the ended session leaves neither its owner nor its shell; daemon: {}",
+        daemon.output_text()
+    );
+    eprintln!("killing_the_frontend: the client was back {reconnected:?} after the kill");
+}
+
+/// What a person sees on the client's terminal: every cell's character and
+/// background.
+#[cfg(target_os = "linux")]
+fn picture(bytes: &[u8]) -> Vec<String> {
+    let mut model = terminal::TerminalCore::new(COLS, ROWS);
+    model.feed(bytes);
+    let frame = model.frame();
+    (0..ROWS)
+        .map(|row| {
+            (0..COLS)
+                .map(|col| {
+                    let cell = frame.cell(row, col);
+                    format!("{}{:?}", cell.ch, cell.bg)
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+/// A fullscreen program on the alternate screen, with a coloured
+/// background, is on the client's terminal when the daemon's frontend is
+/// killed. After the client's return through the new frontend the terminal
+/// shows exactly the picture it showed before: the server's screen model
+/// lives in the session's owner, and the repaint comes from there -- no
+/// reconnect plate left, no row lost, the background where it was.
+#[cfg(target_os = "linux")]
+#[test]
+fn fullscreen_program_repaints_after_frontend_death() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut client = spawn_client_with(
+        &daemon,
+        &key_path,
+        config.path(),
+        &["--verbose", "--status", "off"],
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+
+    // Alternate screen, blue background everywhere, text in three places;
+    // then the program waits for a line.
+    client.type_line(
+        "printf '\\033[?1049h\\033[44;97m\\033[2J\\033[1;1HTOP-LEFT\\033[5;10HFULL-%s\\033[24;60Hbottom-row' \
+         SCREEN; read QSH_LINE; printf '\\033[0m\\033[?1049l'; echo LEFT-$QSH_LINE",
+    );
+    let blue = format!("{:?}", terminal::Color::Indexed(4));
+    let row_text = |row: u16| {
+        let mut model = terminal::TerminalCore::new(COLS, ROWS);
+        model.feed(&screen.bytes());
+        let frame = model.frame();
+        (0..COLS)
+            .map(|col| frame.cell(row, col).ch)
+            .collect::<String>()
+    };
+    assert!(
+        wait_until(|| row_text(4).contains("FULL-SCREEN") && row_text(23).contains("bottom-row")),
+        "the program paints its screen; client saw: {}",
+        screen.text()
+    );
+    let before = picture(&screen.bytes());
+    assert!(
+        before
+            .iter()
+            .all(|row| row.matches(&blue).count() == COLS as usize),
+        "every cell has the program's background: {before:#?}"
+    );
+
+    let host = daemon.child.id();
+    let frontend = frontend_of(host, None);
+    kill_the_frontend(host, frontend);
+    // The client does not wait out its death timer here: the person asks
+    // for a reconnect, which goes to the new frontend.
+    client.master.write_all(b"\x1dr").expect("type ctrl-] r");
+    assert!(
+        wait_for(Duration::from_secs(60), || verbose_log(config.path())
+            .contains("reconnected at address 0")),
+        "Ctrl-] r must reconnect through the new frontend; the verbose log: {}\ndaemon: {}",
+        verbose_log(config.path()),
+        daemon.output_text()
+    );
+    assert!(
+        screen.top_ever_had("reconnecting"),
+        "the plate was over the top row meanwhile; client saw: {}",
+        screen.text()
+    );
+    let mut after = Vec::new();
+    assert!(
+        wait_for(Duration::from_secs(30), || {
+            after = picture(&screen.bytes());
+            after == before
+        }),
+        "the terminal shows the program's screen again, cell for cell;\nbefore: {before:#?}\n\
+         after: {after:#?}\ndaemon: {}",
+        daemon.output_text()
+    );
+    assert!(!screen.has("Start a new session?"));
+
+    // The program is the same process: it takes its line and leaves.
+    client.type_line("done");
+    assert!(
+        wait_for(Duration::from_secs(20), || screen.has("LEFT-done")),
+        "the program reads its line and ends; client saw: {}",
+        screen.text()
+    );
+    assert!(the_same_shell_answers(
+        &mut client,
+        &screen,
+        Duration::from_secs(20)
+    ));
+    exit_cleanly(&mut client, &screen, &daemon);
+}

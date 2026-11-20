@@ -151,6 +151,27 @@ fn children_of(pid: u32) -> Vec<String> {
     all
 }
 
+/// The children of the daemon `pid` in `role`: `__qshd-session-owner-v1`
+/// for its sessions' owners, `__qshd-frontend-v1` for its network frontend
+/// (#529).
+fn children_in_role(pid: u32, role: &str) -> Vec<String> {
+    children_of(pid)
+        .into_iter()
+        .filter(|child| {
+            std::fs::read(format!("/proc/{child}/cmdline"))
+                .is_ok_and(|cmdline| cmdline.split(|b| *b == 0).nth(1) == Some(role.as_bytes()))
+        })
+        .collect()
+}
+
+fn owners_of(pid: u32) -> Vec<String> {
+    children_in_role(pid, "__qshd-session-owner-v1")
+}
+
+fn frontends_of(pid: u32) -> Vec<String> {
+    children_in_role(pid, "__qshd-frontend-v1")
+}
+
 fn leftovers(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
         .unwrap()
@@ -454,7 +475,7 @@ fn a_personal_daemon_replaces_itself_over_qsh_keeping_its_pid_port_key_and_clien
     let mut shells = Vec::new();
     assert!(
         wait_for(Duration::from_secs(15), || {
-            shells = children_of(before.pid)
+            shells = owners_of(before.pid)
                 .iter()
                 .filter_map(|owner| owner.parse::<u32>().ok())
                 .flat_map(children_of)
@@ -463,6 +484,8 @@ fn a_personal_daemon_replaces_itself_over_qsh_keeping_its_pid_port_key_and_clien
         }),
         "the shell is a child of the daemon's session owner"
     );
+    let old_frontends = frontends_of(before.pid);
+    assert_eq!(old_frontends.len(), 1, "the daemon's network frontend");
     sleeper.detach();
     assert!(
         wait_for(Duration::from_secs(20), || status(&sock)
@@ -532,9 +555,25 @@ fn a_personal_daemon_replaces_itself_over_qsh_keeping_its_pid_port_key_and_clien
     );
     assert!(leftovers(bins.dir.path()).is_empty());
     assert!(
-        children_of(after.pid).is_empty(),
+        owners_of(after.pid).is_empty(),
         "the parked session's owner was ended and reaped before the exec, not inherited"
     );
+    // Nor was the old image's frontend: the new image runs one of its own,
+    // and has no other child.
+    let mut new_frontends = Vec::new();
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            new_frontends = frontends_of(after.pid);
+            new_frontends.len() == 1
+        }),
+        "the new image starts its own frontend"
+    );
+    assert_ne!(new_frontends, old_frontends, "not the old image's frontend");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{}", old_frontends[0])).exists(),
+        "the old frontend was stopped and reaped before the exec"
+    );
+    assert_eq!(children_of(after.pid), new_frontends);
     for shell in &shells {
         assert!(
             !std::path::Path::new(&format!("/proc/{shell}")).exists(),
@@ -832,14 +871,13 @@ fn a_session_owner_that_died_refuses_the_replacement() {
     let (victim, _victim_events) = connect(home.path(), port, server_pub, key.private, [7; 16]);
     let mut owners = Vec::new();
     assert!(wait_for(Duration::from_secs(15), || {
-        owners = children_of(before.pid);
+        owners = owners_of(before.pid);
         !owners.is_empty()
     }));
     let owner: i32 = owners[0].parse().expect("a pid");
     assert_eq!(unsafe { nix::libc::kill(owner, nix::libc::SIGKILL) }, 0);
     assert!(
-        wait_for(Duration::from_secs(15), || children_of(before.pid)
-            .is_empty()),
+        wait_for(Duration::from_secs(15), || owners_of(before.pid).is_empty()),
         "the daemon reaps its killed owner"
     );
     victim.detach();

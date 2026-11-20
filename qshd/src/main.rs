@@ -190,6 +190,11 @@ fn main() -> Result<()> {
     if let Some(result) = qshd::owner_process::owner_entry(&args) {
         return result;
     }
+    // The network frontend a personal daemon started (#529), likewise.
+    #[cfg(target_os = "linux")]
+    if let Some(result) = qshd::frontend::frontend_entry(&args) {
+        return result;
+    }
     // The inherited frontend must not consume or forward replacement custody.
     // Service-stage refusal above remains ahead of every private entry.
     if args.first().map(OsString::as_os_str) == Some(OsStr::new("__qshd-frontend-admission-v1")) {
@@ -1746,10 +1751,53 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     // Otherwise already logged by the caller: with nowhere to rename a new
     // binary onto, this daemon does not answer `About` and takes no image.
 
+    // On Linux this process is the host (#529): the router runs in a
+    // frontend process it starts and replaces, behind the same two gates.
+    #[cfg(target_os = "linux")]
+    let host_allowlist = qshd::host::HostAllowlist::new(Arc::clone(&shared_allowlist));
+    #[cfg(target_os = "linux")]
+    let host = {
+        let keys = signature_keys();
+        sessions.host(
+            daemon.clone(),
+            Arc::clone(&active_count),
+            qshd::host::HostStart {
+                server_priv: start.keypair.private,
+                server_pub: start.keypair.public,
+                authorized_keys: keys.as_ref().map(|keys| keys.path.clone()),
+                account: account_name(),
+                allowlist: Arc::clone(&host_allowlist),
+                admission: Arc::clone(&admission),
+                runtime_threads: None,
+            },
+        )
+    };
+
     let runtime =
         tokio::runtime::Runtime::new().context("creating the transport daemon's runtime")?;
     runtime.block_on(async {
         let mut signals = transport_daemon::PersonalSignals::register()?;
+        #[cfg(target_os = "linux")]
+        if let Some(host) = host {
+            let result = transport_daemon::run_hosted_transport_daemon_until_stop(
+                host,
+                start.socket,
+                host_allowlist,
+                start.keypair.public,
+                start.listener,
+                start.cleanup,
+                vec![start.port],
+                active_count,
+                actions,
+                Some(opens),
+                signals.requested(),
+            )
+            .await;
+            // No frontend is left; every session's owner now stops and is
+            // reaped before the daemon exits, as below.
+            let owners = sessions.stop_all().await;
+            return result.and(owners.map_err(|error| anyhow::anyhow!(error)));
+        }
         let result = transport_daemon::run_transport_daemon_until_stop_with_actions(
             start.socket,
             start.keypair.private,
@@ -1807,17 +1855,11 @@ fn personal_server_auth(
         // The app's key is on the allowlist itself -- there is no verifier,
         // and so no `Principal`, on that path. It runs as this daemon's own
         // account, the same one `signature_verifier` hands its own verifier.
-        self_principal: {
-            let uid = nix::unistd::Uid::current().as_raw();
-            let name = std::env::var("USER")
-                .or_else(|_| std::env::var("LOGNAME"))
-                .unwrap_or_else(|_| uid.to_string());
-            transport::Principal {
-                uid,
-                name,
-                identity: "allowlist".to_string(),
-                incarnation: 0,
-            }
+        self_principal: transport::Principal {
+            uid: nix::unistd::Uid::current().as_raw(),
+            name: account_name(),
+            identity: "allowlist".to_string(),
+            incarnation: 0,
         },
         // `transport-ensure` never runs the system mode (that is `serve
         // --system`'s job), so there is no privileged helper here to ask
@@ -1932,6 +1974,20 @@ fn resume_personal_daemon(handover: handover::PreparedHandover) -> Result<()> {
 /// reads it per handshake, so a file created later starts working without a
 /// restart, and one that never appears simply admits nobody by signature.
 fn signature_verifier() -> Option<Arc<dyn transport::AuthVerifier>> {
+    let keys = signature_keys()?;
+    Some(Arc::new(sshauth::verify::AuthorizedKeysVerifier::new(
+        keys.path,
+        nix::unistd::Uid::current().as_raw(),
+        account_name(),
+    )))
+}
+
+/// The file the signature gate reads; see [`signature_verifier`].
+struct SignatureKeys {
+    path: PathBuf,
+}
+
+fn signature_keys() -> Option<SignatureKeys> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         log::warn(
             "qshd",
@@ -1942,17 +1998,17 @@ fn signature_verifier() -> Option<Arc<dyn transport::AuthVerifier>> {
     };
     let path = home.join(".ssh").join("authorized_keys");
     log::info("qshd", &format!("signature login via {}", path.display()));
-    // The account this daemon serves -- it runs as exactly one. The name is
-    // a log label only (nothing selects an account here), so the
-    // environment is a good enough source and keeps the static musl build
-    // free of an NSS lookup.
-    let uid = nix::unistd::Uid::current().as_raw();
-    let name = std::env::var("USER")
+    Some(SignatureKeys { path })
+}
+
+/// The account this daemon serves -- it runs as exactly one. The name is a
+/// log label only (nothing selects an account here), so the environment is
+/// a good enough source and keeps the static musl build free of an NSS
+/// lookup.
+fn account_name() -> String {
+    std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| uid.to_string());
-    Some(Arc::new(sshauth::verify::AuthorizedKeysVerifier::new(
-        path, uid, name,
-    )))
+        .unwrap_or_else(|_| nix::unistd::Uid::current().as_raw().to_string())
 }
 
 /// Default path for the server Noise key file: `transport_server_key.bin`

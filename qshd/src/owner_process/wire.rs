@@ -175,41 +175,41 @@ impl std::error::Error for WireError {}
 
 // ---- primitives --------------------------------------------------------------
 
-struct Enc(Vec<u8>);
+pub(crate) struct Enc(Vec<u8>);
 impl Enc {
-    fn new(kind: u8) -> Enc {
+    pub(crate) fn new(kind: u8) -> Enc {
         // Length placeholder, then the kind.
         Enc(vec![0, 0, 0, 0, kind])
     }
-    fn u8(&mut self, v: u8) -> &mut Self {
+    pub(crate) fn u8(&mut self, v: u8) -> &mut Self {
         self.0.push(v);
         self
     }
-    fn u32(&mut self, v: u32) -> &mut Self {
+    pub(crate) fn u32(&mut self, v: u32) -> &mut Self {
         self.0.extend_from_slice(&v.to_be_bytes());
         self
     }
-    fn u64(&mut self, v: u64) -> &mut Self {
+    pub(crate) fn u64(&mut self, v: u64) -> &mut Self {
         self.0.extend_from_slice(&v.to_be_bytes());
         self
     }
-    fn raw(&mut self, v: &[u8]) -> &mut Self {
+    pub(crate) fn raw(&mut self, v: &[u8]) -> &mut Self {
         self.0.extend_from_slice(v);
         self
     }
-    fn bytes(&mut self, v: &[u8]) -> &mut Self {
+    pub(crate) fn bytes(&mut self, v: &[u8]) -> &mut Self {
         self.u32(v.len() as u32).raw(v)
     }
-    fn slots(&mut self, slots: BackingSlots) -> &mut Self {
+    pub(crate) fn slots(&mut self, slots: BackingSlots) -> &mut Self {
         self.u64(slots.cells as u64).u64(slots.rows as u64)
     }
-    fn outcome(&mut self, result: &Result<(), String>) -> &mut Self {
+    pub(crate) fn outcome(&mut self, result: &Result<(), String>) -> &mut Self {
         match result {
             Ok(()) => self.u8(1),
             Err(detail) => self.u8(0).bytes(detail.as_bytes()),
         }
     }
-    fn finish(mut self) -> Result<Vec<u8>, WireError> {
+    pub(crate) fn finish(mut self) -> Result<Vec<u8>, WireError> {
         let body = self.0.len() - 4;
         if body > MAX_FRAME {
             return Err(WireError::TooLong);
@@ -219,9 +219,9 @@ impl Enc {
     }
 }
 
-struct Dec<'a>(&'a [u8]);
+pub(crate) struct Dec<'a>(pub(crate) &'a [u8]);
 impl<'a> Dec<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         if self.0.len() < n {
             return Err(WireError::Truncated);
         }
@@ -229,49 +229,49 @@ impl<'a> Dec<'a> {
         self.0 = rest;
         Ok(head)
     }
-    fn u8(&mut self) -> Result<u8, WireError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, WireError> {
         Ok(self.take(1)?[0])
     }
-    fn u32(&mut self) -> Result<u32, WireError> {
+    pub(crate) fn u32(&mut self) -> Result<u32, WireError> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn u64(&mut self) -> Result<u64, WireError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, WireError> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
-    fn array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
+    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], WireError> {
         Ok(self.take(N)?.try_into().unwrap())
     }
-    fn bytes(&mut self) -> Result<Vec<u8>, WireError> {
+    pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, WireError> {
         let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
     }
-    fn string(&mut self) -> Result<String, WireError> {
+    pub(crate) fn string(&mut self) -> Result<String, WireError> {
         String::from_utf8(self.bytes()?).map_err(|_| WireError::BadValue)
     }
-    fn size(&mut self) -> Result<usize, WireError> {
+    pub(crate) fn size(&mut self) -> Result<usize, WireError> {
         usize::try_from(self.u64()?).map_err(|_| WireError::BadValue)
     }
-    fn slots(&mut self) -> Result<BackingSlots, WireError> {
+    pub(crate) fn slots(&mut self) -> Result<BackingSlots, WireError> {
         Ok(BackingSlots {
             cells: self.size()?,
             rows: self.size()?,
         })
     }
-    fn outcome(&mut self) -> Result<Result<(), String>, WireError> {
+    pub(crate) fn outcome(&mut self) -> Result<Result<(), String>, WireError> {
         Ok(if self.bool()? {
             Ok(())
         } else {
             Err(self.string()?)
         })
     }
-    fn bool(&mut self) -> Result<bool, WireError> {
+    pub(crate) fn bool(&mut self) -> Result<bool, WireError> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
             _ => Err(WireError::BadValue),
         }
     }
-    fn end(&self) -> Result<(), WireError> {
+    pub(crate) fn end(&self) -> Result<(), WireError> {
         if self.0.is_empty() {
             Ok(())
         } else {
@@ -428,7 +428,7 @@ const H_OPEN_CHARGE: u8 = 15;
 const H_OPEN_RELEASE: u8 = 16;
 const H_OPENS_FENCED: u8 = 17;
 
-fn level_wire(level: log::Level) -> u8 {
+pub(crate) fn level_wire(level: log::Level) -> u8 {
     match level {
         log::Level::Error => 1,
         log::Level::Warn => 2,
@@ -438,7 +438,7 @@ fn level_wire(level: log::Level) -> u8 {
     }
 }
 
-fn level_from(level: u8) -> Result<log::Level, WireError> {
+pub(crate) fn level_from(level: u8) -> Result<log::Level, WireError> {
     Ok(match level {
         1 => log::Level::Error,
         2 => log::Level::Warn,

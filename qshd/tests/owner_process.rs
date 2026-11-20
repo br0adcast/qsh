@@ -159,8 +159,8 @@ fn new_daemon_mark() -> String {
     )
 }
 
-/// Running (not zombie) processes in the session owner role started under
-/// `mark`.
+/// Running (not zombie) processes in the session owner role or the
+/// frontend role started under `mark`.
 fn owners_marked(mark: &str) -> Vec<u32> {
     let needle = format!("{MARK_ENV}={mark}");
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -178,7 +178,9 @@ fn owners_marked(mark: &str) -> Vec<u32> {
                     let rest = &stat[stat.rfind(')')? + 1..];
                     rest.split_whitespace().next().map(str::to_owned)
                 });
-            cmdline.split(|b| *b == 0).nth(1) == Some(b"__qshd-session-owner-v1".as_slice())
+            let role = cmdline.split(|b| *b == 0).nth(1);
+            (role == Some(b"__qshd-session-owner-v1".as_slice())
+                || role == Some(b"__qshd-frontend-v1".as_slice()))
                 && environ
                     .split(|b| *b == 0)
                     .any(|var| var == needle.as_bytes())
@@ -187,7 +189,8 @@ fn owners_marked(mark: &str) -> Vec<u32> {
         .collect()
 }
 
-/// No session owner of the daemon marked `mark` outlives it: waited for
+/// No session owner and no frontend of the daemon marked `mark` outlives
+/// it: waited for
 /// (an owner whose host died drains for at most 10 s), else killed and
 /// reported.
 fn assert_no_owner_left(mark: &str) {
@@ -202,7 +205,7 @@ fn assert_no_owner_left(mark: &str) {
                 unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
             }
             if !std::thread::panicking() {
-                panic!("session owner(s) {left:?} outlived their daemon");
+                panic!("session owner(s) or frontend(s) {left:?} outlived their daemon");
             }
             return;
         }

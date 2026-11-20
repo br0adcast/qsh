@@ -98,7 +98,7 @@ fn run_entry() -> Result<()> {
     result
 }
 
-fn int_option(fd: i32, level: i32, name: i32) -> io::Result<i32> {
+pub(crate) fn int_option(fd: i32, level: i32, name: i32) -> io::Result<i32> {
     let mut value: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     let rc = unsafe {
@@ -118,7 +118,7 @@ fn int_option(fd: i32, level: i32, name: i32) -> io::Result<i32> {
 
 /// Take descriptor `fd` as one end of a socket pair of type `kind` the
 /// parent made.
-fn claim(fd: i32, kind: i32, parent: u32, uid: u32) -> Result<OwnedFd> {
+pub(crate) fn claim(fd: i32, kind: i32, parent: u32, uid: u32) -> Result<OwnedFd> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
         bail!("descriptor {fd} is not open");
@@ -133,7 +133,7 @@ fn claim(fd: i32, kind: i32, parent: u32, uid: u32) -> Result<OwnedFd> {
 
 /// Check that `socket` is one end of a Unix socket pair of type `kind`
 /// whose other end the parent daemon made.
-fn from_parent(socket: &OwnedFd, kind: i32, parent: u32, uid: u32) -> Result<()> {
+pub(crate) fn from_parent(socket: &OwnedFd, kind: i32, parent: u32, uid: u32) -> Result<()> {
     let fd = socket.as_raw_fd();
     if int_option(fd, libc::SOL_SOCKET, libc::SO_DOMAIN)? != libc::AF_UNIX
         || int_option(fd, libc::SOL_SOCKET, libc::SO_TYPE)? != kind
@@ -269,7 +269,7 @@ async fn receive_links(channel: OwnedFd, relinks: OwnerRelink, parent: u32, uid:
     }
 }
 
-fn stream(fd: OwnedFd) -> io::Result<tokio::net::UnixStream> {
+pub(crate) fn stream(fd: OwnedFd) -> io::Result<tokio::net::UnixStream> {
     let stream = std::os::unix::net::UnixStream::from(fd);
     stream.set_nonblocking(true)?;
     tokio::net::UnixStream::from_std(stream)
@@ -322,7 +322,15 @@ async fn run_owner(
     let opens = OpensFence::new(backend.open_registry());
     let backend: Arc<dyn SessionBackend> = Arc::new(backend);
 
-    let reader = tokio::spawn(serve_host(read, client.clone(), opens, shutdown.clone()));
+    let mut owner_init = OwnerInit::new(principal.clone(), login);
+    owner_init.last_generation = last_generation;
+    let reader = tokio::spawn(serve_host(
+        read,
+        client.clone(),
+        opens,
+        shutdown.clone(),
+        owner_init.abandon(),
+    ));
     let signals = {
         use tokio::signal::unix::{signal, SignalKind};
         let mut term = signal(SignalKind::terminate()).context("registering SIGTERM")?;
@@ -338,8 +346,6 @@ async fn run_owner(
         })
     };
 
-    let mut owner_init = OwnerInit::new(principal.clone(), login);
-    owner_init.last_generation = last_generation;
     let links = tokio::spawn(receive_links(relink, owner_init.relinks(), parent, uid));
     let run =
         OwnerLink::run_and_drain(stream(link)?, backend, owner_init, shutdown, DRAIN_TIMEOUT).await;
@@ -618,6 +624,7 @@ async fn serve_host(
     client: Arc<HostClient>,
     opens: OpensFence,
     shutdown: Shutdown,
+    abandon: Shutdown,
 ) {
     // Restart signals are published off this loop: a runner may hold the
     // signal's read side for a moment, and nothing may hold up the replies
@@ -626,12 +633,17 @@ async fn serve_host(
     loop {
         let frame = match wire::read_frame(&mut read).await {
             Ok(Some(body)) => ToOwner::decode(&body),
+            // The host is gone: its sessions are lost, as when a
+            // single-process daemon dies. Nothing tells the frontend the
+            // session ended (`OwnerInit::abandon`).
             Ok(None) => {
                 crate::log::warn("owner", "the host channel closed; ending the session");
+                abandon.request();
                 break;
             }
             Err(error) => {
                 crate::log::error("owner", &format!("host channel read failed: {error}"));
+                abandon.request();
                 break;
             }
         };
@@ -1139,6 +1151,7 @@ mod tests {
             client.clone(),
             OpensFence::new(ChannelOpenRegistry::new(Default::default())),
             Shutdown::default(),
+            Shutdown::default(),
         ));
         let mut published = client.signal.subscribe();
         // The session holds the signal's read side...
@@ -1343,5 +1356,117 @@ mod tests {
         relay.close();
         relay.record(log::Level::Info, "test", "after the end");
         assert_eq!(relay.dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Everything `link` carries until it has been quiet for `quiet`, or
+    /// until its end: the bytes, and whether it ended.
+    async fn read_link(link: &mut tokio::net::UnixStream, quiet: Duration) -> (usize, bool) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0;
+        loop {
+            match tokio::time::timeout(quiet, link.read(&mut buf)).await {
+                Err(_) => return (total, false),
+                Ok(Ok(0)) | Ok(Err(_)) => return (total, true),
+                Ok(Ok(n)) => total += n,
+            }
+        }
+    }
+
+    /// An owner whose host is gone loses its session (as a single-process
+    /// daemon's death loses it): its link closes without a word more, never
+    /// with `Finished`, which a frontend still reading it for a moment
+    /// would take for the end of the session and tell the client so. An
+    /// owner told to stop says `Finished` on its way out.
+    ///
+    /// The owner installs the process's log relay and its `SIGTERM` and
+    /// `SIGINT` handlers for good, so the body runs in a process of its own.
+    #[test]
+    fn an_owner_whose_host_is_gone_closes_its_link_without_a_word() {
+        let name = "owner_process::owner::tests::an_owner_whose_host_is_gone_closes_its_link_without_a_word_body";
+        let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args([
+                name,
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .output()
+            .expect("run the isolated check");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("running 1 test\n"),
+            "the filter must match exactly one test:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            out.status.success(),
+            "the isolated check failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    /// Runs only via [`an_owner_whose_host_is_gone_closes_its_link_without_a_word`],
+    /// in a process of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "runs only via an_owner_whose_host_is_gone_closes_its_link_without_a_word, in a \
+                process of its own"]
+    async fn an_owner_whose_host_is_gone_closes_its_link_without_a_word_body() {
+        use std::io::Write;
+        let uid = unsafe { libc::geteuid() };
+        for host_dies in [true, false] {
+            let (front, owner_link) = std::os::unix::net::UnixStream::pair().unwrap();
+            let (host, owner_host) = std::os::unix::net::UnixStream::pair().unwrap();
+            let (_relink, owner_relink) = nix::sys::socket::socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::SeqPacket,
+                None,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            )
+            .unwrap();
+            let init = ToOwner::Init(HostInit {
+                principal: Principal {
+                    uid,
+                    name: "test".into(),
+                    identity: "fixture".into(),
+                    incarnation: 0,
+                },
+                login: [9; 16],
+                last_generation: 0,
+                updates: false,
+                log_dir: None,
+            });
+            let mut host = host;
+            host.write_all(&init.encode().unwrap()).unwrap();
+            let run = tokio::spawn(run_owner(
+                OwnedFd::from(owner_link),
+                OwnedFd::from(owner_host),
+                owner_relink,
+                std::process::id(),
+                uid,
+            ));
+            front.set_nonblocking(true).unwrap();
+            let mut front = tokio::net::UnixStream::from_std(front).unwrap();
+            // The owner is up: its first credits arrive, then it is quiet.
+            let (first, ended) = read_link(&mut front, Duration::from_millis(500)).await;
+            assert!(first > 0 && !ended, "the owner runs its session");
+
+            let kept = if host_dies {
+                drop(host);
+                None
+            } else {
+                host.write_all(&ToOwner::Stop.encode().unwrap()).unwrap();
+                Some(host)
+            };
+            let (last, ended) = read_link(&mut front, Duration::from_secs(15)).await;
+            assert!(ended, "the owner closes its link");
+            if host_dies {
+                assert_eq!(last, 0, "not a word after its host is gone");
+            } else {
+                assert!(last > 0, "a stop says `Finished`");
+            }
+            drop(kept);
+            let _ = tokio::time::timeout(Duration::from_secs(15), run).await;
+        }
     }
 }

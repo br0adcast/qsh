@@ -91,8 +91,9 @@ pub(crate) use lifecycle::CallbackFailure;
 use lifecycle::Lifecycle;
 pub(crate) use lifecycle::WorkerReceipt;
 pub use owner_link::{
-    loopback, FrontendRelink, LinkEnd, LinkIo, OwnerExit, OwnerInit, OwnerLink, OwnerRelink,
-    OwnerRun, OwnerStarter, RemoteBackend, StartedOwner,
+    loopback, relink_unavailable, FrontendRelink, LinkEnd, LinkIo, Liveness, Lookup, OwnerExit,
+    OwnerInit, OwnerLink, OwnerRelink, OwnerRun, OwnerStarter, RemoteBackend, SessionDirectory,
+    StartedOwner,
 };
 #[cfg(test)]
 #[path = "session_manager_fixture.rs"]
@@ -184,6 +185,13 @@ pub const MAX_SESSIONS_TOTAL: usize = 128;
 /// later if a handshake naming its token is in probation just then (see
 /// `Router::gc_retained`).
 pub const RETAIN_AFTER_DEATH: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How long a server takes a silent client's connection for alive: after it
+/// the connection dies and its session is retained for
+/// [`RETAIN_AFTER_DEATH`]. Public for whoever keeps a session's liveness
+/// across frontend processes (#529), which measures both from the client's
+/// last packet.
+pub const SERVER_DEATH_AFTER: std::time::Duration = crate::conn::SERVER_DEATH_AFTER;
 
 /// Period of the GC tick that reaps expired retained backends. Passes are at
 /// least this far apart, also after the router loop has stalled -- see
@@ -1673,6 +1681,28 @@ pub trait SessionBackend: Send + Sync + 'static {
     fn consumption(&self) -> Consumption {
         Consumption::OnDelivery
     }
+
+    /// Where this backend's sessions are known beyond this process: set
+    /// when they run in owners that outlive it (#529), so a router that has
+    /// never heard of a login can still find its session there. `None`:
+    /// every session lives and dies with this process.
+    fn directory(&self) -> Option<Arc<dyn SessionDirectory>> {
+        None
+    }
+
+    /// Take over a session that an earlier process of this daemon left
+    /// running behind `owner` ([`Lookup::Running`]), in place of
+    /// [`SessionBackend::run`]: the owner's replay comes first, and the
+    /// bridge builds its state from it. Only a backend with a
+    /// [`SessionBackend::directory`] is ever asked.
+    fn resume(
+        &self,
+        io: SessionIo,
+        owner: StartedOwner,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        drop((io, owner));
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// Creates a backend per accepted session. Cloneable handle to a shared
@@ -2085,11 +2115,34 @@ struct Router {
     cookies: CookieCheck,
     /// What the log last said about that load.
     load_log: LoadLog,
+    /// Where the backend's sessions are known beyond this process, if they
+    /// outlive it: it hears when a session is retained.
+    directory: Option<Arc<dyn SessionDirectory>>,
+    /// Logins whose warm start waits for the directory's answer, off this
+    /// loop (`SessionManager::begin_lookup`): at most one per login, and at
+    /// most [`MAX_LOOKUPS`] in all.
+    lookups: std::collections::HashSet<LoginId>,
+    /// Where an answered lookup comes back to the loop.
+    lookup_done: Option<mpsc::UnboundedSender<LookupDone>>,
+}
+
+/// Warm starts that wait for the directory at once: as many as probation
+/// seats, which every one of them held a moment ago.
+const MAX_LOOKUPS: usize = MAX_PROBATION;
+
+/// A warm start for a login the router has no entry for, with the
+/// directory's answer about it.
+struct LookupDone {
+    admission: Admission,
+    found: Lookup,
 }
 
 impl Router {
     fn new() -> Self {
         Router {
+            directory: None,
+            lookups: std::collections::HashSet::new(),
+            lookup_done: None,
             personal_observer: None,
             bootstrap: None,
             server_generation: None,
@@ -2419,6 +2472,10 @@ impl Router {
                                 },
                             };
                             entry.parked_dgram = dg_tx;
+                            // The retention's start outlives this process.
+                            if let Some(directory) = &self.directory {
+                                directory.liveness(ended.token, Liveness::Retained);
+                            }
                         }
                         EntryState::Retained { reason, .. } => {
                             // The first end already parked the stable route.
@@ -2971,6 +3028,10 @@ impl SessionManager {
         let mut buf = vec![0u8; RECV_BUF_LEN];
         let mut router = Router::new();
         router.personal_observer = personal_observer;
+        router.directory = factory.0.directory();
+        // Answers of the directory, which is asked off this loop.
+        let (lookup_tx, mut lookup_rx) = mpsc::unbounded_channel::<LookupDone>();
+        router.lookup_done = Some(lookup_tx);
         if let Some(info) = info {
             router.server_generation = Some(info.generation);
             router.bootstrap = crate::bootstrap::BootstrapResponder::new(*server_priv, info).ok();
@@ -3026,11 +3087,14 @@ impl SessionManager {
                     if let Some(client_key) =
                         on_session_ended_and_notify(&mut router, &auth, ended, tokio::time::Instant::now())
                     {
-                        remove_from_allowlist(&auth.allowlist, &client_key);
+                        forget_key(&auth, &router, &client_key);
                     }
                 }
                 Some(ended) = probation_rx.recv() => {
                     Self::on_probation_ended(&ctx, &mut router, ended).await;
+                }
+                Some(done) = lookup_rx.recv() => {
+                    Self::on_lookup_done(&ctx, &mut router, done).await;
                 }
                 Some((login, incarnation)) = login_ends.recv() => {
                     // No `_and_notify` pairing here, and that is the point:
@@ -3199,7 +3263,17 @@ impl SessionManager {
                     if matches!(d, AcceptDecision::ResendMsg2) {
                         return Some(Msg2Resolution::Cached);
                     }
-                    let resumed = matches!(d, AcceptDecision::WarmReattach);
+                    // A hint only (the acceptance decides): also a warm start
+                    // for a session an earlier process of this daemon left
+                    // running, as far as the directory knew when this one
+                    // started.
+                    let resumed = matches!(d, AcceptDecision::WarmReattach)
+                        || (matches!(d, AcceptDecision::ColdCreate)
+                            && msg1.start_kind == StartKind::Warm
+                            && router
+                                .directory
+                                .as_ref()
+                                .is_some_and(|directory| directory.known(msg1.token)));
                     decision = Some(d);
                     let nonce = match issued_nonce {
                         Some(n) => n,
@@ -3808,7 +3882,7 @@ impl SessionManager {
                         // This is the ONLY place a fast
                         // roam (beats DEATH_AFTER) ever sees the superseded
                         // key -- SessionEnded is never emitted for it.
-                        scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
+                        forget_superseded_key(ctx.auth, router, token, old_key, client_key);
                         // The bridge may already be runnable on another worker.
                         // Release it only after route/revision/incarnation and key
                         // ownership have all committed, before the first await.
@@ -3833,7 +3907,7 @@ impl SessionManager {
                                 },
                                 tokio::time::Instant::now(),
                             ) {
-                                remove_from_allowlist(&ctx.auth.allowlist, &key);
+                                forget_key(ctx.auth, router, &key);
                             }
                             return;
                         }
@@ -3874,7 +3948,7 @@ impl SessionManager {
                             },
                         )
                         .await;
-                        scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
+                        forget_superseded_key(ctx.auth, router, token, old_key, client_key);
                     }
                 }
             }
@@ -3910,7 +3984,7 @@ impl SessionManager {
                     admission,
                 )
                 .await;
-                scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
+                forget_superseded_key(ctx.auth, router, token, old_key, client_key);
             }
             AcceptDecision::ColdCreate => {
                 // A brand-new token grows the table: enforce the session
@@ -3924,24 +3998,126 @@ impl SessionManager {
                 // THIS token's own login, which the client's proof already
                 // created in the helper and which nothing else could ever
                 // report as ended.
-                if !admit_new_backend_or_end_login(router, ctx.auth, admission.principal.uid, token)
+                //
+                // A login this router has never heard of may still have its
+                // session: one that an earlier process of this daemon left
+                // running in its owner (#529). A warm start asks the
+                // directory -- off this loop -- and takes that session over
+                // instead of starting another. A cold start replaces
+                // whatever is there, as it always did.
+                if let (Some(directory), StartKind::Warm) =
+                    (router.directory.clone(), admission.msg1.start_kind)
                 {
+                    Self::begin_lookup(ctx, router, directory, admission);
                     return;
                 }
-                // No prior entry for a brand-new token, so `cold_create`
-                // returns `None` here -- this call is a no-op, kept for
-                // symmetry/safety rather than special-cased away.
-                let client_key = admission.client_key;
-                let old_key = Self::cold_create(
+                Self::create_new(
                     ctx,
                     router,
                     change.expect("reserved binding change"),
                     admission,
+                    None,
                 )
                 .await;
-                scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
             }
         }
+    }
+
+    /// The `ColdCreate` arm's admission and creation, for a brand-new token
+    /// (or, with `running`, for a session an earlier frontend left).
+    async fn create_new(
+        ctx: &ManagerCtx<'_>,
+        router: &mut Router,
+        change: RevisionChange,
+        admission: Admission,
+        running: Option<StartedOwner>,
+    ) {
+        let token = admission.msg1.token;
+        if !admit_new_backend_or_end_login(router, ctx.auth, admission.principal.uid, token) {
+            return;
+        }
+        // No prior entry for a brand-new token, so `create` returns `None`
+        // here -- this call is a no-op, kept for symmetry/safety rather
+        // than special-cased away.
+        let client_key = admission.client_key;
+        let old_key = Self::create(ctx, router, change, admission, running).await;
+        forget_superseded_key(ctx.auth, router, token, old_key, client_key);
+    }
+
+    /// Ask `directory` about a warm start's login off the router loop: the
+    /// loop routes every other session's datagrams meanwhile, and hears the
+    /// answer as a [`LookupDone`]. One question per login at a time; a
+    /// handshake for a login already asked about, or past [`MAX_LOOKUPS`],
+    /// is dropped (see [`Lookup::Unavailable`] for when its client asks
+    /// again). The connection's provisional
+    /// route stays registered, so what its client sends meanwhile queues
+    /// for it.
+    fn begin_lookup(
+        ctx: &ManagerCtx<'_>,
+        router: &mut Router,
+        directory: Arc<dyn SessionDirectory>,
+        admission: Admission,
+    ) {
+        let token = admission.msg1.token;
+        let Some(done) = router.lookup_done.clone() else {
+            return;
+        };
+        if router.lookups.len() >= MAX_LOOKUPS || !router.lookups.insert(token) {
+            log::debug!("a warm start waits for the directory already; dropping a handshake");
+            return;
+        }
+        if let Some(route) = &admission.route {
+            router
+                .sessions
+                .insert(admission.conn.session_id(), route.tx.clone());
+        }
+        let uid = admission.principal.uid;
+        ctx.lifecycle.spawn(async move {
+            let found = directory.lookup(token, uid).await;
+            let _ = done.send(LookupDone { admission, found });
+        });
+    }
+
+    /// The directory answered a warm start ([`SessionManager::begin_lookup`]).
+    /// Applied against the table as it stands NOW, as after a probation: a
+    /// binding that changed meanwhile, or an entry that appeared, wins, and
+    /// this handshake is dropped. No answer (`Unavailable`) drops it too:
+    /// a session that may still run is never replaced by a fresh one on a
+    /// guess. A client that already holds `msg2` for this connection (the
+    /// signature path) then waits out its death timer before it returns,
+    /// as one whose reattach parked ([`AttachResult::Parked`]) does.
+    async fn on_lookup_done(ctx: &ManagerCtx<'_>, router: &mut Router, done: LookupDone) {
+        let LookupDone { admission, found } = done;
+        let token = admission.msg1.token;
+        router.lookups.remove(&token);
+        router.sessions.remove(&admission.conn.session_id());
+        let decision = router.resolve(&token, &admission.msg1_body, admission.msg1.start_kind);
+        if !admission.revision.is_current() || !matches!(decision, AcceptDecision::ColdCreate) {
+            log::debug!("the table changed while the directory was asked; dropping a handshake");
+            return;
+        }
+        let running = match found {
+            Lookup::Unknown => None,
+            Lookup::Running(owner) => Some(owner),
+            Lookup::Unavailable => {
+                log::warn!(
+                    "the host did not answer for a returning session; \
+                     dropping the handshake, the session is kept for the client's next try"
+                );
+                return;
+            }
+            Lookup::Foreign => {
+                log::warn!(
+                    "session refused: token belongs to another account, caller is uid {}",
+                    admission.principal.uid
+                );
+                return;
+            }
+        };
+        let Some(change) = router.revisions.reserve_change() else {
+            return;
+        };
+        Self::create_new(ctx, router, change, admission, running).await;
     }
 
     /// Cold-create a fresh session for `token`: start a persistent bridge and
@@ -3960,6 +4136,21 @@ impl SessionManager {
         router: &mut Router,
         change: RevisionChange,
         admission: Admission,
+    ) -> Option<[u8; 32]> {
+        Self::create(ctx, router, change, admission, None).await
+    }
+
+    /// [`SessionManager::cold_create`], or -- with `running` -- the same
+    /// registration for a session that already runs behind an owner an
+    /// earlier process of this daemon started: the bridge then builds its
+    /// state from that owner's replay instead of starting a backend, and
+    /// the client hears `Resumed`.
+    async fn create(
+        ctx: &ManagerCtx<'_>,
+        router: &mut Router,
+        change: RevisionChange,
+        admission: Admission,
+        running: Option<StartedOwner>,
     ) -> Option<[u8; 32]> {
         let Admission {
             revision: _revision,
@@ -4037,11 +4228,15 @@ impl SessionManager {
         );
         // No backend callback or bridge scheduling precedes the synchronous
         // route, revision and backend registration above.
-        spawn_committed_bridge(BridgeSpawn {
+        let spawn = BridgeSpawn {
             socket: ctx.socket.clone(),
             committed: CommittedAdmission(AuthAcceptance {
                 session_id: conn.session_id(),
-                disposition: SessionDisposition::Fresh,
+                disposition: if running.is_some() {
+                    SessionDisposition::Resumed
+                } else {
+                    SessionDisposition::Fresh
+                },
             }),
             conn,
             channels: BridgeChannels {
@@ -4057,7 +4252,14 @@ impl SessionManager {
             start,
             active_count: ctx.active_count.clone(),
             gates,
-        });
+        };
+        match running {
+            Some(owner) => {
+                let lifecycle = spawn.io.lifecycle.clone();
+                lifecycle.spawn(run_bridge(spawn, 0, Some(owner)));
+            }
+            None => spawn_committed_bridge(spawn),
+        }
 
         send_all(ctx.socket, &out).await;
         superseded.map(|e| e.client_key)
@@ -4196,6 +4398,33 @@ fn remove_from_allowlist(shared_allowlist: &SharedAllowlist, key: &[u8; 32]) {
     }
 }
 
+/// [`remove_from_allowlist`] for the router: the key also goes from the
+/// allowlist that outlives this process, if there is one.
+fn forget_key(auth: &ServerAuth, router: &Router, key: &[u8; 32]) {
+    remove_from_allowlist(&auth.allowlist, key);
+    if let Some(directory) = &router.directory {
+        directory.key_scrubbed(*key);
+    }
+}
+
+/// [`scrub_superseded_key`] for the router, as [`forget_key`]; the
+/// directory also hears which key `token`'s session now has.
+fn forget_superseded_key(
+    auth: &ServerAuth,
+    router: &Router,
+    token: LoginId,
+    old_key: Option<[u8; 32]>,
+    new_key: [u8; 32],
+) {
+    let scrubbed = scrub_superseded_key(&auth.allowlist, old_key, new_key);
+    if let Some(directory) = &router.directory {
+        if let Some(old_key) = scrubbed {
+            directory.key_scrubbed(old_key);
+        }
+        directory.client_key(token, new_key);
+    }
+}
+
 /// After a warm reattach or cold replace supersedes an existing entry's
 /// `client_key` with a NEW one, scrub the OLD key off the shared allowlist --
 /// UNLESS it's the SAME key the new connection also authenticated with (the
@@ -4211,12 +4440,10 @@ fn scrub_superseded_key(
     shared_allowlist: &SharedAllowlist,
     old_key: Option<[u8; 32]>,
     new_key: [u8; 32],
-) {
-    if let Some(old_key) = old_key {
-        if old_key != new_key {
-            remove_from_allowlist(shared_allowlist, &old_key);
-        }
-    }
+) -> Option<[u8; 32]> {
+    let old_key = old_key.filter(|old| *old != new_key)?;
+    remove_from_allowlist(shared_allowlist, &old_key);
+    Some(old_key)
 }
 
 /// Make `conn` one this bridge drives: a proven peer's cap on out-of-order
@@ -4252,6 +4479,11 @@ enum AttachResult {
     Applied,
     Cancelled,
     Rejected(u64),
+    /// The new connection could not be given its session just now (the
+    /// owner's link cannot be replaced yet): the bridge stays parked on the
+    /// link it has, as after that connection's death, and the session waits
+    /// for the client's next return.
+    Parked(u64),
 }
 
 /// What a warm reattach rebuilds, besides the backend link itself, when the
@@ -4395,26 +4627,38 @@ async fn rebuild_from_owner(
 /// the link carried last may never have arrived, and input behind a hole
 /// is not delivered.
 ///
-/// `false` if the link cannot be replaced or the replay does not come: the
-/// session then ends.
+/// `Failed` if the owner is gone or its replay does not come: the session
+/// then ends. `Unavailable` if the owner cannot be reached just now (its
+/// host did not answer, `owner_link::relink_unavailable`): nothing has
+/// changed, and the session is kept for the client's next attempt.
 async fn rebuild_link(
     conn: &Connection,
     link: &mut BackendLink,
     remote: &owner_link::RemoteControl,
     state: &mut BridgeState<'_>,
-) -> bool {
+) -> Rebuild {
+    // The new link first: until it is there, nothing of the current one
+    // changes.
+    let replacement = match remote.replacement() {
+        Ok(replacement) => replacement,
+        Err(error) if owner_link::relink_unavailable(&error) => {
+            log::warn!(
+                "the session owner's link cannot be replaced just now ({error}); \
+                 the session is kept for the client's next return"
+            );
+            return Rebuild::Unavailable;
+        }
+        Err(error) => {
+            log::error!("cannot replace the session owner's link: {error}");
+            return Rebuild::Failed;
+        }
+    };
     if !remote.lost() {
         link.channel_output.report_unconfirmed(conn);
     }
     // Whether the link was lost is asked again once it is replaced: the
     // reader may know of a loss it has not announced yet.
-    let (sender, lost) = match remote.relink() {
-        Ok(replaced) => replaced,
-        Err(error) => {
-            log::error!("cannot replace the session owner's link: {error}");
-            return false;
-        }
-    };
+    let (sender, lost) = remote.relink_with(replacement);
     *state.held_backend = None;
     let snapshots = link.channel_output.snapshots.clone();
     let own_generation = link.ledger.generation();
@@ -4428,7 +4672,7 @@ async fn rebuild_link(
     };
     let Some(rebuilt) = rebuilt else {
         log::error!("the session owner's replay did not arrive; ending the session");
-        return false;
+        return Rebuild::Failed;
     };
     let mut inbound = Inbound::new(InboundTx::Remote(sender));
     inbound.revoked = link.inbound.revoked;
@@ -4444,7 +4688,14 @@ async fn rebuild_link(
     *state.pending_control = rebuilt.pending_control;
     *state.classes = rebuilt.classes;
     *state.first_live_sent |= rebuilt.live_seen;
-    true
+    Rebuild::Done
+}
+
+/// How [`rebuild_link`] went.
+enum Rebuild {
+    Done,
+    Unavailable,
+    Failed,
 }
 
 async fn apply_control(
@@ -4492,11 +4743,11 @@ async fn apply_control(
     match remote {
         // Behind a replaceable owner link the owner pays what is owed
         // (its journal), and this bridge's state is rebuilt from its replay.
-        Some(remote) => {
-            if !rebuild_link(conn, link, remote, state).await {
-                return AttachResult::Rejected(new_conn.session_id());
-            }
-        }
+        Some(remote) => match rebuild_link(conn, link, remote, state).await {
+            Rebuild::Done => {}
+            Rebuild::Unavailable => return AttachResult::Parked(new_conn.session_id()),
+            Rebuild::Failed => return AttachResult::Rejected(new_conn.session_id()),
+        },
         None => link.ledger.carry(),
     }
     link.channel_output.attach(conn, link.ledger.generation());
@@ -4649,10 +4900,10 @@ async fn on_routed_datagram(
     out: &mut Vec<Datagram>,
 ) -> AttachResult {
     while let Ok(control) = control_rx.try_recv() {
-        if let rejected @ AttachResult::Rejected(_) =
+        if let ended @ (AttachResult::Rejected(_) | AttachResult::Parked(_)) =
             apply_control(conn, parked, link, control, state, now, out).await
         {
-            return rejected;
+            return ended;
         }
     }
     out.extend(conn.on_datagram(now, src, bytes));
@@ -5078,6 +5329,21 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
 /// generation the owner has seen (`rebuild_from_owner`), so no earlier
 /// origin ever becomes current again.
 async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
+    run_bridge(spawn, generation, None).await
+}
+
+/// How often, at most, a bridge whose session outlives this process says
+/// that its client is still there.
+const LIVENESS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`run_backend_bridge_from`], or -- with `resume` -- the bridge of a new
+/// frontend process for a session that already runs behind `resume`'s owner
+/// (`SessionBackend::resume`): its backend-facing state comes from the
+/// owner's replay (`rebuild_from_owner`), its generation continues the
+/// owner's, and the backend hears `ResumeReset` for this first connection,
+/// exactly as at a warm reattach in a frontend that lived on.
+async fn run_bridge(spawn: BridgeSpawn, generation: u64, resume: Option<StartedOwner>) {
+    let mut generation = generation;
     let BridgeSpawn {
         socket,
         committed,
@@ -5125,14 +5391,46 @@ async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
     let control = io.control().clone();
     let control_budget = control.budget.clone();
     io.set_control_origin(AttachmentContext::for_connection(&conn, generation));
+    // Sessions that outlive this process: where their liveness is kept.
+    let directory = backend.directory();
+    let resumed = resume.is_some();
     // Started here, not inside the task: a backend behind an owner link
     // installs the link's inbound sender before the bridge's first event.
-    lifecycle.spawn(backend.run(io));
+    lifecycle.spawn(match resume {
+        Some(owner) => backend.resume(io, owner),
+        None => backend.run(io),
+    });
     let inbound_tx = match control.remote.get().and_then(|r| r.take_inbound()) {
         // The bridge's own queue is unused: its sender closes here.
         Some(remote) => InboundTx::Remote(remote),
         None => InboundTx::Local(io_inbound_tx),
     };
+    let mut rebuilt = None;
+    if resumed {
+        rebuilt = tokio::select! {
+            biased;
+            _ = lifecycle.shutdown.requested() => None,
+            rebuilt = tokio::time::timeout(
+                REBUILD_TIMEOUT,
+                rebuild_from_owner(&mut backend_out_rx, resume_snapshots.clone(), generation),
+            ) => rebuilt.ok().flatten(),
+        };
+        let Some(state) = &rebuilt else {
+            // Fail closed: the client hears a close, and the owner hears the
+            // end when it takes the link (the inbound sender drops here).
+            log::error!("the session owner's replay did not arrive; ending the session");
+            out.extend(conn.close(now));
+            send_all(&socket, &out).await;
+            let _ = done_tx.send(SessionEnded {
+                phase: SessionEndPhase::Final,
+                session_id: conn.session_id(),
+                token,
+                graceful: true,
+            });
+            return;
+        };
+        generation = state.generation;
+    }
     let mut link = BackendLink::starting_at(inbound_tx, consumption, generation);
     link.channel_output.snapshots = resume_snapshots;
     let mut pending_control = VecDeque::new();
@@ -5159,6 +5457,7 @@ async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
     // Never `true` before the loop below runs its first recompute, so the
     // early-return below never needs to decrement.
     let mut was_active = false;
+    let mut liveness_said = now;
     // Every class the backend declared: a class, like a recoverability
     // declaration, lives on `conn`, and a warm reattach brings a connection
     // that never heard it (`apply_control` declares these again).
@@ -5167,13 +5466,36 @@ async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
     // asked (see `take_delivered`).
     let mut awaiting_delivery: Vec<(u8, u64)> = Vec::new();
     let mut drain_pending = false;
+    // A session taken over from an earlier frontend process: everything
+    // backend-facing is the owner's replay, and this connection is to the
+    // backend what a warm reattach's is (`apply_control`).
+    let mut resume_reset = false;
+    if let Some(state) = rebuilt {
+        link.channel_output = state.channel_output;
+        pending_control = state.pending_control;
+        classes = state.classes;
+        // A backend that heard `Live` hears `ResumeReset` now; one that
+        // never did (its first frontend died first) still starts here.
+        first_live_sent = state.live_seen;
+        resume_reset = state.live_seen;
+        link.channel_output.attach(&conn, generation);
+    }
     // A proven connection: probation's cap does not follow it here.
     adopt_connection(&mut conn, &classes);
+    if resume_reset {
+        let context = AttachmentContext::for_connection(&conn, generation);
+        link.hand_over(
+            &mut conn,
+            now,
+            SessionInbound::ResumeReset(context),
+            &mut out,
+        );
+    }
 
     // Replay what a probation stage consumed off this connection before the
     // bridge got it. ORDER: the backend hears its session started before any
     // byte of it, exactly as it would have from the drain below.
-    if start.saw_live {
+    if start.saw_live && !first_live_sent {
         first_live_sent = true;
         let context = AttachmentContext::for_connection(&conn, link.ledger.generation());
         link.hand_over(&mut conn, now, SessionInbound::Live(context), &mut out);
@@ -5404,7 +5726,7 @@ async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
                     first_live_sent: &mut first_live_sent,
                     backend_finished,
                 };
-                if let AttachResult::Rejected(session_id) = on_routed_datagram(
+                match on_routed_datagram(
                     &mut conn,
                     &mut parked,
                     &mut control_rx,
@@ -5417,13 +5739,24 @@ async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
                 )
                 .await
                 {
-                    let _ = done_tx.send(SessionEnded {
-                        phase: SessionEndPhase::Final,
-                        session_id,
+                    AttachResult::Rejected(session_id) => {
+                        let _ = done_tx.send(SessionEnded {
+                            phase: SessionEndPhase::Final,
+                            session_id,
+                            token,
+                            graceful: false,
+                        });
+                        break;
+                    }
+                    AttachResult::Parked(session_id) => park_unattached(
+                        &mut parked,
+                        &mut was_active,
+                        &active_count,
+                        &done_tx,
                         token,
-                        graceful: false,
-                    });
-                    break;
+                        session_id,
+                    ),
+                    AttachResult::Applied | AttachResult::Cancelled => {}
                 }
             }
             // The manager dropped the datagram channel -- shut the backend down.
@@ -5616,7 +5949,7 @@ async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
                     first_live_sent: &mut first_live_sent,
                     backend_finished,
                 };
-                if let AttachResult::Rejected(session_id) = apply_control(
+                match apply_control(
                     &mut conn,
                     &mut parked,
                     &mut link,
@@ -5627,13 +5960,24 @@ async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
                 )
                 .await
                 {
-                    let _ = done_tx.send(SessionEnded {
-                        phase: SessionEndPhase::Final,
-                        session_id,
+                    AttachResult::Rejected(session_id) => {
+                        let _ = done_tx.send(SessionEnded {
+                            phase: SessionEndPhase::Final,
+                            session_id,
+                            token,
+                            graceful: false,
+                        });
+                        break;
+                    }
+                    AttachResult::Parked(session_id) => park_unattached(
+                        &mut parked,
+                        &mut was_active,
+                        &active_count,
+                        &done_tx,
                         token,
-                        graceful: false,
-                    });
-                    break;
+                        session_id,
+                    ),
+                    AttachResult::Applied | AttachResult::Cancelled => {}
                 }
             }
             // What waited for the backend went to it: booked to the
@@ -5735,6 +6079,22 @@ async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
         // while Live/PathDown, so an active->inactive transition is noticed
         // within ~`ACTIVE_WINDOW` + a tick.
         let now_active = !parked && is_active(conn.idle_duration(Instant::now()));
+        if let Some(directory) = &directory {
+            // When the client was last heard, kept where it outlives this
+            // process: at every change, and while it goes on.
+            if now_active != was_active
+                || (now_active && now.duration_since(liveness_said) >= LIVENESS_EVERY)
+            {
+                liveness_said = now;
+                directory.liveness(
+                    token,
+                    Liveness::Traffic {
+                        idle: conn.idle_duration(Instant::now()),
+                        active: now_active,
+                    },
+                );
+            }
+        }
         if now_active != was_active {
             if now_active {
                 active_count.fetch_add(1, Ordering::SeqCst);
@@ -6764,12 +7124,38 @@ impl BackendLink {
     }
 }
 
+/// A warm reattach that could not be given the session just now
+/// ([`AttachResult::Parked`]): as at its connection's death, the bridge parks
+/// and the router retains the session (under the new connection's id, which
+/// the reattach made its route), so the client's next return attaches it.
+fn park_unattached(
+    parked: &mut bool,
+    was_active: &mut bool,
+    active_count: &AtomicUsize,
+    done_tx: &mpsc::UnboundedSender<SessionEnded>,
+    token: [u8; 16],
+    session_id: u64,
+) {
+    if !*parked {
+        *parked = true;
+        deactivate(was_active, active_count);
+    }
+    let _ = done_tx.send(SessionEnded {
+        phase: SessionEndPhase::Parked,
+        session_id,
+        token,
+        graceful: false,
+    });
+}
+
 /// The session ends while its owner's link is lost: the end the inbound
 /// sender says when it drops would go nowhere, and the owner would keep the
 /// session's processes until the daemon stops. A new link carries it.
 fn end_lost_session(control: &SessionControl) {
     if let Some(remote) = control.remote.get().filter(|remote| remote.lost()) {
-        drop(remote.relink());
+        if let Ok(link) = remote.replacement() {
+            drop(remote.relink_with(link));
+        }
     }
 }
 

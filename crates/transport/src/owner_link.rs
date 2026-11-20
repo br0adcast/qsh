@@ -132,6 +132,12 @@ const WRITE_BATCH: usize = 64 * 1024;
 /// screen repaint is one record; its size follows the screen model's, which
 /// the owner's screen budget bounds well below this.
 const MAX_DATA_RECORD: usize = 1 << 30;
+/// How long an owner lets a link that is being replaced go on before it
+/// takes it for lost: its frontend ends it in order (`Retire`) right behind
+/// handing over the next one, so a link still up after this belongs to a
+/// frontend that hangs. Below the frontend's wait for the replay
+/// (`REBUILD_TIMEOUT`), so the new link is still listened to when it starts.
+const RETIRE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
 /// In-memory buffer of each direction of a loopback link.
 const LOOPBACK_BUFFER: usize = 256 * 1024;
 
@@ -179,7 +185,84 @@ pub trait FrontendRelink: Send + Sync + 'static {
     /// Hand the owner one end of a new link and return the other. The
     /// owner ends its current link first (it reads it to its `Retire` or
     /// to its end), then replays its custody on the new one.
+    ///
+    /// An error of kind [`std::io::ErrorKind::TimedOut`] or
+    /// [`std::io::ErrorKind::WouldBlock`] says the owner could not be
+    /// reached just now ([`relink_unavailable`]): the session is kept for
+    /// a later attempt. Any other error says the owner is gone. "Not now"
+    /// usually means nothing changed; but after an answer that came too
+    /// late (or a local failure taking it), the host has already handed the
+    /// owner its end of a link nobody holds. The owner then moves onto that
+    /// link, takes the current one for lost once `RETIRE_WITHIN` passed,
+    /// and the next attempt recovers the session through the lost-link
+    /// path (its replay).
     fn relink(&self) -> std::io::Result<Box<dyn LinkIo>>;
+}
+
+/// Whether a [`FrontendRelink::relink`] error means "not now" rather than
+/// "the owner is gone".
+pub fn relink_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// What a frontend that can be replaced keeps where it outlives it (#529):
+/// the host process, which holds every session's owner. The router asks it
+/// about logins it has never heard of, and tells it what a later frontend
+/// must find unchanged.
+pub trait SessionDirectory: Send + Sync + 'static {
+    /// Whether `login`'s session runs behind an owner an earlier frontend
+    /// left, for a warm start by `uid`. Bounded: no answer in time is
+    /// [`Lookup::Unavailable`], never `Unknown`.
+    fn lookup(&self, login: LoginId, uid: u32)
+        -> Pin<Box<dyn Future<Output = Lookup> + Send + '_>>;
+    /// Whether `login` had a session when this frontend started: the hint
+    /// an unproven warm handshake is answered with. Never waits.
+    fn known(&self, login: LoginId) -> bool;
+    /// `login`'s client was heard, or its session was retained. Never waits.
+    fn liveness(&self, login: LoginId, liveness: Liveness);
+    /// `key` was scrubbed off the allowlist. Never waits.
+    fn key_scrubbed(&self, key: [u8; 32]);
+    /// `login`'s session is now its client's under `key`, the key its
+    /// handshake proved: whoever ends the session where this process
+    /// cannot scrubs it. Never waits.
+    fn client_key(&self, login: LoginId, key: [u8; 32]) {
+        let _ = (login, key);
+    }
+}
+
+/// What the directory knows of a login the router does not.
+pub enum Lookup {
+    /// No session: a warm start gets a fresh one, as before.
+    Unknown,
+    /// No answer (in time): whether there is a session is not known. The
+    /// handshake is dropped and nothing else changes -- above all no fresh
+    /// session replaces one that may still run. A client whose `msg1` was
+    /// not answered yet (the allowlist path) asks again with its
+    /// retransmit; one that already holds `msg2` (the signature path, whose
+    /// `msg2` goes out when its proof is checked) hears nothing more on that
+    /// connection and comes back when its death timer ends it.
+    Unavailable,
+    /// A session of another account: refused.
+    Foreign,
+    /// The session runs behind this owner, on a link that replaces the one
+    /// its earlier frontend held.
+    Running(StartedOwner),
+}
+
+/// What a frontend reports of a session's client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// The client was last heard `idle` ago; `active` while that is recent
+    /// (the daemon's count of active sessions).
+    Traffic {
+        idle: std::time::Duration,
+        active: bool,
+    },
+    /// The client's connection died, now: the session is retained.
+    Retained,
 }
 
 /// Hands a session owner the link that replaces its current one
@@ -453,12 +536,17 @@ async fn owner_write_loop<W: AsyncWrite + Unpin>(
     mut priority: mpsc::UnboundedReceiver<ToFrontend>,
     failure: Arc<LinkFailure>,
     lifecycle: Arc<Lifecycle>,
+    abandon: Shutdown,
 ) {
     let mut out = Vec::new();
     loop {
         let first = tokio::select! {
             biased;
             _ = lifecycle.shutdown.requested() => {
+                // A lost session says nothing on its way out.
+                if abandon.is_requested() {
+                    return;
+                }
                 out.clear();
                 if encode(&ToFrontend::Finished, &mut out).is_ok() {
                     let _ = tokio::time::timeout(FAREWELL_WITHIN, async {
@@ -513,7 +601,28 @@ async fn frontend_write_loop<W: AsyncWrite + Unpin>(
     loop {
         let more = tokio::select! {
             biased;
-            _ = lifecycle.shutdown.requested() => return,
+            _ = lifecycle.shutdown.requested() => {
+                // This frontend stops in order. What its bridge handed over
+                // and is still queued here goes out, if the owner takes it
+                // at once: input booked as handed over is then not lost
+                // with the process. Never an `End`: a frontend that stops
+                // does not end its sessions (the link is then lost, and the
+                // owner parks).
+                out.clear();
+                let whole = queue
+                    .take_for_exit()
+                    .iter()
+                    .all(|m| encode(m, &mut out).is_ok());
+                if whole && !out.is_empty() {
+                    let _ = tokio::time::timeout(FAREWELL_WITHIN, async {
+                        if write.write_all(&out).await.is_ok() {
+                            let _ = write.flush().await;
+                        }
+                    })
+                    .await;
+                }
+                return;
+            }
             more = queue.next_batch(&mut batch) => more,
         };
         match more {
@@ -674,6 +783,25 @@ impl LinkQueue {
 
     fn failed(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).failed
+    }
+
+    /// The frontend stops: everything queued, in order, up to an `End` (a
+    /// stopping frontend's bridges drop their senders, and that must not
+    /// end a session). Nothing is accepted afterwards.
+    fn take_for_exit(&self) -> Vec<ToOwner> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.failed {
+            return Vec::new();
+        }
+        st.failed = true;
+        st.keyed.clear();
+        st.live = 0;
+        std::mem::take(&mut st.entries)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .take_while(|m| !matches!(m, ToOwner::End(_)))
+            .collect()
     }
 
     /// End this link in order: `Retire` goes last, and whatever a token of
@@ -1187,12 +1315,19 @@ impl RemoteControl {
     /// Also says whether the replaced link was lost, as known once the new
     /// one is in place: a loss the reader has seen but not announced yet
     /// (it is still asking whether the owner exited) counts.
-    pub(super) fn relink(&self) -> std::io::Result<(CreditSender, bool)> {
-        let relinker = self
-            .relinker
+    ///
+    /// Two steps: [`RemoteControl::replacement`] obtains the new link and
+    /// changes nothing else -- when it fails, the current link and every
+    /// report are as they were -- and this installs it.
+    pub(super) fn replacement(&self) -> std::io::Result<Box<dyn LinkIo>> {
+        self.relinker
             .as_ref()
-            .ok_or_else(|| std::io::Error::other("this owner link cannot be replaced"))?;
-        let link = relinker.relink()?;
+            .ok_or_else(|| std::io::Error::other("this owner link cannot be replaced"))?
+            .relink()
+    }
+
+    /// See [`RemoteControl::replacement`].
+    pub(super) fn relink_with(&self, link: Box<dyn LinkIo>) -> (CreditSender, bool) {
         let (epoch, sender) = open_epoch(link, &self.lifecycle, true);
         let (old, lost) = {
             let mut state = self.state();
@@ -1204,7 +1339,13 @@ impl RemoteControl {
         };
         old.retire();
         self.next_ready.notify_one();
-        Ok((sender, lost))
+        (sender, lost)
+    }
+
+    /// [`RemoteControl::replacement`], then [`RemoteControl::relink_with`].
+    #[cfg(test)]
+    pub(super) fn relink(&self) -> std::io::Result<(CreditSender, bool)> {
+        Ok(self.relink_with(self.replacement()?))
     }
 
     /// The next link the bridge set up. Cancel-safe.
@@ -1229,6 +1370,7 @@ pub struct RemoteBackend {
     /// the session's. An in-process owner runs it here.
     inner: Arc<dyn SessionBackend>,
     starter: Option<Arc<dyn OwnerStarter>>,
+    directory: Option<Arc<dyn SessionDirectory>>,
 }
 
 impl RemoteBackend {
@@ -1237,7 +1379,15 @@ impl RemoteBackend {
         RemoteBackend {
             inner,
             starter: None,
+            directory: None,
         }
+    }
+
+    /// The owners outlive this process: `directory` knows the sessions an
+    /// earlier frontend left running, and keeps what a later one must find.
+    pub fn with_directory(mut self, directory: Arc<dyn SessionDirectory>) -> RemoteBackend {
+        self.directory = Some(directory);
+        self
     }
 
     /// Run each session in an owner that `starter` starts. `inner` is the
@@ -1250,6 +1400,7 @@ impl RemoteBackend {
         RemoteBackend {
             inner,
             starter: Some(starter),
+            directory: None,
         }
     }
 }
@@ -1288,6 +1439,7 @@ impl SessionBackend for RemoteBackend {
             last_generation: 0,
             lifecycle: Some(io.lifecycle.clone()),
             relinks: OwnerRelink::default(),
+            abandon: Shutdown::default(),
         };
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let relink = Arc::new(LoopbackRelink {
@@ -1307,6 +1459,21 @@ impl SessionBackend for RemoteBackend {
 
     fn consumption(&self) -> Consumption {
         self.inner.consumption()
+    }
+
+    fn directory(&self) -> Option<Arc<dyn SessionDirectory>> {
+        self.directory.clone()
+    }
+
+    /// A new frontend process takes a running owner over: `owner.link`
+    /// replaces the link the earlier frontend held, so the owner's replay
+    /// comes first on it.
+    fn resume(
+        &self,
+        io: SessionIo,
+        owner: StartedOwner,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(start_frontend(io, owner.link, Some(owner.relink), true))
     }
 }
 
@@ -1952,6 +2119,9 @@ pub struct OwnerInit {
     /// in-process owner, a fresh one otherwise.
     lifecycle: Option<Arc<Lifecycle>>,
     relinks: OwnerRelink,
+    /// Requested ahead of the lifecycle's stop when the session is lost
+    /// rather than ended (`OwnerInit::abandon`).
+    abandon: Shutdown,
 }
 
 impl OwnerInit {
@@ -1963,12 +2133,23 @@ impl OwnerInit {
             last_generation: 0,
             lifecycle: None,
             relinks: OwnerRelink::default(),
+            abandon: Shutdown::default(),
         }
     }
 
     /// The handle that gives this owner a link in place of its current one.
     pub fn relinks(&self) -> OwnerRelink {
         self.relinks.clone()
+    }
+
+    /// Requested before the owner's lifecycle stops when its session is
+    /// lost, not ended -- the owner's host process died: its link then
+    /// closes without `Finished`. Whatever still reads the link (a
+    /// frontend process that outlives the host for a moment) must not end
+    /// the client's session as if its shell had ended; the client finds
+    /// the session gone, as when a single-process daemon dies.
+    pub fn abandon(&self) -> Shutdown {
+        self.abandon.clone()
     }
 }
 
@@ -2363,6 +2544,8 @@ struct Owner {
     failure: Arc<LinkFailure>,
     /// Leading pieces of the next inbound data event.
     data_parts: Vec<u8>,
+    /// The session is lost, not ended: no link hears `Finished` at the stop.
+    abandon: Shutdown,
 }
 
 /// What a frame did beyond its own effect.
@@ -2439,6 +2622,7 @@ impl OwnerLink {
             last_generation,
             lifecycle,
             relinks,
+            abandon,
         } = init;
         let lifecycle = lifecycle.unwrap_or_else(|| Lifecycle::new(Shutdown::default()));
         let (in_tx, in_rx) = mpsc::channel::<SessionInbound>(INBOUND_CAP);
@@ -2484,11 +2668,16 @@ impl OwnerLink {
             priority: None,
             failure: Arc::new(LinkFailure::default()),
             data_parts: Vec::new(),
+            abandon,
         };
         // The link being read, if any.
         let mut reader = Some(owner.open(Box::new(link), &lifecycle));
-        // A link handed over while the current one has not ended yet.
+        // A link handed over while the current one has not ended yet, and
+        // until when it waits for that end.
         let mut waiting: Option<Box<dyn LinkIo>> = None;
+        let mut retire_by: Option<tokio::time::Instant> = None;
+        // The current link no longer takes what the owner writes.
+        let mut write_dead = false;
         let mut ended = false;
         // The backend finished and everything it sent went out; the frontend
         // still holds custody until it closes the link.
@@ -2503,8 +2692,10 @@ impl OwnerLink {
             let failure = owner.failure.clone();
             let linked = reader.is_some();
             // Its writes failed, but what the frontend wrote is still read.
-            let writable = linked && (owner.data.is_some() || backend_done);
-            let relinkable = waiting.is_none() && !ended && !backend_done;
+            let writable = linked && !write_dead;
+            // Also once the backend is done: the link that replaces the
+            // current one still has to hear what is left, and `Finished`.
+            let relinkable = waiting.is_none() && !ended;
             let wake = tokio::select! {
                 biased;
                 _ = lifecycle.shutdown.requested() => {
@@ -2531,6 +2722,12 @@ impl OwnerLink {
                             }
                         } => OwnerWake::Slot(permit),
                         link = relinks.next(), if relinkable => OwnerWake::Relink(link),
+                        _ = async {
+                            match retire_by {
+                                Some(by) => tokio::time::sleep_until(by).await,
+                                None => std::future::pending().await,
+                            }
+                        } => OwnerWake::RetireOverdue,
                     }
                 } => wake,
             };
@@ -2549,7 +2746,6 @@ impl OwnerLink {
                         }
                     }
                 }
-                OwnerWake::WriteFailed if backend_done => return OwnerExit::Finished,
                 // The frontend's end no longer takes anything -- at a warm
                 // reattach it closes right behind its `Retire`. What it
                 // wrote before is still in the link and still counts: its
@@ -2559,6 +2755,17 @@ impl OwnerLink {
                     log::debug!("owner link: owner write failed; reading the link to its end");
                     owner.data = None;
                     owner.priority = None;
+                    write_dead = true;
+                }
+                // The link that was to be retired did not end in time: its
+                // frontend hangs, or its `Retire` is lost. The link that
+                // waits takes over as after a lost one.
+                OwnerWake::RetireOverdue => {
+                    log::warn!(
+                        "owner link: the replaced link did not end within {} s; taking it for lost",
+                        RETIRE_WITHIN.as_secs()
+                    );
+                    link_over = Some(false);
                 }
                 OwnerWake::Frame(frame) => match frame
                     .and_then(|frame| frame.map(|frame| owner.on_frame(&frame)).transpose())
@@ -2612,18 +2819,51 @@ impl OwnerLink {
                 }
                 // The backend's queue closed: nothing more can be handed over.
                 OwnerWake::Slot(None) => owner.end_inbound(),
-                OwnerWake::Relink(link) if linked => waiting = Some(link),
+                OwnerWake::Relink(link) if linked => {
+                    waiting = Some(link);
+                    retire_by = Some(tokio::time::Instant::now() + RETIRE_WITHIN);
+                }
                 OwnerWake::Relink(link) => {
                     reader = Some(owner.open(link, &lifecycle));
+                    write_dead = false;
                     owner.replay();
                 }
             }
             if let Some(orderly) = link_over {
                 reader = None;
+                retire_by = None;
                 owner.unlink(orderly);
-                if let Some(link) = waiting.take().filter(|_| !ended) {
+                let mut next = waiting.take().filter(|_| !ended);
+                if backend_done {
+                    // The session is over, and the link went before its
+                    // frontend heard so. A link retired in order always has
+                    // a successor (the frontend hands it over first): its
+                    // bridge gets what is left and `Finished`, so its client
+                    // hears the end. Nobody left to tell: the owner is done.
+                    if next.is_none() && orderly && !ended {
+                        next = tokio::select! {
+                            biased;
+                            _ = lifecycle.shutdown.requested() => None,
+                            link = tokio::time::timeout(RETIRE_WITHIN, relinks.next()) => link.ok(),
+                        };
+                    }
+                    if next.is_none() {
+                        return if ended {
+                            OwnerExit::Finished
+                        } else {
+                            OwnerExit::LinkLost
+                        };
+                    }
+                }
+                if let Some(link) = next {
                     reader = Some(owner.open(link, &lifecycle));
+                    write_dead = false;
                     owner.replay();
+                    if backend_done {
+                        owner.to_frontend(ToFrontend::Finished);
+                        owner.data = None;
+                        owner.priority = None;
+                    }
                 }
             }
         }
@@ -2633,6 +2873,7 @@ impl OwnerLink {
 enum OwnerWake {
     Terminal,
     WriteFailed,
+    RetireOverdue,
     Frame(Result<Option<Frame>, LinkError>),
     Backend(Option<SessionOutbound>),
     Slot(Option<mpsc::OwnedPermit<SessionInbound>>),
@@ -2741,6 +2982,7 @@ impl Owner {
             priority_rx,
             failure.clone(),
             lifecycle.clone(),
+            self.abandon.clone(),
         ));
         self.data = Some(data);
         self.priority = Some(priority);

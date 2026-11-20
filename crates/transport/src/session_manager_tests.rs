@@ -12526,3 +12526,454 @@ include!("session_manager_mailbox_tests.rs");
 include!("session_manager_intake_tests.rs");
 
 include!("session_manager_bootstrap_tests.rs");
+
+// ---- a new frontend takes over sessions that outlived the old one (#529) ----
+
+/// A stand-in for a daemon's host process: it starts every session's owner
+/// (in this process, on a lifecycle no frontend's shutdown reaches) and
+/// keeps it across frontends, as the directory a new frontend asks.
+struct TakeoverHost {
+    backend: Arc<dyn SessionBackend>,
+    owners: Mutex<HashMap<LoginId, (u32, OwnerRelink)>>,
+    liveness: Mutex<Vec<(LoginId, Liveness)>>,
+    scrubbed: Mutex<Vec<[u8; 32]>>,
+    /// How the directory answers a lookup.
+    answer: Mutex<TakeoverAnswer>,
+    /// Lets a stalled lookup go (answered then as if it had answered).
+    released: tokio::sync::Notify,
+    /// Lookups the directory was asked.
+    asked: AtomicUsize,
+    /// Relinks fail as "not now" while set.
+    relink_unavailable: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TakeoverAnswer {
+    /// As the host does.
+    Answer,
+    /// No answer in time.
+    Unavailable,
+    /// No answer until `released`.
+    Stall,
+}
+
+struct TakeoverRelink(OwnerRelink, Arc<std::sync::atomic::AtomicBool>);
+impl FrontendRelink for TakeoverRelink {
+    fn exited(&self) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(std::future::ready(false))
+    }
+    fn relink(&self) -> std::io::Result<Box<dyn LinkIo>> {
+        if self.1.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the host did not answer",
+            ));
+        }
+        let (front, owner) = loopback();
+        self.0.relink(owner);
+        Ok(Box::new(front))
+    }
+}
+
+impl TakeoverHost {
+    fn new(backend: Arc<dyn SessionBackend>) -> Arc<TakeoverHost> {
+        Arc::new(TakeoverHost {
+            backend,
+            owners: Mutex::default(),
+            liveness: Mutex::default(),
+            scrubbed: Mutex::default(),
+            answer: Mutex::new(TakeoverAnswer::Answer),
+            released: tokio::sync::Notify::new(),
+            asked: AtomicUsize::new(0),
+            relink_unavailable: Arc::default(),
+        })
+    }
+
+    /// The backend a frontend process of this host runs its router with.
+    fn frontend(self: &Arc<Self>) -> BackendFactory {
+        BackendFactory(Arc::new(
+            RemoteBackend::with_owners(self.backend.clone(), self.clone())
+                .with_directory(self.clone()),
+        ))
+    }
+}
+
+impl OwnerStarter for TakeoverHost {
+    fn start(&self, init: OwnerInit) -> std::io::Result<StartedOwner> {
+        let relinks = init.relinks();
+        let (front, owner) = loopback();
+        self.owners
+            .lock()
+            .unwrap()
+            .insert(init.login, (init.principal.uid, relinks.clone()));
+        let backend = self.backend.clone();
+        tokio::spawn(async move {
+            OwnerLink::run(owner, backend, init).await;
+        });
+        Ok(StartedOwner {
+            link: Box::new(front),
+            relink: Arc::new(TakeoverRelink(relinks, self.relink_unavailable.clone())),
+        })
+    }
+}
+
+impl SessionDirectory for TakeoverHost {
+    fn lookup(
+        &self,
+        login: LoginId,
+        uid: u32,
+    ) -> Pin<Box<dyn Future<Output = Lookup> + Send + '_>> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        let answer = *self.answer.lock().unwrap();
+        Box::pin(async move {
+            match answer {
+                TakeoverAnswer::Answer => {}
+                TakeoverAnswer::Unavailable => return Lookup::Unavailable,
+                TakeoverAnswer::Stall => self.released.notified().await,
+            }
+            match self.owners.lock().unwrap().get(&login) {
+                None => Lookup::Unknown,
+                Some((owner, _)) if *owner != uid => Lookup::Foreign,
+                Some((_, relinks)) => {
+                    let relink = TakeoverRelink(relinks.clone(), self.relink_unavailable.clone());
+                    Lookup::Running(StartedOwner {
+                        link: relink.relink().unwrap(),
+                        relink: Arc::new(relink),
+                    })
+                }
+            }
+        })
+    }
+    fn known(&self, login: LoginId) -> bool {
+        self.owners.lock().unwrap().contains_key(&login)
+    }
+    fn liveness(&self, login: LoginId, liveness: Liveness) {
+        self.liveness.lock().unwrap().push((login, liveness));
+    }
+    fn key_scrubbed(&self, key: [u8; 32]) {
+        self.scrubbed.lock().unwrap().push(key);
+    }
+}
+
+/// Echoes stream 0, and records each start of a backend and each
+/// `ResumeReset` it hears.
+struct TakeoverBackend(Arc<Mutex<Vec<&'static str>>>);
+impl SessionBackend for TakeoverBackend {
+    fn run(&self, mut io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let events = self.0.clone();
+        Box::pin(async move {
+            events.lock().unwrap().push("start");
+            while let Some(ev) = io.recv().await {
+                match ev {
+                    SessionInbound::Data(StreamData { stream_id: 0, data }) => io.send(0, data),
+                    SessionInbound::ResumeReset(_) => events.lock().unwrap().push("reset"),
+                    _ => {}
+                }
+            }
+        })
+    }
+}
+
+async fn takeover_events(events: &Arc<Mutex<Vec<&'static str>>>, want: usize) -> Vec<&'static str> {
+    for _ in 0..100 {
+        if events.lock().unwrap().len() >= want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    events.lock().unwrap().clone()
+}
+
+/// One frontend "process" of `host`: a router on a socket of its own, and
+/// the handle that stops it as a frontend's exit does.
+async fn takeover_frontend(
+    host: &Arc<TakeoverHost>,
+    server: &crate::handshake::Keypair,
+    allowlist: &SharedAllowlist,
+) -> (SocketAddr, Shutdown, tokio::task::JoinHandle<()>) {
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = socket.local_addr().unwrap();
+    let shutdown = Shutdown::default();
+    let serving = SessionManager::serve_until_shutdown(
+        socket,
+        server.private,
+        allowlist_auth(allowlist.clone(), server.public),
+        host.frontend(),
+        Arc::new(AtomicUsize::new(0)),
+        LoginEndedReports::none(),
+        shutdown.clone(),
+    );
+    let task = tokio::spawn(async move {
+        let _ = serving.await;
+    });
+    (addr, shutdown, task)
+}
+
+/// A frontend that stops in order may scrub its sessions' keys off the
+/// allowlist its router shares here (as at their connections' ends); the
+/// host's list -- the truth the next frontend starts from -- keeps a key
+/// its session still runs under. So does this list, again.
+fn as_the_host_keeps(allowlist: &SharedAllowlist, key: [u8; 32]) {
+    let mut list = allowlist.lock().unwrap();
+    if !list.contains(&key) {
+        list.push(key);
+    }
+}
+
+/// The frontend process goes away; the session's owner does not. A new
+/// frontend has never heard of the login, asks the directory at the
+/// client's warm return, and takes the running session over: the client
+/// hears `Resumed`, the backend was started once and hears `ResumeReset`
+/// for the new connection, and the session works. A login the directory
+/// does not know still gets a fresh session.
+#[tokio::test]
+async fn a_new_frontend_takes_over_the_session_its_owner_kept() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let server = generate_keypair();
+        let client = generate_keypair();
+        let allowlist: SharedAllowlist = Arc::new(Mutex::new(vec![client.public]));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let host = TakeoverHost::new(Arc::new(TakeoverBackend(events.clone())));
+        let token = [9u8; 16];
+
+        let (addr, shutdown, task) = takeover_frontend(&host, &server, &allowlist).await;
+        let (mut c1, s1) =
+            handshake_to_live(addr, server.public, client.private, token, StartKind::Cold).await;
+        assert_eq!(echo_one(&mut c1, &s1, 0xAA).await, vec![0xAA]);
+        assert_eq!(takeover_events(&events, 1).await, ["start"]);
+        assert!(
+            host.liveness
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(login, liveness)| *login == token
+                    && matches!(liveness, Liveness::Traffic { active: true, .. })),
+            "the directory hears the client is there"
+        );
+
+        // The frontend exits; nothing ends the session.
+        shutdown.request();
+        task.await.unwrap();
+        as_the_host_keeps(&allowlist, client.public);
+
+        let (addr, _shutdown, _task) = takeover_frontend(&host, &server, &allowlist).await;
+        let (mut c2, s2) =
+            handshake_to_live(addr, server.public, client.private, token, StartKind::Warm).await;
+        assert_eq!(echo_one(&mut c2, &s2, 0xBB).await, vec![0xBB]);
+        assert!(c2.resumed(), "the hint of msg2: the session is known");
+        assert_eq!(
+            takeover_events(&events, 2).await,
+            ["start", "reset"],
+            "the same backend hears ResumeReset on the new frontend's connection"
+        );
+
+        // A login nobody kept is a fresh session, as before.
+        let other = [10u8; 16];
+        let (mut c3, s3) =
+            handshake_to_live(addr, server.public, client.private, other, StartKind::Warm).await;
+        assert!(!c3.resumed());
+        assert_eq!(echo_one(&mut c3, &s3, 0xCC).await, vec![0xCC]);
+        assert_eq!(
+            takeover_events(&events, 3).await,
+            ["start", "reset", "start"],
+            "a second backend"
+        );
+    })
+    .await
+    .expect("timed out");
+}
+
+/// An echo that must not come within `within`: the session behind
+/// `client` does not answer.
+async fn no_echo(client: &mut Connection, client_sock: &UdpSocket, byte: u8, within: Duration) {
+    assert!(
+        tokio::time::timeout(within, echo_one(client, client_sock, byte))
+            .await
+            .is_err(),
+        "no session answers this connection"
+    );
+}
+
+/// A handshake that may or may not complete within `within`.
+async fn try_handshake(
+    addr: SocketAddr,
+    server: [u8; 32],
+    client: [u8; 32],
+    token: [u8; 16],
+    start: StartKind,
+    within: Duration,
+) -> Option<(Connection, UdpSocket)> {
+    tokio::time::timeout(
+        within,
+        handshake_to_live(addr, server, client, token, start),
+    )
+    .await
+    .ok()
+}
+
+/// The host does not answer a new frontend's lookup (busy, a full queue, a
+/// late reply): the warm start is dropped -- no fresh session is started
+/// for the login, which would have the host stop the owner that keeps it
+/// -- and the client's later try takes the same session over.
+#[tokio::test]
+async fn an_unanswered_lookup_drops_the_handshake_and_keeps_the_session() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let server = generate_keypair();
+        let client = generate_keypair();
+        let allowlist: SharedAllowlist = Arc::new(Mutex::new(vec![client.public]));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let host = TakeoverHost::new(Arc::new(TakeoverBackend(events.clone())));
+        let token = [21u8; 16];
+
+        let (addr, shutdown, task) = takeover_frontend(&host, &server, &allowlist).await;
+        let (mut c1, s1) =
+            handshake_to_live(addr, server.public, client.private, token, StartKind::Cold).await;
+        assert_eq!(echo_one(&mut c1, &s1, 0xA1).await, vec![0xA1]);
+        shutdown.request();
+        task.await.unwrap();
+        as_the_host_keeps(&allowlist, client.public);
+
+        *host.answer.lock().unwrap() = TakeoverAnswer::Unavailable;
+        let (addr, _shutdown, _task) = takeover_frontend(&host, &server, &allowlist).await;
+        if let Some((mut c2, s2)) = try_handshake(
+            addr,
+            server.public,
+            client.private,
+            token,
+            StartKind::Warm,
+            Duration::from_secs(10),
+        )
+        .await
+        {
+            no_echo(&mut c2, &s2, 0xA2, Duration::from_millis(500)).await;
+        }
+        for _ in 0..250 {
+            if host.asked.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            host.asked.load(Ordering::SeqCst) >= 1,
+            "the directory was asked"
+        );
+        assert_eq!(
+            takeover_events(&events, 1).await,
+            ["start"],
+            "no fresh session replaced the kept one"
+        );
+
+        *host.answer.lock().unwrap() = TakeoverAnswer::Answer;
+        let (mut c3, s3) =
+            handshake_to_live(addr, server.public, client.private, token, StartKind::Warm).await;
+        assert_eq!(echo_one(&mut c3, &s3, 0xA3).await, vec![0xA3]);
+        assert_eq!(takeover_events(&events, 2).await, ["start", "reset"]);
+    })
+    .await
+    .expect("timed out");
+}
+
+/// A warm reattach inside a running frontend whose owner link cannot be
+/// replaced just now (the host did not answer `Relink`): the new
+/// connection does not get the session, but the session is not ended --
+/// it parks, and the client's next return reattaches it.
+#[tokio::test]
+async fn an_unanswered_relink_parks_the_session_for_the_next_return() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let server = generate_keypair();
+        let client = generate_keypair();
+        let allowlist: SharedAllowlist = Arc::new(Mutex::new(vec![client.public]));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let host = TakeoverHost::new(Arc::new(TakeoverBackend(events.clone())));
+        let token = [22u8; 16];
+
+        let (addr, _shutdown, _task) = takeover_frontend(&host, &server, &allowlist).await;
+        let (mut c1, s1) =
+            handshake_to_live(addr, server.public, client.private, token, StartKind::Cold).await;
+        assert_eq!(echo_one(&mut c1, &s1, 0xB1).await, vec![0xB1]);
+
+        host.relink_unavailable.store(true, Ordering::SeqCst);
+        let (mut c2, s2) =
+            handshake_to_live(addr, server.public, client.private, token, StartKind::Warm).await;
+        no_echo(&mut c2, &s2, 0xB2, Duration::from_millis(500)).await;
+        assert_eq!(
+            takeover_events(&events, 1).await,
+            ["start"],
+            "not ended, not restarted"
+        );
+
+        // Parked as after its connection's death, whose key the router
+        // scrubs: the client adds it again (an SSH bootstrap), and returns.
+        assert!(!allowlist.lock().unwrap().contains(&client.public));
+        allowlist.lock().unwrap().push(client.public);
+        host.relink_unavailable.store(false, Ordering::SeqCst);
+        let (mut c3, s3) =
+            handshake_to_live(addr, server.public, client.private, token, StartKind::Warm).await;
+        assert_eq!(echo_one(&mut c3, &s3, 0xB3).await, vec![0xB3]);
+        assert_eq!(
+            takeover_events(&events, 2).await,
+            ["start", "reset"],
+            "the same backend, reattached"
+        );
+    })
+    .await
+    .expect("timed out");
+}
+
+/// The directory is asked off the router loop: while it takes its time
+/// over one returning client, every other session's traffic is routed as
+/// usual.
+#[tokio::test]
+async fn a_stalled_lookup_does_not_hold_up_other_sessions() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let server = generate_keypair();
+        let client = generate_keypair();
+        let allowlist: SharedAllowlist = Arc::new(Mutex::new(vec![client.public]));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let host = TakeoverHost::new(Arc::new(TakeoverBackend(events.clone())));
+        let (kept, live) = ([23u8; 16], [24u8; 16]);
+
+        let (addr, shutdown, task) = takeover_frontend(&host, &server, &allowlist).await;
+        let (mut c1, s1) =
+            handshake_to_live(addr, server.public, client.private, kept, StartKind::Cold).await;
+        assert_eq!(echo_one(&mut c1, &s1, 0xC1).await, vec![0xC1]);
+        shutdown.request();
+        task.await.unwrap();
+        as_the_host_keeps(&allowlist, client.public);
+
+        let (addr, _shutdown, _task) = takeover_frontend(&host, &server, &allowlist).await;
+        let (mut c2, s2) =
+            handshake_to_live(addr, server.public, client.private, live, StartKind::Cold).await;
+        assert_eq!(echo_one(&mut c2, &s2, 0xC2).await, vec![0xC2]);
+
+        *host.answer.lock().unwrap() = TakeoverAnswer::Stall;
+        let returning = tokio::spawn(try_handshake(
+            addr,
+            server.public,
+            client.private,
+            kept,
+            StartKind::Warm,
+            Duration::from_secs(5),
+        ));
+        for _ in 0..250 {
+            if host.asked.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(host.asked.load(Ordering::SeqCst), 1, "the lookup waits");
+        let routed = tokio::time::timeout(Duration::from_secs(1), echo_one(&mut c2, &s2, 0xC3))
+            .await
+            .expect("another session's traffic is routed while the lookup waits");
+        assert_eq!(routed, vec![0xC3]);
+
+        host.released.notify_one();
+        let (mut c3, s3) = returning
+            .await
+            .unwrap()
+            .expect("the returning client is let in");
+        assert_eq!(echo_one(&mut c3, &s3, 0xC4).await, vec![0xC4]);
+    })
+    .await
+    .expect("timed out");
+}
