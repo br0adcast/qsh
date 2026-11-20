@@ -27,9 +27,7 @@ addresses intentionally supplied by the owner are not private credentials.
 Review the exact outgoing files and commit range for secrets and private data.
 Use a local secret scanner with redacted output, then manually inspect fixtures,
 configuration, logs, generated files, archives, personal paths, addresses,
-author/committer identities, and commit messages. Before first publication or
-making the repository public, scan every branch/tag intended for publication and its history.
-Scan release artifacts separately before uploading them.
+author/committer identities, and commit messages.
 
 Follow [the privacy-check procedure](docs/private-data-check.md). Resolve every
 finding; do not suppress entire test directories or treat a nonzero scan as
@@ -39,8 +37,37 @@ reviewed provenance and must never grant access to a real account or service.
 
 Stop publication for unexplained findings. Real credentials require revocation
 or rotation; deleting a file does not remove its historical copies. Do not
-rewrite shared history or change repository visibility without explicit user
-authorization. Running a scan does not authorize a push or release.
+rewrite shared history. Running a scan does not authorize a push.
+
+## Fix causes with explicit semantics
+
+Fix the underlying cause with a mechanism that states the intended behavior.
+Do not choose an indirect workaround only to avoid changing the responsible
+component or extending its protocol. Do not reuse unrelated commands or
+protocol messages as implicit control signals: if an acknowledgement is
+missing, add an explicit authenticated acknowledgement instead of treating
+other metadata as one. Do not hide missing behavior behind arbitrary delays,
+misleading progress or silent fallback; displayed state must follow actual
+work. Design compatibility with released peers explicitly and test it.
+Capability negotiation and deliberate legacy behavior are valid; they must not
+weaken authentication or hide an unsupported operation.
+
+## Issues and pull requests
+
+Open an issue for bugs, features and work that needs discussion or tracking,
+after checking open and closed issues for duplicates and related work. A small
+self-contained documentation fix may go straight to a pull request. Keep each
+pull request focused on one task and link its issue with `Fixes #N` when
+merging it should close the issue.
+
+Write issues and pull requests in readable Markdown with short paragraphs and
+descriptive headings: Problem, Expected behavior and Acceptance criteria for an
+issue; Change and Validation for a pull request. Use checkboxes for concrete
+verification steps, inline code for identifiers and fenced blocks for multiline
+examples. State priority, evidence status and dependencies when relevant. Keep
+pending CI visibly separate from completed checks, scale the structure to the
+change and avoid empty template sections. Keep the title and description in
+line with the final scope.
 
 ## Preserve the working environment
 
