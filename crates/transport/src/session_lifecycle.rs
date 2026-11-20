@@ -87,6 +87,15 @@ impl fmt::Display for ShutdownError {
     }
 }
 impl std::error::Error for ShutdownError {}
+impl ShutdownError {
+    /// The drain was given up on: something did not join within `within`.
+    pub(crate) fn unjoined(within: std::time::Duration) -> Self {
+        Self(format!(
+            "not every task and worker joined within {} s",
+            within.as_secs()
+        ))
+    }
+}
 
 /// Completion is published only after joining the blocking worker itself.
 #[derive(Clone, Default)]
@@ -146,9 +155,17 @@ pub(super) struct Lifecycle {
 }
 impl Lifecycle {
     pub(super) fn new(shutdown: Shutdown) -> Arc<Self> {
+        Self::with_control_budget(shutdown, crate::control_budget::GlobalBudget::default())
+    }
+    /// A lifecycle whose sessions share `control_budget` (a session owner's
+    /// envelope, see `GlobalBudget::envelope`).
+    pub(super) fn with_control_budget(
+        shutdown: Shutdown,
+        control_budget: crate::control_budget::GlobalBudget,
+    ) -> Arc<Self> {
         Arc::new(Self {
             shutdown,
-            control_budget: crate::control_budget::GlobalBudget::default(),
+            control_budget,
             owner: TaskOwner::default(),
             spawned: tokio::sync::Notify::new(),
         })

@@ -140,7 +140,10 @@ fn validate_tgid(bytes: &[u8], expected_pid: u32) -> Result<bool, Failure> {
 struct Stat {
     state: u8,
     threads: usize,
+    ppid: u32,
     sid: u32,
+    /// Field 22, the start time; `None` if the record ends before it.
+    start: Option<u64>,
 }
 fn parse_stat(bytes: &[u8]) -> Result<Stat, Failure> {
     let end = bytes
@@ -158,14 +161,19 @@ fn parse_stat(bytes: &[u8]) -> Result<Stat, Failure> {
     if !b"RSDZTWtXxKPI".contains(&state) {
         return Err(Failure::Malformed);
     }
+    let ppid = u32::try_from(unsigned_number(fields.get(1).ok_or(Failure::Malformed)?)?)
+        .map_err(|_| Failure::Malformed)?;
     let sid = u32::try_from(unsigned_number(fields.get(3).ok_or(Failure::Malformed)?)?)
         .map_err(|_| Failure::Malformed)?;
     let threads = usize::try_from(positive_number(fields.get(17).ok_or(Failure::Malformed)?)?)
         .map_err(|_| Failure::Malformed)?;
+    let start = fields.get(19).and_then(|field| unsigned_number(field).ok());
     Ok(Stat {
         state,
         threads,
+        ppid,
         sid,
+        start,
     })
 }
 
@@ -411,6 +419,167 @@ impl ProcOperations for Native {
         open_relative_directory(root, &name)
     }
 }
+/// A process pinned by its own procfs descriptor, as its descriptor reads.
+struct Pinned {
+    pid: u32,
+    fd: OwnedFd,
+    ppid: u32,
+    sid: u32,
+    /// Its start time: with `pid`, which process this is among those that
+    /// ever carry that number.
+    start: u64,
+    /// Exited and not yet reaped: a zombie with no thread left.
+    exited: bool,
+}
+
+/// `pid`, pinned and read through its pin: `None` unless the descriptor's
+/// own status names `pid` as both `Pid` and `Tgid` and its stat parses.
+///
+/// The status check proves only that the descriptor is a thread-group
+/// leader's with that number, not a thread's (procfs opens a thread ID by
+/// number too). It does not prove which process had the number when it was
+/// looked up. That is not needed: everything believed about the process
+/// afterwards is read through this descriptor, and every signal goes
+/// through it, so all of it is about one and the same process.
+fn pin(view: &QualifiedProc, pid: u32, ops: &mut impl ProcOperations) -> Option<Pinned> {
+    let fd = ops.open_numeric(&view.root, pid).ok()?;
+    if !ops
+        .status(&fd)
+        .and_then(|bytes| validate_tgid(&bytes, pid))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let stat = ops.stat(&fd).and_then(|bytes| parse_stat(&bytes)).ok()?;
+    Some(Pinned {
+        pid,
+        fd,
+        ppid: stat.ppid,
+        sid: stat.sid,
+        start: stat.start?,
+        exited: stat.state == b'Z' && stat.threads == 1,
+    })
+}
+
+/// How many censuses of a session's members `kill_child_sessions` makes at
+/// most. A pass that signals nobody new ends it; this bound only stops a
+/// session that keeps producing new processes faster than they are found.
+pub(crate) const KILL_PASSES: usize = 32;
+
+/// What `kill_child_sessions` did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SessionKill {
+    /// Processes that were alive (not exited, as read through their pins)
+    /// when they were signalled.
+    pub(crate) killed: usize,
+    /// The last pass found no member left to signal. `false`: every one of
+    /// the `KILL_PASSES` passes still found a new one, so members may remain.
+    pub(crate) settled: bool,
+}
+
+/// A session owner's last resort (#529), when its session did not drain:
+/// SIGKILL every process of the sessions this process's direct children
+/// (`ours` of them) lead -- every process group of each, job-control jobs
+/// included -- and those children themselves.
+///
+/// Exact, as the channel scopes are: nothing is believed about a process
+/// before it is pinned by its own procfs descriptor (within `view`, this
+/// process's own PID namespace), and every signal goes through that
+/// descriptor (`pidfd_send_signal`), never a numeric PID or group. A
+/// session's member is signalled only if the child leading it still reads
+/// through its own pin after the member was found in that session: the
+/// session ID cannot have been reused in between. A child already reaped by
+/// its scope is not found, and its session left alone; so is the rest of a
+/// session from the moment its leading child is reaped.
+///
+/// A member is signalled as soon as it is found, and the members are
+/// listed again until a pass signals nobody new. Signalling one process at
+/// a time does not stop a fork in progress the way a group signal does: a
+/// member can fork after the list passed its place and before its own
+/// SIGKILL, and that child is in no list yet. A killed process cannot
+/// complete another fork, so only processes not yet signalled add members,
+/// and each pass leaves fewer of them. A process already signalled is known
+/// by its PID and start time (never signalled by them), so one that is slow
+/// to die is neither signalled nor counted twice, and no descriptor is kept
+/// per member. A process that has exited is not signalled: it cannot fork.
+///
+/// It never waits and never reaps: the scopes, or init once this process
+/// has exited, do. So it cannot block on a process that cannot finish.
+pub(crate) fn kill_child_sessions(
+    view: &QualifiedProc,
+    ours: impl Fn(u32) -> bool,
+    ops: &mut impl scope::ScopeOperations,
+) -> Result<SessionKill, Failure> {
+    let me = std::process::id();
+    let mut children = Vec::new();
+    ops.census(&view.root, &mut |ops, pid| {
+        if ours(pid) {
+            if let Some(child) = pin(view, pid, ops).filter(|child| child.ppid == me) {
+                children.push(child);
+            }
+        }
+    })?;
+    let mut sessions: Vec<u32> = children
+        .iter()
+        .filter(|child| child.sid == child.pid)
+        .map(|child| child.sid)
+        .collect();
+    let mut signalled = std::collections::HashSet::new();
+    let mut killed = 0;
+    let mut settled = false;
+    for _ in 0..KILL_PASSES {
+        if sessions.is_empty() {
+            settled = true;
+            break;
+        }
+        let mut new = false;
+        ops.census(&view.root, &mut |ops, pid| {
+            let Some(member) = pin(view, pid, ops) else {
+                return;
+            };
+            if member.exited
+                || !sessions.contains(&member.sid)
+                || signalled.contains(&(member.pid, member.start))
+            {
+                return;
+            }
+            let leader = children
+                .iter()
+                .find(|child| child.pid == member.sid)
+                .expect("a session of a pinned child");
+            if ops
+                .stat(&leader.fd)
+                .and_then(|bytes| parse_stat(&bytes))
+                .is_err()
+            {
+                // Reaped: its session ID proves nothing any more.
+                sessions.retain(|sid| *sid != member.sid);
+                return;
+            }
+            if ops.signal(&member.fd, libc::SIGKILL).is_ok() {
+                signalled.insert((member.pid, member.start));
+                killed += 1;
+                new = true;
+            }
+        })?;
+        if !new {
+            settled = true;
+            break;
+        }
+    }
+    // Children that lead no session of their own: each alone.
+    for child in children.iter().filter(|child| child.sid != child.pid) {
+        let alive = ops
+            .stat(&child.fd)
+            .and_then(|bytes| parse_stat(&bytes))
+            .is_ok_and(|stat| !(stat.state == b'Z' && stat.threads == 1));
+        if alive && ops.signal(&child.fd, libc::SIGKILL).is_ok() {
+            killed += 1;
+        }
+    }
+    Ok(SessionKill { killed, settled })
+}
+
 pub fn qualify_native_proc() -> Result<QualifiedProc, Unavailable> {
     let root = retain_proc_root().map_err(|e| {
         Unavailable::SelfOpen(Failure::Errno(e.raw_os_error().unwrap_or(libc::EIO)))
@@ -793,3 +962,7 @@ pub(crate) mod adoption;
 
 mod observation;
 pub(crate) use observation::ObservedProcess;
+
+#[cfg(test)]
+#[path = "kill_child_sessions_tests.rs"]
+mod kill_child_sessions_tests;

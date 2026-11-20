@@ -1098,3 +1098,68 @@ async fn remote_inflating_slices_are_link_errors_and_the_gate_survives() {
         drop(charge);
     }
 }
+
+/// An owner process's session runs within one control budget envelope,
+/// which its host leases to it, not a daemon's whole budget (#529).
+#[tokio::test]
+async fn an_owner_process_session_runs_within_one_envelope() {
+    let (front, _queue, _out) = SessionIo::test_pair();
+    let (tx, rx) = oneshot::channel();
+    let (front_end, owner_end) = loopback();
+    let shutdown = Shutdown::default();
+    let run = tokio::spawn(OwnerLink::run_and_drain(
+        owner_end,
+        Arc::new(Capture(Mutex::new(Some(tx)))),
+        OwnerInit::new(front.principal().clone(), front.login()),
+        shutdown.clone(),
+        Duration::from_secs(10),
+    ));
+    let owner = rx.await.expect("owner io");
+    assert!(owner.global_control_budget().is_envelope_for_test());
+    assert!(!front.global_control_budget().is_envelope_for_test());
+    drop((owner, front_end));
+    shutdown.request();
+    run.await.unwrap();
+}
+
+/// A worker blocked for good does not hold an owner's drain forever: the
+/// drain is given up on after its bound, as a failure (#529).
+#[tokio::test]
+async fn an_owner_drain_gives_up_on_a_worker_that_never_returns() {
+    struct Blocked(Mutex<Option<std::sync::mpsc::Receiver<()>>>);
+    impl SessionBackend for Blocked {
+        fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let held = self.0.lock().unwrap().take().unwrap();
+            let _receipt = io.spawn_blocking_owned(move || {
+                let _ = held.recv();
+            });
+            Box::pin(async move {
+                std::future::pending::<()>().await;
+                drop(io);
+            })
+        }
+    }
+    let (front, _queue, _out) = SessionIo::test_pair();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (_front_end, owner_end) = loopback();
+    let shutdown = Shutdown::default();
+    let run = tokio::spawn(OwnerLink::run_and_drain(
+        owner_end,
+        Arc::new(Blocked(Mutex::new(Some(held)))),
+        OwnerInit::new(front.principal().clone(), front.login()),
+        shutdown.clone(),
+        Duration::from_millis(200),
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    shutdown.request();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("the drain is bounded")
+        .unwrap();
+    assert_eq!(outcome.exit, OwnerExit::Shutdown);
+    let error = outcome
+        .drained
+        .expect_err("an unjoined worker is a failed drain");
+    assert!(error.to_string().contains("within"), "{error}");
+    let _ = release.send(());
+}

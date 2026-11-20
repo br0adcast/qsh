@@ -80,13 +80,64 @@ impl Job {
     }
 }
 
-#[derive(Default)]
+/// What one [`GlobalBudget`] admits in all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GlobalLimits {
+    bytes: usize,
+    response_entries: usize,
+    jobs: usize,
+    principal_jobs: usize,
+}
+impl GlobalLimits {
+    /// A whole daemon's sessions in one process.
+    const DAEMON: GlobalLimits = GlobalLimits {
+        bytes: GLOBAL_BYTES,
+        response_entries: GLOBAL_RESPONSE_ENTRIES,
+        jobs: GLOBAL_JOBS,
+        principal_jobs: PRINCIPAL_JOBS,
+    };
+    /// One session envelope: the daemon-wide limits divided by
+    /// `MAX_SESSIONS_TOTAL`, exactly what one session's own limits add up
+    /// to. A session owner process runs under one such lease from its host
+    /// (#529), which hands out at most `MAX_SESSIONS_TOTAL` of them, and at
+    /// most `MAX_SESSIONS_PER_OWNER` to one uid, so owners together never
+    /// exceed what one daemon's [`GlobalLimits::DAEMON`] allowed.
+    const ENVELOPE: GlobalLimits = GlobalLimits {
+        bytes: SESSION_BYTES,
+        response_entries: GLOBAL_RESPONSE_ENTRIES / MAX_SESSIONS_TOTAL,
+        jobs: GLOBAL_JOBS / MAX_SESSIONS_TOTAL,
+        principal_jobs: GLOBAL_JOBS / MAX_SESSIONS_TOTAL,
+    };
+}
+// The envelope divides the daemon's limits exactly.
+const _: () = assert!(GLOBAL_RESPONSE_ENTRIES.is_multiple_of(MAX_SESSIONS_TOTAL));
+const _: () = assert!(GLOBAL_JOBS.is_multiple_of(MAX_SESSIONS_TOTAL));
+
 struct GlobalState {
+    limits: GlobalLimits,
     bytes: usize,
     response_entries: usize,
     jobs: usize,
     principals: BTreeMap<u32, usize>,
 }
+impl Default for GlobalState {
+    fn default() -> Self {
+        Self::with_limits(GlobalLimits::DAEMON)
+    }
+}
+impl GlobalState {
+    fn with_limits(limits: GlobalLimits) -> Self {
+        Self {
+            limits,
+            bytes: 0,
+            response_entries: 0,
+            jobs: 0,
+            principals: BTreeMap::new(),
+        }
+    }
+}
+/// The daemon-wide control budget: by default a whole daemon's, or one
+/// session envelope's ([`GlobalBudget::envelope`]) in a session owner.
 #[derive(Default, Clone)]
 pub(crate) struct GlobalBudget(Arc<Mutex<GlobalState>>, Arc<Notify>);
 #[derive(Default)]
@@ -103,11 +154,24 @@ pub(crate) struct SessionBudget {
     uid: u32,
 }
 impl GlobalBudget {
+    /// The budget of one session envelope, which a session owner process
+    /// holds as a lease from its host: one session at its own limits fits,
+    /// and nothing more does.
+    pub(crate) fn envelope() -> Self {
+        Self(
+            Arc::new(Mutex::new(GlobalState::with_limits(GlobalLimits::ENVELOPE))),
+            Arc::default(),
+        )
+    }
     /// Register and enable this waiter before checking admission, then keep
     /// servicing the runner while waiting. Refunds wake all registered owners;
     /// there is no accumulated queue of capacity events.
     pub(crate) fn changed(&self) -> Notified<'_> {
         self.1.notified()
+    }
+    #[cfg(test)]
+    pub(crate) fn is_envelope_for_test(&self) -> bool {
+        self.0.lock().unwrap().limits == GlobalLimits::ENVELOPE
     }
     #[cfg(test)]
     pub(crate) fn retained_for_test(&self) -> (usize, usize, usize) {
@@ -189,8 +253,11 @@ impl SessionBudget {
                 return Err(CapacityError::Session);
             }
         }
-        if N > GLOBAL_RESPONSE_ENTRIES.saturating_sub(global.response_entries)
-            || total > GLOBAL_BYTES.saturating_sub(global.bytes)
+        if N > global
+            .limits
+            .response_entries
+            .saturating_sub(global.response_entries)
+            || total > global.limits.bytes.saturating_sub(global.bytes)
         {
             return Err(CapacityError::Global);
         }
@@ -217,10 +284,10 @@ impl SessionBudget {
         if state.jobs[job.index()] {
             return Err(CapacityError::Session);
         }
-        if global.principals.get(&self.uid).copied().unwrap_or(0) >= PRINCIPAL_JOBS {
+        if global.principals.get(&self.uid).copied().unwrap_or(0) >= global.limits.principal_jobs {
             return Err(CapacityError::Principal);
         }
-        if global.jobs >= GLOBAL_JOBS {
+        if global.jobs >= global.limits.jobs {
             return Err(CapacityError::Global);
         }
         global.jobs += 1;
@@ -464,6 +531,52 @@ mod tests {
     include!("control_budget_refund_tests.rs");
     include!("control_budget_open_tests.rs");
     include!("control_budget_copy_tests.rs");
+
+    /// A session owner's budget is one envelope of the daemon's: its one
+    /// session fits at every one of its own limits, and nothing is left for
+    /// a second -- so owner processes cannot multiply the daemon-wide
+    /// budget (#529).
+    #[test]
+    fn an_envelope_admits_one_session_at_its_own_limits_and_no_more() {
+        let global = GlobalBudget::envelope();
+        let first = global.session(1);
+        let mut held = Vec::new();
+        for response in [
+            Response::Ordinary(MAX_RECORD),
+            Response::Open,
+            Response::Update,
+            Response::Snapshot,
+            Response::Restart,
+            Response::Terminal,
+        ] {
+            loop {
+                match first.reserve(response) {
+                    Ok(permit) => held.push(permit),
+                    Err(error) => {
+                        assert_eq!(error, CapacityError::Session);
+                        break;
+                    }
+                }
+            }
+        }
+        let jobs = [
+            first.job(Job::About).unwrap(),
+            first.job(Job::Update).unwrap(),
+        ];
+        assert_eq!(global.retained_for_test(), (SESSION_BYTES, held.len(), 2));
+        let second = global.session(2);
+        assert_eq!(
+            second.reserve(Response::Ordinary(1)).err(),
+            Some(CapacityError::Global)
+        );
+        assert_eq!(second.job(Job::About).err(), Some(CapacityError::Global));
+        // A daemon-wide budget has room for that second session.
+        let daemon = GlobalBudget::default();
+        let _first = daemon.session(1).reserve(Response::Ordinary(MAX_RECORD));
+        assert!(daemon.session(2).reserve(Response::Ordinary(1)).is_ok());
+        drop((held, jobs));
+        assert_eq!(global.retained_for_test(), (0, 0, 0));
+    }
 
     #[test]
     fn mandatory_envelopes_have_finite_nonclone_record_leases() {

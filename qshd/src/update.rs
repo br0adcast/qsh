@@ -714,8 +714,40 @@ pub trait OwnerStop: Send + Sync {
     /// `deadline` for each to send its receipt and be reaped. `true` only
     /// when none is left and every one of them proved its cleanup.
     fn stop_all_until(&self, deadline: Instant) -> bool;
-    /// Accept new owners again: the exec did not happen.
+    /// Accept new owners again, and lift the open fence: the exec did not
+    /// happen.
     fn reopen(&self);
+    /// Fence channel opening in every running owner -- and in every one
+    /// started while the fence stands -- as this daemon fences its own
+    /// registry, and wait until `deadline` for each to answer that its
+    /// registry is fenced with no channel cleanup pending. `Err` with why
+    /// not; the fence stands either way, until [`OwnerStop::reopen_opens`]
+    /// or [`OwnerStop::reopen`].
+    fn fence_opens_until(&self, deadline: Instant) -> Result<(), String>;
+    /// Lift the open fence: the replacement did not get as far as stopping
+    /// the owners.
+    fn reopen_opens(&self);
+}
+
+/// How long the replacement waits for every session owner to fence its
+/// channel opening.
+const OWNER_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Lifts the owners' open fence unless the restart's undo took it over.
+struct OwnersFenced(Option<Arc<dyn OwnerStop>>);
+
+impl OwnersFenced {
+    fn handed_over(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for OwnersFenced {
+    fn drop(&mut self) {
+        if let Some(owners) = self.0.take() {
+            owners.reopen_opens();
+        }
+    }
 }
 
 /// How the replacement execs the staged binary: [`handover::exec_staged`],
@@ -1182,6 +1214,23 @@ impl UpdateTransfer for StagedImage {
                 hook();
             }
         }
+        // Every session owner fences its own channel opening first, as this
+        // daemon's registry is fenced below (#529): from the announcement
+        // on, no channel is created anywhere.
+        let owners_fenced = OwnersFenced(self.owners.clone());
+        if let Some(owners) = &self.owners {
+            if let Err(why) = owners.fence_opens_until(Instant::now() + OWNER_FENCE_TIMEOUT) {
+                return restart_stopped(
+                    RestartStop::FenceUnavailable,
+                    UpdateResult::Rejected {
+                        code: RejectCode::ExecFailed,
+                        detail: format!(
+                            "channel opening could not be fenced in every session: {why}"
+                        ),
+                    },
+                );
+            }
+        }
         let (undo, restart) = {
             let Ok(state) = base.actions.state.lock() else {
                 return restart_stopped(RestartStop::Revoked, revoked_update());
@@ -1209,6 +1258,8 @@ impl UpdateTransfer for StagedImage {
                 lease,
                 owners: self.owners.clone(),
             };
+            // `undo` lifts the owners' fence from here on (`reopen`).
+            owners_fenced.handed_over();
             // On exhaustion, release the action lock before undo runs.
             let announced = self.restarts.announce();
             drop(state);
@@ -2891,6 +2942,12 @@ mod tests {
         /// Whether the control socket was held still when they were stopped.
         gate_held_at_stop: AtomicBool,
         control_gate: std::sync::OnceLock<Arc<tokio::sync::RwLock<()>>>,
+        refuse_fence: AtomicBool,
+        fences: AtomicUsize,
+        fence_reopens: AtomicUsize,
+        /// The daemon's restart phase when the owners were fenced.
+        phase_at_fence: Mutex<Option<RestartPhase>>,
+        signal: std::sync::OnceLock<tokio::sync::watch::Receiver<RestartSignal>>,
     }
     impl OwnerStop for FakeOwners {
         fn proved(&self) -> bool {
@@ -2907,6 +2964,18 @@ mod tests {
         }
         fn reopen(&self) {
             self.reopens.fetch_add(1, Ordering::SeqCst);
+        }
+        fn fence_opens_until(&self, _deadline: Instant) -> Result<(), String> {
+            self.fences.fetch_add(1, Ordering::SeqCst);
+            *self.phase_at_fence.lock().unwrap() =
+                self.signal.get().map(|signal| signal.borrow().phase);
+            if self.refuse_fence.load(Ordering::SeqCst) {
+                return Err("registered channel cleanup is still pending".into());
+            }
+            Ok(())
+        }
+        fn reopen_opens(&self) {
+            self.fence_reopens.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -2934,6 +3003,7 @@ mod tests {
             Some(owners.clone()),
         );
         let _ = owners.control_gate.set(restartable.control_gate.clone());
+        let _ = owners.signal.set(restartable.daemon.restart_signal());
         (restartable, execs, stops_at_exec)
     }
 
@@ -2978,6 +3048,56 @@ mod tests {
             "new owners admitted again"
         );
         assert_eq!(daemon.restart_signal().borrow().phase, RestartPhase::Idle);
+        assert_eq!(owners.fences.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *owners.phase_at_fence.lock().unwrap(),
+            Some(RestartPhase::Idle),
+            "every owner fenced before the announcement"
+        );
+    }
+
+    /// The restart fence spans every session owner: an owner that cannot
+    /// fence its channel opening refuses the replacement before anything is
+    /// announced or any session ends, and the fence is lifted again.
+    #[test]
+    fn an_owner_that_cannot_fence_its_opens_refuses_the_replacement() {
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let dir = tempfile::tempdir().unwrap();
+        let owners = Arc::new(FakeOwners::default());
+        let (
+            Restartable {
+                daemon,
+                transfer,
+                udp: _udp,
+                control: _control,
+                ..
+            },
+            execs,
+            _,
+        ) = transfer_with_owners(dir.path(), &owners);
+        owners.refuse_fence.store(true, Ordering::SeqCst);
+        match transfer.restart() {
+            UpdateResult::Rejected { code, detail } => {
+                assert_eq!(code, RejectCode::ExecFailed, "{detail}");
+                assert!(
+                    detail.contains("could not be fenced in every session"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        assert_eq!(owners.fences.load(Ordering::SeqCst), 1);
+        assert_eq!(owners.fence_reopens.load(Ordering::SeqCst), 1, "lifted");
+        assert_eq!(owners.stops.load(Ordering::SeqCst), 0, "no session ended");
+        assert_eq!(execs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *daemon.restart_signal().borrow(),
+            RestartSignal::IDLE,
+            "never announced"
+        );
+        // Its own registry was never fenced: a later attempt can fence it.
+        assert!(daemon.opens.begin_restart_fence().is_ok());
     }
 
     /// A refusal the requester can still hear -- a busy control socket --

@@ -12,6 +12,8 @@ use transport::channel::{About, DaemonMode, RejectCode, UpdateAnswer, UpdateOffe
 use transport::channel_server::{RestartPhase, RestartSignal};
 use transport::Principal;
 
+use crate::screen_budget::BackingSlots;
+
 /// Largest frame body (kind and payload).
 pub(crate) const MAX_FRAME: usize = 128 * 1024;
 /// Largest image piece one `Write` carries.
@@ -58,6 +60,23 @@ pub(crate) enum ToOwner {
         id: u64,
         result: UpdateResult,
     },
+    /// The shared screen pool charged (`Ok`) or refused.
+    ScreenAcquired {
+        id: u64,
+        result: Result<(), String>,
+    },
+    /// The daemon-wide open count admitted one more open, or not.
+    OpenAcquired {
+        id: u64,
+        granted: bool,
+    },
+    /// Fence this owner's channel opening for the daemon's replacement and
+    /// answer `OpensFenced` with the same `fence`.
+    FenceOpens {
+        fence: u64,
+    },
+    /// The replacement did not happen: open channels again.
+    ReopenOpens,
 }
 
 /// Owner to host.
@@ -104,6 +123,38 @@ pub(crate) enum ToHost {
         component: String,
         message: String,
     },
+    /// Charge the shared screen pool; answered `ScreenAcquired`.
+    ScreenAcquire {
+        id: u64,
+        uid: u32,
+        slots: BackingSlots,
+        models: usize,
+    },
+    /// Refund it (a notice).
+    ScreenRelease {
+        uid: u32,
+        slots: BackingSlots,
+        models: usize,
+    },
+    /// One more open in flight; answered `OpenAcquired`.
+    OpenAcquire {
+        id: u64,
+        uid: u32,
+    },
+    /// One more whatever the limits: a retiring channel (a notice).
+    OpenCharge {
+        uid: u32,
+    },
+    /// One open is over (a notice).
+    OpenRelease {
+        uid: u32,
+    },
+    /// The answer to `FenceOpens`: fenced with no channel cleanup pending
+    /// (`Ok`), or why not.
+    OpensFenced {
+        fence: u64,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +200,15 @@ impl Enc {
     fn bytes(&mut self, v: &[u8]) -> &mut Self {
         self.u32(v.len() as u32).raw(v)
     }
+    fn slots(&mut self, slots: BackingSlots) -> &mut Self {
+        self.u64(slots.cells as u64).u64(slots.rows as u64)
+    }
+    fn outcome(&mut self, result: &Result<(), String>) -> &mut Self {
+        match result {
+            Ok(()) => self.u8(1),
+            Err(detail) => self.u8(0).bytes(detail.as_bytes()),
+        }
+    }
     fn finish(mut self) -> Result<Vec<u8>, WireError> {
         let body = self.0.len() - 4;
         if body > MAX_FRAME {
@@ -187,6 +247,22 @@ impl<'a> Dec<'a> {
     }
     fn string(&mut self) -> Result<String, WireError> {
         String::from_utf8(self.bytes()?).map_err(|_| WireError::BadValue)
+    }
+    fn size(&mut self) -> Result<usize, WireError> {
+        usize::try_from(self.u64()?).map_err(|_| WireError::BadValue)
+    }
+    fn slots(&mut self) -> Result<BackingSlots, WireError> {
+        Ok(BackingSlots {
+            cells: self.size()?,
+            rows: self.size()?,
+        })
+    }
+    fn outcome(&mut self) -> Result<Result<(), String>, WireError> {
+        Ok(if self.bool()? {
+            Ok(())
+        } else {
+            Err(self.string()?)
+        })
     }
     fn bool(&mut self) -> Result<bool, WireError> {
         match self.u8()? {
@@ -329,6 +405,10 @@ const O_OFFERED: u8 = 5;
 const O_WRITTEN: u8 = 6;
 const O_VERIFIED: u8 = 7;
 const O_RESTARTED: u8 = 8;
+const O_SCREEN_ACQUIRED: u8 = 9;
+const O_OPEN_ACQUIRED: u8 = 10;
+const O_FENCE_OPENS: u8 = 11;
+const O_REOPEN_OPENS: u8 = 12;
 
 const H_ABOUT: u8 = 1;
 const H_OFFER: u8 = 2;
@@ -341,6 +421,12 @@ const H_RELEASED: u8 = 8;
 const H_END: u8 = 9;
 const H_DRAINED: u8 = 10;
 const H_LOG: u8 = 11;
+const H_SCREEN_ACQUIRE: u8 = 12;
+const H_SCREEN_RELEASE: u8 = 13;
+const H_OPEN_ACQUIRE: u8 = 14;
+const H_OPEN_CHARGE: u8 = 15;
+const H_OPEN_RELEASE: u8 = 16;
+const H_OPENS_FENCED: u8 = 17;
 
 fn level_wire(level: log::Level) -> u8 {
     match level {
@@ -448,6 +534,19 @@ impl ToOwner {
                 e.u64(*id);
                 put_result(&mut e, result);
             }
+            ToOwner::ScreenAcquired { id, result } => {
+                e = Enc::new(O_SCREEN_ACQUIRED);
+                e.u64(*id).outcome(result);
+            }
+            ToOwner::OpenAcquired { id, granted } => {
+                e = Enc::new(O_OPEN_ACQUIRED);
+                e.u64(*id).u8(*granted as u8);
+            }
+            ToOwner::FenceOpens { fence } => {
+                e = Enc::new(O_FENCE_OPENS);
+                e.u64(*fence);
+            }
+            ToOwner::ReopenOpens => e = Enc::new(O_REOPEN_OPENS),
         }
         e.finish()
     }
@@ -521,6 +620,16 @@ impl ToOwner {
                 id: d.u64()?,
                 result: get_result(&mut d)?,
             },
+            O_SCREEN_ACQUIRED => ToOwner::ScreenAcquired {
+                id: d.u64()?,
+                result: d.outcome()?,
+            },
+            O_OPEN_ACQUIRED => ToOwner::OpenAcquired {
+                id: d.u64()?,
+                granted: d.bool()?,
+            },
+            O_FENCE_OPENS => ToOwner::FenceOpens { fence: d.u64()? },
+            O_REOPEN_OPENS => ToOwner::ReopenOpens,
             _ => return Err(WireError::BadKind),
         };
         d.end()?;
@@ -593,6 +702,35 @@ impl ToHost {
                     .bytes(component.as_bytes())
                     .bytes(message.as_bytes());
             }
+            ToHost::ScreenAcquire {
+                id,
+                uid,
+                slots,
+                models,
+            } => {
+                e = Enc::new(H_SCREEN_ACQUIRE);
+                e.u64(*id).u32(*uid).slots(*slots).u64(*models as u64);
+            }
+            ToHost::ScreenRelease { uid, slots, models } => {
+                e = Enc::new(H_SCREEN_RELEASE);
+                e.u32(*uid).slots(*slots).u64(*models as u64);
+            }
+            ToHost::OpenAcquire { id, uid } => {
+                e = Enc::new(H_OPEN_ACQUIRE);
+                e.u64(*id).u32(*uid);
+            }
+            ToHost::OpenCharge { uid } => {
+                e = Enc::new(H_OPEN_CHARGE);
+                e.u32(*uid);
+            }
+            ToHost::OpenRelease { uid } => {
+                e = Enc::new(H_OPEN_RELEASE);
+                e.u32(*uid);
+            }
+            ToHost::OpensFenced { fence, result } => {
+                e = Enc::new(H_OPENS_FENCED);
+                e.u64(*fence).outcome(result);
+            }
         }
         e.finish()
     }
@@ -642,6 +780,27 @@ impl ToHost {
                 message: d.string()?,
             },
             H_DRAINED => ToHost::Drained(if d.bool()? { Ok(()) } else { Err(d.string()?) }),
+            H_SCREEN_ACQUIRE => ToHost::ScreenAcquire {
+                id: d.u64()?,
+                uid: d.u32()?,
+                slots: d.slots()?,
+                models: d.size()?,
+            },
+            H_SCREEN_RELEASE => ToHost::ScreenRelease {
+                uid: d.u32()?,
+                slots: d.slots()?,
+                models: d.size()?,
+            },
+            H_OPEN_ACQUIRE => ToHost::OpenAcquire {
+                id: d.u64()?,
+                uid: d.u32()?,
+            },
+            H_OPEN_CHARGE => ToHost::OpenCharge { uid: d.u32()? },
+            H_OPEN_RELEASE => ToHost::OpenRelease { uid: d.u32()? },
+            H_OPENS_FENCED => ToHost::OpensFenced {
+                fence: d.u64()?,
+                result: d.outcome()?,
+            },
             _ => return Err(WireError::BadKind),
         };
         d.end()?;
@@ -786,6 +945,50 @@ mod tests {
             level: log::Level::Warn,
             component: "transport".into(),
             message: "parking\nsecond line".into(),
+        });
+        let slots = BackingSlots {
+            cells: 15_360,
+            rows: 7_000,
+        };
+        owner_round_trip(ToOwner::ScreenAcquired {
+            id: 7,
+            result: Ok(()),
+        });
+        owner_round_trip(ToOwner::ScreenAcquired {
+            id: 8,
+            result: Err("owner terminal screen budget exhausted".into()),
+        });
+        owner_round_trip(ToOwner::OpenAcquired {
+            id: 9,
+            granted: true,
+        });
+        owner_round_trip(ToOwner::OpenAcquired {
+            id: 10,
+            granted: false,
+        });
+        owner_round_trip(ToOwner::FenceOpens { fence: 3 });
+        owner_round_trip(ToOwner::ReopenOpens);
+        host_round_trip(ToHost::ScreenAcquire {
+            id: 11,
+            uid: 1000,
+            slots,
+            models: 1,
+        });
+        host_round_trip(ToHost::ScreenRelease {
+            uid: 1000,
+            slots,
+            models: 0,
+        });
+        host_round_trip(ToHost::OpenAcquire { id: 12, uid: 1000 });
+        host_round_trip(ToHost::OpenCharge { uid: 1000 });
+        host_round_trip(ToHost::OpenRelease { uid: 1000 });
+        host_round_trip(ToHost::OpensFenced {
+            fence: 3,
+            result: Ok(()),
+        });
+        host_round_trip(ToHost::OpensFenced {
+            fence: 4,
+            result: Err("cleanup pending".into()),
         });
     }
 

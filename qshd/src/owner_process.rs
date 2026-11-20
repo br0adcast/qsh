@@ -24,16 +24,35 @@
 //! pidfd held from the spawn, so a reused PID is never waited for or
 //! signalled.
 //!
-//! Daemon-wide limits (screen budget, the global control budget, open
-//! limits) are, until Task 4, each owner's own: they bound one session, not
-//! the daemon.
+//! **Daemon-wide limits** are the host's, once for all owners
+//! ([`crate::host_services`]): the host takes a control budget envelope
+//! before it starts an owner (none free: no owner, and the session ends at
+//! once) and gives it back when it has reaped that owner; the owner runs its
+//! session within that one envelope. The screen pool and the open count
+//! are charged over the host channel (`ScreenAcquire`/`OpenAcquire`, each
+//! answered, a refusal also when no answer comes within
+//! [`crate::host_services::HOST_SERVICE_TIMEOUT`]) and refunded by notice
+//! (`ScreenRelease`, `OpenCharge`/`OpenRelease`). Whatever an owner still
+//! holds when it is reaped -- crashed, killed or not -- the host frees then.
+//!
+//! **Restart fence.** Before an in-place replacement announces itself it
+//! fences channel opening in every owner, as in its own registry:
+//! `FenceOpens` to each (and to each one started while the fence stands),
+//! answered by `OpensFenced` once the owner's own registry is fenced, with
+//! no channel cleanup pending there; a replacement that does not happen
+//! lifts it again (`ReopenOpens`).
 //!
 //! **Queue bounds** (every IPC queue is bounded, by entry counts its
 //! producers impose). Host to owner: replies, one per outstanding request;
 //! `Stop`, once; restart signals, one per change of the daemon's restart
-//! attempt (its phases are few and attempts serialized). Owner to host:
+//! attempt (its phases are few and attempts serialized); `FenceOpens` and
+//! `ReopenOpens`, one per change of the fence (attempts are serialized).
+//! Owner to host:
 //! requests, at most one per blocking worker of the session waiting for its
-//! reply (`About`, the one update transfer); `Joined`/`Released`, once per
+//! reply (`About`, the one update transfer, limit requests); limit refunds,
+//! one per charge the host granted (a grant that comes after its request
+//! timed out is refunded once it comes); `OpensFenced`, one per
+//! `FenceOpens`; `Joined`/`Released`, once per
 //! attempt; `Abandon`, once per transfer; `End` and `Drained`, once; log
 //! records in a queue of their own of 256 records, past which new ones are
 //! counted and dropped -- never silently: the count goes to the daemon's
@@ -53,7 +72,7 @@
 //! refused (`OwnerStop::proved`).
 
 #[path = "owner_process/owner.rs"]
-mod owner;
+pub(crate) mod owner;
 #[path = "owner_process/wire.rs"]
 pub(crate) mod wire;
 
@@ -76,6 +95,7 @@ use transport::channel_server::{DaemonUpdates, RestartSignal, UpdateTransfer};
 use transport::session_manager::{LinkIo, OwnerInit, OwnerStarter};
 use transport::Principal;
 
+use crate::host_services::{HostServices, OwnerAccount};
 use wire::{HostInit, ToHost, ToOwner};
 
 /// The only argument of an owner process.
@@ -342,11 +362,22 @@ impl OwnerSlot {
     }
 }
 
+/// Whether channel opening is fenced in every owner, for which attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpensFence {
+    Open,
+    Fenced(u64),
+}
+
 #[derive(Default)]
 struct FleetState {
     /// No new owner is started: the daemon is stopping or replacing itself.
     closed: bool,
     owners: HashMap<u32, Arc<OwnerSlot>>,
+    /// The last fence asked for, and each owner's answer to the fence it
+    /// was last asked for.
+    last_fence: u64,
+    fenced: HashMap<u32, (u64, Result<(), String>)>,
     /// Owners that ended without proving their cleanup (no `Drained(Ok)`,
     /// a non-zero exit, a kill), and why the last one did not. Sticky: their
     /// shells may live on under whoever adopted them.
@@ -356,18 +387,42 @@ struct FleetState {
 
 /// Every owner process a daemon has started and not yet reaped, and
 /// whether every one that ended proved its cleanup.
-#[derive(Default)]
 pub struct OwnerFleet {
     state: Mutex<FleetState>,
     /// An owner was reaped (async waiters).
     gone: tokio::sync::Notify,
-    /// The same, for blocking waiters on `state`.
+    /// The same, or an owner answered a fence, for blocking waiters on
+    /// `state`.
     gone_cv: std::sync::Condvar,
+    /// The restart fence every owner's supervisor relays to its owner.
+    fence: tokio::sync::watch::Sender<OpensFence>,
+}
+
+impl Default for OwnerFleet {
+    fn default() -> Self {
+        OwnerFleet {
+            state: Mutex::default(),
+            gone: tokio::sync::Notify::new(),
+            gone_cv: std::sync::Condvar::new(),
+            fence: tokio::sync::watch::channel(OpensFence::Open).0,
+        }
+    }
 }
 
 impl OwnerFleet {
     pub fn new() -> Arc<OwnerFleet> {
         Arc::default()
+    }
+
+    /// A replacement's open fence stands.
+    fn opens_fenced(&self) -> bool {
+        matches!(*self.fence.borrow(), OpensFence::Fenced(_))
+    }
+
+    /// Owner `pid` answered fence `fence`.
+    fn fence_answered(&self, pid: u32, fence: u64, result: Result<(), String>) {
+        self.lock().fenced.insert(pid, (fence, result));
+        self.gone_cv.notify_all();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FleetState> {
@@ -396,6 +451,7 @@ impl OwnerFleet {
         {
             let mut state = self.lock();
             state.owners.remove(&pid);
+            state.fenced.remove(&pid);
             if let Err(why) = cleanup {
                 Self::count_unproved(&mut state, slot, why);
             }
@@ -502,6 +558,51 @@ impl crate::update::OwnerStop for OwnerFleet {
 
     fn reopen(&self) {
         self.lock().closed = false;
+        self.reopen_opens();
+    }
+
+    fn fence_opens_until(&self, deadline: Instant) -> Result<(), String> {
+        let mut state = self.lock();
+        state.last_fence += 1;
+        let fence = state.last_fence;
+        // Every supervisor relays it to its owner, and so does each one
+        // that starts while it stands.
+        self.fence.send_replace(OpensFence::Fenced(fence));
+        loop {
+            let mut waiting = 0;
+            for pid in state.owners.keys() {
+                match state.fenced.get(pid) {
+                    Some((answered, Ok(()))) if *answered == fence => {}
+                    Some((answered, Err(why))) if *answered == fence => {
+                        return Err(format!("session owner {pid}: {why}"));
+                    }
+                    _ => waiting += 1,
+                }
+            }
+            if waiting == 0 {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "{waiting} session owner(s) did not fence channel opening in time"
+                ));
+            }
+            // Woken by an answer or a reap: no polling.
+            state = self
+                .gone_cv
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    fn reopen_opens(&self) {
+        self.fence.send_if_modified(|fence| {
+            let fenced = *fence != OpensFence::Open;
+            *fence = OpensFence::Open;
+            fenced
+        });
     }
 }
 
@@ -512,20 +613,23 @@ pub struct OwnerHost {
     log_dir: Option<PathBuf>,
     daemon: Option<Arc<dyn DaemonUpdates>>,
     fleet: Arc<OwnerFleet>,
+    services: Arc<HostServices>,
 }
 
 impl OwnerHost {
-    pub fn new(
+    pub(crate) fn new(
         image: SelfImage,
         log_dir: Option<PathBuf>,
         daemon: Option<Arc<dyn DaemonUpdates>>,
         fleet: Arc<OwnerFleet>,
+        services: Arc<HostServices>,
     ) -> OwnerHost {
         OwnerHost {
             image,
             log_dir,
             daemon,
             fleet,
+            services,
         }
     }
 }
@@ -539,6 +643,17 @@ impl OwnerStarter for OwnerHost {
             updates: self.daemon.is_some(),
             log_dir: self.log_dir.clone(),
         };
+        // The owner's control budget envelope, held until it is reaped.
+        let account = self.services.admit(init.principal.uid).map_err(|why| {
+            crate::log::warn(
+                "qshd",
+                &format!(
+                    "no session owner for {} (uid {}): {why}",
+                    init.principal.name, init.principal.uid
+                ),
+            );
+            io::Error::other(why)
+        })?;
         let (child, slot) = {
             // The permit first, then the fleet: a replacement holds the
             // spawn gate for writing while it stops the fleet, so the other
@@ -593,6 +708,7 @@ impl OwnerStarter for OwnerHost {
             host,
             daemon: self.daemon.clone(),
             principal: init.principal,
+            account,
         }));
         let link = link
             .set_nonblocking(true)
@@ -617,6 +733,9 @@ struct Supervised {
     host: UnixStream,
     daemon: Option<Arc<dyn DaemonUpdates>>,
     principal: Principal,
+    /// What the owner holds of the daemon-wide limits; freed when it has
+    /// been reaped.
+    account: OwnerAccount,
 }
 
 type Transfers = Arc<Mutex<HashMap<u64, Box<dyn UpdateTransfer>>>>;
@@ -693,6 +812,7 @@ async fn supervise(s: Supervised) {
         host,
         daemon,
         principal,
+        account,
     } = s;
     let host = host
         .set_nonblocking(true)
@@ -719,6 +839,10 @@ async fn supervise(s: Supervised) {
     if let (Some(rx), Some(out)) = (signal.as_mut(), out.as_ref()) {
         let _ = out.send(ToOwner::Signal(*rx.borrow_and_update()));
     }
+    let mut fence = fleet.fence.subscribe();
+    if let (OpensFence::Fenced(fence), Some(out)) = (*fence.borrow_and_update(), out.as_ref()) {
+        let _ = out.send(ToOwner::FenceOpens { fence });
+    }
     let transfers: Transfers = Arc::default();
     let mut next_transfer = 0u64;
     let mut joined = BTreeSet::new();
@@ -735,9 +859,27 @@ async fn supervise(s: Supervised) {
                 let _ = out.send(ToOwner::Signal(changed));
                 continue;
             }
+            Ok(()) = fence.changed() => {
+                let _ = out.send(match *fence.borrow_and_update() {
+                    OpensFence::Fenced(fence) => ToOwner::FenceOpens { fence },
+                    OpensFence::Open => ToOwner::ReopenOpens,
+                });
+                continue;
+            }
             msg = rx.recv() => msg,
         };
         let Some(msg) = msg else { break };
+        // While the replacement's fence stands no owner opens a channel,
+        // whatever its own registry says (one that started after the fence
+        // was answered, say).
+        let msg = match serve_limits(&account, msg, fleet.opens_fenced()) {
+            Ok(Some(reply)) => {
+                let _ = out.send(reply);
+                continue;
+            }
+            Ok(None) => continue,
+            Err(msg) => msg,
+        };
         match msg {
             ToHost::About { id } => {
                 let daemon = daemon.clone();
@@ -848,6 +990,12 @@ async fn supervise(s: Supervised) {
                 component,
                 message,
             } => crate::log::record_from(pid, level, &component, &message),
+            ToHost::OpensFenced { fence, result } => fleet.fence_answered(pid, fence, result),
+            ToHost::ScreenAcquire { .. }
+            | ToHost::ScreenRelease { .. }
+            | ToHost::OpenAcquire { .. }
+            | ToHost::OpenCharge { .. }
+            | ToHost::OpenRelease { .. } => unreachable!("served by serve_limits"),
         }
     }
     drop(signal);
@@ -870,7 +1018,47 @@ async fn supervise(s: Supervised) {
     if !left.is_empty() {
         let _ = tokio::task::spawn_blocking(move || drop(left)).await;
     }
+    // Reaped: whatever it still held of the daemon-wide limits is free.
+    drop(account);
     fleet.remove(pid, &slot, if proved { Ok(()) } else { Err(text) });
+}
+
+/// Serve `msg` against `account` if it is a daemon-wide limit request: its
+/// reply, if it has one; `Err(msg)` if it is something else. While
+/// `opens_fenced` (a replacement's fence stands) no open is granted.
+pub(crate) fn serve_limits(
+    account: &OwnerAccount,
+    msg: ToHost,
+    opens_fenced: bool,
+) -> Result<Option<ToOwner>, ToHost> {
+    Ok(match msg {
+        ToHost::ScreenAcquire {
+            id,
+            uid,
+            slots,
+            models,
+        } => Some(ToOwner::ScreenAcquired {
+            id,
+            result: account.screen_acquire(uid, slots, models),
+        }),
+        ToHost::ScreenRelease { uid, slots, models } => {
+            account.screen_release(uid, slots, models);
+            None
+        }
+        ToHost::OpenAcquire { id, uid } => Some(ToOwner::OpenAcquired {
+            id,
+            granted: !opens_fenced && account.open_acquire(uid),
+        }),
+        ToHost::OpenCharge { uid } => {
+            account.open_charge(uid);
+            None
+        }
+        ToHost::OpenRelease { uid } => {
+            account.open_release(uid);
+            None
+        }
+        other => return Err(other),
+    })
 }
 
 fn with_transfer<T>(
@@ -934,5 +1122,170 @@ async fn reap(pid: u32, pidfd: OwnedFd) -> (String, bool) {
         }
         Ok(Err(error)) => (format!("wait failed: {error}"), false),
         Err(error) => (format!("wait failed: {error}"), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::update::OwnerStop;
+
+    fn slot() -> Arc<OwnerSlot> {
+        Arc::new(OwnerSlot {
+            stop: tokio::sync::Notify::new(),
+            stopping: AtomicBool::new(false),
+            counted: AtomicBool::new(false),
+            pidfd: OwnedFd::from(std::fs::File::open("/dev/null").unwrap()),
+        })
+    }
+
+    /// A fleet of owners 1 and 2, with no processes behind them.
+    fn fleet() -> Arc<OwnerFleet> {
+        let fleet = OwnerFleet::new();
+        for pid in [1, 2] {
+            fleet.lock().owners.insert(pid, slot());
+        }
+        fleet
+    }
+
+    /// What each owner's supervisor does: relay the next fence to its owner
+    /// and hand back the owner's answer -- here `answers`, straight away.
+    fn answer(
+        fleet: &Arc<OwnerFleet>,
+        answers: Vec<(u32, Result<(), String>)>,
+    ) -> std::thread::JoinHandle<()> {
+        let fleet = fleet.clone();
+        let mut fence = fleet.fence.subscribe();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(fence.changed()).unwrap();
+            let OpensFence::Fenced(id) = *fence.borrow() else {
+                panic!("a fence")
+            };
+            for (pid, result) in answers {
+                fleet.fence_answered(pid, id, result);
+            }
+        })
+    }
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
+    /// The replacement's fence spans every owner: it stands once each one
+    /// has answered that its own registry is fenced, and not before.
+    #[test]
+    fn the_restart_fence_waits_for_every_owner_to_answer() {
+        let fleet = fleet();
+        let answers = answer(&fleet, vec![(1, Ok(())), (2, Ok(()))]);
+        assert_eq!(fleet.fence_opens_until(soon()), Ok(()));
+        answers.join().unwrap();
+
+        // An owner that cannot fence (cleanup pending there) refuses it.
+        let answers = answer(
+            &fleet,
+            vec![(1, Ok(())), (2, Err("cleanup pending".into()))],
+        );
+        let refused = fleet.fence_opens_until(soon()).unwrap_err();
+        assert!(
+            refused.contains("session owner 2: cleanup pending"),
+            "{refused}"
+        );
+        answers.join().unwrap();
+
+        // Answers to an earlier fence do not count: nobody answers this one.
+        let refused = fleet
+            .fence_opens_until(Instant::now() + Duration::from_millis(50))
+            .unwrap_err();
+        assert!(
+            refused.contains("2 session owner(s) did not fence"),
+            "{refused}"
+        );
+
+        // An owner reaped meanwhile is not waited for.
+        let answers = answer(&fleet, vec![(1, Ok(()))]);
+        let gone = fleet.lock().owners.get(&2).unwrap().clone();
+        fleet.remove(2, &gone, Ok(()));
+        assert_eq!(fleet.fence_opens_until(soon()), Ok(()));
+        answers.join().unwrap();
+
+        // Lifted, every supervisor tells its owner so.
+        let mut fence = fleet.fence.subscribe();
+        fleet.reopen_opens();
+        assert!(fence.has_changed().unwrap());
+        assert_eq!(*fence.borrow_and_update(), OpensFence::Open);
+        fleet.reopen_opens();
+        assert!(!fence.has_changed().unwrap(), "once");
+    }
+
+    /// No owner process starts without a control budget envelope: the
+    /// session's start fails before anything is spawned.
+    #[tokio::test]
+    async fn no_owner_starts_without_a_free_envelope() {
+        let services = HostServices::new(crate::host_services::HostLimits {
+            envelopes: 0,
+            ..Default::default()
+        });
+        let fleet = OwnerFleet::new();
+        let host = OwnerHost::new(
+            SelfImage::hold().unwrap(),
+            None,
+            None,
+            fleet.clone(),
+            services.clone(),
+        );
+        let principal = Principal {
+            uid: 1000,
+            name: "me".into(),
+            identity: "fixture".into(),
+            incarnation: 0,
+        };
+        let refused = host.start(OwnerInit::new(principal, [0; 16])).err();
+        let refused = refused.expect("no envelope: no owner");
+        assert!(refused.to_string().contains("envelope"), "{refused}");
+        assert!(fleet.is_empty(), "nothing was spawned");
+        assert_eq!(services.in_use().envelopes, 0);
+    }
+
+    /// The fence holds at the host too: while it stands no owner is granted
+    /// an open -- also one whose own registry was never fenced, such as an
+    /// owner started after every running one had answered.
+    #[test]
+    fn no_open_is_granted_while_the_fence_stands() {
+        let services = HostServices::new(Default::default());
+        let account = services.admit(1000).unwrap();
+        let fleet = OwnerFleet::new();
+        let open = |id| ToHost::OpenAcquire { id, uid: 1000 };
+        assert_eq!(
+            fleet.fence_opens_until(soon()),
+            Ok(()),
+            "no owner to wait for"
+        );
+        assert!(fleet.opens_fenced());
+        assert_eq!(
+            serve_limits(&account, open(1), fleet.opens_fenced()),
+            Ok(Some(ToOwner::OpenAcquired {
+                id: 1,
+                granted: false
+            }))
+        );
+        // A retirement is still charged: it cannot fail.
+        assert_eq!(
+            serve_limits(&account, ToHost::OpenCharge { uid: 1000 }, true),
+            Ok(None)
+        );
+        assert_eq!(services.in_use().opens, 1);
+        fleet.reopen_opens();
+        assert!(!fleet.opens_fenced());
+        assert_eq!(
+            serve_limits(&account, open(2), fleet.opens_fenced()),
+            Ok(Some(ToOwner::OpenAcquired {
+                id: 2,
+                granted: true
+            }))
+        );
+        assert_eq!(services.in_use().opens, 2);
     }
 }

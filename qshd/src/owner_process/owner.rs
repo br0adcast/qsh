@@ -12,19 +12,31 @@ use anyhow::{bail, Context, Result};
 use nix::libc;
 use tokio::sync::{mpsc, watch};
 use transport::channel::{About, RejectCode, UpdateAnswer, UpdateOffer, UpdateResult};
+use transport::channel_open::{ChannelOpenRegistry, OpenAdmission, RestartOpenFence};
 use transport::channel_server::{DaemonUpdates, RestartPhase, RestartSignal, UpdateTransfer};
 use transport::session_manager::{OwnerExit, OwnerInit, OwnerLink, SessionBackend, Shutdown};
 use transport::Principal;
 
 use super::wire::{self, HostInit, ToHost, ToOwner, WRITE_CHUNK};
 use super::{HOST_FD, LINK_FD, OWNER_ROLE};
+use crate::host_services::HOST_SERVICE_TIMEOUT;
+use crate::screen_budget::{BackingSlots, ScreenPool};
 
 /// How long a fresh owner waits for its `Init`.
 const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long it waits for its last frames to leave before it exits.
 const FAREWELL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an ending session may take to join its tasks and workers; a
+/// drain still running then is given up on (a failed receipt). With the
+/// last-resort kill (no waits), the farewell (`FAREWELL_TIMEOUT`) and the
+/// runtime's 2 s shutdown, at most 17 s: below the host's 20 s stop
+/// escalation, so a stopping daemon hears the receipt first.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Log records waiting for the host channel; more are dropped.
 const LOG_QUEUE: usize = 256;
+/// Limit requests given up on whose late answers are still awaited; one
+/// more and the host is taken for unreachable.
+pub(crate) const ABANDONED_MAX: usize = 16;
 
 /// The owner role, if `args` asks for it: dispatched before every other
 /// command. Refused unless this process was started the way a daemon starts
@@ -170,12 +182,17 @@ async fn run_owner(link: OwnedFd, host: OwnedFd) -> Result<()> {
     let shutdown = Shutdown::default();
     let (out, out_rx) = mpsc::unbounded_channel::<ToHost>();
     let writer = tokio::spawn(write_to_host(write, out_rx, logs_rx, relay.clone()));
-    let client = Arc::new(HostClient {
-        out: out.clone(),
-        pending: Mutex::new(Pending::default()),
-        signal: watch::channel(RestartSignal::IDLE).0,
-    });
-    let reader = tokio::spawn(serve_host(read, client.clone(), shutdown.clone()));
+    let client = HostClient::new(out.clone());
+    client.end_session_on_unreachable(shutdown.clone());
+
+    let OwnerBackend {
+        backend,
+        screens: _,
+    } = owner_backend(&client, updates);
+    let opens = OpensFence::new(backend.open_registry());
+    let backend: Arc<dyn SessionBackend> = Arc::new(backend);
+
+    let reader = tokio::spawn(serve_host(read, client.clone(), opens, shutdown.clone()));
     let signals = {
         use tokio::signal::unix::{signal, SignalKind};
         let mut term = signal(SignalKind::terminate()).context("registering SIGTERM")?;
@@ -191,22 +208,24 @@ async fn run_owner(link: OwnedFd, host: OwnedFd) -> Result<()> {
         })
     };
 
-    let budget = Arc::new(crate::screen_budget::ScreenBudget::new(
-        crate::screen_budget::BudgetLimits::default(),
-    ));
-    let mut backend = crate::channel_backend::ChannelSessionBackend::new(budget);
-    if updates {
-        backend = backend.with_daemon(Arc::new(RemoteDaemonUpdates(client.clone())));
-    }
-    let backend: Arc<dyn SessionBackend> = Arc::new(backend);
     let mut owner_init = OwnerInit::new(principal.clone(), login);
     owner_init.last_generation = last_generation;
-    let run = OwnerLink::run_and_drain(stream(link)?, backend, owner_init, shutdown).await;
+    let run =
+        OwnerLink::run_and_drain(stream(link)?, backend, owner_init, shutdown, DRAIN_TIMEOUT).await;
     if run.exit != OwnerExit::Shutdown {
         let _ = out.send(ToHost::End);
     }
     client.close();
-    let drained = run.drained.map_err(|error| error.to_string());
+    let mut drained = run.drained.map_err(|error| error.to_string());
+    if drained.is_err() {
+        // Something of the session did not join: nothing of it may outlive
+        // this process, which is about to exit whatever is still blocked.
+        let killed = end_children();
+        if killed > 0 {
+            drained = drained
+                .map_err(|error| format!("{error}; {killed} process(es) of the session killed"));
+        }
+    }
     match &drained {
         Ok(()) => crate::log::info(
             "owner",
@@ -225,6 +244,91 @@ async fn run_owner(link: OwnedFd, host: OwnedFd) -> Result<()> {
     // A failed drain is a failed owner: the host sees it in the receipt and
     // in the exit status.
     drained.map_err(|error| anyhow::anyhow!("session drain failed: {error}"))
+}
+
+/// Kill every process of the sessions this process's children lead, and
+/// how many were alive when signalled: exactly, through descriptors that pin each one
+/// (`process_scope::kill_child_sessions`), never by a numeric PID or group.
+/// It never waits and never reaps -- the channel scopes, or init once this
+/// process has exited, do -- so it cannot hold up the receipt or the exit.
+fn end_children() -> usize {
+    let view = match crate::process_scope::qualify_native_proc() {
+        Ok(view) => view,
+        Err(error) => {
+            crate::log::error(
+                "owner",
+                &format!(
+                    "the session did not drain, and its processes cannot be pinned \
+                     ({error:?}); none signalled"
+                ),
+            );
+            return 0;
+        }
+    };
+    match crate::process_scope::kill_child_sessions(
+        &view,
+        |_| true,
+        &mut crate::process_scope::Native,
+    ) {
+        Ok(kill) => {
+            if kill.killed > 0 {
+                crate::log::warn(
+                    "owner",
+                    &format!(
+                        "the session did not drain; killed {} of its process(es)",
+                        kill.killed
+                    ),
+                );
+            }
+            if !kill.settled {
+                crate::log::error(
+                    "owner",
+                    &format!(
+                        "the session still had new processes after {} passes; \
+                         some may outlive this owner",
+                        crate::process_scope::KILL_PASSES
+                    ),
+                );
+            }
+            kill.killed
+        }
+        Err(error) => {
+            crate::log::error(
+                "owner",
+                &format!(
+                    "the session did not drain, and its processes could not be listed: {error:?}"
+                ),
+            );
+            0
+        }
+    }
+}
+
+/// What an owner runs its session with.
+pub(crate) struct OwnerBackend {
+    pub(crate) backend: crate::channel_backend::ChannelSessionBackend,
+    /// The screen budget its channels are charged to (given to the
+    /// backend's spawner; read here only by tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) screens: Arc<crate::screen_budget::ScreenBudget>,
+}
+
+/// The owner's channel backend: every daemon-wide limit is the host's,
+/// shared by all of the daemon's owners (`crate::host_services`) -- the
+/// screen pool and the open count by request through `client`; the control
+/// budget is one envelope (`OwnerLink::run_and_drain`). With `updates`, it
+/// speaks for the host's update service.
+pub(crate) fn owner_backend(client: &Arc<HostClient>, updates: bool) -> OwnerBackend {
+    let limits = Arc::new(RemoteLimits(client.clone()));
+    let screens = Arc::new(crate::screen_budget::ScreenBudget::remote(limits.clone()));
+    let spawner =
+        crate::channel_backend::PtyChannelSpawner::new(screens.clone()).with_open_admission(limits);
+    let mut backend =
+        crate::channel_backend::ChannelSessionBackend::with_spawner(Arc::new(spawner));
+    if updates {
+        backend = backend.with_daemon(Arc::new(RemoteDaemonUpdates(client.clone())));
+    }
+    OwnerBackend { backend, screens }
 }
 
 /// The owner's log records on their way to the host: a bounded queue, and
@@ -375,12 +479,18 @@ pub(super) async fn write_to_host<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 /// Read the host channel: `Stop` and the end of input (the host is gone)
-/// both end the session; restart signals and replies go to `client`.
+/// both end the session; restart signals and replies go to `client`, the
+/// restart fence to `opens`.
 async fn serve_host(
     mut read: tokio::net::unix::OwnedReadHalf,
     client: Arc<HostClient>,
+    opens: OpensFence,
     shutdown: Shutdown,
 ) {
+    // Restart signals are published off this loop: a runner may hold the
+    // signal's read side for a moment, and nothing may hold up the replies
+    // and stops this loop delivers.
+    let relay = tokio::spawn(client.clone().relay_signals());
     loop {
         let frame = match wire::read_frame(&mut read).await {
             Ok(Some(body)) => ToOwner::decode(&body),
@@ -395,9 +505,12 @@ async fn serve_host(
         };
         match frame {
             Ok(ToOwner::Stop) => break,
-            Ok(ToOwner::Signal(signal)) => {
-                client.signal.send_replace(signal);
+            Ok(ToOwner::Signal(signal)) => client.push_signal(signal),
+            Ok(ToOwner::FenceOpens { fence }) => {
+                let result = opens.fence();
+                client.notify(ToHost::OpensFenced { fence, result });
             }
+            Ok(ToOwner::ReopenOpens) => opens.reopen(),
             Ok(ToOwner::Init(_)) | Err(_) => {
                 crate::log::error("owner", "the host channel sent a bad frame");
                 break;
@@ -405,10 +518,64 @@ async fn serve_host(
             Ok(reply) => client.reply(reply),
         }
     }
+    relay.abort();
     // The order matters: the session sees the stop before a request it
     // has outstanding fails, so nothing of that failure reaches its client.
     shutdown.request();
     client.close();
+}
+
+/// This owner's channel opening, fenced for the daemon's replacement while
+/// the host asks (`FenceOpens` .. `ReopenOpens`), as a single-process
+/// daemon fences its own registry.
+pub(crate) struct OpensFence {
+    registry: Arc<ChannelOpenRegistry>,
+    held: Mutex<Option<RestartOpenFence>>,
+}
+
+impl OpensFence {
+    pub(crate) fn new(registry: Arc<ChannelOpenRegistry>) -> OpensFence {
+        OpensFence {
+            registry,
+            held: Mutex::new(None),
+        }
+    }
+
+    /// Fence: from here on every open is refused as `Restarting` and every
+    /// pending one cancelled. `Ok` only if no channel cleanup was pending
+    /// or unconfirmed before (the update preflight's condition, which the
+    /// host cannot see in an owner's registry); fenced either way, until
+    /// [`OpensFence::reopen`].
+    pub(crate) fn fence(&self) -> Result<(), String> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        // Still fenced for an earlier attempt (its `ReopenOpens` folded into
+        // this request): fence afresh, as that attempt's undo and this
+        // attempt would have.
+        if let Some(earlier) = held.take() {
+            earlier.reopen();
+        }
+        let debt = match self.registry.cleanup_snapshot() {
+            Some(snapshot) if !snapshot.has_cleanup_debt() => None,
+            Some(_) => Some("registered channel cleanup is still pending or unconfirmed"),
+            None => Some("registered channel cleanup observation is unavailable"),
+        };
+        match self.registry.begin_restart_fence() {
+            Ok(fence) => *held = Some(fence),
+            Err(_) => return Err("channel opening could not be fenced".into()),
+        }
+        match debt {
+            Some(debt) => Err(debt.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// The replacement did not happen: admit opens again.
+    pub(crate) fn reopen(&self) {
+        let fence = self.held.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(fence) = fence {
+            fence.reopen();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -416,18 +583,149 @@ struct Pending {
     closed: bool,
     next: u64,
     waiters: HashMap<u64, std::sync::mpsc::SyncSender<ToOwner>>,
+    /// What gives back a grant whose request was given up on (timed out):
+    /// sent if the grant still arrives. At most one per such request,
+    /// dropped with its answer.
+    abandoned: HashMap<u64, ToHost>,
 }
 
-/// Requests to the host, from the session's blocking workers.
-struct HostClient {
+/// Wait for `wait` on this thread. On a runtime worker the worker's other
+/// tasks -- among them the writer and the reader of the host channel this
+/// wait is for -- move to another thread meanwhile, so a blocking call from
+/// async code cannot hold up its own answer.
+fn block_for<T>(wait: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
+    }
+}
+
+/// Requests to the host, from the session's blocking workers and, for the
+/// daemon-wide limits, from wherever the session charges them.
+pub(crate) struct HostClient {
     out: mpsc::UnboundedSender<ToHost>,
     pending: Mutex<Pending>,
     signal: watch::Sender<RestartSignal>,
+    /// The latest restart signal from the host not yet published, and
+    /// the wake of its relay ([`HostClient::relay_signals`]).
+    incoming: Mutex<Option<RestartSignal>>,
+    relay: tokio::sync::Notify,
+    /// The session, ended when the host is taken for unreachable.
+    on_unreachable: std::sync::OnceLock<Shutdown>,
 }
 
 impl HostClient {
+    /// A client whose requests go to `out`; replies come through
+    /// [`HostClient::reply`].
+    pub(crate) fn new(out: mpsc::UnboundedSender<ToHost>) -> Arc<HostClient> {
+        Arc::new(HostClient {
+            out,
+            pending: Mutex::new(Pending::default()),
+            signal: watch::channel(RestartSignal::IDLE).0,
+            incoming: Mutex::new(None),
+            relay: tokio::sync::Notify::new(),
+            on_unreachable: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// End `shutdown`'s session if the host is ever taken for unreachable.
+    pub(crate) fn end_session_on_unreachable(&self, shutdown: Shutdown) {
+        let _ = self.on_unreachable.set(shutdown);
+    }
+
+    /// A restart signal from the host, for the relay to publish; never
+    /// waits for the signal's readers. A newer one replaces one not yet
+    /// published, as the watch itself would.
+    pub(crate) fn push_signal(&self, signal: RestartSignal) {
+        *self.incoming.lock().unwrap_or_else(|e| e.into_inner()) = Some(signal);
+        self.relay.notify_one();
+    }
+
+    /// Publish the host's restart signals to the session, one at a time;
+    /// a publication that waits for a reader waits here, not in the loop
+    /// that delivers replies.
+    pub(crate) async fn relay_signals(self: Arc<Self>) {
+        loop {
+            self.relay.notified().await;
+            let next = self
+                .incoming
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(signal) = next {
+                block_for(|| {
+                    self.signal.send_replace(signal);
+                });
+            }
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Pending> {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// [`HostClient::call`] for a daemon-wide limit: `None` (a refusal) also
+    /// when no reply came within [`HOST_SERVICE_TIMEOUT`]. A grant that
+    /// arrives after that is given back with `undo`.
+    fn call_within(&self, request: impl FnOnce(u64) -> ToHost, undo: ToHost) -> Option<ToOwner> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let id = {
+            let mut pending = self.lock();
+            if pending.closed {
+                return None;
+            }
+            pending.next += 1;
+            let id = pending.next;
+            pending.waiters.insert(id, tx);
+            if self.out.send(request(id)).is_err() {
+                pending.waiters.remove(&id);
+                return None;
+            }
+            id
+        };
+        match block_for(|| rx.recv_timeout(HOST_SERVICE_TIMEOUT)) {
+            Ok(reply) => Some(reply),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let mut pending = self.lock();
+                if pending.waiters.remove(&id).is_some() {
+                    // Given up: a grant that still comes is given back --
+                    // unless so many went unanswered that the host is taken
+                    // for unreachable: then the session ends (its late
+                    // grants could no longer be given back, and would count
+                    // against the account's other sessions), every later
+                    // request fails at once, and the host frees whatever it
+                    // granted when it reaps this owner.
+                    if !pending.closed {
+                        if pending.abandoned.len() >= ABANDONED_MAX {
+                            drop(pending);
+                            crate::log::error(
+                                "owner",
+                                &format!(
+                                    "{} requests to the daemon went unanswered; \
+                                     taking it for unreachable",
+                                    ABANDONED_MAX + 1
+                                ),
+                            );
+                            // As on `Stop`: the session sees the end before
+                            // its requests fail.
+                            if let Some(shutdown) = self.on_unreachable.get() {
+                                shutdown.request();
+                            }
+                            self.close();
+                        } else {
+                            pending.abandoned.insert(id, undo);
+                        }
+                    }
+                    None
+                } else {
+                    // The reply was handed over just now.
+                    rx.try_recv().ok()
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+        }
     }
 
     /// Send one request and wait for its reply; `None` once the session is
@@ -450,29 +748,92 @@ impl HostClient {
         rx.recv().ok()
     }
 
-    fn reply(&self, reply: ToOwner) {
+    /// One reply from the host, for the request it answers.
+    pub(crate) fn reply(&self, reply: ToOwner) {
         let id = match &reply {
             ToOwner::About { id, .. }
             | ToOwner::Offered { id, .. }
             | ToOwner::Written { id, .. }
             | ToOwner::Verified { id, .. }
-            | ToOwner::Restarted { id, .. } => *id,
+            | ToOwner::Restarted { id, .. }
+            | ToOwner::ScreenAcquired { id, .. }
+            | ToOwner::OpenAcquired { id, .. } => *id,
             _ => return,
         };
-        if let Some(waiter) = self.lock().waiters.remove(&id) {
+        let mut pending = self.lock();
+        if let Some(waiter) = pending.waiters.remove(&id) {
             let _ = waiter.try_send(reply);
+            return;
+        }
+        let Some(undo) = pending.abandoned.remove(&id) else {
+            return;
+        };
+        drop(pending);
+        let granted = matches!(
+            reply,
+            ToOwner::ScreenAcquired { result: Ok(()), .. }
+                | ToOwner::OpenAcquired { granted: true, .. }
+        );
+        if granted {
+            self.notify(undo);
         }
     }
 
-    fn notify(&self, msg: ToHost) {
+    pub(crate) fn notify(&self, msg: ToHost) {
         let _ = self.out.send(msg);
     }
 
     /// Every outstanding and later request fails.
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         let mut pending = self.lock();
         pending.closed = true;
         pending.waiters.clear();
+        pending.abandoned.clear();
+    }
+}
+
+/// The daemon-wide limits, seen from an owner: the host's screen pool and
+/// open count (`crate::host_services`), charged by request with a bounded
+/// wait (no answer in time is a refusal) and refunded by notice.
+pub(crate) struct RemoteLimits(pub(crate) Arc<HostClient>);
+
+impl ScreenPool for RemoteLimits {
+    fn acquire(&self, uid: u32, slots: BackingSlots, models: usize) -> Result<(), String> {
+        let reply = self.0.call_within(
+            |id| ToHost::ScreenAcquire {
+                id,
+                uid,
+                slots,
+                models,
+            },
+            ToHost::ScreenRelease { uid, slots, models },
+        );
+        match reply {
+            Some(ToOwner::ScreenAcquired { result, .. }) => result,
+            _ => Err("terminal screen budget unavailable: the daemon did not answer".into()),
+        }
+    }
+
+    fn release(&self, uid: u32, slots: BackingSlots, models: usize) {
+        self.0.notify(ToHost::ScreenRelease { uid, slots, models });
+    }
+}
+
+impl OpenAdmission for RemoteLimits {
+    fn acquire(&self, uid: u32) -> bool {
+        let reply = self.0.call_within(
+            |id| ToHost::OpenAcquire { id, uid },
+            ToHost::OpenRelease { uid },
+        );
+        matches!(reply, Some(ToOwner::OpenAcquired { granted: true, .. }))
+    }
+
+    fn charge(&self, uid: u32) {
+        self.0.notify(ToHost::OpenCharge { uid });
+    }
+
+    fn release(&self, uid: u32) {
+        self.0.notify(ToHost::OpenRelease { uid });
     }
 }
 
@@ -598,6 +959,167 @@ impl Drop for RemoteTransfer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open_request(
+        session: &transport::channel_open::SessionOpenLedger,
+        instance: u64,
+    ) -> transport::channel_open::OpenRequestSnapshot {
+        transport::channel_open::OpenRequestSnapshot {
+            owner: Principal {
+                uid: 1000,
+                name: "me".into(),
+                identity: "fixture".into(),
+                incarnation: 0,
+            },
+            login: [0; 16],
+            request: transport::channel::OpenRequest {
+                stream: 16,
+                kind: transport::channel::ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            },
+            term: None,
+            identity: transport::channel_open::OpenIdentity {
+                session: session.id(),
+                stream: 16,
+                instance: transport::channel_geometry::ChannelInstance::new(instance).unwrap(),
+                generation: 0,
+                invalidation_epoch: 0,
+            },
+        }
+    }
+
+    /// A restart announcement the host sends ahead of a reply never holds
+    /// that reply up, even while the session holds the signal's read side
+    /// (as an open's admission guard does): the reply arrives, and the
+    /// signal is published once the reader lets go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restart_signal_never_holds_up_the_replies_behind_it() {
+        use tokio::io::AsyncWriteExt;
+        let (mut host_end, owner_end) = tokio::net::UnixStream::pair().unwrap();
+        let (out, mut requests) = mpsc::unbounded_channel();
+        let client = HostClient::new(out);
+        let (read, _write) = owner_end.into_split();
+        let reader = tokio::spawn(serve_host(
+            read,
+            client.clone(),
+            OpensFence::new(ChannelOpenRegistry::new(Default::default())),
+            Shutdown::default(),
+        ));
+        let mut published = client.signal.subscribe();
+        // The session holds the signal's read side...
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let watching = client.signal.subscribe();
+        let holder = std::thread::spawn(move || {
+            let guard = watching.borrow();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+        // ...while one of its opens waits for the host.
+        let asking = client.clone();
+        let caller = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let granted = OpenAdmission::acquire(&RemoteLimits(asking), 1000);
+            (granted, started.elapsed())
+        });
+        let Some(ToHost::OpenAcquire { id, .. }) = requests.recv().await else {
+            panic!("an open request")
+        };
+        let signal = RestartSignal::announced(1, 1);
+        for frame in [
+            ToOwner::Signal(signal),
+            ToOwner::OpenAcquired { id, granted: true },
+        ] {
+            host_end.write_all(&frame.encode().unwrap()).await.unwrap();
+        }
+        let (granted, waited) = tokio::task::spawn_blocking(move || caller.join().unwrap())
+            .await
+            .unwrap();
+        assert!(granted, "the reply behind the signal arrived");
+        assert!(waited < HOST_SERVICE_TIMEOUT, "{waited:?}");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), published.wait_for(|s| *s == signal))
+            .await
+            .expect("published")
+            .unwrap();
+        drop(host_end);
+        reader.await.unwrap();
+    }
+
+    /// A host that answers nothing is not waited for without bound: past
+    /// `ABANDONED_MAX` requests given up on, it is taken for unreachable and
+    /// every later request fails at once, unasked.
+    #[test]
+    fn a_host_that_never_answers_is_taken_for_unreachable() {
+        let (out, mut requests) = mpsc::unbounded_channel();
+        let client = HostClient::new(out);
+        let shutdown = Shutdown::default();
+        client.end_session_on_unreachable(shutdown.clone());
+        let callers: Vec<_> = (0..=ABANDONED_MAX)
+            .map(|_| {
+                let client = client.clone();
+                std::thread::spawn(move || OpenAdmission::acquire(&RemoteLimits(client), 1000))
+            })
+            .collect();
+        for caller in callers {
+            assert!(!caller.join().unwrap(), "unanswered: refused");
+        }
+        let mut asked = 0;
+        while requests.try_recv().is_ok() {
+            asked += 1;
+        }
+        assert_eq!(asked, ABANDONED_MAX + 1);
+        {
+            let pending = client.lock();
+            assert!(pending.closed, "taken for unreachable");
+            assert!(shutdown.is_requested(), "and the session ends");
+            assert!(pending.abandoned.is_empty() && pending.waiters.is_empty());
+        }
+        let started = std::time::Instant::now();
+        assert!(!OpenAdmission::acquire(&RemoteLimits(client.clone()), 1000));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(requests.try_recv().is_err(), "nothing more is asked");
+    }
+
+    /// The host's `FenceOpens` fences this owner's registry as a
+    /// single-process daemon fences its own: opens are refused until
+    /// `ReopenOpens`, and pending cleanup is reported, not hidden.
+    #[test]
+    fn a_fence_from_the_host_refuses_opens_until_it_is_lifted() {
+        use transport::channel_open::OpenRefusal;
+        let registry = ChannelOpenRegistry::new(Default::default());
+        let session = registry.session().unwrap();
+        let opens = OpensFence::new(registry.clone());
+        assert_eq!(opens.fence(), Ok(()));
+        assert_eq!(opens.fence(), Ok(()), "asked again: fenced afresh");
+        assert!(matches!(
+            registry.try_reserve(&session, open_request(&session, 1)),
+            Err(OpenRefusal::Restarting)
+        ));
+        opens.reopen();
+        let job = registry
+            .try_reserve(&session, open_request(&session, 2))
+            .expect("open again");
+        // A cancelled open whose cleanup is not proved is cleanup debt.
+        job.cancel();
+        let refused = opens.fence().unwrap_err();
+        assert!(refused.contains("cleanup"), "{refused}");
+        assert!(
+            matches!(
+                registry.try_reserve(&session, open_request(&session, 3)),
+                Err(OpenRefusal::Restarting)
+            ),
+            "fenced all the same, until the host lifts it"
+        );
+        opens.reopen();
+        assert!(registry.begin_restart_fence().is_ok());
+    }
 
     fn record_text(msg: &ToHost) -> Option<&str> {
         match msg {

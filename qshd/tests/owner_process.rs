@@ -128,6 +128,7 @@ fn file_identity(path: &Path) -> (u64, u64) {
 
 struct Daemon {
     child: Child,
+    mark: String,
     dir: tempfile::TempDir,
     port: u16,
     server_pub: [u8; 32],
@@ -138,6 +139,72 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        assert_no_owner_left(&self.mark);
+    }
+}
+
+/// Marks the daemons this test binary starts: owners inherit the mark from
+/// their daemon's environment, so a leaked owner -- reparented away from
+/// its dead daemon -- is still found.
+const MARK_ENV: &str = "QSHD_TEST_DAEMON_MARK";
+
+fn new_daemon_mark() -> String {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    )
+}
+
+/// Running (not zombie) processes in the session owner role started under
+/// `mark`.
+fn owners_marked(mark: &str) -> Vec<u32> {
+    let needle = format!("{MARK_ENV}={mark}");
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let rest = &stat[stat.rfind(')')? + 1..];
+                    rest.split_whitespace().next().map(str::to_owned)
+                });
+            cmdline.split(|b| *b == 0).nth(1) == Some(b"__qshd-session-owner-v1".as_slice())
+                && environ
+                    .split(|b| *b == 0)
+                    .any(|var| var == needle.as_bytes())
+                && state.is_some_and(|state| state != "Z" && state != "X")
+        })
+        .collect()
+}
+
+/// No session owner of the daemon marked `mark` outlives it: waited for
+/// (an owner whose host died drains for at most 10 s), else killed and
+/// reported.
+fn assert_no_owner_left(mark: &str) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let left = owners_marked(mark);
+        if left.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            for pid in &left {
+                unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+            }
+            if !std::thread::panicking() {
+                panic!("session owner(s) {left:?} outlived their daemon");
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -199,6 +266,7 @@ fn start_daemon_from(binary: &Path, dir: tempfile::TempDir) -> Daemon {
     )
     .expect("authorized_keys");
     let port = free_udp_port();
+    let mark = new_daemon_mark();
     let mut child = Command::new(binary)
         .args([
             "serve",
@@ -211,6 +279,7 @@ fn start_daemon_from(binary: &Path, dir: tempfile::TempDir) -> Daemon {
         ])
         .env("XDG_CACHE_HOME", dir.path())
         .env("HOME", dir.path())
+        .env(MARK_ENV, &mark)
         .env("HISTFILE", "/dev/null")
         .env("SHELL", "/bin/sh")
         .env("TMUX_TMPDIR", dir.path())
@@ -237,6 +306,7 @@ fn start_daemon_from(binary: &Path, dir: tempfile::TempDir) -> Daemon {
     });
     Daemon {
         child,
+        mark,
         dir,
         port,
         server_pub,
@@ -393,6 +463,46 @@ impl Session {
                 pid.is_some()
             }),
             "the shell must say its pid"
+        );
+        pid.unwrap()
+    }
+
+    /// Open a command channel running `sh -c '<script>'`, which must print
+    /// `PID<its pid>-` first, and return that pid.
+    fn open_command(&self, script: &str) -> u32 {
+        self.client
+            .send_bytes(
+                CONTROL_STREAM,
+                encode_client(&ClientRecord::Open(OpenRequest {
+                    stream: FIRST_CHANNEL_STREAM,
+                    kind: ChannelKind::Command,
+                    cols: 80,
+                    rows: 24,
+                    screen: false,
+                    command: format!("sh -c '{script}'").into_bytes(),
+                })),
+            )
+            .expect("open admitted");
+        self.said_pid()
+    }
+
+    /// The pid the channel's process printed as `PID<digits>-`.
+    fn said_pid(&self) -> u32 {
+        let mut pid = None;
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                let text = String::from_utf8_lossy(&self.events.collected.lock().unwrap().shell)
+                    .into_owned();
+                pid = text.match_indices("PID").find_map(|(at, _)| {
+                    let rest = &text[at + 3..];
+                    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                    (!digits.is_empty() && rest[digits.len()..].starts_with('-'))
+                        .then(|| digits.parse().ok())
+                        .flatten()
+                });
+                pid.is_some()
+            }),
+            "the channel's process must say its pid"
         );
         pid.unwrap()
     }
@@ -684,4 +794,67 @@ fn owner_link_eof_parks_instead_of_ending() {
         daemon.log()
     );
     drop(session);
+}
+
+/// An owner whose host dies -- the daemon SIGKILLed -- ends its session
+/// destructively and exits, even while a channel's input writer is blocked
+/// for good in a write into the pseudo-terminal (a process that never reads
+/// its input, under a large paste): neither the owner nor the channel's
+/// process is left behind.
+#[test]
+fn an_owner_whose_host_dies_ends_even_with_a_blocked_channel() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let session = Session::connect(&daemon, [30; 16]);
+    let process = session.open_command("stty raw -echo; echo PID$$-; exec sleep 300");
+    let owner = owner_of(process, &daemon);
+    // More input than the terminal takes: the owner's writer blocks.
+    session
+        .client
+        .send_bytes(FIRST_CHANNEL_STREAM, vec![b'x'; 1 << 20])
+        .expect("paste admitted");
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(running(process) && running(owner));
+
+    daemon.child.kill().expect("SIGKILL the daemon");
+    daemon.child.wait().expect("reap the daemon");
+    assert!(
+        wait_until(Duration::from_secs(40), || !running(owner)
+            && !running(process)),
+        "the owner {owner} ({}) and its channel's process {process} ({}) outlived their host",
+        running(owner),
+        running(process)
+    );
+    drop(session);
+}
+
+/// `SIGTERM` to an owner is `Stop`: its session ends, its shell is reaped,
+/// it reports a clean drain and exits 0 -- and the daemon serves on.
+#[test]
+fn sigterm_to_an_owner_is_a_stop() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let session = Session::connect(&daemon, [31; 16]);
+    let shell = session.open_shell();
+    let owner = owner_of(shell, &daemon);
+    assert_eq!(unsafe { libc::kill(owner as i32, libc::SIGTERM) }, 0);
+    assert!(
+        wait_until(Duration::from_secs(20), || reaped(owner) && reaped(shell)),
+        "owner {owner} and shell {shell} end; log: {}",
+        daemon.log()
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || daemon.log().contains(&format!(
+            "session owner {owner} exited (exit 0); drained"
+        ))),
+        "log: {}",
+        daemon.log()
+    );
+    let next = Session::connect(&daemon, [32; 16]);
+    let other = next.open_shell();
+    assert_ne!(owner_of(other, &daemon), owner);
+    assert!(next.shell_answers(4));
+    let status = daemon.stop();
+    assert!(status.success(), "{status:?}; log: {}", daemon.log());
+    drop((session, next));
 }

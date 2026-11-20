@@ -86,12 +86,79 @@ fn wait_until(mut probe: impl FnMut() -> bool) -> bool {
 /// would.
 struct Daemon {
     child: Child,
+    mark: String,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        assert_no_owner_left(&self.mark);
+    }
+}
+
+/// Marks the daemons this test binary starts: owners inherit the mark from
+/// their daemon's environment, so a leaked owner -- reparented away from
+/// its dead daemon -- is still found.
+const MARK_ENV: &str = "QSHD_TEST_DAEMON_MARK";
+
+fn new_daemon_mark() -> String {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    )
+}
+
+/// Running (not zombie) processes in the session owner role started under
+/// `mark`.
+fn owners_marked(mark: &str) -> Vec<u32> {
+    let needle = format!("{MARK_ENV}={mark}");
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let rest = &stat[stat.rfind(')')? + 1..];
+                    rest.split_whitespace().next().map(str::to_owned)
+                });
+            cmdline.split(|b| *b == 0).nth(1) == Some(b"__qshd-session-owner-v1".as_slice())
+                && environ
+                    .split(|b| *b == 0)
+                    .any(|var| var == needle.as_bytes())
+                && state.is_some_and(|state| state != "Z" && state != "X")
+        })
+        .collect()
+}
+
+/// No session owner of the daemon marked `mark` outlives it: waited for
+/// (an owner whose host died drains for at most 10 s), else killed and
+/// reported.
+fn assert_no_owner_left(mark: &str) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let left = owners_marked(mark);
+        if left.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            for pid in &left {
+                unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+            }
+            if !std::thread::panicking() {
+                panic!("session owner(s) {left:?} outlived their daemon");
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -137,6 +204,7 @@ fn start_daemon(
     authorized_keys: &std::path::Path,
 ) -> (Daemon, [u8; 32]) {
     let bin = env!("CARGO_BIN_EXE_qshd");
+    let mark = new_daemon_mark();
     let mut child = Command::new(bin)
         .args([
             "serve",
@@ -148,6 +216,7 @@ fn start_daemon(
             dir.join("host_key").to_str().expect("utf-8 path"),
         ])
         .env("XDG_CACHE_HOME", dir)
+        .env(MARK_ENV, &mark)
         // The daemon opens a real login shell in a pseudo-terminal, and this test types
         // probe commands into it. Without this the shell appends every one of them to the
         // history of whoever ran the suite -- these tests do not set HOME, so that is the
@@ -190,7 +259,7 @@ fn start_daemon(
         "expected a host-key-fingerprint line, got: {line2:?}"
     );
 
-    (Daemon { child }, server_pub)
+    (Daemon { child, mark }, server_pub)
 }
 
 struct NoopBinder;

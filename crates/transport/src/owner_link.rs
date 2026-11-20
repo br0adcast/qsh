@@ -1581,19 +1581,30 @@ struct Owner {
 
 impl OwnerLink {
     /// [`OwnerLink::run`] on a lifecycle of its own that `shutdown` stops,
-    /// then stop that lifecycle and drain it: when this returns, every task
-    /// and blocking worker of the session has joined (the owner process's
-    /// receipt). Any lifecycle in `init` is replaced.
+    /// then stop that lifecycle and drain it: when this returns with
+    /// `drained: Ok`, every task and blocking worker of the session has
+    /// joined (the owner process's receipt). A drain that has not finished
+    /// within `drain_within` is given up on (`drained: Err`): a worker
+    /// blocked for good -- a write into a pseudo-terminal whose other side
+    /// is gone, say -- must not keep the owner process alive, and it ends
+    /// with the process. Any lifecycle in `init` is replaced.
     pub async fn run_and_drain<L>(
         link: L,
         backend: Arc<dyn SessionBackend>,
         mut init: OwnerInit,
         shutdown: Shutdown,
+        drain_within: std::time::Duration,
     ) -> OwnerRun
     where
         L: AsyncRead + AsyncWrite + Send + 'static,
     {
-        let lifecycle = Lifecycle::new(shutdown);
+        // One session envelope of the daemon's control budget: the host
+        // leases one to each owner process it starts, so owners together
+        // hold no more than one daemon did.
+        let lifecycle = Lifecycle::with_control_budget(
+            shutdown,
+            crate::control_budget::GlobalBudget::envelope(),
+        );
         init.lifecycle = Some(lifecycle.clone());
         let run = Self::run(link, backend, init);
         tokio::pin!(run);
@@ -1608,7 +1619,9 @@ impl OwnerLink {
             }
         };
         lifecycle.shutdown.request();
-        let drained = lifecycle.drain().await;
+        let drained = tokio::time::timeout(drain_within, lifecycle.drain())
+            .await
+            .unwrap_or_else(|_| Err(ShutdownError::unjoined(drain_within)));
         OwnerRun { exit, drained }
     }
 

@@ -67,6 +67,15 @@ impl PtyChannelSpawner {
             opens: ChannelOpenRegistry::new(Default::default()),
         }
     }
+    /// Count this spawner's opens against `admission` too: a session
+    /// owner's, whose daemon-wide open limits its host keeps (#529).
+    pub fn with_open_admission(
+        mut self,
+        admission: Arc<dyn transport::channel_open::OpenAdmission>,
+    ) -> Self {
+        self.opens = ChannelOpenRegistry::with_admission(Default::default(), admission);
+        self
+    }
     /// Explicit retained-owner configuration; ordinary constructors keep their pool.
     pub fn with_retained_screens(
         mut self,
@@ -563,6 +572,9 @@ pub struct PersonalSessions {
         crate::owner_process::SelfImage,
         Arc<crate::owner_process::OwnerFleet>,
     )>,
+    /// The daemon-wide limits every owner charges (`crate::host_services`).
+    #[cfg(target_os = "linux")]
+    services: Arc<crate::host_services::HostServices>,
     #[cfg(target_os = "linux")]
     log_dir: Option<std::path::PathBuf>,
 }
@@ -585,7 +597,11 @@ impl PersonalSessions {
                 None
             }
         };
-        PersonalSessions { owners, log_dir }
+        PersonalSessions {
+            owners,
+            services: crate::host_services::HostServices::new(Default::default()),
+            log_dir,
+        }
     }
 
     /// What an in-place replacement must stop before it execs.
@@ -622,6 +638,7 @@ impl PersonalSessions {
             self.log_dir.clone(),
             daemon,
             fleet.clone(),
+            self.services.clone(),
         );
         // `backend` only answers for the features and the consumption model
         // of the sessions the owners run.

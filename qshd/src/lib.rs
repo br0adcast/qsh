@@ -78,6 +78,8 @@ pub mod log;
 mod modern_restart;
 #[doc(hidden)]
 pub use modern_restart::{interrupt_selected, RestartOutcome};
+#[cfg(target_os = "linux")]
+pub(crate) mod host_services;
 #[cfg(feature = "system")]
 pub mod nonce_pool;
 #[cfg(target_os = "linux")]

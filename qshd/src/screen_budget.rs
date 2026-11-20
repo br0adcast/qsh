@@ -171,11 +171,30 @@ struct State {
     owners: HashMap<u32, Usage>,
 }
 
+/// A daemon's screen pool kept by someone else: in a session owner process
+/// (#529), the host, which serves every owner of the daemon from one pool
+/// ([`crate::host_services`]). Every reservation and resize of the owner's
+/// [`ScreenBudget`] is a charge (`acquire`) and a refund (`release`) there:
+/// a reservation is `acquire(charge, 1 model)`, a resize's preparation
+/// `acquire(delta + scratch, 0)`, its commit `release(scratch, 0)`, its
+/// cancellation `release(delta + scratch, 0)`, the lease's end
+/// `release(charge, 1)`.
+pub trait ScreenPool: Send + Sync {
+    /// Charge `slots` and `models` to `uid`, or refuse. May block, for a
+    /// bounded time; an answer it does not get in that time is a refusal
+    /// (fail-closed, as exhaustion is).
+    fn acquire(&self, uid: u32, slots: BackingSlots, models: usize) -> Result<(), String>;
+    /// Give back what an `acquire` charged. Never blocks.
+    fn release(&self, uid: u32, slots: BackingSlots, models: usize);
+}
+
 /// One pool for all sessions and authenticated uid aliases of a daemon.
 /// No lock survives admission; resize tokens can cross PTY operations safely.
 pub struct ScreenBudget {
     limits: BudgetLimits,
     state: Mutex<State>,
+    /// The daemon's pool, when this process only charges it remotely.
+    remote: Option<Arc<dyn ScreenPool>>,
 }
 
 impl ScreenBudget {
@@ -183,10 +202,41 @@ impl ScreenBudget {
         Self {
             limits,
             state: Mutex::new(State::default()),
+            remote: None,
+        }
+    }
+
+    /// A budget that charges `pool` for everything: a session owner's, so
+    /// that every owner of a daemon shares that daemon's limits.
+    pub fn remote(pool: Arc<dyn ScreenPool>) -> Self {
+        Self {
+            limits: BudgetLimits::default(),
+            state: Mutex::new(State::default()),
+            remote: Some(pool),
         }
     }
 
     fn acquire(&self, uid: u32, slots: BackingSlots, models: usize) -> Result<(), String> {
+        if let Some(pool) = &self.remote {
+            return pool.acquire(uid, slots, models);
+        }
+        self.acquire_slots(uid, slots, models)
+    }
+
+    fn release(&self, uid: u32, slots: BackingSlots, models: usize) {
+        if let Some(pool) = &self.remote {
+            return pool.release(uid, slots, models);
+        }
+        self.release_slots(uid, slots, models)
+    }
+
+    /// Charge this pool directly (the host's side of [`ScreenPool`]).
+    pub(crate) fn acquire_slots(
+        &self,
+        uid: u32,
+        slots: BackingSlots,
+        models: usize,
+    ) -> Result<(), String> {
         let mut state = self.state.lock().expect("screen budget lock poisoned");
         let global = state.global.plus(slots, models)?;
         let owner = state
@@ -211,7 +261,8 @@ impl ScreenBudget {
         Ok(())
     }
 
-    fn release(&self, uid: u32, slots: BackingSlots, models: usize) {
+    /// Refund this pool directly; only what was charged to `uid`.
+    pub(crate) fn release_slots(&self, uid: u32, slots: BackingSlots, models: usize) {
         let mut state = self.state.lock().expect("screen budget lock poisoned");
         state.global.release(slots, models);
         let owner = state
