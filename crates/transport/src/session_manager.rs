@@ -84,6 +84,8 @@ pub(crate) mod binding_revision;
 mod channel_bridge;
 #[path = "session_lifecycle.rs"]
 mod lifecycle;
+#[path = "owner_link.rs"]
+mod owner_link;
 use binding_revision::{BindingRevision, BindingRevisions, RevisionChange};
 pub(crate) use lifecycle::CallbackFailure;
 use lifecycle::Lifecycle;
