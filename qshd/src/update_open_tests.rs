@@ -274,7 +274,7 @@ mod open24_exec_tests {
             offer: offer_for(&image, 101), path: daemon.staging_path(), file: None, created: false,
             hasher: Sha256::new(), written: 0, closed_admission: false,
             binary_path: daemon.binary_path.clone(), active: daemon.active.clone(), in_progress: daemon.in_progress.clone(),
-            restarts: daemon.restarts.clone(), opens: daemon.opens.clone(), handover: daemon.handover.clone(), exec: daemon.exec.clone(),
+            restarts: daemon.restarts.clone(), opens: daemon.opens.clone(), handover: daemon.handover.clone(), exec: daemon.exec.clone(), owners: None,
         };
         let before = *daemon.restart_signal().borrow();
         assert!(matches!(Box::new(staged).restart(), UpdateResult::Rejected { code: RejectCode::Other, .. }));

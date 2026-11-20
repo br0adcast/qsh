@@ -183,6 +183,13 @@ fn main() -> Result<()> {
             "service staging options require checked transport-ensure"
         );
     }
+    // A session owner a personal daemon started (#529): its own role,
+    // before every other command, refused unless started with the
+    // descriptors a daemon hands an owner.
+    #[cfg(target_os = "linux")]
+    if let Some(result) = qshd::owner_process::owner_entry(&args) {
+        return result;
+    }
     // The inherited frontend must not consume or forward replacement custody.
     // Service-stage refusal above remains ahead of every private entry.
     if args.first().map(OsString::as_os_str) == Some(OsStr::new("__qshd-frontend-admission-v1")) {
@@ -1701,35 +1708,40 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     // startup session of its own to decide, and no tmux to drive -- it hands
     // out channels, and what to put in them (attaching to an existing tmux
     // session or something else entirely) is the client's decision now.
-    let mut backend = channel_backend::ChannelSessionBackend::new(Arc::new(
+    let sessions = channel_backend::PersonalSessions::hold(Some(start.cache_dir.clone()));
+    let backend = channel_backend::ChannelSessionBackend::new(Arc::new(
         qshd::screen_budget::ScreenBudget::new(qshd::screen_budget::BudgetLimits::default()),
     ));
     let opens = backend.open_registry();
+    let mut daemon: Option<Arc<dyn transport::channel_server::DaemonUpdates>> = None;
     if !start.binary_path.as_os_str().is_empty() {
         // `None`: the checksum is worked out on the first `About`, off the
         // start-up path. `personal` sweeps away staged files an update that
         // never finished left behind -- all but the one this process may be
         // running from, should its rename have failed.
-        backend = backend.with_daemon(Arc::new(update::DaemonSelf::personal(
-            opens.clone(),
-            None,
-            start.binary_path.clone(),
-            nix::unistd::Uid::current().as_raw(),
-            Arc::clone(&active_count),
-            Some(update::HandoverBase {
-                udp_fd,
-                control_fd,
-                control_path: start.sock_path.clone(),
-                cache_dir: start.cache_dir.clone(),
-                port: start.port,
-                ports: start.ports.clone(),
-                name: start.name.clone(),
-                allowlist: Arc::clone(&shared_allowlist),
-                control_gate: Arc::clone(&control_gate),
-                admission: Arc::clone(&admission),
-                actions: actions.clone(),
-            }),
-        )));
+        daemon = Some(Arc::new(
+            update::DaemonSelf::personal(
+                opens.clone(),
+                None,
+                start.binary_path.clone(),
+                nix::unistd::Uid::current().as_raw(),
+                Arc::clone(&active_count),
+                Some(update::HandoverBase {
+                    udp_fd,
+                    control_fd,
+                    control_path: start.sock_path.clone(),
+                    cache_dir: start.cache_dir.clone(),
+                    port: start.port,
+                    ports: start.ports.clone(),
+                    name: start.name.clone(),
+                    allowlist: Arc::clone(&shared_allowlist),
+                    control_gate: Arc::clone(&control_gate),
+                    admission: Arc::clone(&admission),
+                    actions: actions.clone(),
+                }),
+            )
+            .with_owners(sessions.owner_stop()),
+        ));
     }
     // Otherwise already logged by the caller: with nowhere to rename a new
     // binary onto, this daemon does not answer `About` and takes no image.
@@ -1738,11 +1750,11 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
         tokio::runtime::Runtime::new().context("creating the transport daemon's runtime")?;
     runtime.block_on(async {
         let mut signals = transport_daemon::PersonalSignals::register()?;
-        transport_daemon::run_transport_daemon_until_stop_with_actions(
+        let result = transport_daemon::run_transport_daemon_until_stop_with_actions(
             start.socket,
             start.keypair.private,
             personal_server_auth(shared_allowlist, start.keypair.public, admission),
-            channel_backend::personal_session_backend(backend),
+            sessions.backend(backend, daemon),
             start.listener,
             start.cleanup,
             vec![start.port],
@@ -1751,7 +1763,12 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
             Some(opens),
             signals.requested(),
         )
-        .await
+        .await;
+        // The router has drained; every session's owner now stops and is
+        // reaped before the daemon exits. An owner that did not prove its
+        // cleanup fails the stop, as a failed session worker did before.
+        let owners = sessions.stop_all().await;
+        result.and(owners.map_err(|error| anyhow::anyhow!(error)))
     })
 }
 

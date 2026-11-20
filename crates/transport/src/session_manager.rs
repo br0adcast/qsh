@@ -90,7 +90,10 @@ use binding_revision::{BindingRevision, BindingRevisions, RevisionChange};
 pub(crate) use lifecycle::CallbackFailure;
 use lifecycle::Lifecycle;
 pub(crate) use lifecycle::WorkerReceipt;
-pub use owner_link::{loopback, LinkEnd, OwnerExit, OwnerInit, OwnerLink, RemoteBackend};
+pub use owner_link::{
+    loopback, LinkEnd, LinkIo, OwnerExit, OwnerInit, OwnerLink, OwnerRun, OwnerStarter,
+    RemoteBackend,
+};
 #[cfg(test)]
 #[path = "session_manager_fixture.rs"]
 pub(crate) mod fixture;

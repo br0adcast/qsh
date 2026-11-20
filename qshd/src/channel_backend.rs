@@ -550,18 +550,130 @@ impl ChannelSessionBackend {
     }
 }
 
-/// The backend a personal-mode daemon hands its router. On Linux each
-/// session's channel backend runs behind an owner link (#529): in this
-/// process for now, over an in-memory pipe through the link's real codec, so
-/// the network side holds only mirrors and custody tokens. Elsewhere, and in
-/// the system mode, the router drives the channel backend directly.
-pub fn personal_session_backend(backend: ChannelSessionBackend) -> Arc<dyn SessionBackend> {
-    let backend: Arc<dyn SessionBackend> = Arc::new(backend);
-    if cfg!(target_os = "linux") {
-        Arc::new(transport::session_manager::RemoteBackend::loopback(backend))
-    } else {
-        backend
+/// How a personal-mode daemon runs its sessions. On Linux each session's
+/// channel backend runs in an owner process of its own (#529,
+/// [`crate::owner_process`]), started from the image this daemon held when
+/// it started; the router talks to it through the owner link, holding only
+/// mirrors and custody tokens. Elsewhere -- and on Linux if the running
+/// image cannot be held -- the router drives the channel backend in this
+/// process, as the system mode always does.
+pub struct PersonalSessions {
+    #[cfg(target_os = "linux")]
+    owners: Option<(
+        crate::owner_process::SelfImage,
+        Arc<crate::owner_process::OwnerFleet>,
+    )>,
+    #[cfg(target_os = "linux")]
+    log_dir: Option<std::path::PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl PersonalSessions {
+    /// Called at daemon start: holds this process's own image for the
+    /// owners it will start. `log_dir` is where the daemon logs; owners
+    /// append to the same file.
+    pub fn hold(log_dir: Option<std::path::PathBuf>) -> PersonalSessions {
+        let owners = match crate::owner_process::SelfImage::hold() {
+            Ok(image) => Some((image, crate::owner_process::OwnerFleet::new())),
+            Err(error) => {
+                crate::log::warn(
+                    "qshd",
+                    &format!(
+                        "cannot hold the running image ({error}); sessions run in this process"
+                    ),
+                );
+                None
+            }
+        };
+        PersonalSessions { owners, log_dir }
     }
+
+    /// What an in-place replacement must stop before it execs.
+    pub fn owner_stop(&self) -> Option<Arc<dyn crate::update::OwnerStop>> {
+        self.owners
+            .as_ref()
+            .map(|(_, fleet)| fleet.clone() as Arc<dyn crate::update::OwnerStop>)
+    }
+
+    /// The backend the router runs every session with: `backend` speaking
+    /// for `daemon`, each session in an owner process of its own.
+    pub fn backend(
+        &self,
+        backend: ChannelSessionBackend,
+        daemon: Option<Arc<dyn DaemonUpdates>>,
+    ) -> Arc<dyn SessionBackend> {
+        let Some((image, fleet)) = &self.owners else {
+            return direct_backend(backend, daemon);
+        };
+        let image = match image.try_clone() {
+            Ok(image) => image,
+            Err(error) => {
+                crate::log::warn(
+                    "qshd",
+                    &format!(
+                        "cannot hold the running image ({error}); sessions run in this process"
+                    ),
+                );
+                return direct_backend(backend, daemon);
+            }
+        };
+        let host = crate::owner_process::OwnerHost::new(
+            image,
+            self.log_dir.clone(),
+            daemon,
+            fleet.clone(),
+        );
+        // `backend` only answers for the features and the consumption model
+        // of the sessions the owners run.
+        Arc::new(transport::session_manager::RemoteBackend::with_owners(
+            Arc::new(backend),
+            Arc::new(host),
+        ))
+    }
+
+    /// Stop every owner and wait until each one is reaped: the end of a
+    /// daemon's STOP, after its router has drained. `Err` unless every
+    /// owner this daemon started proved its cleanup.
+    pub async fn stop_all(&self) -> Result<(), String> {
+        match &self.owners {
+            Some((_, fleet)) => fleet.stop_all().await,
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PersonalSessions {
+    pub fn hold(_log_dir: Option<std::path::PathBuf>) -> PersonalSessions {
+        PersonalSessions {}
+    }
+
+    pub fn owner_stop(&self) -> Option<Arc<dyn crate::update::OwnerStop>> {
+        None
+    }
+
+    pub fn backend(
+        &self,
+        backend: ChannelSessionBackend,
+        daemon: Option<Arc<dyn DaemonUpdates>>,
+    ) -> Arc<dyn SessionBackend> {
+        direct_backend(backend, daemon)
+    }
+
+    pub async fn stop_all(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The router drives `backend` itself, in this process.
+fn direct_backend(
+    backend: ChannelSessionBackend,
+    daemon: Option<Arc<dyn DaemonUpdates>>,
+) -> Arc<dyn SessionBackend> {
+    Arc::new(match daemon {
+        Some(daemon) => backend.with_daemon(daemon),
+        None => backend,
+    })
 }
 
 impl SessionBackend for ChannelSessionBackend {

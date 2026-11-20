@@ -697,6 +697,27 @@ impl Restarts {
     }
 }
 
+/// How long the replacement waits for every session owner process to stop
+/// and be reaped once the drain is over (#529).
+pub const OWNER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The session owner processes a daemon started (#529): an exec must not
+/// leave them behind as children the new image never heard of, nor go
+/// ahead after one of them ended without proving its cleanup.
+pub trait OwnerStop: Send + Sync {
+    /// Every owner that has ended so far sent its `Drained(Ok)` receipt and
+    /// exited cleanly. An owner that crashed, was killed, or drained with a
+    /// failure may have left its shells to whoever adopts them: that is
+    /// unproved cleanup, for good.
+    fn proved(&self) -> bool;
+    /// Refuse new owners, ask every running one to stop, and wait until
+    /// `deadline` for each to send its receipt and be reaped. `true` only
+    /// when none is left and every one of them proved its cleanup.
+    fn stop_all_until(&self, deadline: Instant) -> bool;
+    /// Accept new owners again: the exec did not happen.
+    fn reopen(&self);
+}
+
 /// How the replacement execs the staged binary: [`handover::exec_staged`],
 /// or a stand-in in tests. Returns only on failure.
 pub(crate) type ExecFn = Arc<dyn Fn(&Path, RawFd) -> Errno + Send + Sync>;
@@ -715,6 +736,7 @@ pub struct DaemonSelf {
     opens: Arc<ChannelOpenRegistry>,
     handover: Option<Arc<HandoverBase>>,
     exec: Option<ExecFn>,
+    owners: Option<Arc<dyn OwnerStop>>,
 }
 
 impl DaemonSelf {
@@ -746,6 +768,7 @@ impl DaemonSelf {
             opens,
             handover: handover.map(Arc::new),
             exec: None,
+            owners: None,
         }
     }
 
@@ -763,7 +786,14 @@ impl DaemonSelf {
             opens,
             handover: None,
             exec: None,
+            owners: None,
         }
+    }
+
+    /// The session owners an exec must stop first.
+    pub fn with_owners(mut self, owners: Option<Arc<dyn OwnerStop>>) -> DaemonSelf {
+        self.owners = owners;
+        self
     }
 
     #[cfg(test)]
@@ -906,6 +936,7 @@ impl DaemonUpdates for DaemonSelf {
             opens: self.opens.clone(),
             handover: self.handover.clone(),
             exec: self.exec.clone(),
+            owners: self.owners.clone(),
             lease: None,
         }))
     }
@@ -945,6 +976,7 @@ struct StagedImage {
     opens: Arc<ChannelOpenRegistry>,
     handover: Option<Arc<HandoverBase>>,
     exec: Option<ExecFn>,
+    owners: Option<Arc<dyn OwnerStop>>,
 }
 
 impl StagedImage {
@@ -955,6 +987,12 @@ impl StagedImage {
 
     /// Eligibility only: the authoritative effectful fence still follows.
     fn cleanup_preflight(&self) -> Result<(), UpdateResult> {
+        if self.owners.as_ref().is_some_and(|owners| !owners.proved()) {
+            return Err(UpdateResult::Rejected {
+                code: RejectCode::Other,
+                detail: "a session owner process ended without proving its cleanup".into(),
+            });
+        }
         match self.opens.cleanup_snapshot() {
             Some(snapshot) if !snapshot.has_cleanup_debt() => Ok(()),
             Some(_) => Err(UpdateResult::Rejected {
@@ -1169,6 +1207,7 @@ impl UpdateTransfer for StagedImage {
                 opens: Some(fence),
                 actions: base.actions.clone(),
                 lease,
+                owners: self.owners.clone(),
             };
             // On exhaustion, release the action lock before undo runs.
             let announced = self.restarts.announce();
@@ -1259,17 +1298,37 @@ impl UpdateTransfer for StagedImage {
             );
         };
         restart_step(crate::log::Level::Info, RestartStep::ControlGate, "");
-        let reason = self.exec_with_handover(&base, &open_exec_permit);
+        let (stop, reason) = match self.exec_with_handover(&base, &open_exec_permit) {
+            ExecStop::OwnersUnproved => (
+                RestartStop::CleanupUnproved,
+                "session owner processes did not all stop with proven cleanup".to_string(),
+            ),
+            ExecStop::Failed(reason) => (RestartStop::ExecFailed, reason),
+        };
         // Still here: the exec failed, and this daemon goes on as it was --
-        // minus the channels it drained.
+        // minus the channels it drained and, once its owners were stopped,
+        // minus every session. The requester's own session ended with its
+        // owner, after `Restarting`, as it would have after a successful
+        // exec; its client learns the outcome as it would then too, from
+        // `About` once it logs in again (the build is unchanged), and the
+        // log says `replacement stopped: <token>`.
         restart_stopped(
-            RestartStop::ExecFailed,
+            stop,
             UpdateResult::Rejected {
                 code: RejectCode::ExecFailed,
                 detail: reason,
             },
         )
     }
+}
+
+/// Why [`StagedImage::exec_with_handover`] returned.
+enum ExecStop {
+    /// Some session owner did not stop, or ended without proving its
+    /// cleanup: nothing was exec'd.
+    OwnersUnproved,
+    /// Handing over or the exec itself failed.
+    Failed(String),
 }
 
 /// Undoes an attempt on every way out of [`StagedImage::restart`] short of a
@@ -1287,6 +1346,7 @@ struct UndoRestart {
     admission: Arc<AdmissionGate>,
     restarts: Arc<Restarts>,
     opens: Option<RestartOpenFence>,
+    owners: Option<Arc<dyn OwnerStop>>,
 }
 
 impl Drop for UndoRestart {
@@ -1296,6 +1356,9 @@ impl Drop for UndoRestart {
                 self.restarts.end();
                 if let Some(fence) = self.opens.take() {
                     fence.reopen();
+                }
+                if let Some(owners) = &self.owners {
+                    owners.reopen();
                 }
                 self.admission.open();
             }
@@ -1342,7 +1405,11 @@ fn write_within(
 impl StagedImage {
     /// Hand everything over and exec the staged binary. Returns only if that
     /// failed, with the descriptors put back the way this process needs them.
-    fn exec_with_handover(&self, base: &HandoverBase, _opens: &OpenExecPermit<'_>) -> String {
+    ///
+    /// Every step that can fail for its own reasons comes before the session
+    /// owners are stopped (#529), so that once they are -- and every session
+    /// with them -- only the exec itself is left to fail.
+    fn exec_with_handover(&self, base: &HandoverBase, _opens: &OpenExecPermit<'_>) -> ExecStop {
         debug_assert_eq!(self.restarts.phase(), RestartPhase::Draining);
         let allowlist = match base.allowlist.lock() {
             Ok(keys) => keys.clone(),
@@ -1363,7 +1430,7 @@ impl StagedImage {
         };
         let memfd = match handover::write_memfd(&description) {
             Ok(fd) => fd,
-            Err(e) => return format!("could not write the handover: {e:#}"),
+            Err(e) => return ExecStop::Failed(format!("could not write the handover: {e:#}")),
         };
         let keep = [base.udp_fd, base.control_fd, memfd.as_raw_fd()];
         // The exec window: no child may be spawned until `execve` returns,
@@ -1372,22 +1439,35 @@ impl StagedImage {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Err(e) = handover::close_on_exec_except(&keep) {
-            return format!("could not mark descriptors close-on-exec: {e}");
+            return ExecStop::Failed(format!("could not mark descriptors close-on-exec: {e}"));
         }
         let _put_back = PutBackCloexec(base);
         for fd in keep {
             if let Err(e) = handover::set_cloexec(fd, false) {
-                return format!("could not keep descriptor {fd} across exec: {e}");
+                return ExecStop::Failed(format!(
+                    "could not keep descriptor {fd} across exec: {e}"
+                ));
             }
+        }
+        let Some(lease) = self.lease else {
+            return ExecStop::Failed("replacement authority missing".into());
+        };
+        // Last before the exec: every session has reaped its channels by
+        // now, but its owner process still runs. Stop each one and reap it,
+        // or the new image would inherit children it never heard of. No
+        // child is spawned meanwhile (the exec window is open), and stopping
+        // them spawns none.
+        if let Some(owners) = &self.owners {
+            if !owners.stop_all_until(Instant::now() + OWNER_STOP_TIMEOUT) {
+                return ExecStop::OwnersUnproved;
+            }
+            crate::log::info("update", "every session owner stopped with proven cleanup");
         }
         restart_step(
             crate::log::Level::Info,
             RestartStep::Exec,
             &format!("replacing this process with build {}", self.offer.build),
         );
-        let Some(lease) = self.lease else {
-            return "replacement authority missing".into();
-        };
         let guard = ExecAttemptGuard::new(&base.actions, lease);
         let err = match &self.exec {
             Some(exec) => guard.attempt(|| exec(&self.path, memfd.as_raw_fd())),
@@ -1396,7 +1476,9 @@ impl StagedImage {
         // Closed while the spawn gate is still held: it is inheritable now.
         // (The sockets are put back by `_put_back`, dropped before the gate.)
         drop(memfd);
-        format!("exec of the new binary failed: {err}")
+        ExecStop::Failed(format!(
+            "exec of the new binary failed after every session ended: {err}"
+        ))
     }
 }
 
@@ -1664,6 +1746,15 @@ mod tests {
         exec: ExecFn,
         opens: Arc<ChannelOpenRegistry>,
     ) -> Restartable {
+        verified_transfer_with_owners(dir, exec, opens, None)
+    }
+
+    fn verified_transfer_with_owners(
+        dir: &Path,
+        exec: ExecFn,
+        opens: Arc<ChannelOpenRegistry>,
+        owners: Option<Arc<dyn OwnerStop>>,
+    ) -> Restartable {
         let (base, udp, control) = handover_base(dir);
         let admission = Arc::clone(&base.admission);
         let control_gate = Arc::clone(&base.control_gate);
@@ -1676,7 +1767,8 @@ mod tests {
                 Arc::new(AtomicUsize::new(1)),
                 Some(base),
             )
-            .with_exec(exec),
+            .with_exec(exec)
+            .with_owners(owners),
         );
         let image = script_image(101, 0);
         let mut transfer = daemon
@@ -2787,6 +2879,206 @@ mod tests {
             daemon.offer(&me(), &offer_for(&image, 101)).is_ok(),
             "the slot is free"
         );
+    }
+
+    /// A stand-in for a daemon's session owner processes (#529).
+    #[derive(Default)]
+    struct FakeOwners {
+        unproved: AtomicBool,
+        refuse_stop: AtomicBool,
+        stops: AtomicUsize,
+        reopens: AtomicUsize,
+        /// Whether the control socket was held still when they were stopped.
+        gate_held_at_stop: AtomicBool,
+        control_gate: std::sync::OnceLock<Arc<tokio::sync::RwLock<()>>>,
+    }
+    impl OwnerStop for FakeOwners {
+        fn proved(&self) -> bool {
+            !self.unproved.load(Ordering::SeqCst)
+        }
+        fn stop_all_until(&self, _deadline: Instant) -> bool {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            let held = self
+                .control_gate
+                .get()
+                .is_some_and(|gate| gate.try_read().is_err());
+            self.gate_held_at_stop.store(held, Ordering::SeqCst);
+            self.proved() && !self.refuse_stop.load(Ordering::SeqCst)
+        }
+        fn reopen(&self) {
+            self.reopens.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A verified transfer whose daemon has `owners`, and an exec stand-in
+    /// that fails and counts how many owner stops came before it.
+    fn transfer_with_owners(
+        dir: &Path,
+        owners: &Arc<FakeOwners>,
+    ) -> (Restartable, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let execs = Arc::new(AtomicUsize::new(0));
+        let stops_at_exec = Arc::new(AtomicUsize::new(usize::MAX));
+        let exec: ExecFn = {
+            let (execs, stops_at_exec, owners) =
+                (execs.clone(), stops_at_exec.clone(), owners.clone());
+            Arc::new(move |_: &Path, _: RawFd| {
+                execs.fetch_add(1, Ordering::SeqCst);
+                stops_at_exec.store(owners.stops.load(Ordering::SeqCst), Ordering::SeqCst);
+                Errno::ENOENT
+            })
+        };
+        let restartable = verified_transfer_with_owners(
+            dir,
+            exec,
+            ChannelOpenRegistry::new(Default::default()),
+            Some(owners.clone()),
+        );
+        let _ = owners.control_gate.set(restartable.control_gate.clone());
+        (restartable, execs, stops_at_exec)
+    }
+
+    /// Every step that can refuse for its own reasons comes before the
+    /// session owners -- and every session with them -- are stopped: the
+    /// control gate is held by then, and only the exec is left to fail.
+    #[test]
+    fn owners_are_stopped_last_before_the_exec_with_the_control_gate_held() {
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let dir = tempfile::tempdir().unwrap();
+        let owners = Arc::new(FakeOwners::default());
+        let (
+            Restartable {
+                daemon,
+                transfer,
+                udp: _udp,
+                control: _control,
+                ..
+            },
+            execs,
+            stops_at_exec,
+        ) = transfer_with_owners(dir.path(), &owners);
+        match transfer.restart() {
+            UpdateResult::Rejected { code, detail } => {
+                assert_eq!(code, RejectCode::ExecFailed, "{detail}");
+                assert!(detail.contains("after every session ended"), "{detail}");
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        assert_eq!(execs.load(Ordering::SeqCst), 1);
+        assert_eq!(owners.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            stops_at_exec.load(Ordering::SeqCst),
+            1,
+            "stopped before the exec"
+        );
+        assert!(owners.gate_held_at_stop.load(Ordering::SeqCst));
+        assert_eq!(
+            owners.reopens.load(Ordering::SeqCst),
+            1,
+            "new owners admitted again"
+        );
+        assert_eq!(daemon.restart_signal().borrow().phase, RestartPhase::Idle);
+    }
+
+    /// A refusal the requester can still hear -- a busy control socket --
+    /// comes before any session owner is stopped: the requester's session
+    /// lives on and gets its `Rejected`.
+    #[test]
+    fn a_busy_control_socket_refuses_before_any_owner_is_stopped() {
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let dir = tempfile::tempdir().unwrap();
+        let owners = Arc::new(FakeOwners::default());
+        let (
+            Restartable {
+                transfer,
+                control_gate,
+                udp: _udp,
+                control: _control,
+                ..
+            },
+            execs,
+            _,
+        ) = transfer_with_owners(dir.path(), &owners);
+        let silent = control_gate.try_read().expect("a reader holds the gate");
+        match transfer.restart() {
+            UpdateResult::Rejected { code, detail } => {
+                assert_eq!(code, RejectCode::ControlBusy, "{detail}")
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        drop(silent);
+        assert_eq!(
+            owners.stops.load(Ordering::SeqCst),
+            0,
+            "no session was ended"
+        );
+        assert_eq!(execs.load(Ordering::SeqCst), 0);
+    }
+
+    /// An owner that ended without proving its cleanup refuses the update
+    /// before anything is announced; owners that do not all stop cleanly
+    /// refuse the exec.
+    #[test]
+    fn unproved_owner_cleanup_refuses_the_replacement() {
+        let _fds = fd_flags_lock();
+        suppress_shell_history();
+        let dir = tempfile::tempdir().unwrap();
+        let owners = Arc::new(FakeOwners::default());
+        let (
+            Restartable {
+                daemon,
+                transfer,
+                udp: _udp,
+                control: _control,
+                ..
+            },
+            execs,
+            _,
+        ) = transfer_with_owners(dir.path(), &owners);
+        owners.unproved.store(true, Ordering::SeqCst);
+        match transfer.restart() {
+            UpdateResult::Rejected { detail, .. } => {
+                assert!(detail.contains("session owner"), "{detail}")
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        assert_eq!(owners.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(execs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *daemon.restart_signal().borrow(),
+            RestartSignal::IDLE,
+            "never announced"
+        );
+        drop(daemon);
+
+        let dir = tempfile::tempdir().unwrap();
+        let owners = Arc::new(FakeOwners::default());
+        let (
+            Restartable {
+                transfer,
+                udp: _udp,
+                control: _control,
+                ..
+            },
+            execs,
+            _,
+        ) = transfer_with_owners(dir.path(), &owners);
+        owners.refuse_stop.store(true, Ordering::SeqCst);
+        match transfer.restart() {
+            UpdateResult::Rejected { code, detail } => {
+                assert_eq!(code, RejectCode::ExecFailed, "{detail}");
+                assert!(detail.contains("session owner"), "{detail}");
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+        assert_eq!(owners.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            execs.load(Ordering::SeqCst),
+            0,
+            "no exec past unproved owners"
+        );
+        assert_eq!(owners.reopens.load(Ordering::SeqCst), 1);
     }
 
     /// The control socket is held still only from the allowlist snapshot to

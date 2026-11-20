@@ -81,6 +81,8 @@ pub use modern_restart::{interrupt_selected, RestartOutcome};
 #[cfg(feature = "system")]
 pub mod nonce_pool;
 #[cfg(target_os = "linux")]
+pub mod owner_process;
+#[cfg(target_os = "linux")]
 mod process_scope;
 pub mod pty;
 pub mod screen;

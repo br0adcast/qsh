@@ -449,9 +449,19 @@ fn a_personal_daemon_replaces_itself_over_qsh_keeping_its_pid_port_key_and_clien
                 stream: FIRST_CHANNEL_STREAM
             }
     )));
+    // The shell's parent is the session's owner process, the daemon's child
+    // (#529): the shell is that owner's child.
+    let mut shells = Vec::new();
     assert!(
-        !children_of(before.pid).is_empty(),
-        "the shell is the daemon's child"
+        wait_for(Duration::from_secs(15), || {
+            shells = children_of(before.pid)
+                .iter()
+                .filter_map(|owner| owner.parse::<u32>().ok())
+                .flat_map(children_of)
+                .collect();
+            !shells.is_empty()
+        }),
+        "the shell is a child of the daemon's session owner"
     );
     sleeper.detach();
     assert!(
@@ -523,8 +533,14 @@ fn a_personal_daemon_replaces_itself_over_qsh_keeping_its_pid_port_key_and_clien
     assert!(leftovers(bins.dir.path()).is_empty());
     assert!(
         children_of(after.pid).is_empty(),
-        "the parked session's shell was ended and reaped before the exec, not inherited"
+        "the parked session's owner was ended and reaped before the exec, not inherited"
     );
+    for shell in &shells {
+        assert!(
+            !std::path::Path::new(&format!("/proc/{shell}")).exists(),
+            "the parked session's shell {shell} was reaped by its owner, not left to init"
+        );
+    }
 
     // Same port, same server key: a client pinned to both logs in again.
     let (again, again_events) = connect(home.path(), port, server_pub, first.private, [2; 16]);
@@ -780,6 +796,90 @@ fn an_image_that_fails_its_self_check_leaves_the_running_daemon_as_it_was() {
         ask_about(home.path(), &client, &events).checksum,
         sha256(&bins.old),
         "the same connection is still served by the same daemon"
+    );
+    client.close();
+}
+
+/// A session owner that died without its receipt (#529) may have left its
+/// shells to whoever adopted them: the daemon no longer proves that its
+/// sessions' processes are gone, and refuses to replace itself. The
+/// requester hears why -- a `Rejected` result, and no `Restarting` -- and
+/// its own session goes on with the same daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_owner_that_died_refuses_the_replacement() {
+    let _serial = serialised();
+    let bins = stripped_qshd();
+    let home = private_temp_home().expect("home");
+    let sock = home.path().join("qsh").join("control.sock");
+    let old_build = self_check(&bins.bin).build;
+    let mut new_image = bins.old.clone();
+    new_image.extend_from_slice(b"\0qshd-update-test-dead-owner\0");
+    let new_build = old_build + 1;
+    let labels = format!("{}={new_build}", hex::encode(sha256(&new_image)));
+
+    let key = generate_keypair();
+    let port = free_udp_port();
+    let _guard = DaemonGuard::new(sock.clone());
+    let server_pub = start_daemon(&bins.bin, home.path(), port, key.public, &labels);
+    assert!(wait_for(Duration::from_secs(15), || status(&sock).is_some()));
+    // The victim's key is scrubbed off the allowlist when its session ends:
+    // the requester logs in with a key of its own.
+    let requester = generate_keypair();
+    client_request(&sock, &ControlRequest::AddClient(requester.public)).expect("ADD-CLIENT");
+    let before = status(&sock).expect("STATUS");
+
+    let (victim, _victim_events) = connect(home.path(), port, server_pub, key.private, [7; 16]);
+    let mut owners = Vec::new();
+    assert!(wait_for(Duration::from_secs(15), || {
+        owners = children_of(before.pid);
+        !owners.is_empty()
+    }));
+    let owner: i32 = owners[0].parse().expect("a pid");
+    assert_eq!(unsafe { nix::libc::kill(owner, nix::libc::SIGKILL) }, 0);
+    assert!(
+        wait_for(Duration::from_secs(15), || children_of(before.pid)
+            .is_empty()),
+        "the daemon reaps its killed owner"
+    );
+    victim.detach();
+    assert!(wait_for(Duration::from_secs(20), || status(&sock)
+        .is_some_and(|s| s.total_connections == 0)));
+
+    let (client, events) = connect(home.path(), port, server_pub, requester.private, [8; 16]);
+    offer(&client, &new_image, new_build);
+    assert!(
+        wait_for(Duration::from_secs(15), || events
+            .has(|r| *r == ServerRecord::UpdateAnswer(UpdateAnswer::Accept))),
+        "{:?}; log:\n{}",
+        events.control(),
+        daemon_log(home.path())
+    );
+    send_image(&client, &new_image);
+    assert!(
+        wait_for(Duration::from_secs(60), || events.has(|r| matches!(
+            r,
+            ServerRecord::UpdateResult(UpdateResult::Rejected { detail, .. })
+                if detail.contains("session owner")
+        ))),
+        "{:?}; log:\n{}",
+        events.control(),
+        daemon_log(home.path())
+    );
+    assert!(
+        !events.has(
+            |r| *r == ServerRecord::UpdateResult(UpdateResult::Restarting)
+                || *r == ServerRecord::Restarting
+        ),
+        "a refused replacement is never announced"
+    );
+    let after = status(&sock).expect("STATUS");
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(after.build, old_build);
+    assert_eq!(
+        ask_about(home.path(), &client, &events).build,
+        old_build,
+        "the requester's session goes on with the same daemon"
     );
     client.close();
 }

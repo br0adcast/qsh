@@ -370,6 +370,77 @@ fn ctrl_bracket_r_comes_back_to_the_same_shell() {
     );
 }
 
+/// `PPid` of `pid` from `/proc`, `None` once it is gone.
+#[cfg(target_os = "linux")]
+fn parent_of(pid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// On Linux a personal daemon runs each session in an owner process (#529):
+/// the shell's parent is that owner, a child of the daemon in the owner
+/// role, and a warm return comes back to the same shell under the same
+/// owner. Once the run ends, nothing of the session is left.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_warm_return_stays_with_the_shell_and_its_session_owner() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut client = spawn_client_with(
+        &daemon,
+        &key_path,
+        config.path(),
+        &["--verbose", "--status", "off"],
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    let pid = mark_with_pid(&mut client, &screen);
+    let shell: u32 = pid.parse().expect("a pid");
+    let owner = parent_of(shell).expect("the shell is alive");
+    assert_ne!(
+        owner,
+        daemon.child.id(),
+        "the shell is not the daemon's own child"
+    );
+    assert_eq!(parent_of(owner), Some(daemon.child.id()));
+    let role = std::fs::read(format!("/proc/{owner}/cmdline")).expect("the owner's cmdline");
+    assert!(
+        role.split(|&b| b == 0)
+            .any(|arg| arg == b"__qshd-session-owner-v1"),
+        "the shell's parent runs in the owner role: {:?}",
+        String::from_utf8_lossy(&role)
+    );
+
+    client.master.write_all(b"\x1dr").expect("type ctrl-] r");
+    assert!(
+        wait_until(|| verbose_log(config.path()).contains("reconnected at address 0")),
+        "Ctrl-] r must reconnect; the verbose log: {}\ndaemon: {}",
+        verbose_log(config.path()),
+        daemon.output_text()
+    );
+    assert!(
+        the_marked_shell_answers(&mut client, &screen, &pid, Duration::from_secs(20)),
+        "the warm return reaches the same shell; client saw: {}\ndaemon: {}",
+        screen.text(),
+        daemon.output_text()
+    );
+    assert_eq!(parent_of(shell), Some(owner), "the shell keeps its owner");
+
+    exit_cleanly(&mut client, &screen, &daemon);
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            !std::path::Path::new(&format!("/proc/{owner}")).exists()
+                && !std::path::Path::new(&format!("/proc/{shell}")).exists()
+        }),
+        "the ended session leaves neither its owner nor its shell; daemon: {}",
+        daemon.output_text()
+    );
+}
+
 /// A network that dies under a running session: the plate says the link is
 /// lost, the transport's death timer (45 s) ends the link and a round starts
 /// by itself, UDP rounds continue without a countdown; once the

@@ -27,6 +27,28 @@
 //! ever between the bridge's queue and the backend, and the bridge's own
 //! queue, `PENDING_CAP` and its "handed over" moment keep their meaning.
 //!
+//! The link runs over any byte stream ([`LinkIo`]): one end of a Unix
+//! socket pair to an owner process an [`OwnerStarter`] started, or an
+//! in-process [`loopback`] (tests).
+//!
+//! **Handing an event over.** The bridge books an inbound event as handed
+//! over when it takes a credit and enters the frontend's queue. The
+//! frontend's writer drains that queue into the socket as soon as it is
+//! woken, without waiting to fill a batch; a write waits only while the
+//! owner's socket buffer is full, that is while the owner does not read.
+//! What the frontend has written stays readable in the socket after the
+//! frontend dies. So the window in which a booked event can still be lost
+//! is the events in the queue, or in a batch being written, when the
+//! frontend process dies -- at most the owner's credits (`INBOUND_CAP`).
+//! They are lost, never duplicated: nothing is ever sent twice, and the
+//! owner applies only whole frames, so a frame cut by the death is dropped.
+//!
+//! **A stalled or dead owner.** The frontend's queue has no fixed cap;
+//! every kind of message in it is bounded by what produces it (see
+//! `Coalesce`), so an owner that stops reading holds the queue at those
+//! bounds. An owner that dies fails the next write, and the failed link
+//! clears the queue.
+//!
 //! Not yet here (Task 5): the custody journal and the rebuild of a new
 //! frontend's bridge. The owner records the frontend's `Retained`, `Frontier`
 //! and `Unconfirmed` reports but does not act on them, and a link lost
@@ -96,6 +118,22 @@ pub type LinkEnd = tokio::io::DuplexStream;
 /// real codec, in one process.
 pub fn loopback() -> (LinkEnd, LinkEnd) {
     tokio::io::duplex(LOOPBACK_BUFFER)
+}
+
+/// Any byte stream a link can run over: an in-process [`loopback`] end, or
+/// one end of a Unix stream socket pair to an owner process.
+pub trait LinkIo: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> LinkIo for T {}
+
+/// Starts the owner of one cold-created session somewhere else (an owner
+/// process), and hands back the frontend's end of its link.
+///
+/// Called on the bridge's task inside the runtime, once per session, before
+/// the bridge's first event. Whatever the frontend writes before the owner
+/// reads it waits in the link's own buffer. An error ends the session as a
+/// backend that stopped at once.
+pub trait OwnerStarter: Send + Sync + 'static {
+    fn start(&self, init: OwnerInit) -> std::io::Result<Box<dyn LinkIo>>;
 }
 
 // ---- wire conversions ------------------------------------------------------
@@ -907,17 +945,36 @@ impl RemoteControl {
     }
 }
 
-/// A [`SessionBackend`] whose session runs behind an owner link. In this
-/// slice the owner runs in the same process, over [`loopback`], on the same
-/// lifecycle (so daemon-wide budgets and STOP's drain cover it as before).
+/// A [`SessionBackend`] whose session runs behind an owner link: in an
+/// owner process an [`OwnerStarter`] starts per session, or (for tests) in
+/// this process over [`loopback`], on the frontend's own lifecycle.
 pub struct RemoteBackend {
+    /// The backend each owner runs: its features and consumption model are
+    /// the session's. An in-process owner runs it here.
     inner: Arc<dyn SessionBackend>,
+    starter: Option<Arc<dyn OwnerStarter>>,
 }
 
 impl RemoteBackend {
     /// Run `inner` for each session in an in-process owner over a loopback link.
     pub fn loopback(inner: Arc<dyn SessionBackend>) -> RemoteBackend {
-        RemoteBackend { inner }
+        RemoteBackend {
+            inner,
+            starter: None,
+        }
+    }
+
+    /// Run each session in an owner that `starter` starts. `inner` is the
+    /// backend those owners run; here it only answers for its features and
+    /// its consumption model.
+    pub fn with_owners(
+        inner: Arc<dyn SessionBackend>,
+        starter: Arc<dyn OwnerStarter>,
+    ) -> RemoteBackend {
+        RemoteBackend {
+            inner,
+            starter: Some(starter),
+        }
     }
 }
 
@@ -929,6 +986,21 @@ impl SessionBackend for RemoteBackend {
     /// Called by the bridge before its first event: the link and its
     /// inbound sender exist when this returns.
     fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        if let Some(starter) = &self.starter {
+            let init = OwnerInit::new(io.principal().clone(), io.login());
+            let link: Box<dyn LinkIo> = match starter.start(init) {
+                Ok(link) => link,
+                Err(error) => {
+                    log::error!("cannot start a session owner: {error}");
+                    // A link whose owner end is gone: the frontend reads end
+                    // of input at once, and the session ends as with a
+                    // backend that stopped.
+                    let (front, _owner) = loopback();
+                    Box::new(front)
+                }
+            };
+            return Box::pin(start_frontend(io, link));
+        }
         let (front, owner) = loopback();
         let init = OwnerInit {
             principal: io.principal().clone(),
@@ -1439,6 +1511,14 @@ pub enum OwnerExit {
 /// The owner side of a link: a real [`SessionIo`] driven from link frames.
 pub struct OwnerLink;
 
+/// How an owner process's session ended: the link's end, then the drain of
+/// every task and blocking worker the session started (its receipt).
+#[derive(Debug)]
+pub struct OwnerRun {
+    pub exit: OwnerExit,
+    pub drained: Result<(), ShutdownError>,
+}
+
 /// One object the owner holds for the frontend; dropping it releases it.
 enum Custody {
     Charge(OutputCharge),
@@ -1500,6 +1580,38 @@ struct Owner {
 }
 
 impl OwnerLink {
+    /// [`OwnerLink::run`] on a lifecycle of its own that `shutdown` stops,
+    /// then stop that lifecycle and drain it: when this returns, every task
+    /// and blocking worker of the session has joined (the owner process's
+    /// receipt). Any lifecycle in `init` is replaced.
+    pub async fn run_and_drain<L>(
+        link: L,
+        backend: Arc<dyn SessionBackend>,
+        mut init: OwnerInit,
+        shutdown: Shutdown,
+    ) -> OwnerRun
+    where
+        L: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        let lifecycle = Lifecycle::new(shutdown);
+        init.lifecycle = Some(lifecycle.clone());
+        let run = Self::run(link, backend, init);
+        tokio::pin!(run);
+        // A blocking callback's result is published by the lifecycle's
+        // joiner, as the session manager's loop does for a daemon's
+        // sessions: nothing else here would ever hand it to the backend.
+        // The joiner sleeps until a task ends or one is registered.
+        let exit = loop {
+            tokio::select! {
+                exit = &mut run => break exit,
+                _ = lifecycle.join_next_or_wait() => {}
+            }
+        };
+        lifecycle.shutdown.request();
+        let drained = lifecycle.drain().await;
+        OwnerRun { exit, drained }
+    }
+
     /// Run `backend` for one session behind `link` until the session ends.
     /// A link that dies without an explicit end parks the backend: it keeps
     /// running, its custody stays charged, and only shutdown (or the backend
