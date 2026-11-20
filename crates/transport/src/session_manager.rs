@@ -90,6 +90,7 @@ use binding_revision::{BindingRevision, BindingRevisions, RevisionChange};
 pub(crate) use lifecycle::CallbackFailure;
 use lifecycle::Lifecycle;
 pub(crate) use lifecycle::WorkerReceipt;
+pub use owner_link::{loopback, LinkEnd, OwnerExit, OwnerInit, OwnerLink, RemoteBackend};
 #[cfg(test)]
 #[path = "session_manager_fixture.rs"]
 pub(crate) mod fixture;
@@ -436,17 +437,55 @@ impl ChannelOutput {
 pub struct OutputCharge {
     gate: Arc<SendGate>,
     bytes: u64,
+    /// The session owner process holds this charge on its real gate; every
+    /// operation, and the withdrawal on drop, goes to it. `gate` is then the
+    /// owner gate's mirror, for charges the bridge makes of its own. Boxed:
+    /// every queued record carries a charge, and its wrapper stays small.
+    remote: Option<Box<owner_link::ChargeToken>>,
 }
 impl OutputCharge {
+    /// `bytes` the caller already admitted on `gate`.
+    fn admitted(gate: Arc<SendGate>, bytes: u64) -> Self {
+        Self {
+            gate,
+            bytes,
+            remote: None,
+        }
+    }
     pub fn transfer(mut self, tail: u64) -> bool {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.transfer(tail);
+            self.gate.mirror_tail_moved(tail);
+            self.bytes = 0;
+            return false;
+        }
         let opened = self.gate.transfer(self.bytes, tail);
         self.bytes = 0;
         opened
     }
+    /// `n` bytes of this charge entered the connection, whose tail is now
+    /// `tail`; the next independently framed slice owns one more header.
+    fn transfer_slice(&mut self, n: u64, tail: u64) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.slice(n, tail);
+            self.gate.mirror_tail_moved(tail);
+        } else {
+            self.gate.transfer(n, tail);
+            self.gate.admit(5);
+        }
+        self.bytes -= n;
+        self.bytes += 5;
+    }
+    fn gate(&self) -> &Arc<SendGate> {
+        &self.gate
+    }
 }
 impl Drop for OutputCharge {
     fn drop(&mut self) {
-        self.gate.withdraw(self.bytes);
+        // A remote token withdraws the owner's charge on its own drop.
+        if self.remote.is_none() {
+            self.gate.withdraw(self.bytes);
+        }
     }
 }
 
@@ -791,6 +830,10 @@ struct SessionControl {
     terminal_ready: tokio::sync::Notify,
     budget: crate::control_budget::SessionBudget,
     origin: Mutex<ControlOrigin>,
+    /// Frontend side of an owner link: the owner's control is authoritative,
+    /// the bridge's budget retirement must reach it, and the bridge hands
+    /// inbound events to the link itself.
+    remote: OnceLock<owner_link::RemoteControl>,
 }
 impl SessionControl {
     fn new(global: &crate::control_budget::GlobalBudget, uid: u32) -> Self {
@@ -800,7 +843,27 @@ impl SessionControl {
             terminal_ready: tokio::sync::Notify::new(),
             budget: global.session(uid),
             origin: Mutex::new(ControlOrigin::default()),
+            remote: OnceLock::new(),
         }
+    }
+
+    /// `apply_terminal_request` retired this session's reply budget for
+    /// `origin`; a session owner retires its own one too.
+    fn retired_by_bridge(&self, origin: AttachmentContext) {
+        if let Some(remote) = self.remote.get() {
+            remote.link.send(owner_link::budget_retired(origin));
+        }
+    }
+
+    /// A terminal request the session owner already accepted: wake the
+    /// bridge's fixed mailbox as `request_terminal` does, without queueing a
+    /// second alias (the owner's alias arrives as an ordinary record).
+    fn mirror_terminal(&self, request: TerminalRequest) {
+        self.origin
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .requested_abort = Some(request);
+        self.terminal_ready.notify_one();
     }
     fn retire(&self) {
         // This lock is also the Open-admission/final-installation boundary.
@@ -1001,10 +1064,7 @@ impl SessionIo {
         let charge = self
             .gates
             .admit(crate::channel::CONTROL_STREAM, bytes.len() as u64)
-            .map(|gate| OutputCharge {
-                gate,
-                bytes: bytes.len() as u64,
-            });
+            .map(|gate| OutputCharge::admitted(gate, bytes.len() as u64));
         let _ = self.outbound.send(SessionOutbound::ReservedControl {
             origin,
             bytes,
@@ -1057,10 +1117,7 @@ impl SessionIo {
         let charge = self
             .gates
             .admit(crate::channel::CONTROL_STREAM, bytes as u64)
-            .map(|gate| OutputCharge {
-                gate,
-                bytes: bytes as u64,
-            });
+            .map(|gate| OutputCharge::admitted(gate, bytes as u64));
         ControlDelivery { part, charge }
     }
 
@@ -1274,7 +1331,7 @@ impl SessionIo {
                 instance,
                 origin,
                 output,
-                charge: OutputCharge { gate, bytes },
+                charge: OutputCharge::admitted(gate, bytes),
                 gap_reserve,
             },
         );
@@ -4358,6 +4415,7 @@ fn drain_reserved_control(
 }
 
 /// Both mailbox wake paths validate the actual target before retiring debt.
+/// Returns whether the request was this attachment's and retired the budget.
 fn apply_terminal_request(
     conn: &mut Connection,
     generation: u64,
@@ -4365,9 +4423,9 @@ fn apply_terminal_request(
     request: TerminalRequest,
     now: Instant,
     out: &mut Vec<Datagram>,
-) {
+) -> bool {
     if request.origin.session_id != conn.session_id() || request.origin.generation != generation {
-        return;
+        return false;
     }
     budget.retire();
     out.extend(match request.disposition {
@@ -4376,6 +4434,7 @@ fn apply_terminal_request(
             conn.abort_session(now, crate::SessionAbortReason::ResourceExhausted)
         }
     });
+    true
 }
 
 const INTAKE_RECORDS: usize = 32;
@@ -4662,6 +4721,15 @@ thread_local! {
 /// guard makes a stale end-signal from a swapped-out/replaced connection
 /// harmless (and a teardown-exit never matches, so it never wrongly retains).
 async fn run_backend_bridge(spawn: BridgeSpawn) {
+    run_backend_bridge_from(spawn, 0).await
+}
+
+/// [`run_backend_bridge`] whose first attachment has `generation`: the
+/// attachment, ledger and typed-output generations all start there, so a
+/// bridge rebuilt for an existing session owner continues its numbering
+/// instead of making every earlier origin current again (production starts
+/// every bridge at 0 for now).
+async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
     let BridgeSpawn {
         socket,
         committed,
@@ -4708,13 +4776,20 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     let lifecycle = io.lifecycle.clone();
     let control = io.control().clone();
     let control_budget = control.budget.clone();
-    io.set_control_origin(AttachmentContext::for_connection(&conn, 0));
-    lifecycle.spawn(async move { backend.run(io).await });
-    let mut link = BackendLink::new(io_inbound_tx, consumption);
+    io.set_control_origin(AttachmentContext::for_connection(&conn, generation));
+    // Started here, not inside the task: a backend behind an owner link
+    // installs the link's inbound sender before the bridge's first event.
+    lifecycle.spawn(backend.run(io));
+    let inbound_tx = match control.remote.get().and_then(|r| r.take_inbound()) {
+        // The bridge's own queue is unused: its sender closes here.
+        Some(remote) => InboundTx::Remote(remote),
+        None => InboundTx::Local(io_inbound_tx),
+    };
+    let mut link = BackendLink::starting_at(inbound_tx, consumption, generation);
     link.channel_output.snapshots = resume_snapshots;
     let mut pending_control = VecDeque::new();
     link.control_delivery = crate::control_budget::ControlLedger::new(
-        0,
+        generation,
         conn.stream_progress(crate::channel::CONTROL_STREAM).queued,
     );
     let mut backend_finished = false;
@@ -4894,14 +4969,16 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             }
             Wakeup::Terminal => {
                 if let Some(request) = control.take_priority_abort() {
-                    apply_terminal_request(
+                    if apply_terminal_request(
                         &mut conn,
                         link.ledger.generation(),
                         &control_budget,
                         request,
                         now,
                         &mut out,
-                    );
+                    ) {
+                        control.retired_by_bridge(request.origin);
+                    }
                 }
             }
             Wakeup::Backend(Some(SessionOutbound::ReservedControl {
@@ -4956,14 +5033,16 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 // Validate before retirement: stale signals cannot poison the
                 // replacement's budget or change its terminal classification.
                 let request = control.take_abort(fallback);
-                apply_terminal_request(
+                if apply_terminal_request(
                     &mut conn,
                     link.ledger.generation(),
                     &control_budget,
                     request,
                     now,
                     &mut out,
-                );
+                ) {
+                    control.retired_by_bridge(request.origin);
+                }
             }
             // Takes any `Attach` already queued first (see `on_routed_datagram`).
             Wakeup::Dgram(Some((src, bytes))) => {
@@ -5768,10 +5847,15 @@ fn add(m: &mut BTreeMap<u8, u64>, stream_id: u8, n: u64) {
 }
 
 impl ConsumptionLedger {
+    #[cfg(test)]
     fn new(consumption: Consumption) -> Self {
+        Self::starting_at(consumption, 0)
+    }
+
+    fn starting_at(consumption: Consumption, generation: u64) -> Self {
         ConsumptionLedger {
             backend_reports: consumption == Consumption::Explicit,
-            generation: 0,
+            generation,
             outstanding: BTreeMap::new(),
             owed_old: BTreeMap::new(),
             #[cfg(debug_assertions)]
@@ -5991,11 +6075,48 @@ impl Waiting {
     }
 }
 
+/// Where the bridge hands inbound events: its backend's own bounded queue,
+/// or an owner link that grants one slot per free place in the owner's queue
+/// (an event is handed over when it is written to the link).
+enum InboundTx {
+    Local(mpsc::Sender<SessionInbound>),
+    Remote(owner_link::CreditSender),
+}
+enum InboundPermit<'a> {
+    Local(mpsc::Permit<'a, SessionInbound>),
+    Remote(owner_link::CreditPermit<'a>),
+}
+impl InboundTx {
+    fn try_send(
+        &self,
+        ev: SessionInbound,
+    ) -> Result<(), mpsc::error::TrySendError<SessionInbound>> {
+        match self {
+            Self::Local(tx) => tx.try_send(ev),
+            Self::Remote(tx) => tx.try_send(ev),
+        }
+    }
+    async fn reserve(&self) -> Result<InboundPermit<'_>, ()> {
+        match self {
+            Self::Local(tx) => tx.reserve().await.map(InboundPermit::Local).map_err(|_| ()),
+            Self::Remote(tx) => tx.reserve().await.map(InboundPermit::Remote),
+        }
+    }
+}
+impl InboundPermit<'_> {
+    fn send(self, ev: SessionInbound) {
+        match self {
+            Self::Local(permit) => permit.send(ev),
+            Self::Remote(permit) => permit.send(ev),
+        }
+    }
+}
+
 /// The bridge's end of its backend's inbound queue (spec §4.10.2). It never
 /// waits: what the queue has no room for waits here, in order, and goes as
 /// room opens -- the bridge's `room` arm.
 struct Inbound {
-    tx: mpsc::Sender<SessionInbound>,
+    tx: InboundTx,
     pending: VecDeque<Waiting>,
     /// Stream bytes in `pending`.
     pending_bytes: usize,
@@ -6003,7 +6124,7 @@ struct Inbound {
 }
 
 impl Inbound {
-    fn new(tx: mpsc::Sender<SessionInbound>) -> Self {
+    fn new(tx: InboundTx) -> Self {
         Inbound {
             tx,
             pending: VecDeque::new(),
@@ -6128,12 +6249,18 @@ struct BackendLink {
 }
 
 impl BackendLink {
+    #[cfg(test)]
     fn new(tx: mpsc::Sender<SessionInbound>, consumption: Consumption) -> Self {
+        Self::starting_at(InboundTx::Local(tx), consumption, 0)
+    }
+
+    /// A link whose first connection is attachment `generation`.
+    fn starting_at(tx: InboundTx, consumption: Consumption, generation: u64) -> Self {
         BackendLink {
             inbound: Inbound::new(tx),
-            ledger: ConsumptionLedger::new(consumption),
-            channel_output: channel_bridge::ChannelBridge::default(),
-            control_delivery: crate::control_budget::ControlLedger::new(0, 0),
+            ledger: ConsumptionLedger::starting_at(consumption, generation),
+            channel_output: channel_bridge::ChannelBridge::starting_at(generation),
+            control_delivery: crate::control_budget::ControlLedger::new(generation, 0),
         }
     }
 

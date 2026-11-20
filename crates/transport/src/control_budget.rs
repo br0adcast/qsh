@@ -203,7 +203,7 @@ impl SessionBudget {
         drop(state);
         drop(global);
         Ok(charges.map(|(class, bytes)| ResponsePermit {
-            session: self.clone(),
+            session: PermitHolder::Session(self.clone()),
             class,
             bytes,
         }))
@@ -234,9 +234,30 @@ impl SessionBudget {
 }
 #[must_use = "keep the permit with the reply until ACK or scoped teardown"]
 pub(crate) struct ResponsePermit {
-    session: SessionBudget,
+    session: PermitHolder,
     class: usize,
     bytes: usize,
+}
+enum PermitHolder {
+    Session(SessionBudget),
+    /// A reservation the session owner process holds. Dropping the token
+    /// releases it there; nothing is charged on this side.
+    Remote(Box<dyn RemoteResponse>),
+}
+
+/// The frontend end of one reply reservation a session owner holds.
+pub(crate) trait RemoteResponse: Send + Sync {
+    /// Its record entered the connection whole (`ControlLedger::register`).
+    fn admitted(&self);
+}
+
+/// Which reservation a remote permit stands for: its fixed record limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteClass {
+    /// One reply record of exactly these bytes.
+    Record(usize),
+    /// One snapshot representation (`Response::Snapshot`).
+    Snapshot,
 }
 /// One future obligation plus a fixed number of wire records share an envelope.
 /// Neither owner nor record handles can be cloned by callers.
@@ -254,24 +275,40 @@ pub(crate) struct ResponsePart {
 }
 
 impl ResponsePermit {
+    /// A reservation held by the session owner for this frontend.
+    pub(crate) fn remote(token: Box<dyn RemoteResponse>, class: RemoteClass) -> Self {
+        let (class, bytes) = match class {
+            RemoteClass::Record(bytes) => (0, bytes),
+            RemoteClass::Snapshot => Response::Snapshot.charge(),
+        };
+        Self {
+            session: PermitHolder::Remote(token),
+            class,
+            bytes,
+        }
+    }
+
     /// Before issuing any record lease, refund conservative ordinary preflight
     /// bytes. Mandatory envelopes retain their future outcome allowance.
     pub(crate) fn shrink_ordinary(&mut self, bytes: usize) -> Result<(), CapacityError> {
         if self.class != 0 || bytes == 0 || bytes > self.bytes {
             return Err(CapacityError::InvalidSize);
         }
+        let PermitHolder::Session(session) = &self.session else {
+            return Err(CapacityError::InvalidSize);
+        };
         let refund = (self.bytes - bytes) * COPY_WEIGHT[self.class];
         if refund == 0 {
             return Ok(());
         }
-        let mut global = self.session.global.0.lock().unwrap();
-        let mut state = self.session.state.lock().unwrap();
+        let mut global = session.global.0.lock().unwrap();
+        let mut state = session.state.lock().unwrap();
         global.bytes -= refund;
         state.bytes[self.class] -= refund;
-        self.bytes = bytes;
         drop(state);
         drop(global);
-        self.session.global.1.notify_waiters();
+        session.global.1.notify_waiters();
+        self.bytes = bytes;
         Ok(())
     }
     pub(crate) fn into_owner(self) -> ResponseOwner {
@@ -303,6 +340,21 @@ impl ResponseOwner {
 impl ResponsePart {
     pub(crate) fn encoded_bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// One record of exactly `bytes` whose reservation the session owner
+    /// holds; dropping the last handle releases it there.
+    pub(crate) fn remote(token: Box<dyn RemoteResponse>, bytes: usize) -> Self {
+        Self {
+            _permit: Arc::new(ResponsePermit::remote(token, RemoteClass::Record(bytes))),
+            bytes,
+        }
+    }
+
+    fn admitted(&self) {
+        if let PermitHolder::Remote(token) = &self._permit.session {
+            token.admitted();
+        }
     }
 }
 
@@ -345,6 +397,7 @@ impl ControlLedger {
             return Err(part);
         }
         self.last_end = end;
+        part.admitted();
         self.pending.push_back((end, part));
         Ok(())
     }
@@ -363,15 +416,19 @@ impl ControlLedger {
 
 impl Drop for ResponsePermit {
     fn drop(&mut self) {
-        let mut global = self.session.global.0.lock().unwrap();
-        let mut state = self.session.state.lock().unwrap();
+        // A remote token releases the owner's reservation on its own drop.
+        let PermitHolder::Session(session) = &self.session else {
+            return;
+        };
+        let mut global = session.global.0.lock().unwrap();
+        let mut state = session.state.lock().unwrap();
         global.bytes -= self.bytes * COPY_WEIGHT[self.class];
         global.response_entries -= 1;
         state.entries[self.class] -= 1;
         state.bytes[self.class] -= self.bytes * COPY_WEIGHT[self.class];
         drop(state);
         drop(global);
-        self.session.global.1.notify_waiters();
+        session.global.1.notify_waiters();
     }
 }
 /// Shared only by the finite job owner and registered callback/completion

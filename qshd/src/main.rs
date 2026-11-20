@@ -1742,7 +1742,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
             start.socket,
             start.keypair.private,
             personal_server_auth(shared_allowlist, start.keypair.public, admission),
-            Arc::new(backend),
+            channel_backend::personal_session_backend(backend),
             start.listener,
             start.cleanup,
             vec![start.port],

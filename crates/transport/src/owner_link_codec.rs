@@ -65,10 +65,19 @@ pub(crate) enum GeometryOutcomeWire {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GeometryWire {
+    pub instance: u64,
     pub request_id: u64,
     pub outcome: GeometryOutcomeWire,
     pub cols: u16,
     pub rows: u16,
+}
+
+/// The owner's gate a charge counts on: its link-wide id and kind code
+/// (0 screen, 1 pipe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GateWire {
+    pub id: u64,
+    pub kind: u8,
 }
 
 /// Immutable OPEN classification; `kind` is the channel kind code.
@@ -93,7 +102,9 @@ pub(crate) enum OutputBody {
 }
 
 /// A typed outbound record. `id` is the owner's queue position, and names the
-/// custody object (charge, permit, delivery) the owner keeps for it.
+/// custody objects (charge, permit, delivery) the owner keeps for it: each
+/// one is `id` plus a fixed slot (see `owner_link`). A `charge` names the
+/// gate its bytes count on; the charge's size follows from the record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OutRecord {
     RetirementReady {
@@ -104,15 +115,18 @@ pub(crate) enum OutRecord {
         id: u64,
         origin: Ctx,
         bytes: Vec<u8>,
+        charge: Option<GateWire>,
     },
     UpdateAccept {
         id: u64,
         origin: Ctx,
         bytes: Vec<u8>,
+        charge: Option<GateWire>,
     },
     ReservedSessionControl {
         id: u64,
         bytes: Vec<u8>,
+        charge: Option<GateWire>,
     },
     ResourceExhausted {
         origin: Ctx,
@@ -137,6 +151,7 @@ pub(crate) enum OutRecord {
         instance: u64,
         origin: Ctx,
         output: OutputBody,
+        gate: GateWire,
         /// The record carries the pre-reserved gap/bootstrap allowance.
         gap_reserve: bool,
     },
@@ -147,6 +162,9 @@ pub(crate) enum OutRecord {
         origin: Ctx,
         code: Option<i32>,
         open: OpenWire,
+        /// Encoded length of the Exit record its reply reservation covers.
+        control_bytes: u32,
+        charge: Option<GateWire>,
     },
     ProtocolFailure {
         origin: Ctx,
@@ -164,15 +182,54 @@ pub(crate) enum OutRecord {
         stream: u8,
         bulk: bool,
     },
+    Consumed {
+        stream: u8,
+        n: u64,
+    },
+    NotifyDelivered {
+        stream: u8,
+        token: u64,
+    },
+    ChannelOpened {
+        stream: u8,
+        origin: Ctx,
+    },
+    ChannelRefused {
+        stream: u8,
+        origin: Ctx,
+        reason: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChargeOp {
     /// Admission succeeded: move the charge to this connection tail.
     Transfer(u64),
-    /// Admit `n` bytes of the charge.
-    Admit(u64),
+    /// `headers` independently framed slices took `n` bytes of the charge
+    /// into the connection, whose tail is `tail`; each owes the next slice
+    /// one more 5-byte header.
+    Slice {
+        n: u64,
+        tail: u64,
+        headers: u64,
+    },
     Withdraw,
+}
+
+/// One operation on an owner gate, by id (the frontend's mirror gates).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GateOpWire {
+    Admit(u64),
+    Withdraw(u64),
+    Transfer {
+        n: u64,
+        tail: u64,
+    },
+    /// `ready` is the `(instance, generation)` scope to wake if it opened.
+    Update {
+        tail: u64,
+        ready: Option<(u64, u64)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,15 +251,18 @@ pub(crate) enum ToOwner {
         stream: u8,
         data: Vec<u8>,
     },
+    /// A leading piece of the next `Data` event (one event, one credit).
+    DataPart(Vec<u8>),
     Live(Ctx),
     ResumeReset(Ctx),
     RepaintCutover {
         generation: u64,
         sequence: u64,
     },
-    Tail {
-        stream: u8,
-        unacked: u64,
+    Repaint,
+    Gate {
+        gate: u64,
+        op: GateOpWire,
     },
     Charge {
         id: u64,
@@ -237,7 +297,6 @@ pub(crate) enum ToOwner {
     },
     MarkerDelivered {
         stream: u8,
-        instance: u64,
         token: u64,
         generation: u64,
     },
@@ -258,13 +317,9 @@ pub(crate) enum ToFrontend {
         slots: u32,
     },
     Record(OutRecord),
-    GateCreated {
-        stream: u8,
-        kind: u8,
-    },
-    GateDropped {
-        stream: u8,
-    },
+    /// A leading piece of the next record's data body (a body may exceed
+    /// one data frame; a screen repaint is one record).
+    DataPart(Vec<u8>),
     Snapshot {
         id: u64,
         generation: u64,
@@ -303,7 +358,7 @@ const K_DATA: u8 = 1;
 const K_LIVE: u8 = 2;
 const K_RESUME_RESET: u8 = 3;
 const K_REPAINT_CUTOVER: u8 = 4;
-const K_TAIL: u8 = 5;
+const K_GATE: u8 = 5;
 const K_CHARGE: u8 = 6;
 const K_PROGRESS: u8 = 7;
 const K_ADMITTED: u8 = 8;
@@ -316,10 +371,10 @@ const K_MARKER_DELIVERED: u8 = 14;
 const K_BUDGET_RETIRED: u8 = 15;
 const K_LIVENESS: u8 = 16;
 const K_END: u8 = 17;
+const K_REPAINT: u8 = 18;
+const K_DATA_PART_IN: u8 = 19;
 const K_GRANT: u8 = 0x40;
 const K_RECORD: u8 = 0x41;
-const K_GATE_CREATED: u8 = 0x42;
-const K_GATE_DROPPED: u8 = 0x43;
 const K_SNAPSHOT: u8 = 0x44;
 const K_TERMINAL: u8 = 0x45;
 const K_REPLAY_ITEM: u8 = 0x46;
@@ -327,6 +382,7 @@ const K_REPLAY_FRONTIER: u8 = 0x47;
 const K_REPLAY_UNCONFIRMED: u8 = 0x48;
 const K_REPLAY_RETAINED: u8 = 0x49;
 const K_REPLAY_DONE: u8 = 0x4a;
+const K_DATA_PART: u8 = 0x4b;
 
 const R_RETIREMENT_READY: u8 = 0x80;
 const R_RESERVED_CONTROL: u8 = 0x81;
@@ -342,13 +398,23 @@ const R_PROTOCOL_FAILURE: u8 = 0x8a;
 const R_DATA: u8 = 0x8b;
 const R_RESYNCABLE: u8 = 0x8c;
 const R_STREAM_CLASS: u8 = 0x8d;
+const R_CONSUMED: u8 = 0x8e;
+const R_NOTIFY_DELIVERED: u8 = 0x8f;
+const R_CHANNEL_OPENED: u8 = 0x90;
+const R_CHANNEL_REFUSED: u8 = 0x91;
 
 fn known_kind(kind: u8) -> bool {
-    matches!(kind, K_DATA..=K_END | K_GRANT..=K_REPLAY_DONE)
+    matches!(
+        kind,
+        K_DATA..=K_DATA_PART_IN | K_GRANT | K_RECORD | K_SNAPSHOT..=K_DATA_PART
+    )
 }
 
 fn kind_is_data(kind: u8) -> bool {
-    matches!(kind, K_DATA | K_RECORD | K_REPLAY_ITEM)
+    matches!(
+        kind,
+        K_DATA | K_DATA_PART_IN | K_RECORD | K_REPLAY_ITEM | K_DATA_PART
+    )
 }
 
 fn payload_bound(kind: u8) -> usize {
@@ -380,12 +446,10 @@ pub(crate) struct Frame {
     kind: u8,
     payload: Vec<u8>,
 }
+#[cfg(test)]
 impl Frame {
     pub(crate) fn lane(&self) -> Lane {
         self.lane
-    }
-    pub(crate) fn kind(&self) -> u8 {
-        self.kind
     }
 }
 
@@ -418,6 +482,7 @@ impl FrameReader {
         self.body.capacity()
     }
 
+    #[cfg(test)]
     pub(crate) fn next(&mut self, buf: &[u8]) -> Result<Option<Frame>, LinkError> {
         self.feed(buf)?;
         Ok(self.ready.pop_front())
@@ -486,6 +551,11 @@ impl FrameReader {
         let kind = h[7];
         if !known_kind(kind) {
             return Err(LinkError::UnknownKind);
+        }
+        // Only `Terminal` may use the priority lane, and it must: a mislabeled
+        // frame is never promoted by `next_priority`.
+        if h[6] != lane_of(kind) as u8 {
+            return Err(LinkError::BadLane);
         }
         let len = u32::from_be_bytes([h[8], h[9], h[10], h[11]]) as usize;
         if len > payload_bound(kind) {
@@ -569,7 +639,21 @@ impl<'a> Reader<'a> {
             features: self.u32()?,
         })
     }
+    fn gate(&mut self) -> Result<GateWire, LinkError> {
+        Ok(GateWire {
+            id: self.u64()?,
+            kind: self.u8()?,
+        })
+    }
+    fn opt_gate(&mut self) -> Result<Option<GateWire>, LinkError> {
+        if self.bool()? {
+            Ok(Some(self.gate()?))
+        } else {
+            Ok(None)
+        }
+    }
     fn geometry(&mut self) -> Result<GeometryWire, LinkError> {
+        let instance = self.u64()?;
         let request_id = self.u64()?;
         let outcome = match self.u8()? {
             0 => GeometryOutcomeWire::Established,
@@ -578,6 +662,7 @@ impl<'a> Reader<'a> {
             _ => return Err(LinkError::BadValue),
         };
         Ok(GeometryWire {
+            instance,
             request_id,
             outcome,
             cols: self.u16()?,
@@ -628,7 +713,21 @@ fn put_ctx(out: &mut Vec<u8>, c: Ctx) {
 fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_be_bytes());
 }
+fn put_gate(out: &mut Vec<u8>, g: GateWire) {
+    put_u64(out, g.id);
+    out.push(g.kind);
+}
+fn put_opt_gate(out: &mut Vec<u8>, g: Option<GateWire>) {
+    match g {
+        Some(g) => {
+            out.push(1);
+            put_gate(out, g);
+        }
+        None => out.push(0),
+    }
+}
 fn put_geometry(out: &mut Vec<u8>, g: GeometryWire) {
+    put_u64(out, g.instance);
     put_u64(out, g.request_id);
     match g.outcome {
         GeometryOutcomeWire::Established => out.push(0),
@@ -661,21 +760,34 @@ fn put_record(out: &mut Vec<u8>, r: &OutRecord) -> Result<(), LinkError> {
             put_ctx(out, *origin);
             out.push(u8::from(*decisions_complete));
         }
-        OutRecord::ReservedControl { id, origin, bytes } => {
+        OutRecord::ReservedControl {
+            id,
+            origin,
+            bytes,
+            charge,
+        } => {
             out.push(R_RESERVED_CONTROL);
             put_u64(out, *id);
             put_ctx(out, *origin);
+            put_opt_gate(out, *charge);
             put_bytes(out, bytes, CONTROL_FRAME_MAX)?;
         }
-        OutRecord::UpdateAccept { id, origin, bytes } => {
+        OutRecord::UpdateAccept {
+            id,
+            origin,
+            bytes,
+            charge,
+        } => {
             out.push(R_UPDATE_ACCEPT);
             put_u64(out, *id);
             put_ctx(out, *origin);
+            put_opt_gate(out, *charge);
             put_bytes(out, bytes, CONTROL_FRAME_MAX)?;
         }
-        OutRecord::ReservedSessionControl { id, bytes } => {
+        OutRecord::ReservedSessionControl { id, bytes, charge } => {
             out.push(R_RESERVED_SESSION_CONTROL);
             put_u64(out, *id);
+            put_opt_gate(out, *charge);
             put_bytes(out, bytes, CONTROL_FRAME_MAX)?;
         }
         OutRecord::ResourceExhausted { origin } => {
@@ -714,6 +826,7 @@ fn put_record(out: &mut Vec<u8>, r: &OutRecord) -> Result<(), LinkError> {
             instance,
             origin,
             output,
+            gate,
             gap_reserve,
         } => {
             out.push(R_CHANNEL_OUTPUT);
@@ -721,6 +834,7 @@ fn put_record(out: &mut Vec<u8>, r: &OutRecord) -> Result<(), LinkError> {
             out.push(*stream);
             put_u64(out, *instance);
             put_ctx(out, *origin);
+            put_gate(out, *gate);
             out.push(u8::from(*gap_reserve));
             match output {
                 OutputBody::Data(d) => {
@@ -749,12 +863,16 @@ fn put_record(out: &mut Vec<u8>, r: &OutRecord) -> Result<(), LinkError> {
             origin,
             code,
             open,
+            control_bytes,
+            charge,
         } => {
             out.push(R_CHANNEL_EXIT);
             put_u64(out, *id);
             out.push(*stream);
             put_u64(out, *instance);
             put_ctx(out, *origin);
+            out.extend_from_slice(&control_bytes.to_be_bytes());
+            put_opt_gate(out, *charge);
             match code {
                 Some(c) => {
                     out.push(1);
@@ -786,6 +904,27 @@ fn put_record(out: &mut Vec<u8>, r: &OutRecord) -> Result<(), LinkError> {
         OutRecord::StreamClass { stream, bulk } => {
             out.extend_from_slice(&[R_STREAM_CLASS, *stream, u8::from(*bulk)]);
         }
+        OutRecord::Consumed { stream, n } => {
+            out.extend_from_slice(&[R_CONSUMED, *stream]);
+            put_u64(out, *n);
+        }
+        OutRecord::NotifyDelivered { stream, token } => {
+            out.extend_from_slice(&[R_NOTIFY_DELIVERED, *stream]);
+            put_u64(out, *token);
+        }
+        OutRecord::ChannelOpened { stream, origin } => {
+            out.extend_from_slice(&[R_CHANNEL_OPENED, *stream]);
+            put_ctx(out, *origin);
+        }
+        OutRecord::ChannelRefused {
+            stream,
+            origin,
+            reason,
+        } => {
+            out.extend_from_slice(&[R_CHANNEL_REFUSED, *stream]);
+            put_ctx(out, *origin);
+            put_bytes(out, reason, CONTROL_FRAME_MAX)?;
+        }
     }
     Ok(())
 }
@@ -799,15 +938,18 @@ fn get_record(r: &mut Reader<'_>) -> Result<OutRecord, LinkError> {
         R_RESERVED_CONTROL => OutRecord::ReservedControl {
             id: r.u64()?,
             origin: r.ctx()?,
+            charge: r.opt_gate()?,
             bytes: r.bytes(CONTROL_FRAME_MAX)?,
         },
         R_UPDATE_ACCEPT => OutRecord::UpdateAccept {
             id: r.u64()?,
             origin: r.ctx()?,
+            charge: r.opt_gate()?,
             bytes: r.bytes(CONTROL_FRAME_MAX)?,
         },
         R_RESERVED_SESSION_CONTROL => OutRecord::ReservedSessionControl {
             id: r.u64()?,
+            charge: r.opt_gate()?,
             bytes: r.bytes(CONTROL_FRAME_MAX)?,
         },
         R_RESOURCE_EXHAUSTED => OutRecord::ResourceExhausted { origin: r.ctx()? },
@@ -828,6 +970,7 @@ fn get_record(r: &mut Reader<'_>) -> Result<OutRecord, LinkError> {
             let stream = r.u8()?;
             let instance = r.u64()?;
             let origin = r.ctx()?;
+            let gate = r.gate()?;
             let gap_reserve = r.bool()?;
             let output = match r.u8()? {
                 0 => OutputBody::Data(r.bytes(DATA_FRAME_MAX)?),
@@ -843,6 +986,7 @@ fn get_record(r: &mut Reader<'_>) -> Result<OutRecord, LinkError> {
                 instance,
                 origin,
                 output,
+                gate,
                 gap_reserve,
             }
         }
@@ -851,6 +995,8 @@ fn get_record(r: &mut Reader<'_>) -> Result<OutRecord, LinkError> {
             let stream = r.u8()?;
             let instance = r.u64()?;
             let origin = r.ctx()?;
+            let control_bytes = r.u32()?;
+            let charge = r.opt_gate()?;
             let code = if r.bool()? { Some(r.i32()?) } else { None };
             OutRecord::ChannelExit {
                 id,
@@ -859,6 +1005,8 @@ fn get_record(r: &mut Reader<'_>) -> Result<OutRecord, LinkError> {
                 origin,
                 code,
                 open: r.open()?,
+                control_bytes,
+                charge,
             }
         }
         R_PROTOCOL_FAILURE => {
@@ -877,6 +1025,23 @@ fn get_record(r: &mut Reader<'_>) -> Result<OutRecord, LinkError> {
         R_STREAM_CLASS => OutRecord::StreamClass {
             stream: r.u8()?,
             bulk: r.bool()?,
+        },
+        R_CONSUMED => OutRecord::Consumed {
+            stream: r.u8()?,
+            n: r.u64()?,
+        },
+        R_NOTIFY_DELIVERED => OutRecord::NotifyDelivered {
+            stream: r.u8()?,
+            token: r.u64()?,
+        },
+        R_CHANNEL_OPENED => OutRecord::ChannelOpened {
+            stream: r.u8()?,
+            origin: r.ctx()?,
+        },
+        R_CHANNEL_REFUSED => OutRecord::ChannelRefused {
+            stream: r.u8()?,
+            origin: r.ctx()?,
+            reason: r.bytes(CONTROL_FRAME_MAX)?,
         },
         _ => return Err(LinkError::UnknownKind),
     })
@@ -951,10 +1116,41 @@ impl LinkMessage for ToOwner {
                 put_u64(out, *sequence);
                 K_REPAINT_CUTOVER
             }
-            Self::Tail { stream, unacked } => {
-                out.push(*stream);
-                put_u64(out, *unacked);
-                K_TAIL
+            Self::Repaint => K_REPAINT,
+            Self::DataPart(d) => {
+                put_bytes(out, d, DATA_FRAME_MAX)?;
+                K_DATA_PART_IN
+            }
+            Self::Gate { gate, op } => {
+                put_u64(out, *gate);
+                match op {
+                    GateOpWire::Admit(n) => {
+                        out.push(0);
+                        put_u64(out, *n);
+                    }
+                    GateOpWire::Withdraw(n) => {
+                        out.push(1);
+                        put_u64(out, *n);
+                    }
+                    GateOpWire::Transfer { n, tail } => {
+                        out.push(2);
+                        put_u64(out, *n);
+                        put_u64(out, *tail);
+                    }
+                    GateOpWire::Update { tail, ready } => {
+                        out.push(3);
+                        put_u64(out, *tail);
+                        match ready {
+                            Some((instance, generation)) => {
+                                out.push(1);
+                                put_u64(out, *instance);
+                                put_u64(out, *generation);
+                            }
+                            None => out.push(0),
+                        }
+                    }
+                }
+                K_GATE
             }
             Self::Charge { id, op } => {
                 put_u64(out, *id);
@@ -963,11 +1159,13 @@ impl LinkMessage for ToOwner {
                         out.push(0);
                         put_u64(out, *tail);
                     }
-                    ChargeOp::Admit(n) => {
-                        out.push(1);
-                        put_u64(out, *n);
-                    }
                     ChargeOp::Withdraw => out.push(2),
+                    ChargeOp::Slice { n, tail, headers } => {
+                        out.push(3);
+                        put_u64(out, *n);
+                        put_u64(out, *tail);
+                        put_u64(out, *headers);
+                    }
                 }
                 K_CHARGE
             }
@@ -1017,12 +1215,10 @@ impl LinkMessage for ToOwner {
             }
             Self::MarkerDelivered {
                 stream,
-                instance,
                 token,
                 generation,
             } => {
                 out.push(*stream);
-                put_u64(out, *instance);
                 put_u64(out, *token);
                 put_u64(out, *generation);
                 K_MARKER_DELIVERED
@@ -1059,16 +1255,39 @@ impl LinkMessage for ToOwner {
                 generation: r.u64()?,
                 sequence: r.u64()?,
             },
-            K_TAIL => Self::Tail {
-                stream: r.u8()?,
-                unacked: r.u64()?,
-            },
+            K_REPAINT => Self::Repaint,
+            K_DATA_PART_IN => Self::DataPart(r.bytes(DATA_FRAME_MAX)?),
+            K_GATE => {
+                let gate = r.u64()?;
+                let op = match r.u8()? {
+                    0 => GateOpWire::Admit(r.u64()?),
+                    1 => GateOpWire::Withdraw(r.u64()?),
+                    2 => GateOpWire::Transfer {
+                        n: r.u64()?,
+                        tail: r.u64()?,
+                    },
+                    3 => GateOpWire::Update {
+                        tail: r.u64()?,
+                        ready: if r.bool()? {
+                            Some((r.u64()?, r.u64()?))
+                        } else {
+                            None
+                        },
+                    },
+                    _ => return Err(LinkError::BadValue),
+                };
+                Self::Gate { gate, op }
+            }
             K_CHARGE => {
                 let id = r.u64()?;
                 let op = match r.u8()? {
                     0 => ChargeOp::Transfer(r.u64()?),
-                    1 => ChargeOp::Admit(r.u64()?),
                     2 => ChargeOp::Withdraw,
+                    3 => ChargeOp::Slice {
+                        n: r.u64()?,
+                        tail: r.u64()?,
+                        headers: r.u64()?,
+                    },
                     _ => return Err(LinkError::BadValue),
                 };
                 Self::Charge { id, op }
@@ -1096,7 +1315,6 @@ impl LinkMessage for ToOwner {
             },
             K_MARKER_DELIVERED => Self::MarkerDelivered {
                 stream: r.u8()?,
-                instance: r.u64()?,
                 token: r.u64()?,
                 generation: r.u64()?,
             },
@@ -1127,13 +1345,9 @@ impl LinkMessage for ToFrontend {
                 put_record(out, r)?;
                 K_RECORD
             }
-            Self::GateCreated { stream, kind } => {
-                out.extend_from_slice(&[*stream, *kind]);
-                K_GATE_CREATED
-            }
-            Self::GateDropped { stream } => {
-                out.push(*stream);
-                K_GATE_DROPPED
+            Self::DataPart(d) => {
+                put_bytes(out, d, DATA_FRAME_MAX)?;
+                K_DATA_PART
             }
             Self::Snapshot {
                 id,
@@ -1194,11 +1408,7 @@ impl LinkMessage for ToFrontend {
         let msg = match frame.kind {
             K_GRANT => Self::Grant { slots: r.u32()? },
             K_RECORD => Self::Record(get_record(&mut r)?),
-            K_GATE_CREATED => Self::GateCreated {
-                stream: r.u8()?,
-                kind: r.u8()?,
-            },
-            K_GATE_DROPPED => Self::GateDropped { stream: r.u8()? },
+            K_DATA_PART => Self::DataPart(r.bytes(DATA_FRAME_MAX)?),
             K_SNAPSHOT => Self::Snapshot {
                 id: r.u64()?,
                 generation: r.u64()?,

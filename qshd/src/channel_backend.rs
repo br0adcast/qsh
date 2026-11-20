@@ -550,6 +550,20 @@ impl ChannelSessionBackend {
     }
 }
 
+/// The backend a personal-mode daemon hands its router. On Linux each
+/// session's channel backend runs behind an owner link (#529): in this
+/// process for now, over an in-memory pipe through the link's real codec, so
+/// the network side holds only mirrors and custody tokens. Elsewhere, and in
+/// the system mode, the router drives the channel backend directly.
+pub fn personal_session_backend(backend: ChannelSessionBackend) -> Arc<dyn SessionBackend> {
+    let backend: Arc<dyn SessionBackend> = Arc::new(backend);
+    if cfg!(target_os = "linux") {
+        Arc::new(transport::session_manager::RemoteBackend::loopback(backend))
+    } else {
+        backend
+    }
+}
+
 impl SessionBackend for ChannelSessionBackend {
     fn required_features(&self) -> transport::Features {
         transport::Features::CHANNEL_GEOMETRY | transport::Features::AUTH_ACCEPTED

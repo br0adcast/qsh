@@ -35,7 +35,45 @@ pub enum WaitRegistration {
 /// Shared across producer and retained-output owners, not one budget per queue.
 #[derive(Clone)]
 pub struct TimelineBudget {
-    inner: Arc<BudgetInner>,
+    inner: BudgetRef,
+}
+#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+#[derive(Clone)]
+enum BudgetRef {
+    Local(Arc<BudgetInner>),
+    /// A frontend's view of a budget its session owner holds: it admits
+    /// nothing, and the owner applies the coalescing latch.
+    Remote(Arc<dyn RemoteTimeline>),
+}
+
+#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+/// What a retained bridge item became (see [`TimelinePermit::retained`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retention {
+    /// The delivered final marker, kept for a fresh delivery proof.
+    Marker,
+    /// The terminal output gap, kept for the next attachment.
+    Gap,
+}
+
+/// The frontend end of one stream instance's timeline budget, owned by the
+/// session owner process. Reports go to the owner in order.
+#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+pub(crate) trait RemoteTimeline: Send + Sync {
+    /// Bridge progress for `instance` under `generation` (the owner's latch
+    /// decides whether the producer hears `OutputReady`).
+    fn progress(&self, instance: ChannelInstance, generation: u64);
+    /// The stream's last admitted geometry checkpoint.
+    fn frontier(&self, geometry: crate::channel_geometry::GeometryRecord);
+    /// Whether output admitted to the current connection is still unacknowledged.
+    fn unconfirmed(&self, unconfirmed: bool);
+}
+
+/// One permit the session owner holds for a frontend: dropping this releases
+/// the owner's real permit.
+#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+pub(crate) trait RemotePermit: Send + Sync {
+    fn retained(&self, retention: Retention);
 }
 struct BudgetInner {
     state: Mutex<BudgetState>,
@@ -79,9 +117,22 @@ impl BudgetState {
 /// Exclusive ownership of a charged metadata entry. Moving a permit between
 /// queues transfers ownership without making room. Only drop releases it.
 pub struct TimelinePermit {
-    inner: Arc<BudgetInner>,
-    class: EntryClass,
-    bytes: usize,
+    inner: PermitRef,
+}
+#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+enum PermitRef {
+    Local {
+        inner: Arc<BudgetInner>,
+        class: EntryClass,
+        bytes: usize,
+    },
+    /// Boxed: queued records carry permits, and their wrappers stay small.
+    Remote(Box<RemoteParts>),
+}
+#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+struct RemoteParts {
+    token: Box<dyn RemotePermit>,
+    budget: Arc<dyn RemoteTimeline>,
 }
 
 impl TimelineBudget {
@@ -94,7 +145,7 @@ impl TimelineBudget {
         notify: impl Fn(WaitKey) + Send + Sync + 'static,
     ) -> Self {
         Self {
-            inner: Arc::new(BudgetInner {
+            inner: BudgetRef::Local(Arc::new(BudgetInner {
                 state: Mutex::new(BudgetState {
                     scope: WaitKey {
                         instance,
@@ -106,12 +157,36 @@ impl TimelineBudget {
                     notification_pending: false,
                 }),
                 notify: Box::new(notify),
-            }),
+            })),
+        }
+    }
+
+    fn local(&self) -> Option<&Arc<BudgetInner>> {
+        match &self.inner {
+            BudgetRef::Local(inner) => Some(inner),
+            BudgetRef::Remote(_) => None,
+        }
+    }
+
+    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    /// Report the stream's admitted geometry frontier to a remote owner.
+    pub(crate) fn report_frontier(&self, geometry: crate::channel_geometry::GeometryRecord) {
+        if let BudgetRef::Remote(remote) = &self.inner {
+            remote.frontier(geometry);
+        }
+    }
+
+    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    /// Report whether admitted output is unacknowledged to a remote owner.
+    pub(crate) fn report_unconfirmed(&self, unconfirmed: bool) {
+        if let BudgetRef::Remote(remote) = &self.inner {
+            remote.unconfirmed(unconfirmed);
         }
     }
 
     pub fn try_reserve(&self, class: EntryClass, bytes: usize) -> Option<TimelinePermit> {
-        let mut state = self.inner.state.lock().expect("timeline budget");
+        let inner = self.local()?;
+        let mut state = inner.state.lock().expect("timeline budget");
         if !state.has_room(class, bytes) {
             return None;
         }
@@ -119,9 +194,11 @@ impl TimelineBudget {
         usage.entries += 1;
         usage.bytes += bytes;
         Some(TimelinePermit {
-            inner: self.inner.clone(),
-            class,
-            bytes,
+            inner: PermitRef::Local {
+                inner: inner.clone(),
+                class,
+                bytes,
+            },
         })
     }
 
@@ -145,7 +222,10 @@ impl TimelineBudget {
         class: EntryClass,
         bytes: usize,
     ) -> WaitRegistration {
-        let mut state = self.inner.state.lock().expect("timeline budget");
+        let Some(inner) = self.local() else {
+            return WaitRegistration::Retired;
+        };
+        let mut state = inner.state.lock().expect("timeline budget");
         if state.scope
             != (WaitKey {
                 instance,
@@ -167,7 +247,15 @@ impl TimelineBudget {
     /// Coalesce bridge progress with the same latch as permit availability.
     /// The bridge delivers the scoped OutputReady event; no second event queue.
     pub(crate) fn mark_output_ready(&self, instance: ChannelInstance, generation: u64) -> bool {
-        let mut state = self.inner.state.lock().expect("timeline budget");
+        let inner = match &self.inner {
+            BudgetRef::Local(inner) => inner,
+            BudgetRef::Remote(remote) => {
+                // The owner sets its own latch and wakes its producer.
+                remote.progress(instance, generation);
+                return false;
+            }
+        };
+        let mut state = inner.state.lock().expect("timeline budget");
         if state.scope
             != (WaitKey {
                 instance,
@@ -184,7 +272,10 @@ impl TimelineBudget {
     /// Consume exactly the notification for this attachment. An old callback
     /// cannot clear a newer attachment's waiter or pending signal.
     pub fn take_notification(&self, instance: ChannelInstance, generation: u64) -> bool {
-        let mut state = self.inner.state.lock().expect("timeline budget");
+        let Some(inner) = self.local() else {
+            return false;
+        };
+        let mut state = inner.state.lock().expect("timeline budget");
         if state.scope
             != (WaitKey {
                 instance,
@@ -203,7 +294,10 @@ impl TimelineBudget {
     /// Retire a previous attachment's waiter without releasing any owned
     /// output permits. Generations advance; stale resets cannot resurrect one.
     pub fn reset_attachment(&self, instance: ChannelInstance, generation: u64) -> bool {
-        let mut state = self.inner.state.lock().expect("timeline budget");
+        let Some(inner) = self.local() else {
+            return false;
+        };
+        let mut state = inner.state.lock().expect("timeline budget");
         if state.scope.instance != instance || generation <= state.scope.generation {
             return false;
         }
@@ -215,7 +309,12 @@ impl TimelineBudget {
 
     #[cfg(test)]
     pub(crate) fn usage(&self, class: EntryClass) -> (usize, usize) {
-        let state = self.inner.state.lock().expect("timeline budget");
+        let state = self
+            .local()
+            .expect("local budget")
+            .state
+            .lock()
+            .expect("timeline budget");
         let usage = state.usage(class);
         (usage.entries, usage.bytes)
     }
@@ -225,18 +324,48 @@ impl TimelinePermit {
     /// The same admission state, not a new budget for the receiving queue.
     pub fn budget(&self) -> TimelineBudget {
         TimelineBudget {
-            inner: self.inner.clone(),
+            inner: match &self.inner {
+                PermitRef::Local { inner, .. } => BudgetRef::Local(inner.clone()),
+                PermitRef::Remote(parts) => BudgetRef::Remote(parts.budget.clone()),
+            },
+        }
+    }
+
+    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    /// A permit a session owner holds; dropping this releases it there.
+    pub(crate) fn remote(token: Box<dyn RemotePermit>, budget: Arc<dyn RemoteTimeline>) -> Self {
+        Self {
+            inner: PermitRef::Remote(Box::new(RemoteParts { token, budget })),
+        }
+    }
+
+    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    /// The bridge keeps this permit's item past its admission (a delivered
+    /// marker or a terminal gap). Only a remote owner needs to hear it.
+    pub(crate) fn retained(&self, retention: Retention) {
+        if let PermitRef::Remote(parts) = &self.inner {
+            parts.token.retained(retention);
         }
     }
 }
 
 impl Drop for TimelinePermit {
     fn drop(&mut self) {
+        // A remote permit's token releases the owner's permit on its own drop.
+        let PermitRef::Local {
+            inner,
+            class,
+            bytes,
+        } = &self.inner
+        else {
+            return;
+        };
+        let (inner, class, bytes) = (inner, *class, *bytes);
         let notify = {
-            let mut state = self.inner.state.lock().expect("timeline budget");
-            let usage = state.usage_mut(self.class);
+            let mut state = inner.state.lock().expect("timeline budget");
+            let usage = state.usage_mut(class);
             usage.entries -= 1;
-            usage.bytes -= self.bytes;
+            usage.bytes -= bytes;
             if !state.notification_pending
                 && state
                     .waiter
@@ -249,7 +378,7 @@ impl Drop for TimelinePermit {
             }
         };
         if let Some(key) = notify {
-            (self.inner.notify)(key);
+            (inner.notify)(key);
         }
     }
 }

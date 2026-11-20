@@ -10,11 +10,16 @@ fn ctx() -> Ctx {
 
 fn geometry() -> GeometryWire {
     GeometryWire {
+        instance: 11,
         request_id: 9,
         outcome: GeometryOutcomeWire::Refused(3),
         cols: 80,
         rows: 24,
     }
+}
+
+fn gate() -> GateWire {
+    GateWire { id: 21, kind: 1 }
 }
 
 fn open() -> OpenWire {
@@ -36,15 +41,18 @@ fn all_records() -> Vec<OutRecord> {
             id: 1,
             origin: ctx(),
             bytes: vec![1, 2, 3],
+            charge: Some(gate()),
         },
         OutRecord::UpdateAccept {
             id: 2,
             origin: ctx(),
             bytes: vec![4],
+            charge: None,
         },
         OutRecord::ReservedSessionControl {
             id: 3,
             bytes: vec![],
+            charge: Some(gate()),
         },
         OutRecord::ResourceExhausted { origin: ctx() },
         OutRecord::CloseSession { origin: ctx() },
@@ -65,6 +73,7 @@ fn all_records() -> Vec<OutRecord> {
             instance: 11,
             origin: ctx(),
             output: OutputBody::Data(vec![0xaa; 100]),
+            gate: gate(),
             gap_reserve: true,
         },
         OutRecord::ChannelOutput {
@@ -73,6 +82,7 @@ fn all_records() -> Vec<OutRecord> {
             instance: 11,
             origin: ctx(),
             output: OutputBody::Geometry(geometry()),
+            gate: gate(),
             gap_reserve: false,
         },
         OutRecord::ChannelOutput {
@@ -81,6 +91,7 @@ fn all_records() -> Vec<OutRecord> {
             instance: 11,
             origin: ctx(),
             output: OutputBody::EchoAck(77),
+            gate: gate(),
             gap_reserve: false,
         },
         OutRecord::ChannelOutput {
@@ -89,6 +100,7 @@ fn all_records() -> Vec<OutRecord> {
             instance: 11,
             origin: ctx(),
             output: OutputBody::OutputGap(2),
+            gate: gate(),
             gap_reserve: false,
         },
         OutRecord::ChannelOutput {
@@ -97,6 +109,7 @@ fn all_records() -> Vec<OutRecord> {
             instance: 11,
             origin: ctx(),
             output: OutputBody::DeliveryMarker { token: 55 },
+            gate: gate(),
             gap_reserve: false,
         },
         OutRecord::ChannelExit {
@@ -106,6 +119,8 @@ fn all_records() -> Vec<OutRecord> {
             origin: ctx(),
             code: Some(-1),
             open: open(),
+            control_bytes: 10,
+            charge: Some(gate()),
         },
         OutRecord::ChannelExit {
             id: 12,
@@ -114,6 +129,8 @@ fn all_records() -> Vec<OutRecord> {
             origin: ctx(),
             code: None,
             open: open(),
+            control_bytes: 6,
+            charge: None,
         },
         OutRecord::ProtocolFailure {
             origin: ctx(),
@@ -135,6 +152,23 @@ fn all_records() -> Vec<OutRecord> {
             stream: 3,
             bulk: true,
         },
+        OutRecord::Consumed {
+            stream: 3,
+            n: u64::MAX,
+        },
+        OutRecord::NotifyDelivered {
+            stream: 3,
+            token: 8,
+        },
+        OutRecord::ChannelOpened {
+            stream: 3,
+            origin: ctx(),
+        },
+        OutRecord::ChannelRefused {
+            stream: 3,
+            origin: ctx(),
+            reason: b"no".to_vec(),
+        },
     ]
 }
 
@@ -150,17 +184,45 @@ fn all_to_owner() -> Vec<ToOwner> {
             generation: 1,
             sequence: 2,
         },
-        ToOwner::Tail {
-            stream: 4,
-            unacked: 99,
+        ToOwner::Repaint,
+        ToOwner::DataPart(vec![3; 200]),
+        ToOwner::Gate {
+            gate: 4,
+            op: GateOpWire::Admit(99),
+        },
+        ToOwner::Gate {
+            gate: 4,
+            op: GateOpWire::Withdraw(98),
+        },
+        ToOwner::Gate {
+            gate: 4,
+            op: GateOpWire::Transfer { n: 97, tail: 96 },
+        },
+        ToOwner::Gate {
+            gate: 4,
+            op: GateOpWire::Update {
+                tail: 95,
+                ready: Some((8, 2)),
+            },
+        },
+        ToOwner::Gate {
+            gate: 4,
+            op: GateOpWire::Update {
+                tail: 94,
+                ready: None,
+            },
+        },
+        ToOwner::Charge {
+            id: 9,
+            op: ChargeOp::Slice {
+                n: 7,
+                tail: 70,
+                headers: 2,
+            },
         },
         ToOwner::Charge {
             id: 1,
             op: ChargeOp::Transfer(5),
-        },
-        ToOwner::Charge {
-            id: 2,
-            op: ChargeOp::Admit(6),
         },
         ToOwner::Charge {
             id: 3,
@@ -193,7 +255,6 @@ fn all_to_owner() -> Vec<ToOwner> {
         },
         ToOwner::MarkerDelivered {
             stream: 4,
-            instance: 8,
             token: 3,
             generation: 2,
         },
@@ -209,8 +270,7 @@ fn all_to_owner() -> Vec<ToOwner> {
 fn all_to_frontend() -> Vec<ToFrontend> {
     let mut v: Vec<ToFrontend> = vec![
         ToFrontend::Grant { slots: 256 },
-        ToFrontend::GateCreated { stream: 4, kind: 1 },
-        ToFrontend::GateDropped { stream: 4 },
+        ToFrontend::DataPart(vec![6; 300]),
         ToFrontend::Snapshot {
             id: 3,
             generation: 2,
@@ -354,15 +414,23 @@ fn ctx_max_records(n: usize) -> Vec<OutRecord> {
             id: u64::MAX,
             origin: ctx(),
             bytes: vec![1; n],
+            charge: Some(gate()),
         },
         OutRecord::UpdateAccept {
             id: u64::MAX,
             origin: ctx(),
             bytes: vec![2; n],
+            charge: Some(gate()),
         },
         OutRecord::ReservedSessionControl {
             id: u64::MAX,
             bytes: vec![3; n],
+            charge: Some(gate()),
+        },
+        OutRecord::ChannelRefused {
+            stream: 255,
+            origin: ctx(),
+            reason: vec![4; n],
         },
     ]
 }
@@ -386,12 +454,17 @@ fn owner_link_carries_maximum_content_of_every_class() {
         stream: 255,
         data: vec![7; DATA_FRAME_MAX],
     }));
+    round_trip_to_frontend(ToFrontend::DataPart(vec![7; DATA_FRAME_MAX]));
     round_trip_to_frontend(ToFrontend::ReplayItem(OutRecord::ChannelOutput {
         id: u64::MAX,
         stream: 255,
         instance: u64::MAX,
         origin: ctx(),
         output: OutputBody::Data(vec![7; DATA_FRAME_MAX]),
+        gate: GateWire {
+            id: u64::MAX,
+            kind: 0,
+        },
         gap_reserve: true,
     }));
     for r in ctx_max_records(CONTROL_FRAME_MAX) {
@@ -420,6 +493,7 @@ fn owner_link_encode_refuses_content_one_over_the_limit() {
             prefix: 0,
             dto: vec![0; SNAPSHOT_FRAME_MAX + 1],
         },
+        ToFrontend::DataPart(vec![0; DATA_FRAME_MAX + 1]),
     ];
     over.extend(
         ctx_max_records(CONTROL_FRAME_MAX + 1)
@@ -495,8 +569,15 @@ fn owner_link_rejects_unknown_version_and_kind() {
     )
     .unwrap();
     term[6] = 0;
-    let frame = FrameReader::new().next(&term).unwrap().unwrap();
-    assert_eq!(ToFrontend::decode(&frame), Err(LinkError::BadLane));
+    assert_eq!(FrameReader::new().next(&term), Err(LinkError::BadLane));
+    // A data-lane kind labelled priority is refused from its header, so
+    // `next_priority` can never promote it past queued frames.
+    let mut grant = Vec::new();
+    encode(&ToFrontend::Grant { slots: 1 }, &mut grant).unwrap();
+    grant[6] = 1;
+    let mut reader = FrameReader::new();
+    assert_eq!(reader.next_priority(&grant), Err(LinkError::BadLane));
+    assert_eq!(reader.body_capacity(), 0);
     // A ToFrontend kind is not a ToOwner message.
     let mut grant = Vec::new();
     encode(&ToFrontend::Grant { slots: 1 }, &mut grant).unwrap();
@@ -513,14 +594,7 @@ fn owner_link_rejects_unknown_version_and_kind() {
 #[test]
 fn owner_link_rejects_truncated_and_trailing_bytes() {
     let mut bytes = Vec::new();
-    encode(
-        &ToOwner::Tail {
-            stream: 1,
-            unacked: 2,
-        },
-        &mut bytes,
-    )
-    .unwrap();
+    encode(&ToOwner::Released { id: 2 }, &mut bytes).unwrap();
     // Stream ends inside the header and inside the body.
     for cut in [3, HEADER_LEN, bytes.len() - 1] {
         let mut reader = FrameReader::new();

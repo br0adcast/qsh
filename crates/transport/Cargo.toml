@@ -31,8 +31,9 @@ log = "0.4"
 # Optional dependency: needed only by the async drivers `driver_tokio`/
 # `shell_server` (feature `tokio-driver`). The sans-IO core itself does not
 # depend on tokio. `rt`/`sync` are needed by the PTY bridge in `shell_server`:
-# `spawn_blocking` (feature `rt`) and `mpsc` (feature `sync`).
-tokio = { version = "1", optional = true, features = ["net", "time", "macros", "rt", "sync"] }
+# `spawn_blocking` (feature `rt`) and `mpsc` (feature `sync`). `io-util`
+# carries the frontend/owner link over an in-process duplex pipe.
+tokio = { version = "1", optional = true, features = ["net", "time", "macros", "rt", "sync", "io-util"] }
 
 [features]
 # Enables `driver_tokio` -- a minimal async echo server built on top of the core.
