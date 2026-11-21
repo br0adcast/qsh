@@ -39,6 +39,7 @@ pub(crate) struct BusyCommand<'a> {
     pub decision: Option<&'a BusyDecision>,
     pub destructive_consent: Option<&'a daemon_bootstrap_protocol::DestructiveRestartConsent>,
     pub service_restart_consent: Option<&'a daemon_bootstrap_protocol::ServiceRestartConsent>,
+    pub frontend_upgrade_consent: Option<&'a daemon_bootstrap_protocol::FrontendUpgradeConsent>,
 }
 pub(crate) fn command_for_policy(
     path: &str,
@@ -53,6 +54,7 @@ pub(crate) fn command_for_policy(
         decision: busy_decision,
         destructive_consent,
         service_restart_consent,
+        frontend_upgrade_consent,
     } = busy;
     let mut command = command(path, name, port, client_pubkey);
     if matches!(policy, crate::InstallPolicy::RestartOnly) {
@@ -75,6 +77,12 @@ pub(crate) fn command_for_policy(
         command.push_str(" --destructive-consent ");
         command.push_str(&shell::quote(&serde_json::to_string(consent).map_err(
             |_| BringUpError::InvalidRequest("invalid destructive consent".into()),
+        )?));
+    }
+    if let Some(consent) = frontend_upgrade_consent {
+        command.push_str(" --frontend-upgrade-consent ");
+        command.push_str(&shell::quote(&serde_json::to_string(consent).map_err(
+            |_| BringUpError::InvalidRequest("invalid frontend upgrade consent".into()),
         )?));
     }
     if let Some(consent) = service_restart_consent {
@@ -384,6 +392,52 @@ mod tests {
             parse(0, &format!("{ready}{ready}")),
             Err(BringUpError::BadReady(_))
         ));
+    }
+
+    #[test]
+    fn the_upgrade_consent_is_sent_with_its_flag() {
+        let attempt = BusyAttemptId::from_bytes([1; 16]);
+        let consent = crate::FrontendUpgradeConsent {
+            attempt: attempt.clone(),
+            identity: crate::BusyDaemonIdentity {
+                version: "0.5.9".into(),
+                build: 1,
+                checksum: "ab".repeat(32),
+                pid: 42,
+                generation: None,
+            },
+            candidate: crate::CandidateImageIdentity {
+                build: 2,
+                checksum: "ef".repeat(32),
+            },
+            case: crate::UpgradeCase::Soft,
+            action: crate::FrontendUpgradeAction::ReplaceFrontend,
+        };
+        let with = command_for_policy(
+            "/h/qshd",
+            "console",
+            60022,
+            &[7u8; 32],
+            &crate::InstallPolicy::ExistingOnly,
+            BusyCommand {
+                attempt: Some(&attempt),
+                decision: None,
+                destructive_consent: None,
+                service_restart_consent: None,
+                frontend_upgrade_consent: Some(&consent),
+            },
+        )
+        .unwrap();
+        let json = serde_json::to_string(&consent).unwrap();
+        assert!(
+            with.contains(&format!(
+                " --frontend-upgrade-consent {}",
+                shell::quote(&json)
+            )),
+            "{with}"
+        );
+        assert!(!with.contains("--destructive-consent"));
+        assert!(!with.contains("--service-restart-consent"));
     }
 
     #[test]

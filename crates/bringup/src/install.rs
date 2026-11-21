@@ -441,7 +441,16 @@ pub(crate) fn bring_up(
             "invalid busy-daemon decision options".into(),
         ));
     }
-    if req.destructive_consent.is_some() && req.service_restart_consent.is_some() {
+    if [
+        req.destructive_consent.is_some(),
+        req.service_restart_consent.is_some(),
+        req.frontend_upgrade_consent.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count()
+        > 1
+    {
         return Err(BringUpError::InvalidRequest(
             "conflicting restart consent scopes".into(),
         ));
@@ -456,6 +465,18 @@ pub(crate) fn bring_up(
         {
             return Err(BringUpError::InvalidRequest(
                 "service restart needs its observed SSH target and force decision".into(),
+            ));
+        }
+    }
+    if let Some(consent) = &req.frontend_upgrade_consent {
+        if !req.busy_decision.as_ref().is_some_and(|decision| {
+            decision.choice == crate::BusyChoice::ForceUpdate
+                && decision.attempt == consent.attempt
+                && decision.identity == consent.identity
+                && decision.candidate == consent.candidate
+        }) {
+            return Err(BringUpError::InvalidRequest(
+                "stale frontend upgrade consent".into(),
             ));
         }
     }
@@ -487,6 +508,7 @@ pub(crate) fn bring_up(
         }
         if decision.choice == crate::BusyChoice::ForceUpdate
             && req.service_restart_consent.is_none()
+            && req.frontend_upgrade_consent.is_none()
             && (req.destructive_consent.is_none() || decision.identity.generation.is_none())
         {
             return Err(BringUpError::DestructiveRestartUnavailable);
@@ -535,6 +557,7 @@ pub(crate) fn bring_up(
         req.busy_decision,
         req.destructive_consent,
         req.service_restart_consent,
+        req.frontend_upgrade_consent,
         req.pending_busy_target.as_ref(),
         host.clone(),
         username.clone(),
@@ -575,6 +598,7 @@ fn on_session(
     busy_decision: Option<crate::BusyDecision>,
     destructive_consent: Option<crate::DestructiveRestartConsent>,
     service_restart_consent: Option<crate::ServiceRestartConsent>,
+    frontend_upgrade_consent: Option<crate::FrontendUpgradeConsent>,
     pending_busy_target: Option<&crate::BusySshTarget>,
     host: String,
     username: String,
@@ -729,6 +753,9 @@ fn on_session(
             .map(|d| d.attempt.clone())
             .unwrap_or_else(|| crate::BusyAttemptId::from_bytes(rand::random()))
     });
+    let consented = destructive_consent.is_some()
+        || service_restart_consent.is_some()
+        || frontend_upgrade_consent.is_some();
     let output = session
         .command(
             "qshd transport-ensure",
@@ -743,13 +770,14 @@ fn on_session(
                     decision: busy_decision.as_ref(),
                     destructive_consent: destructive_consent.as_ref(),
                     service_restart_consent: service_restart_consent.as_ref(),
+                    frontend_upgrade_consent: frontend_upgrade_consent.as_ref(),
                 },
             )?,
             hooks.timing.ensure,
             cancel,
         )
         .map_err(|error| {
-            if destructive_consent.is_some() || service_restart_consent.is_some() {
+            if consented {
                 BringUpError::DestructiveRestartUncertain {
                     cause: Some(Box::new(error)),
                 }
@@ -758,18 +786,16 @@ fn on_session(
             }
         })?;
     if output.code != 0 {
-        return Err(
-            if destructive_consent.is_some() || service_restart_consent.is_some() {
-                BringUpError::DestructiveRestartUncertain {
-                    cause: Some(Box::new(output.failure("qshd transport-ensure"))),
-                }
-            } else {
-                output.failure("qshd transport-ensure")
-            },
-        );
+        return Err(if consented {
+            BringUpError::DestructiveRestartUncertain {
+                cause: Some(Box::new(output.failure("qshd transport-ensure"))),
+            }
+        } else {
+            output.failure("qshd transport-ensure")
+        });
     }
     let stdout = output.complete_stdout().map_err(|error| {
-        if destructive_consent.is_some() || service_restart_consent.is_some() {
+        if consented {
             BringUpError::DestructiveRestartUncertain {
                 cause: Some(Box::new(BringUpError::BadReady(error))),
             }
@@ -787,9 +813,7 @@ fn on_session(
                 "reported candidate differs from verified provider bytes".into(),
             ));
         }
-        Err(error @ BringUpError::BadReady(_))
-            if (destructive_consent.is_some() || service_restart_consent.is_some()) =>
-        {
+        Err(error @ BringUpError::BadReady(_)) if consented => {
             return Err(BringUpError::DestructiveRestartUncertain {
                 cause: Some(Box::new(error)),
             })

@@ -319,6 +319,7 @@ impl SshStep<'_> {
             busy_decision: None,
             destructive_consent: None,
             service_restart_consent: None,
+            frontend_upgrade_consent: None,
             pending_busy_target: None,
             name: "console".into(),
             ssh: ssh::SshParams {
@@ -360,6 +361,7 @@ impl SshStep<'_> {
         let mut decision = None;
         let mut consent = None;
         let mut service_consent = None;
+        let mut upgrade_consent = None;
         let mut pending_target = None;
         let mut selected = None;
         let result = loop {
@@ -371,6 +373,7 @@ impl SshStep<'_> {
             request.busy_decision = decision.take();
             request.destructive_consent = consent.take();
             request.service_restart_consent = service_consent.take();
+            request.frontend_upgrade_consent = upgrade_consent.take();
             request.pending_busy_target = pending_target.clone();
             let result = bringup::bring_up_probed(
                 request,
@@ -416,14 +419,22 @@ impl SshStep<'_> {
                         Some(crate::busy_daemon::RestartConsent::Exact(value)) => {
                             consent = Some(value);
                             service_consent = None;
+                            upgrade_consent = None;
                         }
                         Some(crate::busy_daemon::RestartConsent::Service(value)) => {
                             service_consent = Some(value);
                             consent = None;
+                            upgrade_consent = None;
+                        }
+                        Some(crate::busy_daemon::RestartConsent::FrontendUpgrade(value)) => {
+                            upgrade_consent = Some(value);
+                            consent = None;
+                            service_consent = None;
                         }
                         None => {
                             consent = None;
                             service_consent = None;
+                            upgrade_consent = None;
                         }
                     }
                 }

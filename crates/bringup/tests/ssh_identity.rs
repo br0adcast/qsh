@@ -36,6 +36,7 @@ fn identified_ready_names_the_same_connection_key() {
             busy_decision: None,
             destructive_consent: None,
             service_restart_consent: None,
+            frontend_upgrade_consent: None,
             pending_busy_target: None,
             name: "identity-test".into(),
             ssh: ssh::SshParams {
@@ -100,6 +101,7 @@ fn ready_records_without_exit_status_are_not_success() {
             busy_decision: None,
             destructive_consent: None,
             service_restart_consent: None,
+            frontend_upgrade_consent: None,
             pending_busy_target: None,
             name: "missing-status-test".into(),
             ssh: ssh::SshParams {
@@ -174,6 +176,7 @@ fn busy_cancel_and_unqualified_force_have_no_ssh_or_daemon_effect() {
                 busy_decision: Some(PendingBusy::new(info.clone()).unwrap().decide(choice)),
                 destructive_consent: confirmed.then(|| info.confirm_destructive_restart()),
                 service_restart_consent: None,
+                frontend_upgrade_consent: None,
                 pending_busy_target: None,
                 name: "busy-test".into(),
                 ssh: ssh::SshParams {
@@ -265,6 +268,7 @@ fn service_confirmation_pins_the_observed_ssh_target_key_and_helper() {
         busy_decision: None,
         destructive_consent: None,
         service_restart_consent: None,
+        frontend_upgrade_consent: None,
         pending_busy_target: None,
         name: "service-boundary".into(),
         ssh: ssh::SshParams {
