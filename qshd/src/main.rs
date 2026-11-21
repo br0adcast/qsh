@@ -1693,27 +1693,32 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     let active_count = Arc::new(AtomicUsize::new(0));
     let control_gate = Arc::new(tokio::sync::RwLock::new(()));
     let admission = Arc::new(update::AdmissionGate::default());
-    let identity = update::OwnImage::current()
-        .ok()
-        .map(|own| BusyDaemonIdentity {
-            version: state::QSHD_VERSION.into(),
-            build: own.build,
-            checksum: own.checksum,
-            pid: std::process::id(),
-            generation: Some(hex::encode(qshd::server_info::current().generation)),
-        });
-    let actions = Arc::new(qshd::RestartActions::new(
-        identity,
-        control_gate.clone(),
-        admission.clone(),
-        cfg!(target_os = "linux"),
-    ));
 
     // The same session backend `serve` hands its router: the daemon has no
     // startup session of its own to decide, and no tmux to drive -- it hands
     // out channels, and what to put in them (attaching to an existing tmux
     // session or something else entirely) is the client's decision now.
     let sessions = channel_backend::PersonalSessions::hold(Some(start.cache_dir.clone()));
+    // Whether this daemon is a host is known before its coordinator is
+    // built: the coordinator's identity and every identity answer of the
+    // control server come from one description of the serving frontend.
+    #[cfg(target_os = "linux")]
+    let host_images = sessions.host_images();
+    #[cfg(target_os = "linux")]
+    let hosted = host_images.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let hosted = false;
+    let serving = qshd::server_info::Serving::own(hosted);
+    let identity = serving
+        .identity()
+        .ok()
+        .map(|identity| identity.busy_identity());
+    let actions = Arc::new(qshd::RestartActions::new(
+        identity,
+        control_gate.clone(),
+        admission.clone(),
+        cfg!(target_os = "linux"),
+    ));
     let backend = channel_backend::ChannelSessionBackend::new(Arc::new(
         qshd::screen_budget::ScreenBudget::new(qshd::screen_budget::BudgetLimits::default()),
     ));
@@ -1756,9 +1761,10 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     #[cfg(target_os = "linux")]
     let host_allowlist = qshd::host::HostAllowlist::new(Arc::clone(&shared_allowlist));
     #[cfg(target_os = "linux")]
-    let host = {
+    let host = host_images.map(|images| {
         let keys = signature_keys();
         sessions.host(
+            images,
             daemon.clone(),
             Arc::clone(&active_count),
             qshd::host::HostStart {
@@ -1774,7 +1780,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
                 runtime_threads: None,
             },
         )
-    };
+    });
 
     let runtime =
         tokio::runtime::Runtime::new().context("creating the transport daemon's runtime")?;
@@ -1792,6 +1798,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
                 vec![start.port],
                 active_count,
                 actions,
+                serving,
                 signals.requested(),
             )
             .await;
@@ -1811,6 +1818,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
             active_count,
             actions,
             Some(opens),
+            serving,
             signals.requested(),
         )
         .await;
@@ -2589,6 +2597,7 @@ mod tests {
             }],
             total_connections: 1,
             pid: 42,
+            host: None,
         }
     }
 

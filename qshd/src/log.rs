@@ -749,7 +749,13 @@ mod tests {
         let warning = super::initialization_warning().expect("retained startup diagnostic");
         assert!(warning.contains("untrusted\\nname"), "{warning}");
         assert!(warning.len() <= 1024);
-        let status = crate::transport_daemon::transport_status_response(&[60000], 0, None).unwrap();
+        let status = crate::transport_daemon::transport_status_response(
+            &[60000],
+            0,
+            None,
+            &crate::server_info::Serving::own(false),
+        )
+        .unwrap();
         assert_eq!(status.logging_warning.as_deref(), Some(warning));
     }
 

@@ -255,6 +255,7 @@ async fn assert_owner_teardown_revokes_exec(fatal: bool) {
         Arc::new(AtomicUsize::new(0)),
         actions.control_gate.clone(),
         None,
+        crate::server_info::Serving::own(false),
         stop,
         Some(actions.clone()),
     )

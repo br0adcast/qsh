@@ -287,6 +287,21 @@ pub struct StatusResponse {
     /// in place.
     #[serde(default)]
     pub pid: u32,
+    /// The host process of a hosted daemon (#529), which keeps its own binary
+    /// while `version`, `build` and `checksum` above name the frontend that
+    /// serves. Absent from a daemon that is no host, and from an older one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostIdentity>,
+}
+
+/// The binary a hosted daemon's host process runs, and the revision of the
+/// host-internal contracts it speaks (`state::HOST_REVISION`): what a
+/// candidate frontend must match to serve under this host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostIdentity {
+    pub version: String,
+    pub build: u64,
+    pub revision: u32,
 }
 
 impl StatusResponse {
@@ -1499,6 +1514,11 @@ mod tests {
             }],
             total_connections: 1,
             pid: 4242,
+            host: Some(HostIdentity {
+                version: "0.1.0".into(),
+                build: 41,
+                revision: 1,
+            }),
         };
         let line = resp.to_line().unwrap();
         assert_eq!(StatusResponse::from_line(line.trim_end()).unwrap(), resp);
@@ -1957,6 +1977,7 @@ mod tests {
             ports: vec![],
             total_connections: 0,
             pid,
+            host: None,
         };
         status.to_line().unwrap().trim_end().to_string()
     }

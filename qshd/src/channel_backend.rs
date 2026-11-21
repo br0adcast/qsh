@@ -619,6 +619,14 @@ pub struct PersonalSessions {
     frontend: Arc<crate::host::FrontendControl>,
 }
 
+/// The running image held for a host: see [`PersonalSessions::host_images`].
+#[cfg(target_os = "linux")]
+pub struct HostImages {
+    for_owners: crate::owner_process::SelfImage,
+    for_frontends: crate::owner_process::SelfImage,
+    fleet: Arc<crate::owner_process::OwnerFleet>,
+}
+
 #[cfg(target_os = "linux")]
 impl PersonalSessions {
     /// Called at daemon start: holds this process's own image for the
@@ -656,23 +664,23 @@ impl PersonalSessions {
         })
     }
 
-    /// This daemon as the host of its sessions: their owners speak for
-    /// `daemon`, the router runs in a frontend process started with `start`,
-    /// and `active` is kept as the count of sessions whose client is there.
-    /// `None` if the running image cannot be held: the router then runs in
-    /// this process ([`PersonalSessions::backend`]).
-    pub fn host(
-        &self,
-        daemon: Option<Arc<dyn DaemonUpdates>>,
-        active: Arc<std::sync::atomic::AtomicUsize>,
-        start: crate::host::HostStart,
-    ) -> Option<Arc<crate::host::Host>> {
+    /// What this daemon needs to be the host of its sessions: the running
+    /// image, held once for the owners and once for the frontends. `None` if
+    /// it cannot be held: the router then runs in this process
+    /// ([`PersonalSessions::backend`]). Asked before [`PersonalSessions::host`]
+    /// so that a daemon knows whether it is a host before it builds what the
+    /// host is then given.
+    pub fn host_images(&self) -> Option<HostImages> {
         let (image, fleet) = self.owners.as_ref()?;
         let images = image
             .try_clone()
             .and_then(|a| image.try_clone().map(|b| (a, b)));
-        let (for_owners, for_frontends) = match images {
-            Ok(images) => images,
+        match images {
+            Ok((for_owners, for_frontends)) => Some(HostImages {
+                for_owners,
+                for_frontends,
+                fleet: fleet.clone(),
+            }),
             Err(error) => {
                 crate::log::warn(
                     "qshd",
@@ -680,9 +688,27 @@ impl PersonalSessions {
                         "cannot hold the running image ({error}); sessions run in this process"
                     ),
                 );
-                return None;
+                None
             }
-        };
+        }
+    }
+
+    /// This daemon as the host of its sessions, from `images`: their owners
+    /// speak for `daemon`, the router runs in a frontend process started
+    /// with `start`, and `active` is kept as the count of sessions whose
+    /// client is there.
+    pub fn host(
+        &self,
+        images: HostImages,
+        daemon: Option<Arc<dyn DaemonUpdates>>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        start: crate::host::HostStart,
+    ) -> Arc<crate::host::Host> {
+        let HostImages {
+            for_owners,
+            for_frontends,
+            fleet,
+        } = images;
         let catalog = crate::host::Catalog::new(active);
         let ended = {
             let catalog = catalog.clone();
@@ -699,17 +725,11 @@ impl PersonalSessions {
             for_owners,
             self.log_dir.clone(),
             daemon,
-            fleet.clone(),
+            fleet,
             self.services.clone(),
         )
         .on_ended(ended);
-        Some(crate::host::Host::new(
-            for_frontends,
-            owners,
-            catalog,
-            self.frontend.clone(),
-            start,
-        ))
+        crate::host::Host::new(for_frontends, owners, catalog, self.frontend.clone(), start)
     }
 
     /// The backend a router in this process runs every session with, when

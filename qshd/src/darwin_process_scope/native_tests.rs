@@ -4732,7 +4732,12 @@ fn rename_proof_actor() {
                 }
             }
             gate_remaining(end)?;
-            match crate::transport_daemon::transport_status_response(&[], 0, None) {
+            match crate::transport_daemon::transport_status_response(
+                &[],
+                0,
+                None,
+                &crate::server_info::Serving::own(false),
+            ) {
                 Ok(value) => {
                     record.status_result = "ok".into();
                     record.status_checksum_matches = Some(value.checksum == sha);

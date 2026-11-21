@@ -200,6 +200,7 @@ async fn stop_with_held_cleanup(replace: bool, signal: bool, fail: bool, pressur
                 Arc::new(AtomicUsize::new(0)),
                 gate,
                 None,
+                crate::server_info::Serving::own(false),
                 stop,
                 None,
             )
@@ -815,6 +816,7 @@ fn spawn_control_fixture(
             Arc::new(AtomicUsize::new(0)),
             gate,
             None,
+            crate::server_info::Serving::own(false),
             stop,
             Some(actions),
         )
@@ -944,6 +946,7 @@ fn spawn_accept_fixture(
             Arc::new(AtomicUsize::new(0)),
             gate,
             None,
+            crate::server_info::Serving::own(false),
             stop,
             None,
         )

@@ -48,6 +48,7 @@ fn fake_daemon_process() {
                 ports: vec![],
                 total_connections: 0,
                 pid: std::process::id(),
+                host: None,
             }
             .to_line()
             .unwrap()
