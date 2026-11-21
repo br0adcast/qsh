@@ -143,7 +143,7 @@ fn busy_cancel_and_unqualified_force_have_no_ssh_or_daemon_effect() {
         ..Default::default()
     });
     let info = BusyDaemonInfo {
-        schema: 2,
+        schema: 3,
         attempt: BusyAttemptId::from_bytes([1; 16]),
         identity: BusyDaemonIdentity {
             version: "0.5.9".into(),
@@ -157,9 +157,11 @@ fn busy_cancel_and_unqualified_force_have_no_ssh_or_daemon_effect() {
             checksum: "ef".repeat(32),
         },
         active_connections: 2,
+        sessions: 2,
         serving_profiles: None,
         preservation: PreservationCapability::Unknown,
         service_restart: None,
+        upgrade: None,
     };
     for (choice, confirmed) in [
         (BusyChoice::Cancel, false),
@@ -241,10 +243,10 @@ fn service_confirmation_pins_the_observed_ssh_target_key_and_helper() {
                     return format!("TRANSPORT-RESTART-FAILED {{\"attempt\":\"{attempt}\",\"disposition\":\"uncertain\"}}\n").into_bytes();
                 }
                 return format!("TRANSPORT-BUSY {}\n", serde_json::json!({
-                    "schema":2,"attempt":attempt,
+                    "schema":3,"attempt":attempt,
                     "identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},
                     "candidate":{"build":2,"checksum":"ef".repeat(32)},
-                    "active_connections":2,"serving_profiles":null,"preservation":"unknown",
+                    "active_connections":2,"sessions":2,"serving_profiles":null,"preservation":"unknown",
                     "service_restart":{"profile":"personal_transport_v1","uid":1000,"endpoint":"/fixture/cache/qsh/control.sock","port":60022}
                 })).into_bytes();
             }

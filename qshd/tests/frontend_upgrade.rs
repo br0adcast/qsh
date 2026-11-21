@@ -22,8 +22,9 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
 use daemon_bootstrap_protocol::{
-    BusyAttemptId, BusyDaemonIdentity, CandidateImageIdentity, FrontendUpgradeAction,
-    FrontendUpgradeConsent, UpgradeCase,
+    BusyAttemptId, BusyChoice, BusyDaemonIdentity, BusyDaemonInfo, CandidateImageIdentity,
+    FrontendUpgradeAction, FrontendUpgradeConsent, FrontendUpgradeOffer, PendingBusy,
+    PreservationCapability, UpgradeCase,
 };
 use qshd::control::{client_request_with_timeout, ControlReply, ControlRequest};
 use qshd::frontend_upgrade::{
@@ -982,5 +983,414 @@ fn a_reused_or_replaced_receipt_is_refused() {
     ));
     assert_eq!(daemon.commit(second), unknown, "used");
     assert_eq!(daemon.commit([7; 16]), unknown, "never issued");
+    daemon.finish();
+}
+
+// ---- `transport-ensure` from the newer image ------------------------------------
+
+/// What one `transport-ensure` run printed.
+struct Ensured {
+    ok: bool,
+    stdout: String,
+    stderr: String,
+}
+
+impl Ensured {
+    /// The one `TRANSPORT-READY` body: there must be exactly one, and no
+    /// `TRANSPORT-BUSY`.
+    fn ready(&self) -> serde_json::Value {
+        assert!(
+            self.ok,
+            "transport-ensure failed: {} {}",
+            self.stdout, self.stderr
+        );
+        let ready: Vec<_> = self
+            .stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("TRANSPORT-READY "))
+            .collect();
+        assert_eq!(ready.len(), 1, "one TRANSPORT-READY: {}", self.stdout);
+        assert!(!self.stdout.contains("TRANSPORT-BUSY"), "{}", self.stdout);
+        serde_json::from_str(ready[0]).expect("a TRANSPORT-READY body")
+    }
+
+    /// The `TRANSPORT-BUSY` record: the only line, no readiness.
+    fn busy(&self) -> BusyDaemonInfo {
+        assert!(
+            self.ok,
+            "transport-ensure failed: {} {}",
+            self.stdout, self.stderr
+        );
+        assert!(!self.stdout.contains("TRANSPORT-READY"), "{}", self.stdout);
+        let line = self
+            .stdout
+            .trim()
+            .strip_prefix("TRANSPORT-BUSY ")
+            .unwrap_or_else(|| panic!("a TRANSPORT-BUSY line: {}", self.stdout));
+        serde_json::from_str(line).expect("a valid schema 3 record")
+    }
+}
+
+const ATTEMPT: [u8; 16] = [0x5a; 16];
+
+/// Runs `transport-ensure` from `image` as a login of the client whose
+/// static key is `client` would: the same account, port and cache as the
+/// daemon, with `extra` arguments.
+fn ensure_from(
+    daemon: &Upgradable,
+    image: &Image,
+    labels: &str,
+    client: &[u8; 32],
+    extra: &[&str],
+) -> Ensured {
+    let port = daemon.port.to_string();
+    let key = BASE64.encode(client);
+    let mut args = vec![
+        "transport-ensure",
+        "--name",
+        "frontend-upgrade",
+        "--port",
+        &port,
+        "--client-pubkey",
+        &key,
+    ];
+    args.extend(extra);
+    let home = daemon.home.path();
+    let output = Command::new(&image.path)
+        .args(&args)
+        .env("XDG_CACHE_HOME", home)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home)
+        .env(MARK_ENV, &daemon.mark)
+        .env("HISTFILE", "/dev/null")
+        .env("SHELL", "/bin/sh")
+        .env("TMUX_TMPDIR", home)
+        .env_remove("TMUX")
+        .env_remove("ENV")
+        .env_remove("BASH_ENV")
+        .env(TEST_BUILD_LABELS_ENV, labels)
+        .env_remove(TEST_IMAGE_FAULTS_ENV)
+        .stdin(Stdio::null())
+        .output()
+        .expect("`qshd transport-ensure` runs");
+    Ensured {
+        ok: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+fn report_busy() -> Vec<String> {
+    vec![
+        "--report-busy".into(),
+        "--busy-attempt".into(),
+        BusyAttemptId::from_bytes(ATTEMPT).as_str().into(),
+    ]
+}
+
+fn strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+impl Upgradable {
+    /// A client with `private` as its static key reaches the daemon, which
+    /// therefore registered it.
+    fn admits(&self, private: [u8; 32], token: [u8; 16]) {
+        let session = Session::start(
+            self.port,
+            self.server_pub,
+            Proof::Allowlisted(private),
+            token,
+            StartKind::Cold,
+        )
+        .unwrap_or_else(|| panic!("the registered client is admitted; log: {}", self.log()));
+        session.client.close();
+    }
+
+    /// The frontend serving is `frontend`, A's, and STATUS says A.
+    fn still_a(&self, images: &Images, frontend: u32) {
+        assert_eq!(
+            frontends_of(self.host),
+            [frontend],
+            "A's frontend serves on"
+        );
+        assert!(runs(frontend, &images.a));
+        let status = status(&self.sock).expect("STATUS");
+        assert_eq!(
+            (status.build, status.checksum.as_str(), status.pid),
+            (images.a.build, images.a.checksum.as_str(), self.host)
+        );
+    }
+
+    /// B's frontend serves under the same host, and STATUS says B.
+    fn serves_b(&self, b: &Image, old: u32) {
+        let next = frontend_after(self.host, old);
+        assert!(runs(next, b), "the new frontend runs B: {}", exe_of(next));
+        let status = status(&self.sock).expect("STATUS");
+        assert_eq!(
+            (status.build, status.checksum.as_str(), status.pid),
+            (b.build, b.checksum.as_str(), self.host)
+        );
+    }
+}
+
+/// Nobody else is attached: B's login replaces the frontend silently,
+/// registers its client with B's frontend, and reports ready once; the
+/// session kept from before answers from the same shell.
+#[test]
+fn ensure_with_no_other_client_upgrades_silently_and_reports_ready() {
+    let _serial = serialised();
+    let images = images();
+    let b = images.newer("qshd-b", b"\0upgrade-b\0", images.a.build + 1);
+    let labels = labels(&[&b]);
+    let daemon = start(&images, &labels, "");
+    let token = [101; 16];
+    let (shell, owner) = retained_shell(&daemon, token, "kept-101");
+    let old = frontend_of(daemon.host);
+    let client = generate_keypair();
+
+    let ensured = ensure_from(&daemon, &b, &labels, &client.public, &[]);
+    let ready = ensured.ready();
+    assert_eq!(
+        ready["warning"],
+        serde_json::Value::Null,
+        "{}",
+        ensured.stdout
+    );
+    daemon.serves_b(&b, old);
+    let status = status(&daemon.sock).unwrap();
+    assert_eq!(ready["version"], status.version.as_str(), "B's version");
+    assert_eq!(ready["ports"], serde_json::json!([daemon.port]));
+    assert!(reaped(old), "the old frontend is reaped");
+
+    daemon.admits(client.private, [102; 16]);
+    let back = daemon.come_back(token);
+    assert_eq!(back.same_shell("kept-101"), shell, "the same shell answers");
+    assert_eq!(ppid(shell), Some(owner));
+    no_session_ended(&daemon, owner);
+    back.client.close();
+    daemon.finish();
+}
+
+/// Another client is attached: a login that can ask reports a soft offer,
+/// bound to the serving frontend and to B, and changes nothing.
+#[test]
+fn ensure_with_another_client_reports_busy_with_a_soft_offer() {
+    let _serial = serialised();
+    let images = images();
+    let b = images.newer("qshd-b", b"\0upgrade-b\0", images.a.build + 1);
+    let labels = labels(&[&b]);
+    let daemon = start(&images, &labels, "");
+    let (shell, _) = retained_shell(&daemon, [103; 16], "kept-103");
+    let other = daemon.connect([104; 16]);
+    daemon.attached(1);
+    let frontend = frontend_of(daemon.host);
+
+    let info = ensure_from(
+        &daemon,
+        &b,
+        &labels,
+        &generate_keypair().public,
+        &strs(&report_busy()),
+    )
+    .busy();
+    assert_eq!(info.schema, 3);
+    assert_eq!(info.attempt, BusyAttemptId::from_bytes(ATTEMPT));
+    assert_eq!(info.identity, daemon.identity());
+    assert_eq!(
+        info.candidate,
+        CandidateImageIdentity {
+            build: b.build,
+            checksum: b.checksum.clone()
+        }
+    );
+    assert_eq!(info.preservation, PreservationCapability::PreservesSessions);
+    assert_eq!(
+        info.upgrade,
+        Some(FrontendUpgradeOffer {
+            case: UpgradeCase::Soft,
+            attached: 1,
+            sessions: 1,
+            stranded: 0
+        })
+    );
+    assert_eq!((info.active_connections, info.sessions), (1, 1));
+    assert!(info.service_restart.is_none());
+    daemon.still_a(&images, frontend);
+    assert!(running(shell));
+    other.client.close();
+    daemon.finish();
+}
+
+/// The user agrees to the soft offer: the rerun with the force decision and
+/// the frontend-upgrade consent replaces the frontend and reports ready.
+#[test]
+fn ensure_with_soft_consent_upgrades() {
+    let _serial = serialised();
+    let images = images();
+    let b = images.newer("qshd-b", b"\0upgrade-b\0", images.a.build + 1);
+    let labels = labels(&[&b]);
+    let daemon = start(&images, &labels, "");
+    let token = [105; 16];
+    let (shell, owner) = retained_shell(&daemon, token, "kept-105");
+    let other = daemon.connect([106; 16]);
+    daemon.attached(1);
+    let old = frontend_of(daemon.host);
+    let client = generate_keypair();
+
+    let info = ensure_from(&daemon, &b, &labels, &client.public, &strs(&report_busy())).busy();
+    let consent = info.confirm_frontend_upgrade().expect("an upgrade offer");
+    assert_eq!(consent.case, UpgradeCase::Soft);
+    let decision = PendingBusy::new(info)
+        .expect("a valid record")
+        .decide(BusyChoice::ForceUpdate);
+    let mut args = report_busy();
+    args.extend([
+        "--busy-decision".into(),
+        serde_json::to_string(&decision).unwrap(),
+        "--frontend-upgrade-consent".into(),
+        serde_json::to_string(&consent).unwrap(),
+    ]);
+    let ensured = ensure_from(&daemon, &b, &labels, &client.public, &strs(&args));
+    let ready = ensured.ready();
+    assert_eq!(
+        ready["warning"],
+        serde_json::Value::Null,
+        "{}",
+        ensured.stdout
+    );
+    daemon.serves_b(&b, old);
+    daemon.admits(client.private, [107; 16]);
+
+    other.client.detach();
+    let back = daemon.come_back(token);
+    assert_eq!(back.same_shell("kept-105"), shell);
+    no_session_ended(&daemon, owner);
+    back.client.close();
+    daemon.finish();
+}
+
+/// A login that cannot ask (no `--report-busy`) never disconnects the other
+/// client: it registers with A's frontend and says why it kept it.
+#[test]
+fn ensure_without_report_busy_keeps_the_old_daemon_and_warns() {
+    let _serial = serialised();
+    let images = images();
+    let b = images.newer("qshd-b", b"\0upgrade-b\0", images.a.build + 1);
+    let labels = labels(&[&b]);
+    let daemon = start(&images, &labels, "");
+    let (shell, _) = retained_shell(&daemon, [108; 16], "kept-108");
+    let other = daemon.connect([109; 16]);
+    daemon.attached(1);
+    let frontend = frontend_of(daemon.host);
+    let before = daemon.identity();
+    let client = generate_keypair();
+
+    let ready = ensure_from(&daemon, &b, &labels, &client.public, &[]).ready();
+    let warning = ready["warning"].as_str().expect("a warning");
+    assert!(warning.contains("1 other client(s)"), "{warning}");
+    daemon.still_a(&images, frontend);
+    assert_eq!(daemon.identity(), before);
+    daemon.attached(1);
+    daemon.admits(client.private, [110; 16]);
+    assert!(running(shell));
+    other.client.close();
+    daemon.finish();
+}
+
+/// B cannot be this host's frontend, and the daemon keeps a session whose
+/// client let go. Before M2 that was a silent STOP that lost it. Now a
+/// login that cannot ask keeps the daemon and warns, and one that can is
+/// asked about the destructive restart, which names the retained session.
+#[test]
+fn ensure_against_an_incompatible_host_with_only_retained_sessions_asks_destructive() {
+    let _serial = serialised();
+    let images = images();
+    let b = images.newer("qshd-b", b"\0upgrade-b\0", images.a.build + 1);
+    let labels = labels(&[&b]);
+    let daemon = start(&images, &labels, &format!("{}=host-revision=2", b.checksum));
+    let (shell, owner) = retained_shell(&daemon, [111; 16], "kept-111");
+    let frontend = frontend_of(daemon.host);
+
+    let ready = ensure_from(&daemon, &b, &labels, &generate_keypair().public, &[]).ready();
+    let warning = ready["warning"].as_str().expect("a warning");
+    assert!(warning.contains("1 session(s)"), "{warning}");
+    daemon.still_a(&images, frontend);
+
+    let info = ensure_from(
+        &daemon,
+        &b,
+        &labels,
+        &generate_keypair().public,
+        &strs(&report_busy()),
+    )
+    .busy();
+    assert_eq!((info.active_connections, info.sessions), (0, 1));
+    assert_eq!(info.preservation, PreservationCapability::Unknown);
+    assert_eq!(info.upgrade, None);
+    assert_eq!(info.identity, daemon.identity());
+    daemon.still_a(&images, frontend);
+    assert!(running(shell) && running(owner), "the session is kept");
+    no_session_ended(&daemon, owner);
+    daemon.finish();
+}
+
+/// B cannot be this host's frontend, and there is no session to lose: the
+/// login restarts the daemon from B without asking, as before M2.
+#[test]
+fn ensure_against_an_incompatible_host_without_sessions_restarts_silently() {
+    let _serial = serialised();
+    let images = images();
+    let b = images.newer("qshd-b", b"\0upgrade-b\0", images.a.build + 1);
+    let labels = labels(&[&b]);
+    let daemon = start(&images, &labels, &format!("{}=host-revision=2", b.checksum));
+    let old_host = daemon.host;
+
+    let ready = ensure_from(
+        &daemon,
+        &b,
+        &labels,
+        &generate_keypair().public,
+        &strs(&report_busy()),
+    )
+    .ready();
+    assert_eq!(ready["warning"], serde_json::Value::Null);
+    let status = status(&daemon.sock).expect("the new daemon answers");
+    assert_ne!(status.pid, old_host, "a new daemon");
+    assert!(runs(status.pid, &b), "it runs B: {}", exe_of(status.pid));
+    assert_eq!(
+        (status.build, status.checksum.as_str()),
+        (b.build, b.checksum.as_str())
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || reaped(old_host)),
+        "the old daemon is gone"
+    );
+    assert_eq!(daemon.guard.finish(), Finished::Stopped);
+}
+
+/// B's frontend exits before it reports ready: the daemon rolls back to A,
+/// and the login registers its client with A's frontend and warns.
+#[test]
+fn ensure_after_a_rollback_registers_with_the_old_daemon_and_warns() {
+    let _serial = serialised();
+    let images = images();
+    let b = images.newer("qshd-b", b"\0upgrade-b\0", images.a.build + 1);
+    let labels = labels(&[&b]);
+    let daemon = start(&images, &labels, &format!("{}=frontend-exit", b.checksum));
+    let token = [112; 16];
+    let (shell, owner) = retained_shell(&daemon, token, "kept-112");
+    let before = daemon.identity();
+    let client = generate_keypair();
+
+    let ready = ensure_from(&daemon, &b, &labels, &client.public, &[]).ready();
+    let warning = ready["warning"].as_str().expect("a warning");
+    assert!(warning.contains("did not start"), "{warning}");
+    rolled_back_to_a(&daemon, &images, &before);
+    daemon.admits(client.private, [113; 16]);
+    let back = daemon.come_back(token);
+    assert_eq!(back.same_shell("kept-112"), shell);
+    no_session_ended(&daemon, owner);
+    back.client.close();
     daemon.finish();
 }

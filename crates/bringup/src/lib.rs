@@ -20,9 +20,10 @@ mod trust;
 
 pub use daemon_bootstrap_protocol::{
     BusyAttemptId, BusyChoice, BusyDaemonIdentity, BusyDaemonInfo, BusyDecision,
-    CandidateImageIdentity, DestructiveRestartAction, DestructiveRestartConsent, PendingBusy,
+    CandidateImageIdentity, DestructiveRestartAction, DestructiveRestartConsent,
+    FrontendUpgradeAction, FrontendUpgradeConsent, FrontendUpgradeOffer, PendingBusy,
     PersonalServiceProfile, PersonalServiceSelector, PreservationCapability, ServiceRestartAction,
-    ServiceRestartConsent,
+    ServiceRestartConsent, UpgradeCase,
 };
 
 pub use image::{

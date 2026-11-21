@@ -75,6 +75,7 @@ pub mod control;
 mod darwin_process_scope;
 mod destructive_restart;
 mod endpoint;
+pub mod ensure_upgrade;
 pub mod service_restart;
 #[doc(hidden)]
 pub mod service_stage;

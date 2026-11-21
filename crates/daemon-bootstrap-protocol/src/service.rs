@@ -77,7 +77,6 @@ pub struct ServiceRestartConsent {
 impl ServiceRestartConsent {
     pub fn matches(&self, info: &crate::BusyDaemonInfo) -> bool {
         info.valid()
-            && info.schema == 2
             && self.attempt == info.attempt
             && Some(&self.service) == info.service_restart.as_ref()
             && self.candidate == info.candidate

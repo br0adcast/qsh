@@ -234,7 +234,7 @@ mod tests {
     }
 
     fn busy_json() -> serde_json::Value {
-        serde_json::json!({"schema":2,"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"active_connections":2,"serving_profiles":null,"preservation":"unknown"})
+        serde_json::json!({"schema":3,"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"active_connections":2,"sessions":2,"serving_profiles":null,"preservation":"unknown"})
     }
 
     #[test]
@@ -318,7 +318,7 @@ mod tests {
         let Err(BringUpError::BusyDaemon(info)) = parse(0, &record) else {
             panic!("expected typed Busy");
         };
-        assert_eq!(info.schema, 2);
+        assert_eq!(info.schema, 3);
         assert_eq!(info.identity.version, "0.5.0");
         assert_eq!(info.active_connections, 2);
         assert_eq!(info.serving_profiles, None);
@@ -342,8 +342,8 @@ mod tests {
             assert!(matches!(parse(0, &output), Err(BringUpError::BadReady(_))));
         }
         for (field, value) in [
-            ("schema", serde_json::json!(1)),
-            ("active_connections", serde_json::json!(0)),
+            ("schema", serde_json::json!(2)),
+            ("sessions", serde_json::json!(null)),
             ("attempt", serde_json::json!("")),
         ] {
             let mut json = busy_json();
@@ -353,6 +353,14 @@ mod tests {
                 Err(BringUpError::BadReady(_))
             ));
         }
+        // Neither a client nor a session: no busy daemon.
+        let mut json = busy_json();
+        json["active_connections"] = 0.into();
+        json["sessions"] = 0.into();
+        assert!(matches!(
+            parse(0, &format!("TRANSPORT-BUSY {json}")),
+            Err(BringUpError::BadReady(_))
+        ));
         for version in ["x".repeat(129), "bad\nversion".into()] {
             let mut json = busy_json();
             json["identity"]["version"] = version.into();

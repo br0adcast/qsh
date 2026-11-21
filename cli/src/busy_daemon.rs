@@ -109,7 +109,7 @@ mod tests {
     use super::*;
     fn info() -> bringup::BusyDaemonInfo {
         bringup::BusyDaemonInfo {
-            schema: 2,
+            schema: 3,
             attempt: bringup::BusyAttemptId::from_bytes([1; 16]),
             identity: bringup::BusyDaemonIdentity {
                 version: "0.5.9".into(),
@@ -123,15 +123,17 @@ mod tests {
                 checksum: "ef".repeat(32),
             },
             active_connections: 2,
+            sessions: 2,
             serving_profiles: None,
             preservation: bringup::PreservationCapability::Unknown,
             service_restart: None,
+            upgrade: None,
         }
     }
     #[test]
     fn service_confirmation_survives_instance_change_but_not_selector_change() {
         let mut live = info();
-        live.schema = 2;
+        live.schema = 3;
         live.service_restart = Some(bringup::PersonalServiceSelector {
             profile: bringup::PersonalServiceProfile::PersonalTransportV1,
             uid: 1000,
@@ -158,7 +160,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         for (input, expected) in [(&b"3\n2\n"[..], true), (&b"3\n\n"[..], false)] {
             let mut live = info();
-            live.schema = 2;
+            live.schema = 3;
             live.service_restart = Some(bringup::PersonalServiceSelector {
                 profile: bringup::PersonalServiceProfile::PersonalTransportV1,
                 uid: 1000,

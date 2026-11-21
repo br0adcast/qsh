@@ -153,6 +153,37 @@ pub enum BusyChoice {
 pub enum PreservationCapability {
     Unknown,
     Unsupported,
+    /// A hosted daemon (#529 M2) can take the candidate by replacing only
+    /// its network frontend, which keeps every session: the record's
+    /// `upgrade` says what that costs.
+    PreservesSessions,
+}
+
+/// What replacing a hosted daemon's frontend with the candidate costs, as
+/// the daemon worked it out: `attached` clients are disconnected briefly,
+/// and in the `Unreachable` case `stranded` of the `sessions` sessions have
+/// clients the candidate cannot serve, which cannot reach them until they
+/// expire. In the `Soft` case the daemon counts only the attached
+/// sessions, all of which are kept, so `sessions` is `attached` there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendUpgradeOffer {
+    pub case: UpgradeCase,
+    pub attached: u64,
+    pub sessions: u64,
+    pub stranded: u64,
+}
+impl FrontendUpgradeOffer {
+    /// Counts that fit the case: a soft case disconnects somebody and
+    /// strands nobody, an unreachable one strands at least one session.
+    pub fn valid(&self) -> bool {
+        self.attached <= self.sessions
+            && self.stranded <= self.sessions
+            && match self.case {
+                UpgradeCase::Soft => self.attached > 0 && self.stranded == 0,
+                UpgradeCase::Unreachable => self.stranded > 0,
+            }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -162,12 +193,20 @@ pub struct BusyDaemonInfo {
     pub attempt: BusyAttemptId,
     pub identity: BusyDaemonIdentity,
     pub candidate: CandidateImageIdentity,
+    /// Sessions with a client attached (`STATUS.total_connections`).
     pub active_connections: u64,
+    /// Every session the daemon is known to keep, attached or retained. A
+    /// daemon without a host does not say, and counts its attached ones.
+    pub sessions: u64,
     /// Complete [wire, handshake, channel] profiles; None means unknown.
     pub serving_profiles: Option<Vec<[u8; 3]>>,
     pub preservation: PreservationCapability,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_restart: Option<PersonalServiceSelector>,
+    /// The frontend replacement offered instead of a restart, exactly when
+    /// `preservation` is [`PreservationCapability::PreservesSessions`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<FrontendUpgradeOffer>,
 }
 impl<'de> Deserialize<'de> for BusyDaemonInfo {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -179,9 +218,11 @@ impl<'de> Deserialize<'de> for BusyDaemonInfo {
             identity: BusyDaemonIdentity,
             candidate: CandidateImageIdentity,
             active_connections: u64,
+            sessions: u64,
             serving_profiles: Option<Vec<[u8; 3]>>,
             preservation: PreservationCapability,
             service_restart: Option<PersonalServiceSelector>,
+            upgrade: Option<FrontendUpgradeOffer>,
         }
         let fields = Fields::deserialize(deserializer)?;
         let value = Self {
@@ -190,9 +231,11 @@ impl<'de> Deserialize<'de> for BusyDaemonInfo {
             identity: fields.identity,
             candidate: fields.candidate,
             active_connections: fields.active_connections,
+            sessions: fields.sessions,
             serving_profiles: fields.serving_profiles,
             preservation: fields.preservation,
             service_restart: fields.service_restart,
+            upgrade: fields.upgrade,
         };
         if value.valid() {
             Ok(value)
@@ -203,16 +246,39 @@ impl<'de> Deserialize<'de> for BusyDaemonInfo {
 }
 
 impl BusyDaemonInfo {
+    /// Schema 3 (#529 M2): a daemon with retained sessions and no attached
+    /// client is busy too, and a frontend replacement is offered exactly
+    /// when the daemon can keep its sessions, with the counts the record
+    /// itself names.
     pub fn valid(&self) -> bool {
-        self.schema == 2
+        self.schema == 3
             && self
                 .service_restart
                 .as_ref()
                 .is_none_or(PersonalServiceSelector::valid)
             && self.identity.valid()
             && self.candidate.valid()
-            && self.active_connections > 0
+            && (self.active_connections > 0 || self.sessions > 0)
             && self.serving_profiles.as_ref().is_none_or(|p| p.len() <= 16)
+            && (self.preservation == PreservationCapability::PreservesSessions)
+                == self.upgrade.is_some()
+            && self.upgrade.as_ref().is_none_or(|offer| {
+                offer.valid()
+                    && offer.attached == self.active_connections
+                    && offer.sessions == self.sessions
+            })
+    }
+    /// The user's agreement to the frontend replacement this record offers,
+    /// if it offers one.
+    pub fn confirm_frontend_upgrade(&self) -> Option<FrontendUpgradeConsent> {
+        self.valid().then_some(())?;
+        Some(FrontendUpgradeConsent {
+            attempt: self.attempt.clone(),
+            identity: self.identity.clone(),
+            candidate: self.candidate.clone(),
+            case: self.upgrade.as_ref()?.case,
+            action: FrontendUpgradeAction::ReplaceFrontend,
+        })
     }
     pub fn confirm_service_restart(&self) -> Option<ServiceRestartConsent> {
         self.valid().then_some(())?;
@@ -420,6 +486,19 @@ impl<'de> Deserialize<'de> for FrontendUpgradeConsent {
     }
 }
 
+impl FrontendUpgradeConsent {
+    /// Whether this consent answers exactly `info`'s offer: the same
+    /// attempt, serving frontend and candidate, and the case offered.
+    pub fn matches(&self, info: &BusyDaemonInfo) -> bool {
+        info.valid()
+            && self.attempt == info.attempt
+            && self.identity == info.identity
+            && self.candidate == info.candidate
+            && info.upgrade.as_ref().map(|offer| offer.case) == Some(self.case)
+            && self.action == FrontendUpgradeAction::ReplaceFrontend
+    }
+}
+
 /// A failed explicit destructive operation never becomes readiness. The
 /// attempt binds this terminal result to the pending authenticated SSH call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,7 +519,7 @@ mod tests {
     use super::*;
     fn info() -> BusyDaemonInfo {
         BusyDaemonInfo {
-            schema: 2,
+            schema: 3,
             attempt: BusyAttemptId::from_bytes([18; 16]),
             identity: BusyDaemonIdentity {
                 version: "0.5.9".into(),
@@ -454,17 +533,19 @@ mod tests {
                 checksum: "ef".repeat(32),
             },
             active_connections: 2,
+            sessions: 2,
             serving_profiles: Some(vec![[2, 1, 1]]),
             preservation: PreservationCapability::Unknown,
             service_restart: None,
+            upgrade: None,
         }
     }
     #[test]
-    fn service_offer_requires_schema2_and_explicit_personal_selector() {
+    fn service_offer_requires_the_schema_and_explicit_personal_selector() {
         let modern = serde_json::to_value(info()).unwrap();
         assert!(modern.get("service_restart").is_none());
         let mut offered = modern.clone();
-        offered["schema"] = 2.into();
+        offered["schema"] = 3.into();
         offered["identity"]
             .as_object_mut()
             .unwrap()
@@ -474,7 +555,7 @@ mod tests {
             "endpoint":"/fixture/cache/qsh/control.sock", "port":60022
         });
         let live: BusyDaemonInfo = serde_json::from_value(offered.clone())
-            .expect("explicit schema2 personal-service offer");
+            .expect("explicit schema 3 personal-service offer");
         assert_eq!(serde_json::to_value(live).unwrap(), offered);
         let mut invalid = offered.clone();
         invalid["schema"] = 1.into();
@@ -569,8 +650,8 @@ mod tests {
             live
         );
         for (field, invalid) in [
-            ("schema", serde_json::json!(1)),
-            ("active_connections", serde_json::json!(0)),
+            ("schema", serde_json::json!(2)),
+            ("sessions", serde_json::json!(null)),
             ("serving_profiles", serde_json::json!(vec![[2, 1, 1]; 17])),
             ("unexpected", serde_json::json!(true)),
         ] {
@@ -635,6 +716,161 @@ mod tests {
             );
         }
     }
+    /// The offer of a soft frontend replacement for `info()`.
+    fn offered() -> BusyDaemonInfo {
+        BusyDaemonInfo {
+            preservation: PreservationCapability::PreservesSessions,
+            upgrade: Some(FrontendUpgradeOffer {
+                case: UpgradeCase::Soft,
+                attached: 2,
+                sessions: 2,
+                stranded: 0,
+            }),
+            ..info()
+        }
+    }
+
+    #[test]
+    fn schema_3_busy_info_allows_retained_only_sessions() {
+        let encoded = serde_json::to_value(info()).unwrap();
+        assert_eq!(encoded["schema"], 3);
+        assert_eq!(encoded["sessions"], 2);
+        assert!(encoded.get("upgrade").is_none(), "no offer, no field");
+
+        // Sessions without an attached client still need a choice.
+        let mut retained = encoded.clone();
+        retained["active_connections"] = 0.into();
+        retained["sessions"] = 1.into();
+        let live: BusyDaemonInfo =
+            serde_json::from_value(retained.clone()).expect("retained-only sessions");
+        assert_eq!((live.active_connections, live.sessions), (0, 1));
+        assert_eq!(serde_json::to_value(&live).unwrap(), retained);
+
+        // Nothing to lose is no busy daemon.
+        let mut idle = retained.clone();
+        idle["sessions"] = 0.into();
+        assert!(serde_json::from_value::<BusyDaemonInfo>(idle).is_err());
+        // The schema 2 record, with or without the new field, is refused.
+        let mut old = encoded.clone();
+        old["schema"] = 2.into();
+        assert!(serde_json::from_value::<BusyDaemonInfo>(old.clone()).is_err());
+        old.as_object_mut().unwrap().remove("sessions");
+        assert!(serde_json::from_value::<BusyDaemonInfo>(old).is_err());
+        let mut missing = encoded;
+        missing.as_object_mut().unwrap().remove("sessions");
+        assert!(
+            serde_json::from_value::<BusyDaemonInfo>(missing).is_err(),
+            "schema 3 always says how many sessions"
+        );
+    }
+
+    #[test]
+    fn preservation_and_upgrade_offer_go_together() {
+        let live = offered();
+        assert!(live.valid());
+        let encoded = serde_json::to_value(&live).unwrap();
+        assert_eq!(encoded["preservation"], "preserves_sessions");
+        assert_eq!(
+            encoded["upgrade"],
+            serde_json::json!({"case":"soft","attached":2,"sessions":2,"stranded":0})
+        );
+        assert_eq!(
+            serde_json::from_value::<BusyDaemonInfo>(encoded.clone()).unwrap(),
+            live
+        );
+
+        // Either one alone is refused.
+        let mut alone = encoded.clone();
+        alone.as_object_mut().unwrap().remove("upgrade");
+        assert!(serde_json::from_value::<BusyDaemonInfo>(alone).is_err());
+        let mut alone = encoded.clone();
+        alone["preservation"] = "unknown".into();
+        assert!(serde_json::from_value::<BusyDaemonInfo>(alone).is_err());
+
+        // The offer's counts are the record's, and fit its case.
+        for (field, value) in [
+            ("attached", 1),
+            ("sessions", 3),
+            ("stranded", 1),
+            ("unknown", 1),
+        ] {
+            let mut invalid = encoded.clone();
+            invalid["upgrade"][field] = value.into();
+            assert!(
+                serde_json::from_value::<BusyDaemonInfo>(invalid).is_err(),
+                "{field}"
+            );
+        }
+        let mut unreachable = live.clone();
+        unreachable.active_connections = 0;
+        unreachable.sessions = 3;
+        unreachable.upgrade = Some(FrontendUpgradeOffer {
+            case: UpgradeCase::Unreachable,
+            attached: 0,
+            sessions: 3,
+            stranded: 2,
+        });
+        assert!(unreachable.valid(), "retained-only sessions, stranded");
+        unreachable.upgrade.as_mut().unwrap().stranded = 0;
+        assert!(!unreachable.valid(), "an unreachable case strands one");
+        unreachable.upgrade.as_mut().unwrap().stranded = 4;
+        assert!(!unreachable.valid(), "of the sessions there are");
+
+        // The consent names the case offered, and only an offer gives one.
+        let consent = live.confirm_frontend_upgrade().expect("an offer");
+        assert_eq!(consent.case, UpgradeCase::Soft);
+        assert_eq!(consent.action, FrontendUpgradeAction::ReplaceFrontend);
+        assert_eq!(
+            (&consent.attempt, &consent.identity, &consent.candidate),
+            (&live.attempt, &live.identity, &live.candidate)
+        );
+        assert!(consent.matches(&live));
+        let mut other = live.clone();
+        other.identity.generation = Some("ef".repeat(16));
+        assert!(!consent.matches(&other));
+        assert!(info().confirm_frontend_upgrade().is_none());
+    }
+
+    #[test]
+    fn frontend_upgrade_consent_rejects_unknown_fields_and_bad_identity() {
+        let consent = offered().confirm_frontend_upgrade().unwrap();
+        let encoded = serde_json::to_value(&consent).unwrap();
+        assert_eq!(
+            serde_json::from_value::<FrontendUpgradeConsent>(encoded.clone()).unwrap(),
+            consent
+        );
+        for (path, value) in [
+            (&["unknown"][..], serde_json::json!(true)),
+            (&["identity", "unknown"], serde_json::json!(1)),
+            (&["identity", "checksum"], serde_json::json!("ab")),
+            (
+                &["identity", "generation"],
+                serde_json::json!("zz".repeat(16)),
+            ),
+            (&["identity", "version"], serde_json::json!("bad\nversion")),
+            (&["candidate", "checksum"], serde_json::json!("ef")),
+            (&["attempt"], serde_json::json!("12")),
+        ] {
+            let mut invalid = encoded.clone();
+            let mut at = &mut invalid;
+            for key in &path[..path.len() - 1] {
+                at = &mut at[*key];
+            }
+            at[path[path.len() - 1]] = value;
+            assert!(
+                serde_json::from_value::<FrontendUpgradeConsent>(invalid).is_err(),
+                "{path:?}"
+            );
+        }
+        let mut destructive = serde_json::to_value(info().confirm_destructive_restart()).unwrap();
+        assert!(serde_json::from_value::<FrontendUpgradeConsent>(destructive.clone()).is_err());
+        destructive["case"] = "soft".into();
+        assert!(
+            serde_json::from_value::<FrontendUpgradeConsent>(destructive).is_err(),
+            "a destructive action is no frontend replacement"
+        );
+    }
+
     #[test]
     fn attempt_ids_reject_malformed_wire_values() {
         for invalid in ["", "not-an-attempt", &"ab".repeat(17), &"zz".repeat(16)] {

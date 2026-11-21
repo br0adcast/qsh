@@ -261,7 +261,7 @@ impl Remote for Fixture {
                     .next()
                     .unwrap()
                     .trim_matches('\'');
-                let info = serde_json::json!({"schema":2,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":candidate,"active_connections":2,"serving_profiles":null,"preservation":"unknown"});
+                let info = serde_json::json!({"schema":3,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":candidate,"active_connections":2,"sessions":2,"serving_profiles":null,"preservation":"unknown"});
                 return Ok(exec::test_support::output(
                     0,
                     &format!("TRANSPORT-BUSY {info}\n"),
@@ -855,7 +855,7 @@ fn confirmed_destructive_command_loss_is_uncertain_without_retry_or_ready() {
         fixture.bootstrap_capabilities = Some(r#"{"schema":1,"busy_decisions":true}"#.into());
         fixture.ensure_fault = Some(fault);
         let busy = BusyDaemonInfo {
-            schema: 2,
+            schema: 3,
             attempt: BusyAttemptId::from_bytes([1; 16]),
             identity: BusyDaemonIdentity {
                 version: "0.6.0-rc1".into(),
@@ -869,9 +869,11 @@ fn confirmed_destructive_command_loss_is_uncertain_without_retry_or_ready() {
                 checksum: "ef".repeat(32),
             },
             active_connections: 2,
+            sessions: 2,
             serving_profiles: None,
             preservation: PreservationCapability::Unknown,
             service_restart: None,
+            upgrade: None,
         };
         let consent = busy.confirm_destructive_restart();
         let decision = PendingBusy::new(busy)
@@ -1164,7 +1166,7 @@ fn service_observation(
 ) {
     use daemon_bootstrap_protocol::*;
     let info = BusyDaemonInfo {
-        schema: 2,
+        schema: 3,
         attempt: BusyAttemptId::from_bytes([1; 16]),
         identity: BusyDaemonIdentity {
             version: "0.5.0".into(),
@@ -1178,6 +1180,7 @@ fn service_observation(
             checksum: "ef".repeat(32),
         },
         active_connections: 2,
+        sessions: 2,
         serving_profiles: None,
         preservation: PreservationCapability::Unknown,
         service_restart: Some(PersonalServiceSelector {
@@ -1192,6 +1195,7 @@ fn service_observation(
                 .into(),
             port: 60022,
         }),
+        upgrade: None,
     };
     let consent = info.confirm_service_restart().unwrap();
     let decision = PendingBusy::new(info)
