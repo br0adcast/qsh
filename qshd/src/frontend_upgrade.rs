@@ -9,9 +9,125 @@
 //! frontend and every live owner, which keeps its own binary), and the qsh
 //! session profiles (between clients and the frontend).
 
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
+
+use daemon_bootstrap_protocol::{
+    BusyDaemonIdentity, CandidateImageIdentity, FrontendUpgradeAction, FrontendUpgradeConsent,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::version::Replacement;
+
+/// How long the daemon may take to answer `PREPARE-FRONTEND-UPGRADE`: the
+/// candidate is hashed and its `self-check` runs
+/// ([`crate::update::SELF_CHECK_TIMEOUT`]) within it.
+pub const PREPARE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a client waits for that answer: the daemon's bound and a margin.
+pub const PREPARE_CLIENT_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long the daemon may take to answer `COMMIT-FRONTEND-UPGRADE`: the
+/// old frontend's stop, the new one's start and its `Ready`, or a rollback.
+pub const COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a client waits for that answer.
+pub const COMMIT_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// `PREPARE-FRONTEND-UPGRADE`: replace the serving frontend with the
+/// executable at `path`, which the caller expects to be `size` bytes with
+/// sha256 `checksum` and build `build`, while `identity` serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareRequest {
+    pub path: String,
+    pub size: u64,
+    /// sha256 of the candidate, lower-case hex.
+    pub checksum: String,
+    pub build: u64,
+    /// The serving frontend the caller saw: the upgrade is refused if
+    /// another one serves by now.
+    pub identity: BusyDaemonIdentity,
+    /// The user's agreement to a disruptive case, if one was asked for.
+    #[serde(default)]
+    pub consent: Option<FrontendUpgradeConsent>,
+}
+
+/// The answer to a prepare.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PrepareResponse {
+    /// The candidate is held; `receipt` (hex) commits it, once, within
+    /// `destructive_restart::RECEIPT_TTL`.
+    Ready {
+        receipt: String,
+        outcome: Outcome,
+    },
+    /// The upgrade would disconnect or strand clients: prepare again with a
+    /// consent that covers `outcome`.
+    NeedsConsent {
+        outcome: Outcome,
+    },
+    /// Only a full restart of the daemon installs this candidate.
+    NotPreservable {
+        outcome: Outcome,
+    },
+    /// The candidate is the serving frontend's image.
+    UpToDate,
+    Refused {
+        reason: Refusal,
+    },
+}
+
+/// The answer to a commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CommitResponse {
+    /// The candidate's frontend serves, as `identity`.
+    Replaced {
+        identity: BusyDaemonIdentity,
+    },
+    /// The candidate's frontend did not come up; the previous image serves
+    /// again, under the identity it had.
+    RolledBack {
+        reason: String,
+    },
+    Refused {
+        reason: Refusal,
+    },
+}
+
+/// Why a prepare or a commit was refused: nothing changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Refusal {
+    /// Another frontend serves than the request names.
+    Mismatch,
+    /// The candidate is not what the request says, or cannot serve.
+    Candidate { detail: String },
+    /// The candidate is older than the serving frontend.
+    Older,
+    /// Another upgrade, or a replacement of the whole daemon, is under way.
+    Busy,
+    /// The receipt's time ran out.
+    Expired,
+    /// No such receipt: never issued, used already, or replaced by a newer
+    /// prepare.
+    Unknown,
+    /// The daemon's sessions changed since the prepare, and the receipt no
+    /// longer covers what the upgrade would come to now.
+    Changed { outcome: Outcome },
+    /// The daemon is stopping.
+    Stopping,
+}
+
+/// A future the control server awaits without naming its type.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// What the control server of a hosted daemon hands the two upgrade
+/// requests to. A daemon without one answers neither, as an older daemon.
+pub trait FrontendUpgrades: Send + Sync {
+    fn prepare(&self, request: PrepareRequest) -> BoxFuture<'_, PrepareResponse>;
+    fn commit(&self, receipt: [u8; 16]) -> BoxFuture<'_, CommitResponse>;
+}
 
 /// One session of the running daemon, as the host's catalog keeps it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,11 +200,7 @@ pub enum Outcome {
 }
 
 /// A frontend replacement the user agreed to, at most this disruptive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpgradeCase {
-    Soft,
-    Unreachable,
-}
+pub use daemon_bootstrap_protocol::UpgradeCase;
 
 /// What replacing `daemon`'s frontend with `candidate` comes to. In order:
 /// an image that is not newer never replaces (as [`crate::version::replacement`]
@@ -164,6 +276,33 @@ pub fn consent_covers(consented: UpgradeCase, outcome: &Outcome) -> bool {
         UpgradeCase::Unreachable => 2,
     };
     needed <= given
+}
+
+/// The case `consent` agrees to, if it names exactly the frontend that
+/// serves (`serving`, pid and generation included) and exactly the held
+/// `candidate`. Any other consent counts as none.
+pub fn consented_case(
+    consent: Option<&FrontendUpgradeConsent>,
+    serving: &BusyDaemonIdentity,
+    candidate: &CandidateImageIdentity,
+) -> Option<UpgradeCase> {
+    consent
+        .filter(|c| {
+            c.identity == *serving
+                && c.candidate == *candidate
+                && c.action == FrontendUpgradeAction::ReplaceFrontend
+        })
+        .map(|c| c.case)
+}
+
+/// Whether a receipt may be issued, and later carried out, for `outcome`:
+/// a silent replacement needs nobody's consent, a disruptive one the
+/// user's, to a case at least as disruptive.
+pub fn receipt_covers(consented: Option<UpgradeCase>, outcome: &Outcome) -> bool {
+    match consented {
+        Some(case) => consent_covers(case, outcome),
+        None => *outcome == Outcome::Silent,
+    }
 }
 
 #[cfg(test)]
@@ -407,5 +546,122 @@ mod tests {
         );
         let back: Outcome = serde_json::from_value(json).unwrap();
         assert!(matches!(back, Outcome::Unreachable { stranded: 1, .. }));
+    }
+
+    fn serving() -> BusyDaemonIdentity {
+        BusyDaemonIdentity {
+            version: "0.6.0".into(),
+            build: 10,
+            checksum: SERVING.repeat(32),
+            pid: 42,
+            generation: Some("cd".repeat(16)),
+        }
+    }
+
+    fn held() -> CandidateImageIdentity {
+        CandidateImageIdentity {
+            build: 11,
+            checksum: CANDIDATE.repeat(32),
+        }
+    }
+
+    fn consent(case: UpgradeCase) -> FrontendUpgradeConsent {
+        FrontendUpgradeConsent {
+            attempt: daemon_bootstrap_protocol::BusyAttemptId::from_bytes([1; 16]),
+            identity: serving(),
+            candidate: held(),
+            case,
+            action: FrontendUpgradeAction::ReplaceFrontend,
+        }
+    }
+
+    #[test]
+    fn a_matching_consent_covers_its_case() {
+        let soft = Outcome::Soft { attached: 2 };
+        let given = consent(UpgradeCase::Soft);
+        let case = consented_case(Some(&given), &serving(), &held());
+        assert_eq!(case, Some(UpgradeCase::Soft));
+        assert!(receipt_covers(case, &soft));
+        assert!(receipt_covers(case, &Outcome::Silent));
+        // Without one, only a silent replacement is covered.
+        assert!(receipt_covers(None, &Outcome::Silent));
+        assert!(!receipt_covers(None, &soft));
+        assert!(!receipt_covers(None, &Outcome::UpToDate));
+    }
+
+    #[test]
+    fn a_consent_for_another_candidate_or_frontend_counts_as_none() {
+        let given = consent(UpgradeCase::Unreachable);
+        let other_build = CandidateImageIdentity {
+            build: 12,
+            ..held()
+        };
+        let other_bytes = CandidateImageIdentity {
+            checksum: "ee".repeat(32),
+            ..held()
+        };
+        for candidate in [other_build, other_bytes] {
+            assert_eq!(consented_case(Some(&given), &serving(), &candidate), None);
+        }
+        for changed in 0..3 {
+            let mut other = serving();
+            match changed {
+                0 => other.pid += 1,
+                1 => other.generation = Some("ab".repeat(16)),
+                _ => other.build += 1,
+            }
+            assert_eq!(consented_case(Some(&given), &other, &held()), None);
+        }
+        assert_eq!(consented_case(None, &serving(), &held()), None);
+    }
+
+    #[test]
+    fn a_consent_to_a_milder_case_does_not_cover_a_worse_one() {
+        let given = consent(UpgradeCase::Soft);
+        let case = consented_case(Some(&given), &serving(), &held());
+        let unreachable = Outcome::Unreachable {
+            attached: 0,
+            sessions: 1,
+            stranded: 1,
+        };
+        assert!(!receipt_covers(case, &unreachable));
+        assert!(!receipt_covers(
+            case,
+            &Outcome::Destructive {
+                attached: 0,
+                sessions: 1
+            }
+        ));
+    }
+
+    /// The JSON forms of the prepare and commit answers.
+    #[test]
+    fn upgrade_answers_are_tagged_by_status_and_kind() {
+        let changed = PrepareResponse::Refused {
+            reason: Refusal::Changed {
+                outcome: Outcome::Soft { attached: 1 },
+            },
+        };
+        let json = serde_json::to_value(&changed).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"status": "refused", "reason": {"kind": "changed",
+                "outcome": {"case": "soft", "attached": 1}}})
+        );
+        assert_eq!(
+            serde_json::from_value::<PrepareResponse>(json).unwrap(),
+            changed
+        );
+        assert_eq!(
+            serde_json::to_value(PrepareResponse::UpToDate).unwrap(),
+            serde_json::json!({"status": "up_to_date"})
+        );
+        let rolled = CommitResponse::RolledBack {
+            reason: "it exited".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&rolled).unwrap(),
+            serde_json::json!({"status": "rolled_back", "reason": "it exited"})
+        );
     }
 }

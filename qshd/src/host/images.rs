@@ -16,8 +16,6 @@ pub(crate) enum ImageIdentity {
     Own { generation: [u8; 16] },
     /// Another image, as the host verified it, under the generation minted
     /// for it.
-    // Not built until the frontend upgrade (#529 M2) is in.
-    #[cfg_attr(not(test), allow(dead_code))]
     Known(FrontendIdentity),
 }
 
@@ -35,8 +33,6 @@ impl ImageIdentity {
 pub(crate) struct ImageInfo {
     pub(crate) identity: ImageIdentity,
     /// Its [`crate::state::HOST_REVISION`].
-    // Not read until the frontend upgrade (#529 M2) is in.
-    #[allow(dead_code)]
     pub(crate) host_revision: u32,
     /// The owner link versions it speaks, and so every owner started from
     /// it.
@@ -91,10 +87,13 @@ impl Readiness {
     /// Returns once the frontend has said that it serves, at once if it
     /// already has. A frontend that never says so leaves this pending: the
     /// caller bounds the wait.
-    // Not awaited until the frontend upgrade (#529 M2) is in.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn reported(&self) {
         // The sender is `self`: it cannot close while this waits.
         let _ = self.0.subscribe().wait_for(|ready| *ready).await;
+    }
+
+    /// Whether the frontend has said that it serves.
+    pub(crate) fn has_reported(&self) -> bool {
+        *self.0.borrow()
     }
 }

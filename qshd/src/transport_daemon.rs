@@ -45,6 +45,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::destructive_restart::Actions;
+use crate::frontend_upgrade::{
+    FrontendUpgrades, PrepareResponse, Refusal, COMMIT_TIMEOUT, PREPARE_TIMEOUT,
+};
 use crate::server_info::{FrontendIdentity, Serving};
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -498,6 +501,7 @@ pub async fn run_hosted_transport_daemon_until_stop(
     active_count: Arc<AtomicUsize>,
     actions: Arc<Actions>,
     serving: Arc<Serving>,
+    upgrades: Option<Arc<dyn FrontendUpgrades>>,
     stop: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     let control_gate = actions.control_gate.clone();
@@ -525,6 +529,7 @@ pub async fn run_hosted_transport_daemon_until_stop(
         serving,
         stop,
         Some(actions),
+        upgrades,
     )
     .await
 }
@@ -586,6 +591,7 @@ async fn run_transport_daemon_with_acceptor(
         serving,
         stop,
         actions,
+        None,
     )
     .await
 }
@@ -601,6 +607,7 @@ async fn run_daemon(
     serving: Arc<Serving>,
     stop: impl std::future::Future<Output = Result<()>>,
     actions: Option<Arc<Actions>>,
+    upgrades: Option<Arc<dyn FrontendUpgrades>>,
 ) -> Result<()> {
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
 
@@ -706,7 +713,7 @@ async fn run_daemon(
                     retry_delay = CONTROL_ACCEPT_RETRY_INITIAL;
                     spawn_control_handler(&mut handlers, stream,
                         shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                        active_count.clone(), control_gate.clone(), cleanup.clone(), Some(running_info.clone()), actions.clone());
+                        active_count.clone(), control_gate.clone(), cleanup.clone(), Some(running_info.clone()), actions.clone(), upgrades.clone());
                 }
                 Err(error) if recoverable_control_accept(&error) => {
                     let now = tokio::time::Instant::now();
@@ -908,7 +915,7 @@ pub async fn serve_transport_control(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => spawn_control_handler(&mut handlers, stream,
                     shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                    active_count.clone(), control_gate.clone(), cleanup_registry.clone().map(CleanupSource::Registry), None, None),
+                    active_count.clone(), control_gate.clone(), cleanup_registry.clone().map(CleanupSource::Registry), None, None, None),
                 Err(error) => log::warn("qshd", &format!("error accepting transport control connection: {error}")),
             },
             result = handlers.join_next(), if !handlers.is_empty() => {
@@ -932,6 +939,7 @@ fn spawn_control_handler(
     cleanup: Option<CleanupSource>,
     running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
     actions: Option<Arc<Actions>>,
+    upgrades: Option<Arc<dyn FrontendUpgrades>>,
 ) {
     let shared_allowlist: ControlAllowlist = shared_allowlist.into();
     let deadline = tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT;
@@ -947,6 +955,7 @@ fn spawn_control_handler(
             deadline,
             running_info,
             actions,
+            upgrades,
         )
         .await
         {
@@ -1022,6 +1031,7 @@ async fn handle_transport_control_connection(
         deadline,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1038,6 +1048,7 @@ async fn handle_transport_control_connection_with_info(
     deadline: tokio::time::Instant,
     running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
     actions: Option<Arc<Actions>>,
+    upgrades: Option<Arc<dyn FrontendUpgrades>>,
 ) -> Result<()> {
     let shared_allowlist: ControlAllowlist = shared_allowlist.into();
     handle_transport_control_connection_with_peer_check_and_info(
@@ -1051,6 +1062,7 @@ async fn handle_transport_control_connection_with_info(
         deadline,
         running_info,
         actions,
+        upgrades,
         |stream| {
             control::require_same_account(
                 control::peer_uid(stream),
@@ -1086,6 +1098,7 @@ async fn handle_transport_control_connection_with_peer_check(
         deadline,
         None,
         None,
+        None,
         check,
     )
     .await
@@ -1103,6 +1116,7 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
     deadline: tokio::time::Instant,
     running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
     actions: Option<Arc<Actions>>,
+    upgrades: Option<Arc<dyn FrontendUpgrades>>,
     check: impl FnOnce(&tokio::net::UnixStream) -> Result<()>,
 ) -> Result<()> {
     let shared_allowlist: ControlAllowlist = shared_allowlist.into();
@@ -1113,18 +1127,64 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
         .as_ref()
         .map_or_else(|| Serving::own(false), |info| info.serving.clone());
 
-    tokio::time::timeout_at(deadline, async {
-        let (read_half, mut write_half) = stream.into_split();
+    let (request, mut write_half) = tokio::time::timeout_at(deadline, async {
+        let (read_half, write_half) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(read_half);
         let mut line = String::new();
-        (&mut reader).take(4097)
+        (&mut reader)
+            .take(4097)
             .read_line(&mut line)
             .await
             .context("reading the request from the transport control socket")?;
-        anyhow::ensure!(line.len()<=4096 && line.ends_with('\n'),"control request exceeds limit or is incomplete");
-        let line = line.trim_end_matches('\n');
+        anyhow::ensure!(
+            line.len() <= 4096 && line.ends_with('\n'),
+            "control request exceeds limit or is incomplete"
+        );
+        Ok((
+            control::parse_request(line.trim_end_matches('\n')),
+            write_half,
+        ))
+    })
+    .await
+    .context("transport control request exceeded its accepted deadline")??;
+    let Some(request) = request else {
+        return Ok(());
+    };
+    // A frontend upgrade runs before the read gate, on bounds of its own:
+    // its commit takes the gate exclusively. A daemon without upgrades
+    // answers neither request, as an older daemon.
+    match request {
+        ControlRequest::PrepareFrontendUpgrade(prepare) => {
+            let Some(upgrades) = upgrades else {
+                return Ok(());
+            };
+            let response = tokio::time::timeout(PREPARE_TIMEOUT, upgrades.prepare(prepare))
+                .await
+                .unwrap_or_else(|_| PrepareResponse::Refused {
+                    reason: Refusal::Candidate {
+                        detail: format!(
+                            "its checks did not finish within {} s",
+                            PREPARE_TIMEOUT.as_secs()
+                        ),
+                    },
+                });
+            return write_answer(&mut write_half, &response).await;
+        }
+        ControlRequest::CommitFrontendUpgrade(receipt) => {
+            let Some(upgrades) = upgrades else {
+                return Ok(());
+            };
+            // Past its bound the outcome is not known here: no answer is
+            // better than a wrong one.
+            let response = tokio::time::timeout(COMMIT_TIMEOUT, upgrades.commit(receipt))
+                .await
+                .context("the frontend upgrade's commit exceeded its bound")?;
+            return write_answer(&mut write_half, &response).await;
+        }
+        _ => {}
+    }
 
-        let Some(request)=control::parse_request(line) else {return Ok(());};
+    tokio::time::timeout_at(deadline, async {
         // Commit takes the exclusive gate directly, never by upgrading the
         // ordinary request's read guard. No ACK is part of commitment.
         if let ControlRequest::CommitDestructiveStop { receipt,ref consent }=request {
@@ -1134,7 +1194,9 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
         }
         let _gate=control_gate.read().await;
         match request {
-            ControlRequest::CommitDestructiveStop {..}=>unreachable!("handled before read gate"),
+            ControlRequest::CommitDestructiveStop {..}
+            | ControlRequest::PrepareFrontendUpgrade(_)
+            | ControlRequest::CommitFrontendUpgrade(_) => unreachable!("handled before read gate"),
             ControlRequest::DestructiveRestartInfo(challenge)=> {
                 if let Some(actions)=&actions {
                     if let Some(identity)=actions.receipt_identity() {
@@ -1220,6 +1282,22 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
     })
     .await
     .context("transport control request exceeded its accepted deadline")?
+}
+
+/// Write one answer line, within [`CONTROL_REQUEST_TIMEOUT`]: a caller that
+/// went away meanwhile only loses its answer.
+async fn write_answer(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &impl serde::Serialize,
+) -> Result<()> {
+    let line = format!("{}\n", serde_json::to_string(response)?);
+    tokio::time::timeout(
+        CONTROL_REQUEST_TIMEOUT,
+        write_half.write_all(line.as_bytes()),
+    )
+    .await
+    .context("writing the answer to the transport control socket")??;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1768,6 +1846,7 @@ mod server_info_tests {
                 tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT,
                 Some(info.clone()),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1817,6 +1896,7 @@ mod server_info_tests {
                 serving,
             })),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1854,6 +1934,7 @@ mod server_info_tests {
             None,
             tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT,
             Some(info.clone()),
+            None,
             None,
         )
         .await

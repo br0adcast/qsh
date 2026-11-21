@@ -56,6 +56,14 @@ pub enum ControlRequest {
         receipt: [u8; 16],
         consent: daemon_bootstrap_protocol::DestructiveRestartConsent,
     },
+    /// Hold a candidate image for replacing a hosted daemon's network
+    /// frontend (#529 M2), and say what that comes to
+    /// ([`crate::frontend_upgrade::PrepareResponse`]). A daemon that is no
+    /// host answers nothing.
+    PrepareFrontendUpgrade(crate::frontend_upgrade::PrepareRequest),
+    /// Carry out the prepared frontend upgrade the receipt names
+    /// ([`crate::frontend_upgrade::CommitResponse`]).
+    CommitFrontendUpgrade([u8; 16]),
     /// Exact-generation executable identity guard, checked atomically with insertion.
     AddClientIf {
         generation: [u8; 16],
@@ -355,6 +363,22 @@ pub fn parse_request(line: &str) -> Option<ControlRequest> {
                 consent: serde_json::from_slice(&raw).ok()?,
             })
         }
+        "PREPARE-FRONTEND-UPGRADE" => {
+            let raw = BASE64.decode(parts.next()?).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::PrepareFrontendUpgrade(
+                serde_json::from_slice(&raw).ok()?,
+            ))
+        }
+        "COMMIT-FRONTEND-UPGRADE" => {
+            let receipt = hex::decode(parts.next()?).ok()?.try_into().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::CommitFrontendUpgrade(receipt))
+        }
         "SERVER-INFO" => {
             let text = parts.next()?;
             if text.len() != 64 {
@@ -439,6 +463,13 @@ pub fn format_request(req: &ControlRequest) -> String {
             hex::encode(receipt),
             BASE64.encode(serde_json::to_vec(consent).expect("consent serializes"))
         ),
+        ControlRequest::PrepareFrontendUpgrade(request) => format!(
+            "PREPARE-FRONTEND-UPGRADE {}\n",
+            BASE64.encode(serde_json::to_vec(request).expect("request serializes"))
+        ),
+        ControlRequest::CommitFrontendUpgrade(receipt) => {
+            format!("COMMIT-FRONTEND-UPGRADE {}\n", hex::encode(receipt))
+        }
         ControlRequest::ServerInfo(challenge) => {
             format!("SERVER-INFO {}\n", hex::encode(challenge))
         }
@@ -596,6 +627,8 @@ fn client_request_at(
             | ControlRequest::DestructiveRestartInfo(_)
             | ControlRequest::PrepareDestructiveStop(_)
             | ControlRequest::CommitDestructiveStop { .. }
+            | ControlRequest::PrepareFrontendUpgrade(_)
+            | ControlRequest::CommitFrontendUpgrade(_)
     ) {
         std::io::Read::take(&mut reader, 4097).read_line(&mut line)
     } else {
@@ -608,6 +641,8 @@ fn client_request_at(
             | ControlRequest::DestructiveRestartInfo(_)
             | ControlRequest::PrepareDestructiveStop(_)
             | ControlRequest::CommitDestructiveStop { .. }
+            | ControlRequest::PrepareFrontendUpgrade(_)
+            | ControlRequest::CommitFrontendUpgrade(_)
     ) && line.len() > 4096
     {
         anyhow::bail!("server-info response exceeds limit");
@@ -796,10 +831,22 @@ impl EnsureLock {
     }
 
     pub fn request(&self, request: &ControlRequest) -> Result<ControlReply> {
+        self.request_with_timeout(request, CLIENT_READ_TIMEOUT)
+    }
+
+    /// As [`EnsureLock::request`], waiting up to `timeout` for the answer: a
+    /// request the daemon takes longer over, such as a frontend upgrade's
+    /// prepare or commit ([`crate::frontend_upgrade::PREPARE_CLIENT_TIMEOUT`],
+    /// [`crate::frontend_upgrade::COMMIT_CLIENT_TIMEOUT`]).
+    pub fn request_with_timeout(
+        &self,
+        request: &ControlRequest,
+        timeout: Duration,
+    ) -> Result<ControlReply> {
         client_request_at(
             self.endpoint.authority(),
             request,
-            CLIENT_READ_TIMEOUT,
+            timeout,
             check_control_peer,
         )
     }
@@ -1172,6 +1219,51 @@ mod tests {
         }
         let info = ControlRequest::RegistrationInfo([8; 32]);
         assert_eq!(parse_request(format_request(&info).trim_end()), Some(info));
+    }
+
+    #[test]
+    fn frontend_upgrade_codec_round_trips_and_refuses_malformed_lines() {
+        let identity = daemon_bootstrap_protocol::BusyDaemonIdentity {
+            version: "0.6.0".into(),
+            build: 1,
+            checksum: "ab".repeat(32),
+            pid: 42,
+            generation: Some("cd".repeat(16)),
+        };
+        let prepare = crate::frontend_upgrade::PrepareRequest {
+            path: "/home/me/.cache/qsh/qshd-new".into(),
+            size: 123,
+            checksum: "ef".repeat(32),
+            build: 2,
+            identity: identity.clone(),
+            consent: Some(daemon_bootstrap_protocol::FrontendUpgradeConsent {
+                attempt: daemon_bootstrap_protocol::BusyAttemptId::from_bytes([1; 16]),
+                identity,
+                candidate: daemon_bootstrap_protocol::CandidateImageIdentity {
+                    build: 2,
+                    checksum: "ef".repeat(32),
+                },
+                case: daemon_bootstrap_protocol::UpgradeCase::Soft,
+                action: daemon_bootstrap_protocol::FrontendUpgradeAction::ReplaceFrontend,
+            }),
+        };
+        for request in [
+            ControlRequest::PrepareFrontendUpgrade(prepare),
+            ControlRequest::CommitFrontendUpgrade([7; 16]),
+        ] {
+            let line = format_request(&request);
+            assert!(line.len() <= 4096);
+            assert_eq!(parse_request(line.trim_end()), Some(request));
+            assert!(parse_request(&format!("{} extra", line.trim_end())).is_none());
+        }
+        for line in [
+            "COMMIT-FRONTEND-UPGRADE 0000".to_string(),
+            "COMMIT-FRONTEND-UPGRADE".to_string(),
+            format!("PREPARE-FRONTEND-UPGRADE {}", BASE64.encode(b"{}")),
+            "PREPARE-FRONTEND-UPGRADE not-base64!".to_string(),
+        ] {
+            assert!(parse_request(&line).is_none(), "{line}");
+        }
     }
 
     #[test]

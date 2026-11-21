@@ -1781,6 +1781,13 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
             },
         )
     });
+    // A host's frontend can be replaced by a newer image (#529 M2); the
+    // control server hands the two upgrade requests to this.
+    #[cfg(target_os = "linux")]
+    let upgrades = host.as_ref().map(|host| {
+        qshd::host::upgrade::Upgrader::new(host.clone(), serving.clone(), Some(actions.clone()))
+            as Arc<dyn qshd::frontend_upgrade::FrontendUpgrades>
+    });
 
     let runtime =
         tokio::runtime::Runtime::new().context("creating the transport daemon's runtime")?;
@@ -1799,6 +1806,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
                 active_count,
                 actions,
                 serving,
+                upgrades,
                 signals.requested(),
             )
             .await;

@@ -360,6 +360,66 @@ impl DestructiveRestartConsent {
     }
 }
 
+/// A replacement of a hosted daemon's network frontend (#529 M2) that the
+/// user agreed to, at most this disruptive: `Soft` disconnects attached
+/// clients briefly, `Unreachable` also strands sessions whose clients the
+/// new frontend cannot serve until they expire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeCase {
+    Soft,
+    Unreachable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FrontendUpgradeAction {
+    #[serde(rename = "replace_frontend")]
+    ReplaceFrontend,
+}
+
+/// The user's consent to replace the frontend of exactly this serving
+/// frontend (pid and generation included) with exactly this candidate, at
+/// most as disruptive as `case`. The daemon still decides the case itself
+/// and issues a receipt only when the consent covers it; this value alone
+/// authorizes nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrontendUpgradeConsent {
+    pub attempt: BusyAttemptId,
+    pub identity: BusyDaemonIdentity,
+    pub candidate: CandidateImageIdentity,
+    pub case: UpgradeCase,
+    pub action: FrontendUpgradeAction,
+}
+impl<'de> Deserialize<'de> for FrontendUpgradeConsent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            attempt: BusyAttemptId,
+            identity: BusyDaemonIdentity,
+            candidate: CandidateImageIdentity,
+            case: UpgradeCase,
+            action: FrontendUpgradeAction,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let value = Self {
+            attempt: fields.attempt,
+            identity: fields.identity,
+            candidate: fields.candidate,
+            case: fields.case,
+            action: fields.action,
+        };
+        if value.identity.valid() && value.candidate.valid() {
+            Ok(value)
+        } else {
+            Err(serde::de::Error::custom(
+                "invalid FrontendUpgradeConsent fields",
+            ))
+        }
+    }
+}
+
 /// A failed explicit destructive operation never becomes readiness. The
 /// attempt binds this terminal result to the pending authenticated SSH call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,6 +597,43 @@ mod tests {
             .unwrap(),
             consent
         );
+    }
+    #[test]
+    fn frontend_upgrade_consent_round_trips_and_rejects_other_shapes() {
+        let live = info();
+        let consent = FrontendUpgradeConsent {
+            attempt: live.attempt.clone(),
+            identity: live.identity.clone(),
+            candidate: live.candidate.clone(),
+            case: UpgradeCase::Soft,
+            action: FrontendUpgradeAction::ReplaceFrontend,
+        };
+        let encoded = serde_json::to_value(&consent).unwrap();
+        assert_eq!(encoded["case"], "soft");
+        assert_eq!(encoded["action"], "replace_frontend");
+        assert_eq!(
+            serde_json::from_value::<FrontendUpgradeConsent>(encoded.clone()).unwrap(),
+            consent
+        );
+        // A destructive consent is never read as an upgrade consent.
+        assert!(serde_json::from_value::<FrontendUpgradeConsent>(
+            serde_json::to_value(live.confirm_destructive_restart()).unwrap()
+        )
+        .is_err());
+        for field in ["case", "action", "unknown", "candidate", "identity"] {
+            let mut invalid = encoded.clone();
+            match field {
+                "case" => invalid[field] = "destructive".into(),
+                "action" => invalid[field] = "stop_and_restart".into(),
+                "unknown" => invalid[field] = true.into(),
+                "candidate" => invalid[field]["checksum"] = "bad".into(),
+                _ => invalid[field]["generation"] = "zz".into(),
+            }
+            assert!(
+                serde_json::from_value::<FrontendUpgradeConsent>(invalid).is_err(),
+                "{field}"
+            );
+        }
     }
     #[test]
     fn attempt_ids_reject_malformed_wire_values() {

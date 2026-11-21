@@ -196,6 +196,76 @@ impl SelfImage {
         Ok(SelfImage { fd: dup_high(&fd)? })
     }
 
+    /// Open the executable at `path` and hold it from now on: whatever
+    /// happens to the path afterwards -- a rename over it, a deletion --
+    /// the image is the file opened here. It must be a regular file.
+    /// (`O_NONBLOCK` only keeps a FIFO or device at `path` from blocking the
+    /// open; it means nothing for a regular file.)
+    pub fn open(path: &std::path::Path) -> io::Result<SelfImage> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let raw = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if raw < 0 {
+            return Err(last_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let image = SelfImage { fd: dup_high(&fd)? };
+        if image.stat()?.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok(image)
+    }
+
+    fn stat(&self) -> io::Result<libc::stat> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(self.fd.as_raw_fd(), &mut stat) } < 0 {
+            return Err(last_error());
+        }
+        Ok(stat)
+    }
+
+    /// The held file's size now.
+    pub(crate) fn size(&self) -> io::Result<u64> {
+        Ok(self.stat()?.st_size as u64)
+    }
+
+    /// Up to `buf.len()` bytes of the held file at `offset`, read through
+    /// the held descriptor itself, never by its path.
+    pub(crate) fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        loop {
+            let read = unsafe {
+                libc::pread(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    offset as libc::off_t,
+                )
+            };
+            if read >= 0 {
+                return Ok(read as usize);
+            }
+            let error = last_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// The path that reaches the held file from this process
+    /// (`/proc/self/fd/N`), for as long as `self` lives.
+    pub(crate) fn proc_path(&self) -> std::path::PathBuf {
+        format!("/proc/self/fd/{}", self.fd.as_raw_fd()).into()
+    }
+
     /// Another descriptor of the same image.
     pub fn try_clone(&self) -> io::Result<SelfImage> {
         Ok(SelfImage {

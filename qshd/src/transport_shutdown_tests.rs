@@ -731,6 +731,7 @@ async fn personal39_join_retains_a_stop_ack_whose_writer_is_pending() {
         None,
         None,
         None,
+        None,
     );
     stop_rx
         .recv()

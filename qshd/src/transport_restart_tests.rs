@@ -46,6 +46,7 @@ async fn dispatch(
         deadline,
         None,
         Some(actions),
+        None,
     )
     .await
 }
@@ -281,4 +282,108 @@ async fn stop_future_latches_shutdown_before_acceptor_drop_can_attempt_exec() {
 #[tokio::test]
 async fn fatal_accept_latches_shutdown_before_acceptor_drop_can_attempt_exec() {
     assert_owner_teardown_revokes_exec(true).await;
+}
+
+/// The two frontend-upgrade requests, as a client sends them.
+fn upgrade_requests() -> [ControlRequest; 2] {
+    [
+        ControlRequest::PrepareFrontendUpgrade(crate::frontend_upgrade::PrepareRequest {
+            path: "/nonexistent/qshd".into(),
+            size: 1,
+            checksum: "ef".repeat(32),
+            build: 2,
+            identity: binding().identity,
+            consent: None,
+        }),
+        ControlRequest::CommitFrontendUpgrade([5; 16]),
+    ]
+}
+
+/// One request through the control handler with `upgrades`: the line it
+/// answers with, if any.
+async fn upgrade_answer(
+    request: &ControlRequest,
+    upgrades: Option<Arc<dyn FrontendUpgrades>>,
+) -> String {
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    client
+        .write_all(control::format_request(request).as_bytes())
+        .await
+        .unwrap();
+    let (stop_tx, _stop_rx) = mpsc::channel(1);
+    let actions = actions();
+    handle_transport_control_connection_with_peer_check_and_info(
+        server,
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+        vec![60000],
+        stop_tx,
+        Arc::new(AtomicUsize::new(0)),
+        actions.control_gate.clone(),
+        None,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        None,
+        Some(actions),
+        upgrades,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    let mut answer = String::new();
+    client.read_to_string(&mut answer).await.unwrap();
+    answer
+}
+
+/// A daemon that is no host (no upgrades) answers neither frontend-upgrade
+/// request: it writes no line and closes, exactly as an older daemon that
+/// does not know the verbs.
+#[tokio::test]
+async fn a_daemon_without_upgrades_answers_neither_request() {
+    for request in upgrade_requests() {
+        assert_eq!(upgrade_answer(&request, None).await, "", "{request:?}");
+    }
+}
+
+struct Answering;
+impl FrontendUpgrades for Answering {
+    fn prepare(
+        &self,
+        request: crate::frontend_upgrade::PrepareRequest,
+    ) -> crate::frontend_upgrade::BoxFuture<'_, PrepareResponse> {
+        Box::pin(async move {
+            PrepareResponse::Refused {
+                reason: Refusal::Candidate {
+                    detail: request.path,
+                },
+            }
+        })
+    }
+    fn commit(
+        &self,
+        receipt: [u8; 16],
+    ) -> crate::frontend_upgrade::BoxFuture<'_, crate::frontend_upgrade::CommitResponse> {
+        Box::pin(async move {
+            crate::frontend_upgrade::CommitResponse::RolledBack {
+                reason: hex::encode(receipt),
+            }
+        })
+    }
+}
+
+/// A hosted daemon hands both requests to its upgrades and answers with
+/// one line each.
+#[tokio::test]
+async fn a_hosted_daemon_answers_both_requests_with_one_line() {
+    let [prepare, commit] = upgrade_requests();
+    let upgrades: Option<Arc<dyn FrontendUpgrades>> = Some(Arc::new(Answering));
+    assert_eq!(
+        upgrade_answer(&prepare, upgrades.clone()).await,
+        "{\"status\":\"refused\",\"reason\":{\"kind\":\"candidate\",\"detail\":\"/nonexistent/qshd\"}}\n"
+    );
+    assert_eq!(
+        upgrade_answer(&commit, upgrades).await,
+        format!(
+            "{{\"status\":\"rolled_back\",\"reason\":\"{}\"}}\n",
+            "05".repeat(16)
+        )
+    );
 }

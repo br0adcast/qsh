@@ -502,7 +502,7 @@ fn host_serving(image: FrontendImage) -> Arc<Host> {
             runtime_threads: None,
         },
     );
-    host.set_current(image);
+    host.set_current(Arc::new(image));
     host
 }
 
@@ -546,17 +546,22 @@ fn the_census_reports_each_sessions_owner_links_and_client_profiles() {
     let (looked_up, kept) = ([1; 16], [2; 16]);
     let (relink, _owner_end) = relink_pair();
     let started = host.current();
-    host.created(looked_up, 1000, raw_owner(91, relink), &started)
+    let profiles = &started.info.profiles;
+    host.created(looked_up, 1000, raw_owner(91, relink), &started, profiles)
         .unwrap();
-    host.created(kept, 1000, raw_owner(92, descriptor()), &started)
+    host.created(kept, 1000, raw_owner(92, descriptor()), &started, profiles)
         .unwrap();
     host.catalog.traffic(kept, Duration::ZERO, true);
 
-    host.set_current(image(2, vec![2], vec![[2, 2, 2]]));
+    let b = Arc::new(image(2, vec![2], vec![[2, 2, 2]]));
+    host.set_current(b.clone());
     // The running frontend dies; the next one, started from B, is handed
     // one of the sessions.
     host.catalog.detach_all();
-    assert!(matches!(host.lookup(looked_up, 1000), Found::Owner(..)));
+    assert!(matches!(
+        host.lookup(looked_up, 1000, &b.info),
+        Found::Owner(..)
+    ));
     host.catalog.traffic(looked_up, Duration::ZERO, true);
 
     let mut facts = host.catalog.census();
@@ -594,14 +599,28 @@ async fn a_frontends_ready_is_recorded_for_whoever_waits() {
     );
     let alive = ToHost::Alive.encode().unwrap();
     assert!(
-        host.serve_request(&channel, 7, &alive, &mut HashMap::new(), &ready)
-            .await
+        host.serve_request(
+            &channel,
+            7,
+            &alive,
+            &mut HashMap::new(),
+            &ready,
+            &ImageInfo::own()
+        )
+        .await
     );
     assert!(tokio::time::timeout(wait, ready.reported()).await.is_err());
     let packet = ToHost::Ready.encode().unwrap();
     assert!(
-        host.serve_request(&channel, 7, &packet, &mut HashMap::new(), &ready)
-            .await
+        host.serve_request(
+            &channel,
+            7,
+            &packet,
+            &mut HashMap::new(),
+            &ready,
+            &ImageInfo::own()
+        )
+        .await
     );
     tokio::time::timeout(wait, ready.reported())
         .await
