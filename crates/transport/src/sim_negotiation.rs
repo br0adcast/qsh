@@ -26,7 +26,8 @@ impl Pair {
 
     fn agreed(self) -> Features {
         match self {
-            Pair::BothNew => Features::SUPPORTED,
+            // The simulated server holds no session-reset secret.
+            Pair::BothNew => Features::SUPPORTED_WITHOUT_RESET,
             Pair::OldServer | Pair::OldClient => Features::NONE,
         }
     }

@@ -370,6 +370,86 @@ fn ctrl_bracket_r_comes_back_to_the_same_shell() {
     );
 }
 
+/// `PPid` of `pid` from `/proc`, `None` once it is gone.
+#[cfg(target_os = "linux")]
+fn parent_of(pid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// On Linux a personal daemon runs each session in an owner process (#529):
+/// the shell's parent is that owner, a child of the daemon in the owner
+/// role, and a warm return comes back to the same shell under the same
+/// owner. Once the run ends, nothing of the session is left.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_warm_return_stays_with_the_shell_and_its_session_owner() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut client = spawn_client_with(
+        &daemon,
+        &key_path,
+        config.path(),
+        &["--verbose", "--status", "off"],
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    let pid = mark_with_pid(&mut client, &screen);
+    let shell: u32 = pid.parse().expect("a pid");
+    let owner = parent_of(shell).expect("the shell is alive");
+    assert_ne!(
+        owner,
+        daemon.child.id(),
+        "the shell is not the daemon's own child"
+    );
+    assert_eq!(parent_of(owner), Some(daemon.child.id()));
+    let role = std::fs::read(format!("/proc/{owner}/cmdline")).expect("the owner's cmdline");
+    assert!(
+        role.split(|&b| b == 0)
+            .any(|arg| arg == b"__qshd-session-owner-v1"),
+        "the shell's parent runs in the owner role: {:?}",
+        String::from_utf8_lossy(&role)
+    );
+
+    client.master.write_all(b"\x1dr").expect("type ctrl-] r");
+    assert!(
+        wait_until(|| verbose_log(config.path()).contains("reconnected at address 0")),
+        "Ctrl-] r must reconnect; the verbose log: {}\ndaemon: {}",
+        verbose_log(config.path()),
+        daemon.output_text()
+    );
+    assert!(
+        the_marked_shell_answers(&mut client, &screen, &pid, Duration::from_secs(20)),
+        "the warm return reaches the same shell; client saw: {}\ndaemon: {}",
+        screen.text(),
+        daemon.output_text()
+    );
+    assert_eq!(parent_of(shell), Some(owner), "the shell keeps its owner");
+    // Every warm return gives the owner a new link and rebuilds the
+    // frontend's bridge from the owner's replay.
+    assert!(
+        wait_until(|| daemon
+            .output_text()
+            .contains("the frontend replaced the session's link")),
+        "the warm return replaced the owner's link; daemon: {}",
+        daemon.output_text()
+    );
+
+    exit_cleanly(&mut client, &screen, &daemon);
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            !std::path::Path::new(&format!("/proc/{owner}")).exists()
+                && !std::path::Path::new(&format!("/proc/{shell}")).exists()
+        }),
+        "the ended session leaves neither its owner nor its shell; daemon: {}",
+        daemon.output_text()
+    );
+}
+
 /// A network that dies under a running session: the plate says the link is
 /// lost, the transport's death timer (45 s) ends the link and a round starts
 /// by itself, UDP rounds continue without a countdown; once the
@@ -1592,4 +1672,343 @@ fn recovery206_live_ingress_byte_limit_keeps_the_daemon_shell() {
         daemon.output_text()
     );
     exit_cleanly(&mut resumed, &resumed_screen, &daemon);
+}
+
+// ---- the daemon's network frontend dies (#529) -------------------------------
+
+/// The daemon's frontend process: the child of `host` in the frontend role,
+/// waited for. `not` is a frontend that is gone or going.
+#[cfg(target_os = "linux")]
+fn frontend_of(host: u32, not: Option<u32>) -> u32 {
+    let find = || {
+        std::fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .find(|pid| {
+                Some(*pid) != not
+                    && parent_of(*pid) == Some(host)
+                    && std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                        cmdline.split(|&b| b == 0).nth(1) == Some(b"__qshd-frontend-v1".as_slice())
+                    })
+                    && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                        stat.rfind(')')
+                            .and_then(|at| stat[at + 1..].split_whitespace().next())
+                            .is_some_and(|state| state != "Z" && state != "X")
+                    })
+            })
+    };
+    let mut found = None;
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            found = find();
+            found.is_some()
+        }),
+        "the daemon runs a frontend process"
+    );
+    found.expect("checked above")
+}
+
+/// The session owners `host` runs now: its children in the owner role.
+#[cfg(target_os = "linux")]
+fn owners_of(host: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            parent_of(*pid) == Some(host)
+                && std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                    cmdline.split(|&b| b == 0).nth(1) == Some(b"__qshd-session-owner-v1".as_slice())
+                })
+        })
+        .collect()
+}
+
+/// Kill the frontend `pid` of `host`, and wait for the one that replaces it.
+#[cfg(target_os = "linux")]
+fn kill_the_frontend(host: u32, pid: u32) -> u32 {
+    assert_eq!(parent_of(pid), Some(host), "the daemon's own frontend");
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGKILL) }, 0);
+    frontend_of(host, Some(pid))
+}
+
+/// The daemon's network frontend is killed under a running `qsh`. The next
+/// datagram the client sends reaches the frontend that replaced it, which
+/// does not know the connection and says so with a session reset carrying
+/// the token the client's msg2 gave it: the client lets the link go at once
+/// -- not after its 45 s death timer -- and the round it starts by itself, a
+/// fresh signed handshake, is back in the SAME shell: same pid, same
+/// variable, same owner, and no question about a new session.
+#[cfg(target_os = "linux")]
+#[test]
+fn killing_the_frontend_keeps_the_same_shell() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut client = spawn_client_with(
+        &daemon,
+        &key_path,
+        config.path(),
+        &["--verbose", "--status", "off"],
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    let pid = mark_with_pid(&mut client, &screen);
+    let shell: u32 = pid.parse().expect("a pid");
+    let owner = parent_of(shell).expect("the shell is alive");
+    let host = daemon.child.id();
+    assert_eq!(
+        parent_of(owner),
+        Some(host),
+        "the owner is the host's child"
+    );
+    assert!(
+        verbose_log(config.path()).contains("session-reset"),
+        "the connection negotiated the session reset: {}",
+        verbose_log(config.path())
+    );
+
+    let frontend = frontend_of(host, None);
+    let killed = Instant::now();
+    let next = kill_the_frontend(host, frontend);
+    assert_ne!(next, frontend);
+
+    // A PING is never more than 1.5 s away, then the reset and a round.
+    assert!(
+        wait_for(Duration::from_secs(30), || verbose_log(config.path())
+            .contains("reconnected at address 0")),
+        "the client must reconnect by itself once the new frontend resets its link; \
+         the verbose log: {}\ndaemon: {}",
+        verbose_log(config.path()),
+        daemon.output_text()
+    );
+    let reconnected = killed.elapsed();
+    assert!(
+        verbose_log(config.path()).contains("(session reset)"),
+        "the reset ended the link, not the death timer: {}",
+        verbose_log(config.path())
+    );
+    assert!(
+        the_marked_shell_answers(&mut client, &screen, &pid, Duration::from_secs(30)),
+        "after the frontend died the run must be back in the SAME shell; client saw: {}\n\
+         daemon: {}",
+        screen.text(),
+        daemon.output_text()
+    );
+    assert!(
+        reconnected < Duration::from_secs(10),
+        "the client came back on the reset, about a second after the kill, not on its \
+         death timer (45 s): {reconnected:?}"
+    );
+    assert_eq!(parent_of(shell), Some(owner), "the shell keeps its owner");
+    assert_eq!(parent_of(owner), Some(host));
+    assert!(!screen.has("Start a new session?"));
+
+    exit_cleanly(&mut client, &screen, &daemon);
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            !std::path::Path::new(&format!("/proc/{owner}")).exists()
+                && !std::path::Path::new(&format!("/proc/{shell}")).exists()
+        }),
+        "the ended session leaves neither its owner nor its shell; daemon: {}",
+        daemon.output_text()
+    );
+    eprintln!("killing_the_frontend: the client was back {reconnected:?} after the kill");
+}
+
+/// The whole daemon restarts under a running `qsh`, and its sessions with it.
+/// The session-reset secret beside its host key does not change, so the new
+/// daemon's first answer to the client's old connection is a reset the
+/// client trusts: it returns at once, and hears at once that its session is
+/// gone -- the question about a new session comes within seconds, nobody
+/// pressing anything, instead of after the 45 s death timer.
+#[cfg(target_os = "linux")]
+#[test]
+fn full_daemon_restart_tells_client_session_is_gone() {
+    let _serial = serialised();
+    let (mut daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut client = spawn_client_with(
+        &daemon,
+        &key_path,
+        config.path(),
+        &["--verbose", "--status", "off"],
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    let shell: u32 = mark_with_pid(&mut client, &screen).parse().expect("a pid");
+    let owner = parent_of(shell).expect("the shell is alive");
+    assert_eq!(parent_of(owner), Some(daemon.child.id()), "under the host");
+    assert_eq!(
+        owners_of(daemon.child.id()),
+        [owner],
+        "what the leak check sees"
+    );
+    let (secret, mode) = daemon
+        .session_reset_secret()
+        .expect("the daemon keeps a session-reset secret beside its key");
+    assert_eq!((secret.len(), mode), (32, 0o600));
+
+    let restarted = Instant::now();
+    daemon.restart();
+    assert!(
+        wait_for(Duration::from_secs(40), || screen
+            .has("Start a new session? [Y/n]")),
+        "the client hears of the lost session by itself; client saw: {}\nlog: {}\ndaemon: {}",
+        screen.text(),
+        verbose_log(config.path()),
+        daemon.output_text()
+    );
+    let asked = restarted.elapsed();
+    let gone = |pid: u32| !std::path::Path::new(&format!("/proc/{pid}")).exists();
+    assert!(
+        wait_for(Duration::from_secs(20), || gone(owner) && gone(shell)),
+        "the killed daemon leaves neither its session's owner nor its shell; daemon: {}",
+        daemon.output_text()
+    );
+    assert!(
+        verbose_log(config.path()).contains("(session reset)"),
+        "the reset ended the link: {}",
+        verbose_log(config.path())
+    );
+    assert!(
+        asked < Duration::from_secs(15),
+        "asked about a new session within seconds of the restart: {asked:?}"
+    );
+    assert_eq!(
+        daemon.session_reset_secret(),
+        Some((secret, 0o600)),
+        "the restarted daemon kept its secret"
+    );
+    client.master.write_all(b"no\n").unwrap();
+    assert_eq!(
+        wait_for_exit(&mut client.child).unwrap().code(),
+        Some(13),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        owners_of(daemon.child.id()).is_empty(),
+        "the restarted daemon started no session for the declined run; daemon: {}",
+        daemon.output_text()
+    );
+    eprintln!("full_daemon_restart: asked {asked:?} after the restart");
+}
+
+/// What a person sees on the client's terminal: every cell's character and
+/// background.
+#[cfg(target_os = "linux")]
+fn picture(bytes: &[u8]) -> Vec<String> {
+    let mut model = terminal::TerminalCore::new(COLS, ROWS);
+    model.feed(bytes);
+    let frame = model.frame();
+    (0..ROWS)
+        .map(|row| {
+            (0..COLS)
+                .map(|col| {
+                    let cell = frame.cell(row, col);
+                    format!("{}{:?}", cell.ch, cell.bg)
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+/// A fullscreen program on the alternate screen, with a coloured
+/// background, is on the client's terminal when the daemon's frontend is
+/// killed. After the client's return through the new frontend the terminal
+/// shows exactly the picture it showed before: the server's screen model
+/// lives in the session's owner, and the repaint comes from there -- no
+/// reconnect plate left, no row lost, the background where it was.
+#[cfg(target_os = "linux")]
+#[test]
+fn fullscreen_program_repaints_after_frontend_death() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut client = spawn_client_with(
+        &daemon,
+        &key_path,
+        config.path(),
+        &["--verbose", "--status", "off"],
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+
+    // Alternate screen, blue background everywhere, text in three places;
+    // then the program waits for a line.
+    client.type_line(
+        "printf '\\033[?1049h\\033[44;97m\\033[2J\\033[1;1HTOP-LEFT\\033[5;10HFULL-%s\\033[24;60Hbottom-row' \
+         SCREEN; read QSH_LINE; printf '\\033[0m\\033[?1049l'; echo LEFT-$QSH_LINE",
+    );
+    let blue = format!("{:?}", terminal::Color::Indexed(4));
+    let row_text = |row: u16| {
+        let mut model = terminal::TerminalCore::new(COLS, ROWS);
+        model.feed(&screen.bytes());
+        let frame = model.frame();
+        (0..COLS)
+            .map(|col| frame.cell(row, col).ch)
+            .collect::<String>()
+    };
+    assert!(
+        wait_until(|| row_text(4).contains("FULL-SCREEN") && row_text(23).contains("bottom-row")),
+        "the program paints its screen; client saw: {}",
+        screen.text()
+    );
+    let before = picture(&screen.bytes());
+    assert!(
+        before
+            .iter()
+            .all(|row| row.matches(&blue).count() == COLS as usize),
+        "every cell has the program's background: {before:#?}"
+    );
+
+    let host = daemon.child.id();
+    let frontend = frontend_of(host, None);
+    kill_the_frontend(host, frontend);
+    // The client does not wait out its death timer here: the person asks
+    // for a reconnect, which goes to the new frontend.
+    client.master.write_all(b"\x1dr").expect("type ctrl-] r");
+    assert!(
+        wait_for(Duration::from_secs(60), || verbose_log(config.path())
+            .contains("reconnected at address 0")),
+        "Ctrl-] r must reconnect through the new frontend; the verbose log: {}\ndaemon: {}",
+        verbose_log(config.path()),
+        daemon.output_text()
+    );
+    assert!(
+        screen.top_ever_had("reconnecting"),
+        "the plate was over the top row meanwhile; client saw: {}",
+        screen.text()
+    );
+    let mut after = Vec::new();
+    assert!(
+        wait_for(Duration::from_secs(30), || {
+            after = picture(&screen.bytes());
+            after == before
+        }),
+        "the terminal shows the program's screen again, cell for cell;\nbefore: {before:#?}\n\
+         after: {after:#?}\ndaemon: {}",
+        daemon.output_text()
+    );
+    assert!(!screen.has("Start a new session?"));
+
+    // The program is the same process: it takes its line and leaves.
+    client.type_line("done");
+    assert!(
+        wait_for(Duration::from_secs(20), || screen.has("LEFT-done")),
+        "the program reads its line and ends; client saw: {}",
+        screen.text()
+    );
+    assert!(the_same_shell_answers(
+        &mut client,
+        &screen,
+        Duration::from_secs(20)
+    ));
+    exit_cleanly(&mut client, &screen, &daemon);
 }

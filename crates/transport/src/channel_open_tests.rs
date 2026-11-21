@@ -1043,3 +1043,115 @@ async fn open24_executor_removed_registration_retains_exact_cleanup_confirmation
         assert_eq!(observation.screen_drops.load(Ordering::SeqCst), 1);
     }
 }
+
+/// A daemon-wide count kept outside the registries, as a session owner's
+/// host keeps it (#529).
+struct SharedOpenCount {
+    per_uid: usize,
+    held: Mutex<std::collections::HashMap<u32, usize>>,
+    asked: AtomicUsize,
+}
+impl SharedOpenCount {
+    fn held(&self, uid: u32) -> usize {
+        self.held.lock().unwrap().get(&uid).copied().unwrap_or(0)
+    }
+}
+impl OpenAdmission for SharedOpenCount {
+    fn acquire(&self, uid: u32) -> bool {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        let mut held = self.held.lock().unwrap();
+        let count = held.entry(uid).or_default();
+        if *count >= self.per_uid {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+    fn charge(&self, uid: u32) {
+        *self.held.lock().unwrap().entry(uid).or_default() += 1;
+    }
+    fn release(&self, uid: u32) {
+        *self.held.lock().unwrap().get_mut(&uid).unwrap() -= 1;
+    }
+}
+
+#[test]
+fn open_admission_counts_every_registry_together() {
+    let shared = Arc::new(SharedOpenCount {
+        per_uid: 3,
+        held: Default::default(),
+        asked: AtomicUsize::new(0),
+    });
+    let a = ChannelOpenRegistry::with_admission(OpenLimits::default(), shared.clone());
+    let b = ChannelOpenRegistry::with_admission(OpenLimits::default(), shared.clone());
+    let (sa, sb) = (a.session().unwrap(), b.session().unwrap());
+    let _first = a.try_reserve(&sa, request(&sa, 7, 1)).unwrap();
+    let _second = a.try_reserve(&sa, request(&sa, 7, 2)).unwrap();
+    let third = b.try_reserve(&sb, request(&sb, 7, 3)).unwrap();
+    assert_eq!(shared.held(7), 3);
+    assert!(
+        matches!(
+            b.try_reserve(&sb, request(&sb, 7, 4)),
+            Err(OpenRefusal::Capacity)
+        ),
+        "the daemon-wide count refuses although this registry alone has room"
+    );
+    assert_eq!(b.outstanding(), 1);
+    // A refused open leaves the count as it was; a proved cleanup gives
+    // its open back to the daemon-wide count.
+    assert_eq!(shared.held(7), 3);
+    let failure = third.custody().refuse_before_creation("fixture".into());
+    let SpawnCleanup::NoChild(proof) = failure.cleanup else {
+        unreachable!()
+    };
+    assert!(b.finish_cleanup(third.id(), &proof));
+    assert_eq!(shared.held(7), 2);
+    let _fourth = b.try_reserve(&sb, request(&sb, 7, 4)).unwrap();
+    assert_eq!(shared.held(7), 3);
+    // A fenced registry refuses before it asks.
+    let asked = shared.asked.load(Ordering::SeqCst);
+    let fence = a.begin_restart_fence().unwrap();
+    assert!(matches!(
+        a.try_reserve(&sa, request(&sa, 8, 5)),
+        Err(OpenRefusal::Restarting)
+    ));
+    assert_eq!(shared.asked.load(Ordering::SeqCst), asked);
+    assert_eq!(shared.held(8), 0);
+    fence.reopen();
+}
+
+/// What a registry refuses on its own is refused before the daemon-wide
+/// count is asked: no wait, and no grant held meanwhile.
+#[test]
+fn open_admission_is_not_asked_for_what_the_registry_refuses() {
+    let shared = Arc::new(SharedOpenCount {
+        per_uid: 8,
+        held: Default::default(),
+        asked: AtomicUsize::new(0),
+    });
+    let registry = ChannelOpenRegistry::with_admission(
+        OpenLimits {
+            global: 8,
+            per_uid: 1,
+        },
+        shared.clone(),
+    );
+    let session = registry.session().unwrap();
+    let _first = registry
+        .try_reserve(&session, request(&session, 7, 1))
+        .unwrap();
+    assert_eq!(shared.asked.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        registry.try_reserve(&session, request(&session, 7, 2)),
+        Err(OpenRefusal::Capacity)
+    ));
+    let other = registry.session().unwrap();
+    let mut foreign = request(&other, 8, 3);
+    foreign.identity.session = session.id();
+    assert!(matches!(
+        registry.try_reserve(&other, foreign),
+        Err(OpenRefusal::InvalidIdentity)
+    ));
+    assert_eq!(shared.asked.load(Ordering::SeqCst), 1, "never asked");
+    assert_eq!(shared.held(7), 1);
+}

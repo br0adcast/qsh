@@ -3,6 +3,16 @@ mod open24_tests {
     use super::*;
     use std::sync::Condvar;
 
+    /// Admission as the runner does it: the daemon-wide grant first.
+    fn admit_granted(
+        prepared: PreparedOpen,
+        update: &SessionUpdate,
+        registry: &Arc<crate::channel_open::ChannelOpenRegistry>,
+    ) -> Result<crate::channel_open::OpenJob, crate::channel_open::OpenRefusal> {
+        let grant = registry.pre_admit(&prepared.session, &prepared.request)?;
+        admit_prepared_open(prepared, grant, update, registry)
+    }
+
     #[tokio::test]
     async fn fresh_open_geometry_establishes_instance_after_empty_attachment_snapshot() {
         let spawner = FakeSpawner::new();
@@ -803,6 +813,101 @@ mod open24_tests {
         assert!(opening.is_empty());
     }
 
+    /// A daemon-wide count that may wait (a session owner's host) and, while
+    /// asked, publishes the restart signal from another thread: that only
+    /// completes if no restart-signal guard is held across the wait.
+    struct WaitingAdmission {
+        publication: Arc<watch::Sender<RestartSignal>>,
+        published: AtomicBool,
+        publishers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+        asked: AtomicUsize,
+    }
+    impl crate::channel_open::OpenAdmission for WaitingAdmission {
+        fn acquire(&self, _uid: u32) -> bool {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let (sent, received) = std_mpsc::sync_channel(1);
+            let publication = self.publication.clone();
+            self.publishers
+                .lock()
+                .unwrap()
+                .push(std::thread::spawn(move || {
+                    let current = *publication.borrow();
+                    publication.send_replace(current);
+                    let _ = sent.send(());
+                }));
+            self.published.store(
+                received.recv_timeout(Duration::from_secs(1)).is_ok(),
+                Ordering::SeqCst,
+            );
+            // Refused: nothing is scheduled.
+            false
+        }
+        fn charge(&self, _uid: u32) {}
+        fn release(&self, _uid: u32) {}
+    }
+
+    #[test]
+    fn open24_daemon_wide_admission_waits_outside_the_admission_guards() {
+        let daemon = FakeDaemon::new();
+        let update = SessionUpdate::new(with_daemon(&daemon));
+        let admission = Arc::new(WaitingAdmission {
+            publication: daemon.restart_tx.clone(),
+            published: AtomicBool::new(false),
+            publishers: Mutex::new(Vec::new()),
+            asked: AtomicUsize::new(0),
+        });
+        let registry = crate::channel_open::ChannelOpenRegistry::with_admission(
+            Default::default(),
+            admission.clone(),
+        );
+        let context = ProducerContext {
+            attachment: channel_context(),
+            opens: OpenScope::new(registry.clone()),
+            ..ProducerContext::default()
+        };
+        let spawner = FakeSpawner::new();
+        let executor = crate::channel_open::ChannelOpenExecutor::new(spawner, registry.clone());
+        let (mut io, _input, mut output) = channel_pair();
+        process_fixture_live(&mut io);
+        let mut channels = HashMap::new();
+        let mut opening = HashMap::new();
+        let [response, terminal] = io.control_budget().reserve_open().unwrap();
+        open_channel_async(
+            &io,
+            &mut channels,
+            &executor,
+            &mut opening,
+            OpenRequest {
+                stream: 16,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            },
+            None,
+            1,
+            &update,
+            &context,
+            response.into_owner(),
+            terminal.into_owner(),
+        );
+        for publisher in admission.publishers.lock().unwrap().drain(..) {
+            publisher.join().unwrap();
+        }
+        assert_eq!(admission.asked.load(Ordering::SeqCst), 1);
+        assert!(
+            admission.published.load(Ordering::SeqCst),
+            "the restart signal could not be published while the open waited"
+        );
+        assert!(matches!(
+            output.try_recv().ok().and_then(reserved_open_refusal),
+            Some((_, 16, _))
+        ));
+        assert_eq!(registry.outstanding(), 0);
+        assert!(opening.is_empty());
+    }
+
     #[test]
     fn open24_admission_reads_latest_epoch_and_respects_the_surviving_fence() {
         let daemon = FakeDaemon::new();
@@ -834,19 +939,19 @@ mod open24_tests {
             .send_replace(RestartSignal::announced(1, 1));
         daemon.restart_tx.send_replace(RestartSignal::idle(1));
         let job =
-            admit_prepared_open(prepared_before_restart, &update, &context.opens.registry).unwrap();
+            admit_granted(prepared_before_restart, &update, &context.opens.registry).unwrap();
         assert_eq!(job.request().identity.invalidation_epoch, 1);
         let fence = context.opens.registry.begin_restart_fence().unwrap();
         assert!(job.custody().is_cancelled());
         assert!(matches!(
-            admit_prepared_open(prepare(), &update, &context.opens.registry),
+            admit_granted(prepare(), &update, &context.opens.registry),
             Err(crate::channel_open::OpenRefusal::Restarting)
         ));
         daemon
             .restart_tx
             .send_replace(RestartSignal::announced(2, 2));
         assert!(matches!(
-            admit_prepared_open(prepare(), &update, &context.opens.registry),
+            admit_granted(prepare(), &update, &context.opens.registry),
             Err(crate::channel_open::OpenRefusal::Restarting)
         ));
         // This test never submitted the exact admitted job to a constructor.
@@ -856,7 +961,7 @@ mod open24_tests {
         assert!(fence.wait_until(std::time::Instant::now()).is_some());
         daemon.restart_tx.send_replace(RestartSignal::idle(2));
         fence.reopen();
-        let later = admit_prepared_open(prepare(), &update, &context.opens.registry).unwrap();
+        let later = admit_granted(prepare(), &update, &context.opens.registry).unwrap();
         assert_eq!(later.request().identity.invalidation_epoch, 2);
         later
             .custody()

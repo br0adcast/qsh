@@ -101,6 +101,16 @@ impl Daemon {
         self.restart();
     }
 
+    /// The daemon's session-reset secret file beside its host key, if it
+    /// made one: its bytes and its permission bits.
+    pub fn session_reset_secret(&self) -> Option<(Vec<u8>, u32)> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.home.path().join("host_key.session-reset");
+        let bytes = std::fs::read(&path).ok()?;
+        let mode = std::fs::metadata(&path).ok()?.permissions().mode() & 0o777;
+        Some((bytes, mode))
+    }
+
     /// Record real shell starts without changing the daemon's transport behavior.
     pub fn track_shell_starts(&self) {
         use std::os::unix::fs::PermissionsExt;
@@ -132,12 +142,25 @@ impl Daemon {
     /// Stops this daemon and starts a new one on the same port, with the same host key
     /// and `authorized_keys`: a restarted daemon with no sessions.
     ///
-    /// The old process is killed and reaped first, so its UDP port is free
-    /// again by the time the new one binds it. What the old one printed stays
-    /// at the front of [`Daemon::output`], for diagnostics.
+    /// The old process is killed and reaped first, and the new one starts
+    /// once the UDP port is free again: on Linux the old daemon's network
+    /// frontend is a child that the kernel kills with it, and that may let
+    /// go of the port a moment after the daemon itself is reaped -- as a
+    /// service manager waits for a whole service to be gone before it
+    /// starts it again. What the old one printed stays at the front of
+    /// [`Daemon::output`], for diagnostics.
     pub fn restart(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, self.port)).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "port {} is still taken 10 s after the old daemon was reaped",
+                self.port
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let (child, output) =
             spawn_serve(self.home.path(), self.port, &self.shell, &self.parent_env);
         {

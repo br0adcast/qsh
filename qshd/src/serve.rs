@@ -642,6 +642,25 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| uid.to_string());
 
+    // On Linux the router runs in a frontend process that this one -- the
+    // host -- starts and replaces (#529): it is given the same gate.
+    #[cfg(target_os = "linux")]
+    let host_start = |allowlist: Arc<crate::host::HostAllowlist>| crate::host::HostStart {
+        server_priv: keypair.private,
+        server_pub: keypair.public,
+        reset_secret: crate::host::reset_secret_beside(&parsed.host_key),
+        authorized_keys: parsed.authorized_keys.clone(),
+        account: name.clone(),
+        allowlist,
+        // A `serve` daemon never replaces itself: the gate stays open.
+        admission: Arc::default(),
+        runtime_threads: parsed.runtime_threads,
+    };
+    #[cfg(target_os = "linux")]
+    let host_start = host_start(crate::host::HostAllowlist::new(Arc::new(Mutex::new(
+        Vec::new(),
+    ))));
+
     let auth = ServerAuth {
         // Nothing is bootstrapped over SSH here, so the allowlist starts (and
         // stays) empty: every client proves itself with a signature.
@@ -677,34 +696,65 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         logins: Arc::new(crate::ForgetNothing),
     };
 
+    let sessions = crate::channel_backend::PersonalSessions::hold(cache_dir(false).ok());
+    let backend = ChannelSessionBackend::new(Arc::new(crate::screen_budget::ScreenBudget::new(
+        crate::screen_budget::BudgetLimits::default(),
+    )));
+    let daemon = managed_daemon(&backend);
     let runtime = serve_runtime(parsed.runtime_threads)?;
+    #[cfg(target_os = "linux")]
+    let host = sessions.host(
+        Some(daemon.clone()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        host_start,
+    );
     runtime.block_on(async {
         let mut signals = transport_daemon::PersonalSignals::register()?;
-        transport_daemon::run_serve_loop_until_stop(
+        #[cfg(target_os = "linux")]
+        if let Some(host) = host {
+            let result =
+                transport_daemon::run_host_until_stop(host, socket, signals.requested()).await;
+            // No frontend is left; every session's owner now stops and is
+            // reaped before the daemon exits, as below.
+            let owners = sessions.stop_all().await;
+            return result.and(owners.map_err(|error| anyhow::anyhow!(error)));
+        }
+        let result = transport_daemon::run_serve_loop_until_stop(
             socket,
             keypair.private,
             auth,
-            Arc::new(managed(ChannelSessionBackend::new(Arc::new(
-                crate::screen_budget::ScreenBudget::new(
-                    crate::screen_budget::BudgetLimits::default(),
-                ),
-            )))),
+            sessions.backend(backend, Some(daemon)),
             // No helper, so nobody can report a login ended from outside: in
             // the personal mode the router is the only authority on whether a
             // login lives.
             LoginEndedReports::none(),
             signals.requested(),
         )
-        .await
+        .await;
+        // The router has drained; every session's owner now stops and is
+        // reaped before the daemon exits. An owner that did not prove its
+        // cleanup fails the stop, as a failed session worker did before.
+        let owners = sessions.stop_all().await;
+        result.and(owners.map_err(|error| anyhow::anyhow!(error)))
     })
 }
 
 /// A `serve` daemon describes itself but never replaces itself: a service
 /// manager started it, from a path a package or an administrator owns. Its
 /// own checksum is worked out on the first `About`, not here.
+#[cfg(feature = "system")]
 fn managed(backend: ChannelSessionBackend) -> ChannelSessionBackend {
-    let opens = backend.open_registry();
-    backend.with_daemon(Arc::new(crate::update::DaemonSelf::managed(opens, None)))
+    let daemon = managed_daemon(&backend);
+    backend.with_daemon(daemon)
+}
+
+fn managed_daemon(
+    backend: &ChannelSessionBackend,
+) -> Arc<dyn transport::channel_server::DaemonUpdates> {
+    Arc::new(crate::update::DaemonSelf::managed(
+        backend.open_registry(),
+        None,
+    ))
 }
 
 /// The system mode's authentication setup, built inside the worker after

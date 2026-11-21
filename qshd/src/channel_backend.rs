@@ -49,6 +49,10 @@ pub struct PtyChannelSpawner {
     opens: Arc<ChannelOpenRegistry>,
     budget: Arc<ScreenBudget>,
     retained_screens: Option<Arc<crate::session_owner::screen_owner::RetainedScreenFactory>>,
+    /// Who hears of every session leader this spawner starts: a session
+    /// owner's host (#529).
+    #[cfg(target_os = "linux")]
+    leaders: Option<Arc<dyn crate::process_scope::LeaderReports>>,
     #[cfg(all(test, target_os = "linux"))]
     fixture_leader_observer: Option<fixture_leader_observation::FixtureLeaderObserver>,
     #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
@@ -60,12 +64,36 @@ impl PtyChannelSpawner {
         Self {
             budget,
             retained_screens: None,
+            #[cfg(target_os = "linux")]
+            leaders: None,
             #[cfg(all(test, target_os = "linux"))]
             fixture_leader_observer: None,
             #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
             keeper_fixture: None,
             opens: ChannelOpenRegistry::new(Default::default()),
         }
+    }
+    /// Count this spawner's opens against `admission` too: a session
+    /// owner's, whose daemon-wide open limits its host keeps (#529).
+    pub fn with_open_admission(
+        mut self,
+        admission: Arc<dyn transport::channel_open::OpenAdmission>,
+    ) -> Self {
+        self.opens = ChannelOpenRegistry::with_admission(Default::default(), admission);
+        self
+    }
+    /// Tell `leaders` of every session leader this spawner starts -- before
+    /// it starts (an open whose start `leaders` does not note is refused
+    /// before anything is created), who it is once started, and when its
+    /// session was proved empty and it was reaped: a session owner's, whose
+    /// host checks those sessions itself if the owner dies (#529).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_leader_reports(
+        mut self,
+        leaders: Arc<dyn crate::process_scope::LeaderReports>,
+    ) -> Self {
+        self.leaders = Some(leaders);
+        self
     }
     /// Explicit retained-owner configuration; ordinary constructors keep their pool.
     pub fn with_retained_screens(
@@ -189,6 +217,8 @@ impl ChannelSpawner for PtyChannelSpawner {
             screen,
             #[cfg(target_os = "linux")]
             process_view,
+            #[cfg(target_os = "linux")]
+            self.leaders.as_ref(),
             #[cfg(all(test, target_os = "linux"))]
             fixture_observation,
         )
@@ -196,6 +226,7 @@ impl ChannelSpawner for PtyChannelSpawner {
 }
 
 /// Portable PTY creation for a selected modern/Linux owner.
+#[allow(clippy::too_many_arguments)]
 fn spawn_personal_pty(
     req: &OpenRequest,
     size: PtySize,
@@ -204,6 +235,7 @@ fn spawn_personal_pty(
     screen: Box<dyn SessionScreen>,
     #[cfg(target_os = "linux")] process_view: crate::process_scope::QualifiedProc,
     #[cfg(target_os = "macos")] process_view: crate::darwin_process_scope::QualifiedDarwin,
+    #[cfg(target_os = "linux")] leaders: Option<&Arc<dyn crate::process_scope::LeaderReports>>,
     #[cfg(all(test, target_os = "linux"))] fixture_observation: Option<
         fixture_leader_observation::Registration,
     >,
@@ -211,6 +243,18 @@ fn spawn_personal_pty(
     if custody.is_cancelled() {
         return Err(custody.refuse_before_creation("channel startup was cancelled".into()));
     }
+    // Announced before anything starts, and before the spawn permit: the
+    // host knows of every leader that may exist before it can. Dropped
+    // without an outcome (the spawn below failed), it tells that nothing
+    // started.
+    #[cfg(target_os = "linux")]
+    let window = match leaders {
+        Some(leaders) => Some(
+            crate::process_scope::LeaderWindow::open(leaders)
+                .map_err(|why| custody.refuse_before_creation(why))?,
+        ),
+        None => None,
+    };
     // Never inside a replacement's exec window: this child would inherit
     // the descriptors it makes inheritable (see `crate::update`). Held
     // until the spawn has returned -- the child has exec'd by then.
@@ -238,7 +282,7 @@ fn spawn_personal_pty(
     // portable-pty has completed its owned setsid/exec handshake. Retain
     // the unreaped leader before any fallible descriptor preparation.
     #[cfg(target_os = "linux")]
-    let wait = crate::process_scope::own_child(child, process_view);
+    let wait = crate::process_scope::own_reported_child(child, process_view, window);
     #[cfg(target_os = "macos")]
     let wait = crate::darwin_process_scope::own_child(child, process_view);
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -548,6 +592,180 @@ impl ChannelSessionBackend {
         self.daemon = Some(daemon);
         self
     }
+}
+
+/// How a personal-mode daemon runs its sessions. On Linux each session's
+/// channel backend runs in an owner process of its own (#529,
+/// [`crate::owner_process`]), started from the image this daemon held when
+/// it started, and the router runs in a frontend process that the daemon
+/// -- the host ([`crate::host`]) -- starts from the same image and replaces
+/// when it dies, without a session noticing more than a lost connection.
+/// Elsewhere -- and on Linux if the running image cannot be held -- the
+/// router drives the channel backend in this process, as the system mode
+/// always does.
+pub struct PersonalSessions {
+    #[cfg(target_os = "linux")]
+    owners: Option<(
+        crate::owner_process::SelfImage,
+        Arc<crate::owner_process::OwnerFleet>,
+    )>,
+    /// The daemon-wide limits every owner charges (`crate::host_services`).
+    #[cfg(target_os = "linux")]
+    services: Arc<crate::host_services::HostServices>,
+    #[cfg(target_os = "linux")]
+    log_dir: Option<std::path::PathBuf>,
+    /// Stops the frontend process around a replacement of the daemon.
+    #[cfg(target_os = "linux")]
+    frontend: Arc<crate::host::FrontendControl>,
+}
+
+#[cfg(target_os = "linux")]
+impl PersonalSessions {
+    /// Called at daemon start: holds this process's own image for the
+    /// owners it will start. `log_dir` is where the daemon logs; owners
+    /// append to the same file.
+    pub fn hold(log_dir: Option<std::path::PathBuf>) -> PersonalSessions {
+        let owners = match crate::owner_process::SelfImage::hold() {
+            Ok(image) => Some((image, crate::owner_process::OwnerFleet::new())),
+            Err(error) => {
+                crate::log::warn(
+                    "qshd",
+                    &format!(
+                        "cannot hold the running image ({error}); sessions run in this process"
+                    ),
+                );
+                None
+            }
+        };
+        PersonalSessions {
+            owners,
+            services: crate::host_services::HostServices::new(Default::default()),
+            log_dir,
+            frontend: Arc::default(),
+        }
+    }
+
+    /// What an in-place replacement must stop before it execs: every
+    /// session's owner, and the frontend process.
+    pub fn owner_stop(&self) -> Option<Arc<dyn crate::update::OwnerStop>> {
+        self.owners.as_ref().map(|(_, fleet)| {
+            Arc::new(crate::host::HostStop {
+                owners: fleet.clone(),
+                frontend: self.frontend.clone(),
+            }) as Arc<dyn crate::update::OwnerStop>
+        })
+    }
+
+    /// This daemon as the host of its sessions: their owners speak for
+    /// `daemon`, the router runs in a frontend process started with `start`,
+    /// and `active` is kept as the count of sessions whose client is there.
+    /// `None` if the running image cannot be held: the router then runs in
+    /// this process ([`PersonalSessions::backend`]).
+    pub fn host(
+        &self,
+        daemon: Option<Arc<dyn DaemonUpdates>>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        start: crate::host::HostStart,
+    ) -> Option<Arc<crate::host::Host>> {
+        let (image, fleet) = self.owners.as_ref()?;
+        let images = image
+            .try_clone()
+            .and_then(|a| image.try_clone().map(|b| (a, b)));
+        let (for_owners, for_frontends) = match images {
+            Ok(images) => images,
+            Err(error) => {
+                crate::log::warn(
+                    "qshd",
+                    &format!(
+                        "cannot hold the running image ({error}); sessions run in this process"
+                    ),
+                );
+                return None;
+            }
+        };
+        let catalog = crate::host::Catalog::new(active);
+        let ended = {
+            let catalog = catalog.clone();
+            let allowlist = start.allowlist.clone();
+            Arc::new(move |pid| {
+                // The keys of the sessions that end here, unless their
+                // clients were added again since.
+                for (key, seq) in catalog.owner_ended(pid) {
+                    allowlist.scrub(&key, seq);
+                }
+            })
+        };
+        let owners = crate::owner_process::OwnerHost::new(
+            for_owners,
+            self.log_dir.clone(),
+            daemon,
+            fleet.clone(),
+            self.services.clone(),
+        )
+        .on_ended(ended);
+        Some(crate::host::Host::new(
+            for_frontends,
+            owners,
+            catalog,
+            self.frontend.clone(),
+            start,
+        ))
+    }
+
+    /// The backend a router in this process runs every session with, when
+    /// this daemon is no host ([`PersonalSessions::host`] gave `None`):
+    /// `backend` speaking for `daemon`, driven here.
+    pub fn backend(
+        &self,
+        backend: ChannelSessionBackend,
+        daemon: Option<Arc<dyn DaemonUpdates>>,
+    ) -> Arc<dyn SessionBackend> {
+        direct_backend(backend, daemon)
+    }
+
+    /// Stop every owner and wait until each one is reaped: the end of a
+    /// daemon's STOP, after its router has drained. `Err` unless every
+    /// owner this daemon started proved its cleanup.
+    pub async fn stop_all(&self) -> Result<(), String> {
+        match &self.owners {
+            Some((_, fleet)) => fleet.stop_all().await,
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PersonalSessions {
+    pub fn hold(_log_dir: Option<std::path::PathBuf>) -> PersonalSessions {
+        PersonalSessions {}
+    }
+
+    pub fn owner_stop(&self) -> Option<Arc<dyn crate::update::OwnerStop>> {
+        None
+    }
+
+    pub fn backend(
+        &self,
+        backend: ChannelSessionBackend,
+        daemon: Option<Arc<dyn DaemonUpdates>>,
+    ) -> Arc<dyn SessionBackend> {
+        direct_backend(backend, daemon)
+    }
+
+    pub async fn stop_all(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The router drives `backend` itself, in this process.
+fn direct_backend(
+    backend: ChannelSessionBackend,
+    daemon: Option<Arc<dyn DaemonUpdates>>,
+) -> Arc<dyn SessionBackend> {
+    Arc::new(match daemon {
+        Some(daemon) => backend.with_daemon(daemon),
+        None => backend,
+    })
 }
 
 impl SessionBackend for ChannelSessionBackend {

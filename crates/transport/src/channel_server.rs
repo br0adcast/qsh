@@ -2881,19 +2881,47 @@ fn open_channel_async(
             return;
         }
     };
+    let refusal = |reason: crate::channel_open::OpenRefusal| {
+        if reason == crate::channel_open::OpenRefusal::Restarting {
+            "the daemon is restarting"
+        } else {
+            "too many pending channels"
+        }
+    };
+    // The daemon-wide count first: it may wait (a session owner asks its
+    // host), so never inside the admission lock or the restart-signal guard
+    // below. Its grant is given back if admission then refuses.
+    let grant = match context
+        .opens
+        .registry
+        .pre_admit(&prepared.session, &prepared.request)
+    {
+        Ok(grant) => grant,
+        Err(reason) => {
+            reserved_refusal(
+                io,
+                stream,
+                refusal(reason).into(),
+                context.attachment,
+                response,
+            );
+            return;
+        }
+    };
     let admitted =
-        io.admit_effect(|| admit_prepared_open(prepared, update, &context.opens.registry));
+        io.admit_effect(|| admit_prepared_open(prepared, grant, update, &context.opens.registry));
     let job = match admitted {
         Err(()) => return,
         Ok(result) => match result {
             Ok(job) => job,
             Err(reason) => {
-                let reason = if reason == crate::channel_open::OpenRefusal::Restarting {
-                    "the daemon is restarting"
-                } else {
-                    "too many pending channels"
-                };
-                reserved_refusal(io, stream, reason.into(), context.attachment, response);
+                reserved_refusal(
+                    io,
+                    stream,
+                    refusal(reason).into(),
+                    context.attachment,
+                    response,
+                );
                 return;
             }
         },
@@ -3148,6 +3176,7 @@ fn prepare_open(
 
 fn admit_prepared_open(
     prepared: PreparedOpen,
+    grant: crate::channel_open::OpenGrant,
     update: &SessionUpdate,
     registry: &Arc<crate::channel_open::ChannelOpenRegistry>,
 ) -> Result<crate::channel_open::OpenJob, crate::channel_open::OpenRefusal> {
@@ -3159,7 +3188,7 @@ fn admit_prepared_open(
     request.identity.invalidation_epoch = epoch.epoch();
     // Guarded admission cannot cross Announced -> Idle rollback and reuse a
     // stale epoch. No output, backend callback or scheduling occurs here.
-    let admitted = registry.try_reserve(&session, request);
+    let admitted = registry.try_reserve_granted(&session, request, grant);
     drop(epoch);
     admitted
 }

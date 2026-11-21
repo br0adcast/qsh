@@ -87,6 +87,15 @@ impl fmt::Display for ShutdownError {
     }
 }
 impl std::error::Error for ShutdownError {}
+impl ShutdownError {
+    /// The drain was given up on: something did not join within `within`.
+    pub(crate) fn unjoined(within: std::time::Duration) -> Self {
+        Self(format!(
+            "not every task and worker joined within {} s",
+            within.as_secs()
+        ))
+    }
+}
 
 /// Completion is published only after joining the blocking worker itself.
 #[derive(Clone, Default)]
@@ -141,13 +150,24 @@ pub(super) struct Lifecycle {
     pub(super) shutdown: Shutdown,
     pub(super) control_budget: crate::control_budget::GlobalBudget,
     owner: TaskOwner,
+    /// A task was registered: wakes a joiner that found the set empty.
+    spawned: tokio::sync::Notify,
 }
 impl Lifecycle {
     pub(super) fn new(shutdown: Shutdown) -> Arc<Self> {
+        Self::with_control_budget(shutdown, crate::control_budget::GlobalBudget::default())
+    }
+    /// A lifecycle whose sessions share `control_budget` (a session owner's
+    /// envelope, see `GlobalBudget::envelope`).
+    pub(super) fn with_control_budget(
+        shutdown: Shutdown,
+        control_budget: crate::control_budget::GlobalBudget,
+    ) -> Arc<Self> {
         Arc::new(Self {
             shutdown,
-            control_budget: crate::control_budget::GlobalBudget::default(),
+            control_budget,
             owner: TaskOwner::default(),
+            spawned: tokio::sync::Notify::new(),
         })
     }
     pub(super) fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
@@ -161,6 +181,7 @@ impl Lifecycle {
                 future.await;
                 None
             });
+        self.spawned.notify_waiters();
     }
     pub(super) fn spawn_callback<T: Send + 'static>(
         &self,
@@ -188,6 +209,7 @@ impl Lifecycle {
                     })),
                 })
             });
+        self.spawned.notify_waiters();
         receiver
     }
     pub(super) fn spawn_blocking(&self, work: impl FnOnce() + Send + 'static) -> WorkerReceipt {
@@ -253,6 +275,21 @@ impl Lifecycle {
         }
         Some(())
     }
+    /// Join the next task, waiting for one to be registered if there is
+    /// none: a joiner that never polls an empty set in a loop. Cancel-safe.
+    pub(super) async fn join_next_or_wait(&self) {
+        loop {
+            let spawned = self.spawned.notified();
+            tokio::pin!(spawned);
+            spawned.as_mut().enable();
+            if !self.is_empty() {
+                self.next().await;
+                return;
+            }
+            spawned.await;
+        }
+    }
+
     pub(super) async fn drain(&self) -> Result<(), ShutdownError> {
         // Only already-registered tasks may register descendants now. Their
         // handles cannot complete before that registration, so an empty set

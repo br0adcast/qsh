@@ -35,6 +35,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod dropped;
 #[cfg(feature = "system")]
 pub(crate) mod relay;
 
@@ -52,7 +54,13 @@ enum Sink {
     File(Logger),
     #[cfg(feature = "system")]
     Worker(relay::Sender),
+    /// A session owner (#529): its records go to the daemon, the only
+    /// process that writes and rotates the file.
+    Relay(Relay),
 }
+
+/// Where a session owner's records go: level, component, message.
+pub type Relay = Box<dyn Fn(Level, &str, &str) + Send>;
 
 const MAX_RECORD_BYTES: usize = 8192;
 const TRUNCATED: &str = "[truncated]";
@@ -206,6 +214,19 @@ pub fn init(cache_dir: &Path) {
     init_prepared(prepare(cache_dir));
 }
 
+/// For a session owner process: every record (this module's and the `log`
+/// crate's) goes to `relay` instead of a file, already bounded; the daemon
+/// writes it with [`record_from`]. Only one process may rotate the file, or
+/// one would write on into a file the other already renamed away.
+pub fn init_relay(relay: Relay) {
+    if LOGGER.get().is_some() {
+        return;
+    }
+    install_adapter();
+    let _ = INITIALIZATION_WARNING.set(None);
+    let _ = LOGGER.set(Mutex::new(Some(Sink::Relay(relay))));
+}
+
 /// [`init`] without a cache directory: `why` is reported the way a log that
 /// cannot be opened is, and no file is written.
 pub fn init_unavailable(why: &dyn std::fmt::Display) {
@@ -301,7 +322,13 @@ pub fn error(component: &str, msg: &str) {
 /// tests without [`init`]), and no-op for good once [`mute`] has been
 /// called.
 pub fn record(level: Level, component: &str, msg: &str) {
-    write_record(level, component, msg, false);
+    write_record(std::process::id(), level, component, msg, false);
+}
+
+/// A record another process of this daemon relayed (a session owner, see
+/// [`init_relay`]): written here, under that process's `pid`.
+pub fn record_from(pid: u32, level: Level, component: &str, msg: &str) {
+    write_record(pid, level, component, msg, false);
 }
 
 /// As [`record`], and ALWAYS on standard error too, exactly once (whether
@@ -310,22 +337,29 @@ pub fn record(level: Level, component: &str, msg: &str) {
 /// operator reads first -- the worker saying why it ends, `serve`'s startup
 /// warnings.
 pub fn loud(level: Level, component: &str, msg: &str) {
-    write_record(level, component, msg, true);
+    write_record(std::process::id(), level, component, msg, true);
 }
 
-fn write_record(level: Level, component: &str, msg: &str, to_stderr: bool) {
+fn write_record(pid: u32, level: Level, component: &str, msg: &str, to_stderr: bool) {
     if muted() {
         return;
     }
     let component = bounded_text(component, 96);
     let msg = bounded_text(msg, 4096);
-    let lines = logging::format_lines(
-        SystemTime::now(),
-        std::process::id(),
-        level,
-        &component,
-        &msg,
-    );
+    if let Some(cell) = LOGGER.get() {
+        if let Ok(sink) = cell.lock() {
+            if let Some(Sink::Relay(relay)) = sink.as_ref() {
+                relay(level, &component, &msg);
+                if to_stderr {
+                    let lines =
+                        logging::format_lines(SystemTime::now(), pid, level, &component, &msg);
+                    write_stderr(bounded_record(&joined(&lines)).as_bytes());
+                }
+                return;
+            }
+        }
+    }
+    let lines = logging::format_lines(SystemTime::now(), pid, level, &component, &msg);
     let text = joined(&lines);
     let text = bounded_record(&text);
     if let Some(cell) = LOGGER.get() {
@@ -336,6 +370,7 @@ fn write_record(level: Level, component: &str, msg: &str, to_stderr: bool) {
                 Some(Sink::Worker(sender)) => {
                     sender.report(level, &component, &msg);
                 }
+                Some(Sink::Relay(_)) => {}
                 None => {}
             }
         }

@@ -71,7 +71,7 @@ async fn capacity_snapshot_old_wire_debt_is_gone_when_reset_is_delivered() {
             .is_pending());
     }
     let mut parked = false;
-    let applied = apply_control(
+    let applied = apply_local_control(
         &mut conn,
         &mut parked,
         &mut link,
@@ -148,7 +148,7 @@ async fn capacity_snapshot_cancelled_or_mismatched_attach_keeps_live_wire_debt()
         } else {
             drop(commit);
         }
-        let applied = apply_control(
+        let applied = apply_local_control(
             &mut conn,
             &mut false,
             &mut link,

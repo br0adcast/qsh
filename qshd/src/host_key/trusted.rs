@@ -31,8 +31,8 @@ const LEAF_FLAGS: OFlag = OFlag::O_RDONLY
     .union(OFlag::O_NOCTTY)
     .union(OFlag::O_CLOEXEC);
 
-fn refused(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, message)
+fn refused(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message.into())
 }
 
 /// Only root and this daemon account may control parent names. Sticky writable
@@ -234,20 +234,39 @@ pub(super) struct FileIo;
 impl ReadIo for FileIo {}
 
 pub(super) struct Loaded {
-    pub bytes: [u8; 64],
+    pub bytes: Vec<u8>,
     pub repaired_mode: Option<u32>,
 }
 
-fn validate(file: &File, uid: Uid) -> io::Result<Metadata> {
+/// What a trusted file must be: its exact length, and the name its errors
+/// give it, so a broken session-reset secret is never reported as the host
+/// key (whose loss changes the daemon's identity).
+#[derive(Clone, Copy)]
+pub(super) struct Expected {
+    pub len: usize,
+    pub what: &'static str,
+}
+
+/// A static key file: the private key and its public key.
+pub(super) const HOST_KEY: Expected = Expected {
+    len: 64,
+    what: "host key",
+};
+
+/// The largest file this reads, whatever it is meant to hold.
+const MAX_LEN: usize = HOST_KEY.len;
+
+fn validate(file: &File, uid: Uid, expected: Expected) -> io::Result<Metadata> {
+    let Expected { len, what } = expected;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(refused("host key is not a regular file"));
+        return Err(refused(format!("{what} is not a regular file")));
     }
     if metadata.uid() != uid.as_raw() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "host key has untrusted uid={} mode={:04o}; expected uid={}",
+                "{what} has untrusted uid={} mode={:04o}; expected uid={}",
                 metadata.uid(),
                 metadata.mode() & 0o7777,
                 uid.as_raw()
@@ -255,31 +274,44 @@ fn validate(file: &File, uid: Uid) -> io::Result<Metadata> {
         ));
     }
     if metadata.nlink() != 1 {
-        return Err(refused("host key must have exactly one link"));
+        return Err(refused(format!("{what} must have exactly one link")));
     }
-    if metadata.len() != 64 {
+    if metadata.len() != len as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "host key must contain exactly 64 bytes",
+            format!("{what} must contain exactly {len} bytes"),
         ));
     }
     Ok(metadata)
 }
 
-fn read_opened(mut file: File, uid: Uid, io: &mut impl ReadIo) -> io::Result<Loaded> {
-    let metadata = validate(&file, uid)?;
+#[cfg(test)]
+fn read_opened(file: File, uid: Uid, io: &mut impl ReadIo) -> io::Result<Loaded> {
+    read_opened_as(file, uid, io, HOST_KEY)
+}
+
+/// [`read_opened`] for an `expected` file (at most `MAX_LEN` bytes).
+fn read_opened_as(
+    mut file: File,
+    uid: Uid,
+    io: &mut impl ReadIo,
+    expected: Expected,
+) -> io::Result<Loaded> {
+    let Expected { len, what } = expected;
+    assert!(len <= MAX_LEN, "a bounded secret file");
+    let metadata = validate(&file, uid, expected)?;
     let mode = metadata.mode() & 0o777;
     let repaired_mode = if mode & 0o077 != 0 {
         io.repair(&file).map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!("repairing verified host key permissions: {error}"),
+                format!("repairing verified {what} permissions: {error}"),
             )
         })?;
-        if validate(&file, uid)?.mode() & 0o077 != 0 {
-            return Err(refused(
-                "host key permission repair did not remove group/other access",
-            ));
+        if validate(&file, uid, expected)?.mode() & 0o077 != 0 {
+            return Err(refused(format!(
+                "{what} permission repair did not remove group/other access"
+            )));
         }
         Some(mode)
     } else {
@@ -287,7 +319,8 @@ fn read_opened(mut file: File, uid: Uid, io: &mut impl ReadIo) -> io::Result<Loa
     };
     // Metadata never authorizes an unbounded allocation, even if the trusted
     // owner changes file size after validation. No byte is read before repair.
-    let mut buffer = [0u8; 65];
+    let mut buffer = [0u8; MAX_LEN + 1];
+    let buffer = &mut buffer[..len + 1];
     let mut length = 0;
     while length < buffer.len() {
         match io.read(&mut file, &mut buffer[length..]) {
@@ -297,34 +330,46 @@ fn read_opened(mut file: File, uid: Uid, io: &mut impl ReadIo) -> io::Result<Loa
             Err(error) => return Err(error),
         }
     }
-    if length != 64 {
+    if length != len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "host key must contain exactly 64 bytes",
+            format!("{what} must contain exactly {len} bytes"),
         ));
     }
-    let mut bytes = [0u8; 64];
-    bytes.copy_from_slice(&buffer[..64]);
     Ok(Loaded {
-        bytes,
+        bytes: buffer[..len].to_vec(),
         repaired_mode,
     })
 }
 
+#[cfg(test)]
 pub(super) fn read(path: &Path, uid: Uid, io: &mut impl ReadIo) -> io::Result<Loaded> {
-    let (parent, leaf) = parent(path, uid)?;
-    read_at(&parent, &leaf, uid, io)
-        .map_err(|error| logging::path_error(path, "reading host key", error))
+    read_as(path, uid, io, HOST_KEY)
 }
 
-pub(super) fn read_at(
+/// A trusted `expected` file.
+pub(super) fn read_as(
+    path: &Path,
+    uid: Uid,
+    io: &mut impl ReadIo,
+    expected: Expected,
+) -> io::Result<Loaded> {
+    let (parent, leaf) = parent(path, uid)?;
+    read_at_as(&parent, &leaf, uid, io, expected)
+        .map_err(|error| logging::path_error(path, &format!("reading {}", expected.what), error))
+}
+
+/// The `expected` file `leaf` in the verified `parent`, under the rules of
+/// [`read_as`].
+pub(super) fn read_at_as(
     parent: &File,
     leaf: &std::ffi::OsStr,
     uid: Uid,
     io: &mut impl ReadIo,
+    expected: Expected,
 ) -> io::Result<Loaded> {
     let file = owned(fcntl::openat(parent, leaf, LEAF_FLAGS, Mode::empty())?);
-    read_opened(file, uid, io)
+    read_opened_as(file, uid, io, expected)
 }
 
 #[cfg(test)]

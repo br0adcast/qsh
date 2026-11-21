@@ -165,12 +165,49 @@ pub struct PortStatus {
 
 /// A snapshot of registered personal-channel custody only. Empty custody does
 /// not prove that every OS descendant or a privileged helper has completed.
+///
+/// A hosted daemon (#529, Linux personal mode) holds no session's channels
+/// itself -- its session owners do -- and reports instead whether every
+/// owner that ended proved its cleanup: `completed`, or `unresolved` with
+/// the sessions a dead owner may have left processes in (`unproved`), and
+/// no `counts`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupStatusResponse {
     pub domain: CleanupDomain,
     pub phase: CleanupPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counts: Option<CleanupCounts>,
+    /// The first of the sessions that keep a hosted daemon's cleanup
+    /// unproved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unproved: Vec<UnprovedSession>,
+    /// How many more there are than `unproved` names.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unproved_more: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// A session a dead session owner may have left processes in (#529).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnprovedSession {
+    /// The session's ID (its leader's pid, as `ps -s` takes it). Absent:
+    /// the daemon never learned it, and the session stays unproved until
+    /// the daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<u32>,
+    /// When the session's leader started, in clock ticks after boot (the
+    /// 22nd field of its `/proc/<pid>/stat`): which process led it, among
+    /// those that ever had its pid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_start: Option<u64>,
+    /// The pid the owner had.
+    pub owner: u32,
+    /// How the owner ended and what keeps the session unproved -- the
+    /// processes still in it, or why it could not be checked.
+    pub reason: String,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -220,6 +257,8 @@ impl CleanupStatusResponse {
             domain: CleanupDomain::PersonalChannels,
             phase,
             counts,
+            unproved: Vec::new(),
+            unproved_more: 0,
         }
     }
 }

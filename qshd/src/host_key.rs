@@ -41,7 +41,7 @@ pub fn load_or_create_transport_key(path: &Path) -> Result<Keypair> {
 /// Validation and permission repair use the same descriptor policy as ordinary startup.
 pub fn load_transport_key(path: &Path) -> Result<Keypair> {
     let bytes = FileIo
-        .read(path)
+        .read(path, trusted::HOST_KEY)
         .context("existing qshd identity is unavailable; recovery cannot create an identity")?;
     decode_key(path, &bytes)
 }
@@ -49,10 +49,16 @@ pub fn load_transport_key(path: &Path) -> Result<Keypair> {
 // Keep filesystem phase boundaries explicit so failure tests exercise the real
 // staging/publication path while substituting only the failing operation.
 trait KeyFileIo {
-    fn read(&mut self, path: &Path) -> io::Result<Vec<u8>> {
-        let loaded = trusted::read(path, nix::unistd::Uid::effective(), &mut trusted::FileIo)?;
-        warn_repair(path, loaded.repaired_mode);
-        Ok(loaded.bytes.to_vec())
+    /// The bytes of the trusted `expected` file at `path`.
+    fn read(&mut self, path: &Path, expected: trusted::Expected) -> io::Result<Vec<u8>> {
+        let loaded = trusted::read_as(
+            path,
+            nix::unistd::Uid::effective(),
+            &mut trusted::FileIo,
+            expected,
+        )?;
+        warn_repair(path, loaded.repaired_mode, expected.what);
+        Ok(loaded.bytes)
     }
 
     fn write(&mut self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
@@ -79,8 +85,17 @@ trait KeyFileIo {
 struct FileIo;
 impl KeyFileIo for FileIo {}
 
+/// A static key file: the 32-byte private key, then its public key.
+const KEY_FILE_LEN: usize = trusted::HOST_KEY.len;
+
+/// The session-reset secret file: 32 raw bytes.
+const SESSION_RESET_SECRET: trusted::Expected = trusted::Expected {
+    len: transport::session_reset::SESSION_RESET_SECRET_LEN,
+    what: "session-reset secret",
+};
+
 fn decode_key(path: &Path, bytes: &[u8]) -> Result<Keypair> {
-    if bytes.len() != 64 {
+    if bytes.len() != KEY_FILE_LEN {
         bail!(
             "key file {} is corrupt: expected 64 bytes, found {}",
             logging::diagnostic(&path.to_string_lossy()),
@@ -95,8 +110,66 @@ fn decode_key(path: &Path, bytes: &[u8]) -> Result<Keypair> {
 }
 
 fn load_or_create_with(path: &Path, io: &mut impl KeyFileIo) -> Result<Keypair> {
-    match io.read(path) {
-        Ok(bytes) => return decode_key(path, &bytes),
+    let bytes = load_or_create_file(path, io, trusted::HOST_KEY, || {
+        let keypair = transport::handshake::generate_keypair();
+        let mut bytes = vec![0u8; 64];
+        bytes[..32].copy_from_slice(&keypair.private);
+        bytes[32..].copy_from_slice(&keypair.public);
+        Ok(bytes)
+    })?;
+    decode_key(path, &bytes)
+}
+
+/// The session-reset secret kept beside the static key at `key_path`
+/// (`transport::session_reset`): `<key file name>.session-reset`.
+pub fn session_reset_secret_path(key_path: &Path) -> std::path::PathBuf {
+    let mut name = key_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".session-reset");
+    key_path.with_file_name(name)
+}
+
+/// Load the daemon's session-reset secret, or atomically publish a new one if
+/// absent: 32 raw random bytes, under exactly the rules of the static key
+/// ([`load_or_create_transport_key`]) -- trusted parents, owner, single link,
+/// mode 0600 (repaired on the opened descriptor), never replaced when it is
+/// there but invalid, and a concurrent creator's winner read back.
+pub fn load_or_create_session_reset_secret(
+    path: &Path,
+) -> Result<transport::session_reset::SessionResetSecret> {
+    load_or_create_secret_with(path, &mut FileIo)
+}
+
+fn load_or_create_secret_with(
+    path: &Path,
+    io: &mut impl KeyFileIo,
+) -> Result<transport::session_reset::SessionResetSecret> {
+    use transport::session_reset::{SessionResetSecret, SESSION_RESET_SECRET_LEN};
+    let bytes = load_or_create_file(path, io, SESSION_RESET_SECRET, || {
+        let secret = SessionResetSecret::generate()?;
+        Ok(secret.expose().to_vec())
+    })?;
+    let Ok(raw) = <[u8; SESSION_RESET_SECRET_LEN]>::try_from(&bytes[..]) else {
+        bail!(
+            "session-reset secret {} is corrupt: expected {SESSION_RESET_SECRET_LEN} bytes, found {}",
+            logging::diagnostic(&path.to_string_lossy()),
+            bytes.len()
+        );
+    };
+    Ok(SessionResetSecret::from_bytes(raw))
+}
+
+/// The `len` bytes of the file at `path`, read under the trusted-file rules, or --
+/// when there is none -- the bytes `generate` makes, published there without
+/// replacing a concurrent creator's winner (whose bytes are returned then).
+fn load_or_create_file(
+    path: &Path,
+    io: &mut impl KeyFileIo,
+    expected: trusted::Expected,
+    generate: impl FnOnce() -> io::Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let what = expected.what;
+    match io.read(path, expected) {
+        Ok(bytes) => return Ok(bytes),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(error).with_context(|| {
@@ -114,66 +187,68 @@ fn load_or_create_with(path: &Path, io: &mut impl KeyFileIo) -> Result<Keypair> 
         })?;
     let mut staged = io.stage(&parent).with_context(|| {
         format!(
-            "staging key for {}",
+            "staging {what} for {}",
             logging::diagnostic(&path.to_string_lossy())
         )
     })?;
-    let keypair = transport::handshake::generate_keypair();
-    let mut bytes = [0u8; 64];
-    bytes[..32].copy_from_slice(&keypair.private);
-    bytes[32..].copy_from_slice(&keypair.public);
+    let bytes = match generate() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let error = anyhow::Error::new(error).context("generating a key");
+            return Err(cleanup_error(io, &parent, &staged.name, what, error));
+        }
+    };
     let preparation = io
         .write(&mut staged.file, &bytes)
         .with_context(|| {
             format!(
-                "writing staged key for {}",
+                "writing staged {what} for {}",
                 logging::diagnostic(&path.to_string_lossy())
             )
         })
         .and_then(|()| {
             io.sync(&staged.file).with_context(|| {
                 format!(
-                    "syncing staged key for {}",
+                    "syncing staged {what} for {}",
                     logging::diagnostic(&path.to_string_lossy())
                 )
             })
         });
     if let Err(error) = preparation {
-        return Err(cleanup_error(io, &parent, &staged.name, error));
+        return Err(cleanup_error(io, &parent, &staged.name, what, error));
     }
     match io.publish(&parent, &staged.name, &leaf) {
-        Ok(()) => Ok(keypair),
+        Ok(()) => Ok(bytes),
         Err(error) => {
             let exists = error.kind() == io::ErrorKind::AlreadyExists;
             let error = anyhow::Error::new(error).context(format!(
-                "publishing key {} (requires atomic exclusive rename support)",
+                "publishing {what} {} (requires atomic exclusive rename support)",
                 logging::diagnostic(&path.to_string_lossy())
             ));
             // Only our exclusive staging name is removed. A failed cleanup is
             // an error even when another creator has already published a key.
             if let Err(cleanup) = io.cleanup(&parent, &staged.name) {
-                return Err(
-                    error.context(format!("removing owned host key stage failed: {cleanup}"))
-                );
+                return Err(error.context(format!("removing owned {what} stage failed: {cleanup}")));
             }
             if !exists {
                 return Err(error);
             }
             // Never re-resolve the original pathname after an EEXIST race.
-            let loaded = trusted::read_at(
+            let loaded = trusted::read_at_as(
                 &parent,
                 &leaf,
                 nix::unistd::Uid::effective(),
                 &mut trusted::FileIo,
+                expected,
             )
             .with_context(|| {
                 format!(
-                    "reading winning key {}",
+                    "reading winning {what} {}",
                     logging::diagnostic(&path.to_string_lossy())
                 )
             })?;
-            warn_repair(path, loaded.repaired_mode);
-            decode_key(path, &loaded.bytes)
+            warn_repair(path, loaded.repaired_mode, what);
+            Ok(loaded.bytes)
         }
     }
 }
@@ -182,18 +257,19 @@ fn cleanup_error(
     io: &mut impl KeyFileIo,
     parent: &File,
     name: &CStr,
+    what: &str,
     error: anyhow::Error,
 ) -> anyhow::Error {
     match io.cleanup(parent, name) {
         Ok(()) => error,
-        Err(cleanup) => error.context(format!("removing owned host key stage failed: {cleanup}")),
+        Err(cleanup) => error.context(format!("removing owned {what} stage failed: {cleanup}")),
     }
 }
 
-fn warn_repair(path: &Path, mode: Option<u32>) {
+fn warn_repair(path: &Path, mode: Option<u32>, what: &str) {
     if let Some(mode) = mode {
         crate::log::warn("qshd", &format!(
-            "host key {} was accessible to more than its owner (mode {mode:03o}); \
+            "{what} {} was accessible to more than its owner (mode {mode:03o}); \
              verified file permissions tightened to 0600, which cannot undo a possible past disclosure",
             logging::diagnostic(&path.to_string_lossy())
         ));
@@ -228,6 +304,80 @@ mod existing_identity_tests {
         std::fs::write(&path, b"invalid").unwrap();
         assert!(super::load_transport_key(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"invalid");
+    }
+}
+
+#[cfg(test)]
+mod session_reset_secret_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn private_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
+    /// Beside the key, named after it; created once, private, and read back
+    /// unchanged by every later start.
+    #[test]
+    fn the_reset_secret_is_created_once_beside_the_key_and_kept() {
+        let dir = private_dir();
+        let key = dir.path().join("host_key");
+        let path = super::session_reset_secret_path(&key);
+        assert_eq!(path, dir.path().join("host_key.session-reset"));
+        let first = super::load_or_create_session_reset_secret(&path).unwrap();
+        let stored = std::fs::read(&path).unwrap();
+        assert_eq!(stored, first.expose());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let again = super::load_or_create_session_reset_secret(&path).unwrap();
+        assert_eq!(
+            again.expose(),
+            first.expose(),
+            "the same secret after a restart"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), stored);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no stage left"
+        );
+    }
+
+    /// The static key's rules: a file that is there but wrong is refused and
+    /// left as it is, never replaced; one open to others is tightened first.
+    #[test]
+    fn a_wrong_reset_secret_is_refused_and_never_replaced() {
+        let dir = private_dir();
+        let path = dir.path().join("k.session-reset");
+        std::fs::write(&path, [7u8; 31]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let error = format!(
+            "{:#}",
+            super::load_or_create_session_reset_secret(&path).unwrap_err()
+        );
+        assert!(
+            error.contains("session-reset secret must contain exactly 32 bytes")
+                && !error.contains("host key"),
+            "named as what it is, never as the identity: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), [7u8; 31]);
+
+        std::fs::write(&path, [9u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let secret = super::load_or_create_session_reset_secret(&path).unwrap();
+        assert_eq!(secret.expose(), &[9u8; 32]);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let link = dir.path().join("link.session-reset");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(super::load_or_create_session_reset_secret(&link).is_err());
     }
 }
 
@@ -519,7 +669,7 @@ mod tests {
             reads: usize,
         }
         impl KeyFileIo for DeniedRead {
-            fn read(&mut self, _: &Path) -> io::Result<Vec<u8>> {
+            fn read(&mut self, _: &Path, _: trusted::Expected) -> io::Result<Vec<u8>> {
                 self.reads += 1;
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,

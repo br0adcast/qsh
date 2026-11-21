@@ -70,11 +70,11 @@ fn inactive_reservation_leaves_legacy_handshake_bytes_unchanged() {
     });
     let mut expected = vec![2, 0];
     expected.extend([0x11; 16]);
-    expected.extend([0, 0, 0, 0, 0x3f]);
+    expected.extend([0, 0, 0, 0, 0xbf]);
     assert_eq!(msg1, expected);
     let mut expected = vec![2, 0, 0, 0, 0, 0, 0, 0, 7, 0];
     expected.extend([0x22; 16]);
-    expected.extend([0, 0, 0, 0x3f]);
+    expected.extend([0, 0, 0, 0xbf]);
     assert_eq!(
         encode_msg2(7, false, &[0x22; 16], Features::SUPPORTED),
         expected

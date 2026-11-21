@@ -1616,10 +1616,13 @@ dependencies = [
  "blake2 0.11.0",
  "chacha20poly1305 0.11.0",
  "getrandom 0.4.3",
+ "hmac",
  "log",
  "polling",
+ "sha2 0.11.1",
  "snow",
  "socket2",
+ "subtle",
  "terminal-size",
  "zeroize",
 ]

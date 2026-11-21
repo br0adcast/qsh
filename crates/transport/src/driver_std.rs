@@ -2110,6 +2110,12 @@ fn dispatch_event(
                 enabled,
             });
         }
+        // The `Closed` that follows does what the death timer would: the
+        // owner returns warm. Said once per connection, and only for a reset
+        // that carried this connection's token.
+        Event::SessionReset => {
+            log::info!("the server no longer has this connection (session reset); returning");
+        }
         Event::UnofferedFeatureEnabled { enabled } => {
             events.on_protocol_failure(crate::ProtocolFailure::UnofferedFeatures { enabled });
             #[cfg(test)]

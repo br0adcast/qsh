@@ -70,13 +70,11 @@ pub const PROVEN_BURST: u32 = 5;
 /// until the table is swept, as WireGuard's limiter does when full.
 pub const PROVEN_RATE_SOURCES: usize = 8192;
 
-/// What one proven handshake costs a source's budget.
-const PROVEN_COST: Duration = Duration::from_nanos(1_000_000_000 / PROVEN_PER_SECOND as u64);
-
-/// A full budget: the burst. Also how long a spent budget takes to fill
-/// again, so how often the table is swept of sources idle that long.
-const PROVEN_BUCKET: Duration =
-    Duration::from_nanos(1_000_000_000 / PROVEN_PER_SECOND as u64 * PROVEN_BURST as u64);
+/// A full budget of proven handshakes: the burst. Also how long a spent
+/// budget takes to fill again, so how often the table is swept of sources
+/// idle that long.
+#[cfg(test)]
+const PROVEN_BUCKET: Duration = bucket_of(PROVEN_PER_SECOND, PROVEN_BURST).1;
 
 /// The domain of the cookie MAC.
 const COOKIE_LABEL: &[u8] = b"qsh cookie v1";
@@ -134,7 +132,7 @@ pub struct CookieCheck {
     last_window: u32,
     limits: LoadLimits,
     loaded: bool,
-    proven_rate: ProvenRate,
+    proven_rate: SourceRate,
 }
 
 impl CookieCheck {
@@ -153,7 +151,7 @@ impl CookieCheck {
             last_window: 0,
             limits,
             loaded: false,
-            proven_rate: ProvenRate::new(now),
+            proven_rate: SourceRate::new(now, PROVEN_PER_SECOND, PROVEN_BURST, PROVEN_RATE_SOURCES),
         }
     }
 
@@ -278,63 +276,92 @@ impl CookieCheck {
     }
 }
 
-/// Proven handshakes per source while the daemon is under load:
-/// WireGuard's token bucket (`ratelimiter.c`). Each source starts with a full
-/// budget of [`PROVEN_BUCKET`], pays [`PROVEN_COST`] per handshake worked
-/// on, and earns it back as time passes.
-struct ProvenRate {
+/// Work per source, on WireGuard's token bucket (`ratelimiter.c`): each
+/// source group ([`source_group_key`]) starts with a full budget of `bucket`,
+/// pays `cost` per piece of work, and earns it back as time passes. At most
+/// `sources` budgets are held; a new source past that is refused until the
+/// table is swept of budgets that have filled again. The proven handshakes
+/// under load ([`PROVEN_PER_SECOND`]) and the session resets
+/// (`crate::session_reset`) are each held to one.
+pub(crate) struct SourceRate {
     budgets: HashMap<[u8; 16], Budget>,
     /// When the table was last swept of budgets that have filled again.
     swept_at: Instant,
+    cost: Duration,
+    bucket: Duration,
+    sources: usize,
 }
 
+/// One budget of a token bucket: the time's worth of work still allowed.
 #[derive(Clone, Copy)]
-struct Budget {
-    /// The time's worth of handshakes this source may still have worked on.
+pub(crate) struct Budget {
+    /// The time's worth of work this budget may still have done.
     left: Duration,
     /// When `left` was last brought up to date.
     at: Instant,
 }
 
-impl ProvenRate {
-    fn new(now: Instant) -> Self {
-        ProvenRate {
-            budgets: HashMap::new(),
-            swept_at: now,
+impl Budget {
+    /// A full budget of `bucket` at `now`.
+    pub(crate) fn full(now: Instant, bucket: Duration) -> Budget {
+        Budget {
+            left: bucket,
+            at: now,
         }
     }
 
-    /// Whether a proven handshake from `ip` may be worked on now; charges it
-    /// if so. A new source past [`PROVEN_RATE_SOURCES`] may not.
-    fn allow(&mut self, now: Instant, ip: IpAddr) -> bool {
-        if now.saturating_duration_since(self.swept_at) >= PROVEN_BUCKET {
+    /// Whether `cost` may be paid at `now`, earning back up to `bucket`
+    /// first; pays it if so.
+    pub(crate) fn take(&mut self, now: Instant, cost: Duration, bucket: Duration) -> bool {
+        let left = (self.left + now.saturating_duration_since(self.at)).min(bucket);
+        self.at = now;
+        if left < cost {
+            self.left = left;
+            return false;
+        }
+        self.left = left - cost;
+        true
+    }
+}
+
+/// What one piece of work costs at `per_second`, and the full budget that
+/// holds `burst` of them.
+pub(crate) const fn bucket_of(per_second: u32, burst: u32) -> (Duration, Duration) {
+    let cost = 1_000_000_000 / per_second as u64;
+    (
+        Duration::from_nanos(cost),
+        Duration::from_nanos(cost * burst as u64),
+    )
+}
+
+impl SourceRate {
+    pub(crate) fn new(now: Instant, per_second: u32, burst: u32, sources: usize) -> Self {
+        let (cost, bucket) = bucket_of(per_second, burst);
+        SourceRate {
+            budgets: HashMap::new(),
+            swept_at: now,
+            cost,
+            bucket,
+            sources,
+        }
+    }
+
+    /// Whether work for `ip` may be done now; charges it if so. A new
+    /// source past the table's size may not.
+    pub(crate) fn allow(&mut self, now: Instant, ip: IpAddr) -> bool {
+        let (cost, bucket) = (self.cost, self.bucket);
+        if now.saturating_duration_since(self.swept_at) >= bucket {
             // A budget untouched this long is full again: as good as none.
-            // At most one sweep per `PROVEN_BUCKET`, whatever arrives.
+            // At most one sweep per `bucket`, whatever arrives.
             self.budgets
-                .retain(|_, b| now.saturating_duration_since(b.at) < PROVEN_BUCKET);
+                .retain(|_, b| now.saturating_duration_since(b.at) < bucket);
             self.swept_at = now;
         }
-        let full = self.budgets.len() >= PROVEN_RATE_SOURCES;
+        let full = self.budgets.len() >= self.sources;
         match self.budgets.entry(source_group_key(ip)) {
-            Entry::Occupied(mut e) => {
-                let b = e.get_mut();
-                let left = (b.left + now.saturating_duration_since(b.at)).min(PROVEN_BUCKET);
-                b.at = now;
-                if left < PROVEN_COST {
-                    b.left = left;
-                    return false;
-                }
-                b.left = left - PROVEN_COST;
-                true
-            }
+            Entry::Occupied(mut e) => e.get_mut().take(now, cost, bucket),
             Entry::Vacant(_) if full => false,
-            Entry::Vacant(e) => {
-                e.insert(Budget {
-                    left: PROVEN_BUCKET - PROVEN_COST,
-                    at: now,
-                });
-                true
-            }
+            Entry::Vacant(e) => e.insert(Budget::full(now, bucket)).take(now, cost, bucket),
         }
     }
 }

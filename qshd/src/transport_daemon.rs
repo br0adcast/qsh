@@ -135,6 +135,93 @@ pub fn apply_add_client(shared: &SharedAllowlist, pubkey: [u8; 32]) {
     }
 }
 
+/// The allowlist the control server adds to (`ADD-CLIENT`).
+#[derive(Clone)]
+pub enum ControlAllowlist {
+    /// Read by a router in this process.
+    Local(SharedAllowlist),
+    /// A host's (#529): its frontend process admits a key once the host
+    /// has sent it there.
+    #[cfg(target_os = "linux")]
+    Host(Arc<crate::host::HostAllowlist>),
+}
+
+impl From<SharedAllowlist> for ControlAllowlist {
+    fn from(keys: SharedAllowlist) -> Self {
+        ControlAllowlist::Local(keys)
+    }
+}
+
+impl ControlAllowlist {
+    /// Add `pubkey`, answered once a handshake under it is admitted:
+    /// at once in this process; for a host, once its running frontend has
+    /// it (bounded, see [`crate::host::HostAllowlist`]).
+    pub async fn add(&self, pubkey: [u8; 32]) {
+        match self {
+            ControlAllowlist::Local(keys) => apply_add_client(keys, pubkey),
+            #[cfg(target_os = "linux")]
+            ControlAllowlist::Host(host) => {
+                host.add_and_wait(pubkey, crate::host::ADD_CLIENT_WAIT)
+                    .await
+            }
+        }
+    }
+}
+
+/// Where `STATUS` takes its cleanup from.
+#[derive(Clone)]
+pub(crate) enum CleanupSource {
+    /// This process's channel registry: its sessions run here.
+    Registry(Arc<ChannelOpenRegistry>),
+    /// A host's session owners (#529): each holds its session's channels,
+    /// and the host knows what is unproved of those that ended.
+    #[cfg(target_os = "linux")]
+    Owners(Arc<crate::owner_process::OwnerFleet>),
+}
+
+impl CleanupSource {
+    fn registry(&self) -> Option<&ChannelOpenRegistry> {
+        match self {
+            CleanupSource::Registry(registry) => Some(registry),
+            #[cfg(target_os = "linux")]
+            CleanupSource::Owners(_) => None,
+        }
+    }
+}
+
+/// [`transport_status_response`] with its cleanup from `cleanup`: a host's
+/// owners checked afresh (a bounded census, on a blocking thread).
+async fn status_with(
+    ports: &[u16],
+    total_connections: u64,
+    cleanup: Option<&CleanupSource>,
+) -> Result<StatusResponse> {
+    // Only Linux hosts fill the owners' cleanup in below.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut response = transport_status_response(
+        ports,
+        total_connections,
+        cleanup.and_then(CleanupSource::registry),
+    )?;
+    #[cfg(target_os = "linux")]
+    if let Some(CleanupSource::Owners(fleet)) = cleanup {
+        let fleet = fleet.clone();
+        // A check that did not finish proves nothing, and STATUS still
+        // answers: the cleanup is unknown.
+        let cleanup = tokio::task::spawn_blocking(move || fleet.cleanup_status())
+            .await
+            .unwrap_or_else(|error| {
+                log::error(
+                    "qshd",
+                    &format!("checking the session owners' cleanup failed: {error}"),
+                );
+                control::CleanupStatusResponse::from_snapshot(None)
+            });
+        response.cleanup = Some(cleanup);
+    }
+    Ok(response)
+}
+
 /// Builds the transport daemon's `STATUS` response: the same
 /// [`StatusResponse`] shape as qsh (read by `version::reconcile` and the
 /// `transport-ensure` client). `total_connections` is the LIVE active-session
@@ -342,13 +429,110 @@ impl ControlAcceptor for tokio::net::UnixListener {
     }
 }
 
+/// Where the daemon's session router runs.
+enum Router {
+    /// In this process, on `socket`.
+    InProcess {
+        socket: std::net::UdpSocket,
+        server_priv: [u8; 32],
+        auth: ServerAuth,
+        backend: Arc<dyn SessionBackend>,
+    },
+    /// In a frontend process that `host` starts on `socket` and replaces
+    /// when it dies (#529); this process keeps the sessions and the
+    /// allowlist.
+    #[cfg(target_os = "linux")]
+    Frontend {
+        host: Arc<crate::host::Host>,
+        socket: std::net::UdpSocket,
+        allowlist: Arc<crate::host::HostAllowlist>,
+        server_pub: [u8; 32],
+    },
+}
+
+/// The personal daemon as a host (#529): the control server here, the
+/// session router in a frontend process of `host`. Otherwise as
+/// [`run_transport_daemon_until_stop_with_actions`].
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_hosted_transport_daemon_until_stop(
+    host: Arc<crate::host::Host>,
+    socket: std::net::UdpSocket,
+    allowlist: Arc<crate::host::HostAllowlist>,
+    server_pub: [u8; 32],
+    listener: std::os::unix::net::UnixListener,
+    _cleanup: control::SocketCleanup,
+    ports: Vec<u16>,
+    active_count: Arc<AtomicUsize>,
+    actions: Arc<Actions>,
+    stop: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let control_gate = actions.control_gate.clone();
+    listener
+        .set_nonblocking(true)
+        .context("switching the control socket to non-blocking mode")?;
+    let listener = tokio::net::UnixListener::from_std(listener)
+        .context("adopting the control socket into tokio")?;
+    // Each session's channels are held by its owner, in a process of its
+    // own: `STATUS` reports the owners' cleanup, never this process's own
+    // (always empty) registry.
+    let cleanup = Some(CleanupSource::Owners(host.fleet()));
+    run_daemon(
+        Router::Frontend {
+            host,
+            socket,
+            allowlist,
+            server_pub,
+        },
+        listener,
+        ports,
+        active_count,
+        control_gate,
+        cleanup,
+        stop,
+        Some(actions),
+    )
+    .await
+}
+
+/// A host without a control socket (`serve`): frontends of `host` on
+/// `socket` until `stop`, then until the last one is reaped.
+#[cfg(target_os = "linux")]
+pub async fn run_host_until_stop(
+    host: Arc<crate::host::Host>,
+    socket: std::net::UdpSocket,
+    stop: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let shutdown = transport::Shutdown::default();
+    let serving = host.serve(
+        socket,
+        shutdown.clone(),
+        crate::server_info::current().generation,
+    );
+    tokio::pin!(serving);
+    tokio::pin!(stop);
+    let (result, stop_error) = tokio::select! {
+        biased;
+        stopped = &mut stop => {
+            shutdown.request();
+            (serving.await, stopped.err())
+        }
+        result = &mut serving => (result, None),
+    };
+    result?;
+    match stop_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_transport_daemon_with_acceptor(
     socket: std::net::UdpSocket,
     server_priv: [u8; 32],
     auth: ServerAuth,
     backend: Arc<dyn SessionBackend>,
-    mut listener: impl ControlAcceptor,
+    listener: impl ControlAcceptor,
     ports: Vec<u16>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
@@ -356,15 +540,35 @@ async fn run_transport_daemon_with_acceptor(
     stop: impl std::future::Future<Output = Result<()>>,
     actions: Option<Arc<Actions>>,
 ) -> Result<()> {
-    // Sized here, where every socket the daemon serves passes -- one it
-    // bound, and one an older binary handed over on an update (spec §4.12).
-    transport::log_socket_buffers(&transport::tune_udp_buffers(&socket));
-    socket
-        .set_nonblocking(true)
-        .context("switching the transport UDP socket to non-blocking mode")?;
-    let socket = tokio::net::UdpSocket::from_std(socket)
-        .context("adopting the transport UDP socket into tokio")?;
+    run_daemon(
+        Router::InProcess {
+            socket,
+            server_priv,
+            auth,
+            backend,
+        },
+        listener,
+        ports,
+        active_count,
+        control_gate,
+        cleanup_registry.map(CleanupSource::Registry),
+        stop,
+        actions,
+    )
+    .await
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn run_daemon(
+    router: Router,
+    mut listener: impl ControlAcceptor,
+    ports: Vec<u16>,
+    active_count: Arc<AtomicUsize>,
+    control_gate: Arc<tokio::sync::RwLock<()>>,
+    cleanup: Option<CleanupSource>,
+    stop: impl std::future::Future<Output = Result<()>>,
+    actions: Option<Arc<Actions>>,
+) -> Result<()> {
     let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
 
     log::info(
@@ -380,7 +584,15 @@ async fn run_transport_daemon_with_acceptor(
     // updated incrementally by each session bridge in the manager, read by
     // the control server's STATUS/ADD-CLIENT/ADD-PORT replies
     // (`total_connections`) and by the update service.
-    let shared_allowlist = auth.allowlist.clone();
+    let (shared_allowlist, server_pub): (ControlAllowlist, _) = match &router {
+        Router::InProcess { auth, .. } => (auth.allowlist.clone().into(), auth.server_pub),
+        #[cfg(target_os = "linux")]
+        Router::Frontend {
+            allowlist,
+            server_pub,
+            ..
+        } => (ControlAllowlist::Host(allowlist.clone()), *server_pub),
+    };
     let mut handlers = tokio::task::JoinSet::new();
     // The multi-session router: one UDP socket, per-token sessions, the
     // per-session channel backend. It snapshots the allowlist fresh at every
@@ -390,20 +602,43 @@ async fn run_transport_daemon_with_acceptor(
         .map(|a| a.shutdown.clone())
         .unwrap_or_default();
     let running_info = Arc::new(crate::server_info::RunningServerInfo {
-        public_key: auth.server_pub,
+        public_key: server_pub,
         info: crate::server_info::current(),
     });
-    let manager_loop = SessionManager::serve_with_server_info(
-        Arc::new(socket),
-        server_priv,
-        auth,
-        BackendFactory(backend),
-        active_count.clone(),
-        LoginEndedReports::none(),
-        shutdown.clone(),
-        Some(running_info.info.clone()),
-    );
-    tokio::pin!(manager_loop);
+    let mut manager_loop: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+        match router {
+            Router::InProcess {
+                socket,
+                server_priv,
+                auth,
+                backend,
+            } => {
+                // Sized here, where every socket the daemon serves passes --
+                // one it bound, and one an older binary handed over on an
+                // update (spec §4.12).
+                transport::log_socket_buffers(&transport::tune_udp_buffers(&socket));
+                socket
+                    .set_nonblocking(true)
+                    .context("switching the transport UDP socket to non-blocking mode")?;
+                let socket = tokio::net::UdpSocket::from_std(socket)
+                    .context("adopting the transport UDP socket into tokio")?;
+                let serving = SessionManager::serve_with_server_info(
+                    Arc::new(socket),
+                    server_priv,
+                    auth,
+                    BackendFactory(backend),
+                    active_count.clone(),
+                    LoginEndedReports::none(),
+                    shutdown.clone(),
+                    Some(running_info.info.clone()),
+                );
+                Box::pin(async move { serving.await.map_err(anyhow::Error::new) })
+            }
+            #[cfg(target_os = "linux")]
+            Router::Frontend { host, socket, .. } => {
+                Box::pin(host.serve(socket, shutdown.clone(), running_info.info.generation))
+            }
+        };
 
     tokio::pin!(stop);
     let mut trigger_error = None;
@@ -440,7 +675,7 @@ async fn run_transport_daemon_with_acceptor(
                     retry_delay = CONTROL_ACCEPT_RETRY_INITIAL;
                     spawn_control_handler(&mut handlers, stream,
                         shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                        active_count.clone(), control_gate.clone(), cleanup_registry.clone(), Some(running_info.clone()), actions.clone());
+                        active_count.clone(), control_gate.clone(), cleanup.clone(), Some(running_info.clone()), actions.clone());
                 }
                 Err(error) if recoverable_control_accept(&error) => {
                     let now = tokio::time::Instant::now();
@@ -628,20 +863,21 @@ pub(crate) async fn run_serve_loop_until_shutdown(
 /// connection doesn't take down the whole control socket.
 pub async fn serve_transport_control(
     listener: tokio::net::UnixListener,
-    shared_allowlist: SharedAllowlist,
+    shared_allowlist: impl Into<ControlAllowlist>,
     ports: Vec<u16>,
     stop_tx: mpsc::Sender<()>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
 ) {
+    let shared_allowlist: ControlAllowlist = shared_allowlist.into();
     let mut handlers = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => spawn_control_handler(&mut handlers, stream,
                     shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                    active_count.clone(), control_gate.clone(), cleanup_registry.clone(), None, None),
+                    active_count.clone(), control_gate.clone(), cleanup_registry.clone().map(CleanupSource::Registry), None, None),
                 Err(error) => log::warn("qshd", &format!("error accepting transport control connection: {error}")),
             },
             result = handlers.join_next(), if !handlers.is_empty() => {
@@ -657,15 +893,16 @@ pub async fn serve_transport_control(
 fn spawn_control_handler(
     handlers: &mut tokio::task::JoinSet<()>,
     stream: tokio::net::UnixStream,
-    shared_allowlist: SharedAllowlist,
+    shared_allowlist: impl Into<ControlAllowlist>,
     ports: Vec<u16>,
     stop_tx: mpsc::Sender<()>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
-    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    cleanup: Option<CleanupSource>,
     running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
     actions: Option<Arc<Actions>>,
 ) {
+    let shared_allowlist: ControlAllowlist = shared_allowlist.into();
     let deadline = tokio::time::Instant::now() + CONTROL_REQUEST_TIMEOUT;
     handlers.spawn(async move {
         if let Err(error) = handle_transport_control_connection_with_info(
@@ -675,7 +912,7 @@ fn spawn_control_handler(
             stop_tx,
             active_count,
             control_gate,
-            cleanup_registry,
+            cleanup,
             deadline,
             running_info,
             actions,
@@ -734,7 +971,7 @@ async fn join_control_handlers(
 #[cfg(test)]
 async fn handle_transport_control_connection(
     stream: tokio::net::UnixStream,
-    shared_allowlist: SharedAllowlist,
+    shared_allowlist: impl Into<ControlAllowlist>,
     ports: Vec<u16>,
     stop_tx: mpsc::Sender<()>,
     active_count: Arc<AtomicUsize>,
@@ -742,6 +979,7 @@ async fn handle_transport_control_connection(
     cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
+    let shared_allowlist: ControlAllowlist = shared_allowlist.into();
     handle_transport_control_connection_with_info(
         stream,
         shared_allowlist,
@@ -749,7 +987,7 @@ async fn handle_transport_control_connection(
         stop_tx,
         active_count,
         control_gate,
-        cleanup_registry,
+        cleanup_registry.map(CleanupSource::Registry),
         deadline,
         None,
         None,
@@ -760,16 +998,17 @@ async fn handle_transport_control_connection(
 #[allow(clippy::too_many_arguments)]
 async fn handle_transport_control_connection_with_info(
     stream: tokio::net::UnixStream,
-    shared_allowlist: SharedAllowlist,
+    shared_allowlist: impl Into<ControlAllowlist>,
     ports: Vec<u16>,
     stop_tx: mpsc::Sender<()>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
-    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    cleanup: Option<CleanupSource>,
     deadline: tokio::time::Instant,
     running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
     actions: Option<Arc<Actions>>,
 ) -> Result<()> {
+    let shared_allowlist: ControlAllowlist = shared_allowlist.into();
     handle_transport_control_connection_with_peer_check_and_info(
         stream,
         shared_allowlist,
@@ -777,7 +1016,7 @@ async fn handle_transport_control_connection_with_info(
         stop_tx,
         active_count,
         control_gate,
-        cleanup_registry,
+        cleanup,
         deadline,
         running_info,
         actions,
@@ -795,7 +1034,7 @@ async fn handle_transport_control_connection_with_info(
 #[cfg(test)]
 async fn handle_transport_control_connection_with_peer_check(
     stream: tokio::net::UnixStream,
-    shared_allowlist: SharedAllowlist,
+    shared_allowlist: impl Into<ControlAllowlist>,
     ports: Vec<u16>,
     stop_tx: mpsc::Sender<()>,
     active_count: Arc<AtomicUsize>,
@@ -804,6 +1043,7 @@ async fn handle_transport_control_connection_with_peer_check(
     deadline: tokio::time::Instant,
     check: impl FnOnce(&tokio::net::UnixStream) -> Result<()>,
 ) -> Result<()> {
+    let shared_allowlist: ControlAllowlist = shared_allowlist.into();
     handle_transport_control_connection_with_peer_check_and_info(
         stream,
         shared_allowlist,
@@ -811,7 +1051,7 @@ async fn handle_transport_control_connection_with_peer_check(
         stop_tx,
         active_count,
         control_gate,
-        cleanup_registry,
+        cleanup_registry.map(CleanupSource::Registry),
         deadline,
         None,
         None,
@@ -823,17 +1063,18 @@ async fn handle_transport_control_connection_with_peer_check(
 #[allow(clippy::too_many_arguments)]
 async fn handle_transport_control_connection_with_peer_check_and_info(
     stream: tokio::net::UnixStream,
-    shared_allowlist: SharedAllowlist,
+    shared_allowlist: impl Into<ControlAllowlist>,
     ports: Vec<u16>,
     stop_tx: mpsc::Sender<()>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
-    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    cleanup: Option<CleanupSource>,
     deadline: tokio::time::Instant,
     running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
     actions: Option<Arc<Actions>>,
     check: impl FnOnce(&tokio::net::UnixStream) -> Result<()>,
 ) -> Result<()> {
+    let shared_allowlist: ControlAllowlist = shared_allowlist.into();
     check(&stream)?;
 
     tokio::time::timeout_at(deadline, async {
@@ -880,7 +1121,7 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
             }
             ControlRequest::RegistrationInfo(challenge) => {
                 if let Some(info) = &running_info {
-                    let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup_registry.as_deref())?;
+                    let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup.as_ref().and_then(CleanupSource::registry))?;
                     let response = control::RegistrationInfoResponse { schema:1, challenge:hex::encode(challenge), conditional_add_client:true, identity:daemon_bootstrap_protocol::BusyDaemonIdentity {
                         version:status.version, build:status.build, checksum:status.checksum, pid:status.pid, generation:Some(hex::encode(info.info.generation)),
                     }};
@@ -889,37 +1130,40 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
                 }
             }
             ControlRequest::AddClientIf { generation, build, checksum, pid, key } => {
-                let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup_registry.as_deref())?;
+                let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup.as_ref().and_then(CleanupSource::registry))?;
                 if running_info.as_ref().is_some_and(|info| info.info.generation == generation)
                     && status.build == build && status.checksum == hex::encode(checksum) && status.pid == pid {
-                    apply_add_client(&shared_allowlist, key);
+                    shared_allowlist.add(key).await;
                     write_half.write_all(status.to_line()?.as_bytes()).await?;
                 } else { write_half.write_all(b"{\"error\":\"daemon identity changed; rediscover before registering\"}\n").await?; }
             }
             ControlRequest::Status => {
-                let response = transport_status_response(
+                let response = status_with(
                     &ports,
                     active_count.load(Ordering::SeqCst) as u64,
-                    cleanup_registry.as_deref(),
-                )?;
+                    cleanup.as_ref(),
+                )
+                .await?;
                 write_half.write_all(response.to_line()?.as_bytes()).await?;
             }
             ControlRequest::AddClient(pubkey) => {
-                apply_add_client(&shared_allowlist, pubkey);
-                let response = transport_status_response(
+                shared_allowlist.add(pubkey).await;
+                let response = status_with(
                     &ports,
                     active_count.load(Ordering::SeqCst) as u64,
-                    cleanup_registry.as_deref(),
-                )?;
+                    cleanup.as_ref(),
+                )
+                .await?;
                 write_half.write_all(response.to_line()?.as_bytes()).await?;
             }
             ControlRequest::AddPort(_) => {
                 // The transport has no live port addition -- reply with status.
-                let response = transport_status_response(
+                let response = status_with(
                     &ports,
                     active_count.load(Ordering::SeqCst) as u64,
-                    cleanup_registry.as_deref(),
-                )?;
+                    cleanup.as_ref(),
+                )
+                .await?;
                 write_half.write_all(response.to_line()?.as_bytes()).await?;
             }
             ControlRequest::Stop => {

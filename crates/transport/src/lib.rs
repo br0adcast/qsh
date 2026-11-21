@@ -47,6 +47,7 @@ mod rtt;
 pub mod send_gate;
 #[cfg(feature = "tokio-driver")]
 pub mod session_manager;
+pub mod session_reset;
 pub mod shell_frame;
 #[cfg(feature = "tokio-driver")]
 pub mod shell_server;

@@ -27,6 +27,44 @@ impl Default for OpenLimits {
         }
     }
 }
+/// The daemon-wide open limits, when someone else keeps them: a session
+/// owner process's host (#529), which counts the opens of every owner of a
+/// daemon against one [`OpenLimits`]. A registry with one asks it for every
+/// open it admits, besides checking its own limits, and tells it of every
+/// charge and release, so the count there is the count of every owner's
+/// registry together.
+pub trait OpenAdmission: Send + Sync {
+    /// One more open in flight for `uid`, if the daemon-wide limits allow
+    /// it. May block, for a bounded time; an answer it does not get in that
+    /// time is `false` (fail-closed).
+    fn acquire(&self, uid: u32) -> bool;
+    /// One more for `uid` whatever the limits: a retirement cannot fail.
+    fn charge(&self, uid: u32);
+    /// One acquired or charged open for `uid` is over.
+    fn release(&self, uid: u32);
+}
+
+/// One open the daemon-wide count granted ([`ChannelOpenRegistry::pre_admit`])
+/// and no registry has admitted yet: given back when dropped unadmitted.
+/// Empty for a registry without an [`OpenAdmission`].
+#[must_use = "hand the grant to try_reserve_granted, or drop it to give it back"]
+pub struct OpenGrant {
+    admission: Option<Arc<dyn OpenAdmission>>,
+    uid: u32,
+}
+impl OpenGrant {
+    fn keep(mut self) {
+        self.admission = None;
+    }
+}
+impl Drop for OpenGrant {
+    fn drop(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            admission.release(self.uid);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionOpenId(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,6 +155,8 @@ impl CleanupSnapshot {
 pub struct ChannelOpenRegistry {
     state: Mutex<RegistryState>,
     limits: OpenLimits,
+    /// The daemon-wide count, when it is kept elsewhere.
+    admission: Option<Arc<dyn OpenAdmission>>,
     changed: Condvar,
 }
 
@@ -167,7 +207,8 @@ impl OpenJob {
         }
         let spawned = channel.adopt()?;
         let removed = state.jobs.remove(&self.id).expect("registered adoption");
-        release_uid(&mut state, removed.request.owner.uid);
+        self.registry
+            .release_uid(&mut state, removed.request.owner.uid);
         let slot = InstalledSlot {
             session: removed.session.clone(),
             uid: removed.request.owner.uid,
@@ -227,7 +268,9 @@ impl AdoptedOpen {
         };
         let bridges = installation.commit(spawned, slot);
         let removed = state.jobs.remove(&self.job.id);
-        release_uid(&mut state, self.job.registration.request.owner.uid);
+        self.job
+            .registry
+            .release_uid(&mut state, self.job.registration.request.owner.uid);
         drop(state);
         drop(removed);
         Some(bridges)
@@ -256,7 +299,9 @@ impl AdoptedOpen {
         };
         installation.commit(spawned, slot);
         let removed = state.jobs.remove(&self.job.id);
-        release_uid(&mut state, self.job.registration.request.owner.uid);
+        self.job
+            .registry
+            .release_uid(&mut state, self.job.registration.request.owner.uid);
         drop(state);
         drop(removed);
         Some(())
@@ -288,17 +333,30 @@ impl Drop for InstalledSlot {
     }
 }
 
-fn release_uid(state: &mut RegistryState, uid: u32) {
-    if let Some(count) = state.uids.get_mut(&uid) {
-        *count -= 1;
-        if *count == 0 {
-            state.uids.remove(&uid);
+impl ChannelOpenRegistry {
+    fn release_uid(&self, state: &mut RegistryState, uid: u32) {
+        if let Some(count) = state.uids.get_mut(&uid) {
+            *count -= 1;
+            if *count == 0 {
+                state.uids.remove(&uid);
+            }
+            if let Some(admission) = &self.admission {
+                admission.release(uid);
+            }
         }
     }
-}
 
-impl ChannelOpenRegistry {
     pub fn new(limits: OpenLimits) -> Arc<Self> {
+        Self::build(limits, None)
+    }
+
+    /// A registry whose daemon-wide count `admission` keeps: `limits` then
+    /// bound this registry alone, `admission` every registry it serves.
+    pub fn with_admission(limits: OpenLimits, admission: Arc<dyn OpenAdmission>) -> Arc<Self> {
+        Self::build(limits, Some(admission))
+    }
+
+    fn build(limits: OpenLimits, admission: Option<Arc<dyn OpenAdmission>>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(RegistryState {
                 observations: [0; 3],
@@ -312,6 +370,7 @@ impl ChannelOpenRegistry {
                 fence: None,
             }),
             limits,
+            admission,
             changed: Condvar::new(),
         })
     }
@@ -332,15 +391,13 @@ impl ChannelOpenRegistry {
             ready: Arc::new(tokio::sync::Notify::new()),
         }))
     }
-    pub fn try_reserve(
+    /// Whether this registry alone admits `request` now.
+    fn admissible(
         self: &Arc<Self>,
+        state: &RegistryState,
         session: &Arc<SessionOpenLedger>,
-        request: OpenRequestSnapshot,
-    ) -> Result<OpenJob, OpenRefusal> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| OpenRefusal::InvalidIdentity)?;
+        request: &OpenRequestSnapshot,
+    ) -> Result<(), OpenRefusal> {
         if state.fence.is_some() {
             return Err(OpenRefusal::Restarting);
         }
@@ -357,6 +414,82 @@ impl ChannelOpenRegistry {
         {
             return Err(OpenRefusal::Capacity);
         }
+        Ok(())
+    }
+
+    /// The daemon-wide count's grant for `request`: the step of admission
+    /// that may wait (for a session owner's host, a bounded request), so
+    /// callers take it before any lock or guard of their own and hand it to
+    /// [`ChannelOpenRegistry::try_reserve_granted`]. This registry's own
+    /// checks come first (cheaply, under its lock only): what it would
+    /// refuse anyway is refused without asking, so it neither waits nor
+    /// holds a daemon-wide grant. The check under the lock that admits
+    /// stays the authoritative one. Without an admission the grant is empty
+    /// and nothing waits.
+    pub fn pre_admit(
+        self: &Arc<Self>,
+        session: &Arc<SessionOpenLedger>,
+        request: &OpenRequestSnapshot,
+    ) -> Result<OpenGrant, OpenRefusal> {
+        let uid = request.owner.uid;
+        let Some(admission) = &self.admission else {
+            return Ok(OpenGrant {
+                admission: None,
+                uid,
+            });
+        };
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| OpenRefusal::InvalidIdentity)?;
+            self.admissible(&state, session, request)?;
+        }
+        if !admission.acquire(uid) {
+            return Err(OpenRefusal::Capacity);
+        }
+        Ok(OpenGrant {
+            admission: Some(admission.clone()),
+            uid,
+        })
+    }
+
+    /// [`ChannelOpenRegistry::pre_admit`] then
+    /// [`ChannelOpenRegistry::try_reserve_granted`], for callers that hold
+    /// no lock of their own.
+    pub fn try_reserve(
+        self: &Arc<Self>,
+        session: &Arc<SessionOpenLedger>,
+        request: OpenRequestSnapshot,
+    ) -> Result<OpenJob, OpenRefusal> {
+        let grant = self.pre_admit(session, &request)?;
+        self.try_reserve_granted(session, request, grant)
+    }
+
+    /// Admit `request` with the daemon-wide `grant` taken before: only this
+    /// registry's own checks, under its lock -- nothing here waits. A
+    /// refusal gives the grant back.
+    pub fn try_reserve_granted(
+        self: &Arc<Self>,
+        session: &Arc<SessionOpenLedger>,
+        request: OpenRequestSnapshot,
+        grant: OpenGrant,
+    ) -> Result<OpenJob, OpenRefusal> {
+        let uid = request.owner.uid;
+        let matches = grant.uid == uid
+            && match (&self.admission, &grant.admission) {
+                (None, None) => true,
+                (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
+                _ => false,
+            };
+        if !matches {
+            return Err(OpenRefusal::InvalidIdentity);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| OpenRefusal::InvalidIdentity)?;
+        self.admissible(&state, session, &request)?;
         let id = OpenJobId(state.next_job);
         state.next_job = state
             .next_job
@@ -373,6 +506,7 @@ impl ChannelOpenRegistry {
         registration.custody.bind_registration(self, id);
         state.jobs.insert(id, registration.clone());
         *state.uids.entry(uid).or_default() += 1;
+        grant.keep();
         session.occupied.fetch_add(1, Ordering::SeqCst);
         Ok(OpenJob {
             id,
@@ -480,6 +614,9 @@ impl ChannelOpenRegistry {
             // several healthy installed children exceed the pending-open cap;
             // the charge prevents further unresolved-retirement churn.
             *state.uids.entry(uid).or_default() += 1;
+            if let Some(admission) = &self.admission {
+                admission.charge(uid);
+            }
             state.fence.is_some()
         };
         if stop {
@@ -517,7 +654,7 @@ impl ChannelOpenRegistry {
             return;
         }
         let removed = state.retiring.remove(&key).expect("exact registered reap");
-        release_uid(&mut state, removed.uid);
+        self.release_uid(&mut state, removed.uid);
         self.changed.notify_all();
         drop(state);
         drop(removed);
@@ -550,7 +687,7 @@ impl ChannelOpenRegistry {
             return false;
         }
         let removed = state.jobs.remove(&id).expect("validated registration");
-        release_uid(&mut state, removed.request.owner.uid);
+        self.release_uid(&mut state, removed.request.owner.uid);
         removed.session.occupied.fetch_sub(1, Ordering::SeqCst);
         removed.session.ready.notify_one();
         self.changed.notify_all();

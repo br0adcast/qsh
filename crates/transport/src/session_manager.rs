@@ -84,10 +84,17 @@ pub(crate) mod binding_revision;
 mod channel_bridge;
 #[path = "session_lifecycle.rs"]
 mod lifecycle;
+#[path = "owner_link.rs"]
+mod owner_link;
 use binding_revision::{BindingRevision, BindingRevisions, RevisionChange};
 pub(crate) use lifecycle::CallbackFailure;
 use lifecycle::Lifecycle;
 pub(crate) use lifecycle::WorkerReceipt;
+pub use owner_link::{
+    loopback, relink_unavailable, FrontendRelink, LinkEnd, LinkIo, Liveness, Lookup, OwnerExit,
+    OwnerInit, OwnerLink, OwnerRelink, OwnerRun, OwnerStarter, RemoteBackend, SessionDirectory,
+    StartedOwner,
+};
 #[cfg(test)]
 #[path = "session_manager_fixture.rs"]
 pub(crate) mod fixture;
@@ -178,6 +185,13 @@ pub const MAX_SESSIONS_TOTAL: usize = 128;
 /// later if a handshake naming its token is in probation just then (see
 /// `Router::gc_retained`).
 pub const RETAIN_AFTER_DEATH: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How long a server takes a silent client's connection for alive: after it
+/// the connection dies and its session is retained for
+/// [`RETAIN_AFTER_DEATH`]. Public for whoever keeps a session's liveness
+/// across frontend processes (#529), which measures both from the client's
+/// last packet.
+pub const SERVER_DEATH_AFTER: std::time::Duration = crate::conn::SERVER_DEATH_AFTER;
 
 /// Period of the GC tick that reaps expired retained backends. Passes are at
 /// least this far apart, also after the router loop has stalled -- see
@@ -434,17 +448,55 @@ impl ChannelOutput {
 pub struct OutputCharge {
     gate: Arc<SendGate>,
     bytes: u64,
+    /// The session owner process holds this charge on its real gate; every
+    /// operation, and the withdrawal on drop, goes to it. `gate` is then the
+    /// owner gate's mirror, for charges the bridge makes of its own. Boxed:
+    /// every queued record carries a charge, and its wrapper stays small.
+    remote: Option<Box<owner_link::ChargeToken>>,
 }
 impl OutputCharge {
+    /// `bytes` the caller already admitted on `gate`.
+    fn admitted(gate: Arc<SendGate>, bytes: u64) -> Self {
+        Self {
+            gate,
+            bytes,
+            remote: None,
+        }
+    }
     pub fn transfer(mut self, tail: u64) -> bool {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.transfer(tail);
+            self.gate.mirror_tail_moved(tail);
+            self.bytes = 0;
+            return false;
+        }
         let opened = self.gate.transfer(self.bytes, tail);
         self.bytes = 0;
         opened
     }
+    /// `n` bytes of this charge entered the connection, whose tail is now
+    /// `tail`; the next independently framed slice owns one more header.
+    fn transfer_slice(&mut self, n: u64, tail: u64) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.slice(n, tail);
+            self.gate.mirror_tail_moved(tail);
+        } else {
+            self.gate.transfer(n, tail);
+            self.gate.admit(5);
+        }
+        self.bytes -= n;
+        self.bytes += 5;
+    }
+    fn gate(&self) -> &Arc<SendGate> {
+        &self.gate
+    }
 }
 impl Drop for OutputCharge {
     fn drop(&mut self) {
-        self.gate.withdraw(self.bytes);
+        // A remote token withdraws the owner's charge on its own drop.
+        if self.remote.is_none() {
+            self.gate.withdraw(self.bytes);
+        }
     }
 }
 
@@ -615,6 +667,53 @@ pub enum SessionOutbound {
         stream_id: u8,
         n: usize,
     },
+    /// A step of a bridge rebuild behind an owner link. Only the link's
+    /// frontend makes these; a backend cannot.
+    Replay(ReplayStep),
+}
+
+/// One step of the rebuild of a bridge from a session owner's custody
+/// (see `owner_link`). Opaque: only an owner link makes one.
+pub struct ReplayStep(Box<Replay>);
+impl ReplayStep {
+    fn new(step: Replay) -> Self {
+        Self(Box::new(step))
+    }
+}
+
+/// What an owner link's frontend tells its bridge about the link itself.
+enum Replay {
+    /// The link died under a running session: the bridge drops its
+    /// connection without a word and parks, and the next warm reattach
+    /// brings a new link.
+    Lost,
+    /// The owner's replay starts on a link that replaced an earlier one.
+    /// Everything queued ahead of this belongs to the replaced link.
+    Start {
+        /// The highest attachment generation the owner has seen.
+        last_generation: u64,
+        /// Whether the owner's backend ever heard `Live`.
+        live_seen: bool,
+    },
+    /// A stream instance the earlier bridge held state for.
+    Stream {
+        stream: u8,
+        instance: crate::channel_geometry::ChannelInstance,
+        gate: Arc<SendGate>,
+        reserve: crate::channel_timeline::TimelinePermit,
+    },
+    /// The stream's last admitted geometry.
+    Frontier {
+        stream: u8,
+        geometry: crate::channel_geometry::GeometryRecord,
+    },
+    /// The stream owes its next attachment the gap warning.
+    Unconfirmed { stream: u8 },
+    /// The stream's replayed final marker (or else terminal gap) was past
+    /// its admission.
+    Retained { stream: u8, marker: bool },
+    /// The replay is complete.
+    Done,
 }
 
 impl SessionOutbound {
@@ -789,6 +888,10 @@ struct SessionControl {
     terminal_ready: tokio::sync::Notify,
     budget: crate::control_budget::SessionBudget,
     origin: Mutex<ControlOrigin>,
+    /// Frontend side of an owner link: the owner's control is authoritative,
+    /// the bridge's budget retirement must reach it, and the bridge hands
+    /// inbound events to the link itself.
+    remote: OnceLock<owner_link::RemoteControl>,
 }
 impl SessionControl {
     fn new(global: &crate::control_budget::GlobalBudget, uid: u32) -> Self {
@@ -798,7 +901,27 @@ impl SessionControl {
             terminal_ready: tokio::sync::Notify::new(),
             budget: global.session(uid),
             origin: Mutex::new(ControlOrigin::default()),
+            remote: OnceLock::new(),
         }
+    }
+
+    /// `apply_terminal_request` retired this session's reply budget for
+    /// `origin`; a session owner retires its own one too.
+    fn retired_by_bridge(&self, origin: AttachmentContext) {
+        if let Some(remote) = self.remote.get() {
+            remote.send(owner_link::budget_retired(origin));
+        }
+    }
+
+    /// A terminal request the session owner already accepted: wake the
+    /// bridge's fixed mailbox as `request_terminal` does, without queueing a
+    /// second alias (the owner's alias arrives as an ordinary record).
+    fn mirror_terminal(&self, request: TerminalRequest) {
+        self.origin
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .requested_abort = Some(request);
+        self.terminal_ready.notify_one();
     }
     fn retire(&self) {
         // This lock is also the Open-admission/final-installation boundary.
@@ -999,10 +1122,7 @@ impl SessionIo {
         let charge = self
             .gates
             .admit(crate::channel::CONTROL_STREAM, bytes.len() as u64)
-            .map(|gate| OutputCharge {
-                gate,
-                bytes: bytes.len() as u64,
-            });
+            .map(|gate| OutputCharge::admitted(gate, bytes.len() as u64));
         let _ = self.outbound.send(SessionOutbound::ReservedControl {
             origin,
             bytes,
@@ -1055,10 +1175,7 @@ impl SessionIo {
         let charge = self
             .gates
             .admit(crate::channel::CONTROL_STREAM, bytes as u64)
-            .map(|gate| OutputCharge {
-                gate,
-                bytes: bytes as u64,
-            });
+            .map(|gate| OutputCharge::admitted(gate, bytes as u64));
         ControlDelivery { part, charge }
     }
 
@@ -1272,7 +1389,7 @@ impl SessionIo {
                 instance,
                 origin,
                 output,
-                charge: OutputCharge { gate, bytes },
+                charge: OutputCharge::admitted(gate, bytes),
                 gap_reserve,
             },
         );
@@ -1563,6 +1680,28 @@ pub trait SessionBackend: Send + Sync + 'static {
     /// own doc).
     fn consumption(&self) -> Consumption {
         Consumption::OnDelivery
+    }
+
+    /// Where this backend's sessions are known beyond this process: set
+    /// when they run in owners that outlive it (#529), so a router that has
+    /// never heard of a login can still find its session there. `None`:
+    /// every session lives and dies with this process.
+    fn directory(&self) -> Option<Arc<dyn SessionDirectory>> {
+        None
+    }
+
+    /// Take over a session that an earlier process of this daemon left
+    /// running behind `owner` ([`Lookup::Running`]), in place of
+    /// [`SessionBackend::run`]: the owner's replay comes first, and the
+    /// bridge builds its state from it. Only a backend with a
+    /// [`SessionBackend::directory`] is ever asked.
+    fn resume(
+        &self,
+        io: SessionIo,
+        owner: StartedOwner,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        drop((io, owner));
+        Box::pin(std::future::ready(()))
     }
 }
 
@@ -1976,11 +2115,40 @@ struct Router {
     cookies: CookieCheck,
     /// What the log last said about that load.
     load_log: LoadLog,
+    /// Where the backend's sessions are known beyond this process, if they
+    /// outlive it: it hears when a session is retained.
+    directory: Option<Arc<dyn SessionDirectory>>,
+    /// Logins whose warm start waits for the directory's answer, off this
+    /// loop (`SessionManager::begin_lookup`): at most one per login, and at
+    /// most [`MAX_LOOKUPS`] in all.
+    lookups: std::collections::HashSet<LoginId>,
+    /// Where an answered lookup comes back to the loop.
+    lookup_done: Option<mpsc::UnboundedSender<LookupDone>>,
+    /// What answers a `Transport` datagram for a connection this router does
+    /// not route, when the directory holds a session-reset secret
+    /// (`crate::session_reset`). `None`: such a datagram is dropped, and no
+    /// connection negotiates `session-reset`.
+    reset: Option<crate::session_reset::ResetResponder>,
+}
+
+/// Warm starts that wait for the directory at once: as many as probation
+/// seats, which every one of them held a moment ago.
+const MAX_LOOKUPS: usize = MAX_PROBATION;
+
+/// A warm start for a login the router has no entry for, with the
+/// directory's answer about it.
+struct LookupDone {
+    admission: Admission,
+    found: Lookup,
 }
 
 impl Router {
     fn new() -> Self {
         Router {
+            directory: None,
+            lookups: std::collections::HashSet::new(),
+            lookup_done: None,
+            reset: None,
             personal_observer: None,
             bootstrap: None,
             server_generation: None,
@@ -2310,6 +2478,10 @@ impl Router {
                                 },
                             };
                             entry.parked_dgram = dg_tx;
+                            // The retention's start outlives this process.
+                            if let Some(directory) = &self.directory {
+                                directory.liveness(ended.token, Liveness::Retained);
+                            }
                         }
                         EntryState::Retained { reason, .. } => {
                             // The first end already parked the stable route.
@@ -2862,6 +3034,15 @@ impl SessionManager {
         let mut buf = vec![0u8; RECV_BUF_LEN];
         let mut router = Router::new();
         router.personal_observer = personal_observer;
+        router.directory = factory.0.directory();
+        router.reset = router
+            .directory
+            .as_ref()
+            .and_then(|directory| directory.session_reset())
+            .map(|secret| crate::session_reset::ResetResponder::new(secret, Instant::now()));
+        // Answers of the directory, which is asked off this loop.
+        let (lookup_tx, mut lookup_rx) = mpsc::unbounded_channel::<LookupDone>();
+        router.lookup_done = Some(lookup_tx);
         if let Some(info) = info {
             router.server_generation = Some(info.generation);
             router.bootstrap = crate::bootstrap::BootstrapResponder::new(*server_priv, info).ok();
@@ -2917,11 +3098,14 @@ impl SessionManager {
                     if let Some(client_key) =
                         on_session_ended_and_notify(&mut router, &auth, ended, tokio::time::Instant::now())
                     {
-                        remove_from_allowlist(&auth.allowlist, &client_key);
+                        forget_key(&auth, &router, &client_key);
                     }
                 }
                 Some(ended) = probation_rx.recv() => {
                     Self::on_probation_ended(&ctx, &mut router, ended).await;
+                }
+                Some(done) = lookup_rx.recv() => {
+                    Self::on_lookup_done(&ctx, &mut router, done).await;
                 }
                 Some((login, incarnation)) = login_ends.recv() => {
                     // No `_and_notify` pairing here, and that is the point:
@@ -3085,12 +3269,23 @@ impl SessionManager {
                 // key), which must stay silent as they always have.
                 let mut nonce_failure: Option<String> = None;
                 let server_generation = router.server_generation;
+                let reset_secret = router.reset.as_ref().map(|reset| reset.secret().clone());
                 let mut resolve_for_msg2 = |msg1: &Msg1Payload| -> Option<Msg2Resolution> {
                     let d = router.resolve(&msg1.token, body, msg1.start_kind);
                     if matches!(d, AcceptDecision::ResendMsg2) {
                         return Some(Msg2Resolution::Cached);
                     }
-                    let resumed = matches!(d, AcceptDecision::WarmReattach);
+                    // A hint only (the acceptance decides): also a warm start
+                    // for a session an earlier process of this daemon left
+                    // running, as far as the directory knew when this one
+                    // started.
+                    let resumed = matches!(d, AcceptDecision::WarmReattach)
+                        || (matches!(d, AcceptDecision::ColdCreate)
+                            && msg1.start_kind == StartKind::Warm
+                            && router
+                                .directory
+                                .as_ref()
+                                .is_some_and(|directory| directory.known(msg1.token)));
                     decision = Some(d);
                     let nonce = match issued_nonce {
                         Some(n) => n,
@@ -3117,7 +3312,7 @@ impl SessionManager {
                 } else {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
-                    Connection::accept_resolved_with_generation(
+                    Connection::accept_resolved_with_extensions(
                         ConnectionConfig {
                             required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
@@ -3131,12 +3326,13 @@ impl SessionManager {
                         body,
                         &mut resolve_for_msg2,
                         server_generation,
+                        reset_secret.as_ref(),
                     )
                 };
                 if matches!(outcome, ResolvedAccept::Rejected) && ctx.auth.verifier.is_some() {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
-                    outcome = Connection::accept_resolved_with_generation(
+                    outcome = Connection::accept_resolved_with_extensions(
                         ConnectionConfig {
                             required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
@@ -3150,6 +3346,7 @@ impl SessionManager {
                         body,
                         &mut resolve_for_msg2,
                         server_generation,
+                        reset_secret.as_ref(),
                     );
                 }
                 match outcome {
@@ -3234,8 +3431,16 @@ impl SessionManager {
                     // has ended; its `SessionEnded` signal (or an
                     // already-drained one) reclaims the entry.
                     let _ = tx.send(src, buf[..len].to_vec());
+                } else if let Some(reset) = &mut router.reset {
+                    // No matching session: this router does not have the
+                    // connection (an earlier frontend, or daemon, had it, or
+                    // it ended here). Say so, within the reset's budgets and
+                    // never with more bytes than came in.
+                    if let Some(reply) = reset.answer(Instant::now(), src, len, session_id) {
+                        let _ = ctx.socket.send_to(&reply, src).await;
+                    }
                 }
-                // No matching session -- drop.
+                // Otherwise no matching session -- drop.
             }
             // HandshakeResp on the server side, or malformed input from the
             // network -- silently ignored.
@@ -3699,7 +3904,7 @@ impl SessionManager {
                         // This is the ONLY place a fast
                         // roam (beats DEATH_AFTER) ever sees the superseded
                         // key -- SessionEnded is never emitted for it.
-                        scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
+                        forget_superseded_key(ctx.auth, router, token, old_key, client_key);
                         // The bridge may already be runnable on another worker.
                         // Release it only after route/revision/incarnation and key
                         // ownership have all committed, before the first await.
@@ -3724,7 +3929,7 @@ impl SessionManager {
                                 },
                                 tokio::time::Instant::now(),
                             ) {
-                                remove_from_allowlist(&ctx.auth.allowlist, &key);
+                                forget_key(ctx.auth, router, &key);
                             }
                             return;
                         }
@@ -3765,7 +3970,7 @@ impl SessionManager {
                             },
                         )
                         .await;
-                        scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
+                        forget_superseded_key(ctx.auth, router, token, old_key, client_key);
                     }
                 }
             }
@@ -3801,7 +4006,7 @@ impl SessionManager {
                     admission,
                 )
                 .await;
-                scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
+                forget_superseded_key(ctx.auth, router, token, old_key, client_key);
             }
             AcceptDecision::ColdCreate => {
                 // A brand-new token grows the table: enforce the session
@@ -3815,24 +4020,126 @@ impl SessionManager {
                 // THIS token's own login, which the client's proof already
                 // created in the helper and which nothing else could ever
                 // report as ended.
-                if !admit_new_backend_or_end_login(router, ctx.auth, admission.principal.uid, token)
+                //
+                // A login this router has never heard of may still have its
+                // session: one that an earlier process of this daemon left
+                // running in its owner (#529). A warm start asks the
+                // directory -- off this loop -- and takes that session over
+                // instead of starting another. A cold start replaces
+                // whatever is there, as it always did.
+                if let (Some(directory), StartKind::Warm) =
+                    (router.directory.clone(), admission.msg1.start_kind)
                 {
+                    Self::begin_lookup(ctx, router, directory, admission);
                     return;
                 }
-                // No prior entry for a brand-new token, so `cold_create`
-                // returns `None` here -- this call is a no-op, kept for
-                // symmetry/safety rather than special-cased away.
-                let client_key = admission.client_key;
-                let old_key = Self::cold_create(
+                Self::create_new(
                     ctx,
                     router,
                     change.expect("reserved binding change"),
                     admission,
+                    None,
                 )
                 .await;
-                scrub_superseded_key(&ctx.auth.allowlist, old_key, client_key);
             }
         }
+    }
+
+    /// The `ColdCreate` arm's admission and creation, for a brand-new token
+    /// (or, with `running`, for a session an earlier frontend left).
+    async fn create_new(
+        ctx: &ManagerCtx<'_>,
+        router: &mut Router,
+        change: RevisionChange,
+        admission: Admission,
+        running: Option<StartedOwner>,
+    ) {
+        let token = admission.msg1.token;
+        if !admit_new_backend_or_end_login(router, ctx.auth, admission.principal.uid, token) {
+            return;
+        }
+        // No prior entry for a brand-new token, so `create` returns `None`
+        // here -- this call is a no-op, kept for symmetry/safety rather
+        // than special-cased away.
+        let client_key = admission.client_key;
+        let old_key = Self::create(ctx, router, change, admission, running).await;
+        forget_superseded_key(ctx.auth, router, token, old_key, client_key);
+    }
+
+    /// Ask `directory` about a warm start's login off the router loop: the
+    /// loop routes every other session's datagrams meanwhile, and hears the
+    /// answer as a [`LookupDone`]. One question per login at a time; a
+    /// handshake for a login already asked about, or past [`MAX_LOOKUPS`],
+    /// is dropped (see [`Lookup::Unavailable`] for when its client asks
+    /// again). The connection's provisional
+    /// route stays registered, so what its client sends meanwhile queues
+    /// for it.
+    fn begin_lookup(
+        ctx: &ManagerCtx<'_>,
+        router: &mut Router,
+        directory: Arc<dyn SessionDirectory>,
+        admission: Admission,
+    ) {
+        let token = admission.msg1.token;
+        let Some(done) = router.lookup_done.clone() else {
+            return;
+        };
+        if router.lookups.len() >= MAX_LOOKUPS || !router.lookups.insert(token) {
+            log::debug!("a warm start waits for the directory already; dropping a handshake");
+            return;
+        }
+        if let Some(route) = &admission.route {
+            router
+                .sessions
+                .insert(admission.conn.session_id(), route.tx.clone());
+        }
+        let uid = admission.principal.uid;
+        ctx.lifecycle.spawn(async move {
+            let found = directory.lookup(token, uid).await;
+            let _ = done.send(LookupDone { admission, found });
+        });
+    }
+
+    /// The directory answered a warm start ([`SessionManager::begin_lookup`]).
+    /// Applied against the table as it stands NOW, as after a probation: a
+    /// binding that changed meanwhile, or an entry that appeared, wins, and
+    /// this handshake is dropped. No answer (`Unavailable`) drops it too:
+    /// a session that may still run is never replaced by a fresh one on a
+    /// guess. A client that already holds `msg2` for this connection (the
+    /// signature path) then waits out its death timer before it returns,
+    /// as one whose reattach parked ([`AttachResult::Parked`]) does.
+    async fn on_lookup_done(ctx: &ManagerCtx<'_>, router: &mut Router, done: LookupDone) {
+        let LookupDone { admission, found } = done;
+        let token = admission.msg1.token;
+        router.lookups.remove(&token);
+        router.sessions.remove(&admission.conn.session_id());
+        let decision = router.resolve(&token, &admission.msg1_body, admission.msg1.start_kind);
+        if !admission.revision.is_current() || !matches!(decision, AcceptDecision::ColdCreate) {
+            log::debug!("the table changed while the directory was asked; dropping a handshake");
+            return;
+        }
+        let running = match found {
+            Lookup::Unknown => None,
+            Lookup::Running(owner) => Some(owner),
+            Lookup::Unavailable => {
+                log::warn!(
+                    "the host did not answer for a returning session; \
+                     dropping the handshake, the session is kept for the client's next try"
+                );
+                return;
+            }
+            Lookup::Foreign => {
+                log::warn!(
+                    "session refused: token belongs to another account, caller is uid {}",
+                    admission.principal.uid
+                );
+                return;
+            }
+        };
+        let Some(change) = router.revisions.reserve_change() else {
+            return;
+        };
+        Self::create_new(ctx, router, change, admission, running).await;
     }
 
     /// Cold-create a fresh session for `token`: start a persistent bridge and
@@ -3851,6 +4158,21 @@ impl SessionManager {
         router: &mut Router,
         change: RevisionChange,
         admission: Admission,
+    ) -> Option<[u8; 32]> {
+        Self::create(ctx, router, change, admission, None).await
+    }
+
+    /// [`SessionManager::cold_create`], or -- with `running` -- the same
+    /// registration for a session that already runs behind an owner an
+    /// earlier process of this daemon started: the bridge then builds its
+    /// state from that owner's replay instead of starting a backend, and
+    /// the client hears `Resumed`.
+    async fn create(
+        ctx: &ManagerCtx<'_>,
+        router: &mut Router,
+        change: RevisionChange,
+        admission: Admission,
+        running: Option<StartedOwner>,
     ) -> Option<[u8; 32]> {
         let Admission {
             revision: _revision,
@@ -3928,11 +4250,15 @@ impl SessionManager {
         );
         // No backend callback or bridge scheduling precedes the synchronous
         // route, revision and backend registration above.
-        spawn_committed_bridge(BridgeSpawn {
+        let spawn = BridgeSpawn {
             socket: ctx.socket.clone(),
             committed: CommittedAdmission(AuthAcceptance {
                 session_id: conn.session_id(),
-                disposition: SessionDisposition::Fresh,
+                disposition: if running.is_some() {
+                    SessionDisposition::Resumed
+                } else {
+                    SessionDisposition::Fresh
+                },
             }),
             conn,
             channels: BridgeChannels {
@@ -3948,7 +4274,14 @@ impl SessionManager {
             start,
             active_count: ctx.active_count.clone(),
             gates,
-        });
+        };
+        match running {
+            Some(owner) => {
+                let lifecycle = spawn.io.lifecycle.clone();
+                lifecycle.spawn(run_bridge(spawn, 0, Some(owner)));
+            }
+            None => spawn_committed_bridge(spawn),
+        }
 
         send_all(ctx.socket, &out).await;
         superseded.map(|e| e.client_key)
@@ -4087,6 +4420,33 @@ fn remove_from_allowlist(shared_allowlist: &SharedAllowlist, key: &[u8; 32]) {
     }
 }
 
+/// [`remove_from_allowlist`] for the router: the key also goes from the
+/// allowlist that outlives this process, if there is one.
+fn forget_key(auth: &ServerAuth, router: &Router, key: &[u8; 32]) {
+    remove_from_allowlist(&auth.allowlist, key);
+    if let Some(directory) = &router.directory {
+        directory.key_scrubbed(*key);
+    }
+}
+
+/// [`scrub_superseded_key`] for the router, as [`forget_key`]; the
+/// directory also hears which key `token`'s session now has.
+fn forget_superseded_key(
+    auth: &ServerAuth,
+    router: &Router,
+    token: LoginId,
+    old_key: Option<[u8; 32]>,
+    new_key: [u8; 32],
+) {
+    let scrubbed = scrub_superseded_key(&auth.allowlist, old_key, new_key);
+    if let Some(directory) = &router.directory {
+        if let Some(old_key) = scrubbed {
+            directory.key_scrubbed(old_key);
+        }
+        directory.client_key(token, new_key);
+    }
+}
+
 /// After a warm reattach or cold replace supersedes an existing entry's
 /// `client_key` with a NEW one, scrub the OLD key off the shared allowlist --
 /// UNLESS it's the SAME key the new connection also authenticated with (the
@@ -4102,12 +4462,10 @@ fn scrub_superseded_key(
     shared_allowlist: &SharedAllowlist,
     old_key: Option<[u8; 32]>,
     new_key: [u8; 32],
-) {
-    if let Some(old_key) = old_key {
-        if old_key != new_key {
-            remove_from_allowlist(shared_allowlist, &old_key);
-        }
-    }
+) -> Option<[u8; 32]> {
+    let old_key = old_key.filter(|old| *old != new_key)?;
+    remove_from_allowlist(shared_allowlist, &old_key);
+    Some(old_key)
 }
 
 /// Make `conn` one this bridge drives: a proven peer's cap on out-of-order
@@ -4143,6 +4501,223 @@ enum AttachResult {
     Applied,
     Cancelled,
     Rejected(u64),
+    /// The new connection could not be given its session just now (the
+    /// owner's link cannot be replaced yet): the bridge stays parked on the
+    /// link it has, as after that connection's death, and the session waits
+    /// for the client's next return.
+    Parked(u64),
+}
+
+/// What a warm reattach rebuilds, besides the backend link itself, when the
+/// session runs behind a replaceable owner link (`rebuild_link`).
+struct BridgeState<'a> {
+    control: &'a SessionControl,
+    lifecycle: &'a Lifecycle,
+    backend_out_rx: &'a mut mpsc::UnboundedReceiver<SessionOutbound>,
+    held_backend: &'a mut Option<PendingBackend>,
+    pending_control: &'a mut VecDeque<PendingControl>,
+    classes: &'a mut BTreeMap<u8, StreamClass>,
+    first_live_sent: &'a mut bool,
+    backend_finished: bool,
+}
+
+/// How long a warm reattach waits for a session owner's replay before it
+/// gives the session up: an owner that does not answer must not hold its
+/// bridge, and with it the session's entry, for good.
+const REBUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A bridge's backend-facing state, built from a session owner's replay.
+struct Rebuilt {
+    generation: u64,
+    /// The owner's backend has heard `Live`: no bridge says it again.
+    live_seen: bool,
+    channel_output: channel_bridge::ChannelBridge,
+    pending_control: VecDeque<PendingControl>,
+    classes: BTreeMap<u8, StreamClass>,
+}
+
+/// Build a bridge's backend-facing state from the replay a session owner
+/// sends on a link that replaced an earlier one (see `owner_link`), in the
+/// owner's order: declarations and tombstones, the stream instances, the
+/// journal's items through the ordinary `push`, then each stream's frontier,
+/// confirmation flag and retained items through `restore`. Records queued
+/// ahead of the replay belong to the replaced link and are dropped; their
+/// custody is the owner's.
+///
+/// The attachment generation continues from the highest one the owner has
+/// seen -- and from `own_generation`, which a bridge that lived through the
+/// replacement may have used for an event the owner has not read yet.
+/// `None` if the backend's queue closes, the new link is lost, or the
+/// generations are used up.
+async fn rebuild_from_owner(
+    backend_out_rx: &mut mpsc::UnboundedReceiver<SessionOutbound>,
+    snapshots: channel_bridge::SnapshotMailbox,
+    own_generation: u64,
+) -> Option<Rebuilt> {
+    let (last_generation, live_seen) = loop {
+        if let SessionOutbound::Replay(step) = backend_out_rx.recv().await? {
+            if let Replay::Start {
+                last_generation,
+                live_seen,
+            } = *step.0
+            {
+                break (last_generation, live_seen);
+            }
+        }
+    };
+    let generation = last_generation.max(own_generation).checked_add(1)?;
+    let mut channel_output = channel_bridge::ChannelBridge::starting_at(generation);
+    channel_output.snapshots = snapshots;
+    let mut pending_control = VecDeque::new();
+    let mut classes = BTreeMap::new();
+    let mut restored: BTreeMap<u8, channel_bridge::Restored> = BTreeMap::new();
+    loop {
+        match backend_out_rx.recv().await? {
+            SessionOutbound::Replay(step) => match *step.0 {
+                Replay::Stream {
+                    stream,
+                    instance,
+                    gate,
+                    reserve,
+                } => channel_output.restore_stream(stream, instance, gate, reserve),
+                Replay::Frontier { stream, geometry } => {
+                    restored.entry(stream).or_default().frontier = Some(geometry)
+                }
+                Replay::Unconfirmed { stream } => {
+                    restored.entry(stream).or_default().unconfirmed = true
+                }
+                Replay::Retained { stream, marker } => {
+                    let restored = restored.entry(stream).or_default();
+                    if marker {
+                        restored.marker = true;
+                    } else {
+                        restored.gap = true;
+                    }
+                }
+                Replay::Done => break,
+                Replay::Start { .. } | Replay::Lost => return None,
+            },
+            SessionOutbound::Resyncable {
+                stream_id,
+                resyncable,
+            } => channel_output.declare(stream_id, resyncable),
+            SessionOutbound::StreamClass { stream_id, class } => {
+                if class == StreamClass::Interactive {
+                    classes.remove(&stream_id);
+                } else {
+                    classes.insert(stream_id, class);
+                }
+            }
+            message @ (SessionOutbound::ChannelOutput { .. }
+            | SessionOutbound::ChannelExit { .. }
+            | SessionOutbound::ChannelClosed { .. }) => channel_output.push(message),
+            SessionOutbound::ReservedSessionControl { bytes, delivery } => pending_control
+                .push_back(PendingControl {
+                    origin: None,
+                    bytes,
+                    delivery,
+                    committed: None,
+                }),
+            // Nothing else is part of a replay.
+            _ => {}
+        }
+    }
+    for (stream, restored) in restored {
+        channel_output.restore(stream, restored);
+    }
+    Some(Rebuilt {
+        generation,
+        live_seen,
+        channel_output,
+        pending_control,
+        classes,
+    })
+}
+
+/// The orderly handoff of a warm reattach behind an owner link: instead of
+/// keeping the bridge's backend-facing state across the connections, give
+/// the owner a new link, retire the current one behind exact reports, and
+/// build that state anew from the owner's replay -- the same rebuild a new
+/// frontend process does after the old one died, so every warm reattach
+/// exercises it. A link that was lost (`Replay::Lost`) is replaced the same
+/// way, without the exact reports.
+///
+/// What stays with this bridge: events the old connection delivered that
+/// the backend's queue has not taken yet (`Inbound::pending`). They go to
+/// the new link in order, ahead of `ResumeReset`, booked to the replaced
+/// connection as before. After a lost link they are dropped with it: what
+/// the link carried last may never have arrived, and input behind a hole
+/// is not delivered.
+///
+/// `Failed` if the owner is gone or its replay does not come: the session
+/// then ends. `Unavailable` if the owner cannot be reached just now (its
+/// host did not answer, `owner_link::relink_unavailable`): nothing has
+/// changed, and the session is kept for the client's next attempt.
+async fn rebuild_link(
+    conn: &Connection,
+    link: &mut BackendLink,
+    remote: &owner_link::RemoteControl,
+    state: &mut BridgeState<'_>,
+) -> Rebuild {
+    // The new link first: until it is there, nothing of the current one
+    // changes.
+    let replacement = match remote.replacement() {
+        Ok(replacement) => replacement,
+        Err(error) if owner_link::relink_unavailable(&error) => {
+            log::warn!(
+                "the session owner's link cannot be replaced just now ({error}); \
+                 the session is kept for the client's next return"
+            );
+            return Rebuild::Unavailable;
+        }
+        Err(error) => {
+            log::error!("cannot replace the session owner's link: {error}");
+            return Rebuild::Failed;
+        }
+    };
+    if !remote.lost() {
+        link.channel_output.report_unconfirmed(conn);
+    }
+    // Whether the link was lost is asked again once it is replaced: the
+    // reader may know of a loss it has not announced yet.
+    let (sender, lost) = remote.relink_with(replacement);
+    *state.held_backend = None;
+    let snapshots = link.channel_output.snapshots.clone();
+    let own_generation = link.ledger.generation();
+    let rebuilt = tokio::select! {
+        biased;
+        _ = state.lifecycle.shutdown.requested() => None,
+        rebuilt = tokio::time::timeout(
+            REBUILD_TIMEOUT,
+            rebuild_from_owner(state.backend_out_rx, snapshots, own_generation),
+        ) => rebuilt.ok().flatten(),
+    };
+    let Some(rebuilt) = rebuilt else {
+        log::error!("the session owner's replay did not arrive; ending the session");
+        return Rebuild::Failed;
+    };
+    let mut inbound = Inbound::new(InboundTx::Remote(sender));
+    inbound.revoked = link.inbound.revoked;
+    if !lost {
+        inbound.pending = std::mem::take(&mut link.inbound.pending);
+        inbound.pending_bytes = std::mem::take(&mut link.inbound.pending_bytes);
+    }
+    // Everything replaced here held tokens of the retired link, which report
+    // nothing any more: the owner's journal decided about each of them.
+    link.inbound = inbound;
+    link.ledger = link.ledger.successor(rebuilt.generation);
+    link.channel_output = rebuilt.channel_output;
+    *state.pending_control = rebuilt.pending_control;
+    *state.classes = rebuilt.classes;
+    *state.first_live_sent |= rebuilt.live_seen;
+    Rebuild::Done
+}
+
+/// How [`rebuild_link`] went.
+enum Rebuild {
+    Done,
+    Unavailable,
+    Failed,
 }
 
 async fn apply_control(
@@ -4150,7 +4725,7 @@ async fn apply_control(
     parked: &mut bool,
     link: &mut BackendLink,
     control: BridgeControl,
-    classes: &BTreeMap<u8, StreamClass>,
+    state: &mut BridgeState<'_>,
     now: Instant,
     out: &mut Vec<Datagram>,
 ) -> AttachResult {
@@ -4177,7 +4752,26 @@ async fn apply_control(
     // 1: two `Attach`es applied back to back on one `on_routed_datagram`
     // turn skip `drain_events` between them).
     link.channel_output.observe_discards(conn);
-    link.ledger.carry();
+    // A backend that has ended -- also one whose end the intake has read
+    // and holds for its own turn -- has no owner left to replay anything:
+    // the bridge finishes the session on its own state.
+    let finished =
+        state.backend_finished || matches!(state.held_backend, Some(PendingBackend::Eof));
+    let remote = state
+        .control
+        .remote
+        .get()
+        .filter(|remote| remote.can_relink() && !finished);
+    match remote {
+        // Behind a replaceable owner link the owner pays what is owed
+        // (its journal), and this bridge's state is rebuilt from its replay.
+        Some(remote) => match rebuild_link(conn, link, remote, state).await {
+            Rebuild::Done => {}
+            Rebuild::Unavailable => return AttachResult::Parked(new_conn.session_id()),
+            Rebuild::Failed => return AttachResult::Rejected(new_conn.session_id()),
+        },
+        None => link.ledger.carry(),
+    }
     link.channel_output.attach(conn, link.ledger.generation());
     *conn = *new_conn;
     // Destruction of the old Connection is the exact wire-custody boundary.
@@ -4189,7 +4783,7 @@ async fn apply_control(
     // Before the queued datagrams below: an ACK among them may already let
     // a stream send, and it must go by its class. Before them too, the
     // proven peer's cap on out-of-order data replaces probation's.
-    adopt_connection(conn, classes);
+    adopt_connection(conn, state.classes);
     *parked = false;
     let context = AttachmentContext::for_connection(conn, link.ledger.generation());
     link.hand_over(conn, now, SessionInbound::ResumeReset(context), out);
@@ -4204,6 +4798,80 @@ async fn apply_control(
         out.extend(conn.on_datagram(now, src, &bytes));
     }
     AttachResult::Applied
+}
+
+/// Test fixtures drive `apply_control` and `on_routed_datagram` for a bridge
+/// whose backend is in-process: nothing of `BridgeState` is rebuilt there.
+#[cfg(test)]
+struct LocalBridgeState {
+    control: SessionControl,
+    lifecycle: Arc<Lifecycle>,
+    backend_out_rx: mpsc::UnboundedReceiver<SessionOutbound>,
+    held_backend: Option<PendingBackend>,
+    pending_control: VecDeque<PendingControl>,
+    classes: BTreeMap<u8, StreamClass>,
+    first_live_sent: bool,
+}
+#[cfg(test)]
+impl LocalBridgeState {
+    fn new(classes: &BTreeMap<u8, StreamClass>) -> Self {
+        Self {
+            control: SessionControl::new(&crate::control_budget::GlobalBudget::default(), 0),
+            lifecycle: Lifecycle::new(Shutdown::default()),
+            backend_out_rx: mpsc::unbounded_channel().1,
+            held_backend: None,
+            pending_control: VecDeque::new(),
+            classes: classes.clone(),
+            first_live_sent: false,
+        }
+    }
+    fn state(&mut self) -> BridgeState<'_> {
+        BridgeState {
+            control: &self.control,
+            lifecycle: &self.lifecycle,
+            backend_out_rx: &mut self.backend_out_rx,
+            held_backend: &mut self.held_backend,
+            pending_control: &mut self.pending_control,
+            classes: &mut self.classes,
+            first_live_sent: &mut self.first_live_sent,
+            backend_finished: false,
+        }
+    }
+}
+
+#[cfg(test)]
+async fn apply_local_control(
+    conn: &mut Connection,
+    parked: &mut bool,
+    link: &mut BackendLink,
+    control: BridgeControl,
+    classes: &BTreeMap<u8, StreamClass>,
+    now: Instant,
+    out: &mut Vec<Datagram>,
+) -> AttachResult {
+    let mut local = LocalBridgeState::new(classes);
+    apply_control(conn, parked, link, control, &mut local.state(), now, out).await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn on_local_routed_datagram(
+    conn: &mut Connection,
+    parked: &mut bool,
+    control_rx: &mut mpsc::UnboundedReceiver<BridgeControl>,
+    link: &mut BackendLink,
+    classes: &BTreeMap<u8, StreamClass>,
+    now: Instant,
+    src: SocketAddr,
+    bytes: &[u8],
+    out: &mut Vec<Datagram>,
+) -> AttachResult {
+    let mut local = LocalBridgeState::new(classes);
+    let mut state = local.state();
+    on_routed_datagram(
+        conn, parked, control_rx, link, &mut state, now, src, bytes, out,
+    )
+    .await
 }
 
 /// A backend's declaration of `stream_id`'s class: applied to `conn` now,
@@ -4247,17 +4915,17 @@ async fn on_routed_datagram(
     parked: &mut bool,
     control_rx: &mut mpsc::UnboundedReceiver<BridgeControl>,
     link: &mut BackendLink,
-    classes: &BTreeMap<u8, StreamClass>,
+    state: &mut BridgeState<'_>,
     now: Instant,
     src: SocketAddr,
     bytes: &[u8],
     out: &mut Vec<Datagram>,
 ) -> AttachResult {
     while let Ok(control) = control_rx.try_recv() {
-        if let rejected @ AttachResult::Rejected(_) =
-            apply_control(conn, parked, link, control, classes, now, out).await
+        if let ended @ (AttachResult::Rejected(_) | AttachResult::Parked(_)) =
+            apply_control(conn, parked, link, control, state, now, out).await
         {
-            return rejected;
+            return ended;
         }
     }
     out.extend(conn.on_datagram(now, src, bytes));
@@ -4356,6 +5024,7 @@ fn drain_reserved_control(
 }
 
 /// Both mailbox wake paths validate the actual target before retiring debt.
+/// Returns whether the request was this attachment's and retired the budget.
 fn apply_terminal_request(
     conn: &mut Connection,
     generation: u64,
@@ -4363,9 +5032,9 @@ fn apply_terminal_request(
     request: TerminalRequest,
     now: Instant,
     out: &mut Vec<Datagram>,
-) {
+) -> bool {
     if request.origin.session_id != conn.session_id() || request.origin.generation != generation {
-        return;
+        return false;
     }
     budget.retire();
     out.extend(match request.disposition {
@@ -4374,6 +5043,7 @@ fn apply_terminal_request(
             conn.abort_session(now, crate::SessionAbortReason::ResourceExhausted)
         }
     });
+    true
 }
 
 const INTAKE_RECORDS: usize = 32;
@@ -4654,12 +5324,48 @@ thread_local! {
 ///   exit). This is what keeps a retained backend alive across a death so a
 ///   later warm reattach can revive it.
 ///
+/// Behind a replaceable owner link (`owner_link`, a personal daemon's
+/// session owners) the bridge task and its connection handling are the
+/// same, but what it holds for its backend does not persist across
+/// connections: every `Attach` hands the owner a new link, retires the
+/// current one, and builds the backend-facing state anew from the owner's
+/// replay (`rebuild_link`) before the ordinary attach and `ResumeReset`. A
+/// link that is lost under a live connection (`Replay::Lost`) drops that
+/// connection without a word and parks, like a death; the client's warm
+/// return then rebuilds the same way.
+///
 /// Otherwise ended by the manager dropping the datagram/control channels (cold
 /// replace or shutdown -> `Dgram(None)` / `Control(None)`): it signals
 /// `SessionEnded` for its CURRENT `session_id`; `on_session_ended`'s session_id
 /// guard makes a stale end-signal from a swapped-out/replaced connection
 /// harmless (and a teardown-exit never matches, so it never wrongly retains).
 async fn run_backend_bridge(spawn: BridgeSpawn) {
+    run_backend_bridge_from(spawn, 0).await
+}
+
+/// [`run_backend_bridge`] whose first attachment has `generation`: the
+/// attachment, ledger and typed-output generations all start there. A
+/// cold-created session starts at 0. A session behind an owner link never
+/// starts over: at every warm reattach, and after a lost link, its bridge
+/// state is rebuilt from the owner's replay and continues from the highest
+/// generation the owner has seen (`rebuild_from_owner`), so no earlier
+/// origin ever becomes current again.
+async fn run_backend_bridge_from(spawn: BridgeSpawn, generation: u64) {
+    run_bridge(spawn, generation, None).await
+}
+
+/// How often, at most, a bridge whose session outlives this process says
+/// that its client is still there.
+const LIVENESS_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`run_backend_bridge_from`], or -- with `resume` -- the bridge of a new
+/// frontend process for a session that already runs behind `resume`'s owner
+/// (`SessionBackend::resume`): its backend-facing state comes from the
+/// owner's replay (`rebuild_from_owner`), its generation continues the
+/// owner's, and the backend hears `ResumeReset` for this first connection,
+/// exactly as at a warm reattach in a frontend that lived on.
+async fn run_bridge(spawn: BridgeSpawn, generation: u64, resume: Option<StartedOwner>) {
+    let mut generation = generation;
     let BridgeSpawn {
         socket,
         committed,
@@ -4706,13 +5412,52 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     let lifecycle = io.lifecycle.clone();
     let control = io.control().clone();
     let control_budget = control.budget.clone();
-    io.set_control_origin(AttachmentContext::for_connection(&conn, 0));
-    lifecycle.spawn(async move { backend.run(io).await });
-    let mut link = BackendLink::new(io_inbound_tx, consumption);
+    io.set_control_origin(AttachmentContext::for_connection(&conn, generation));
+    // Sessions that outlive this process: where their liveness is kept.
+    let directory = backend.directory();
+    let resumed = resume.is_some();
+    // Started here, not inside the task: a backend behind an owner link
+    // installs the link's inbound sender before the bridge's first event.
+    lifecycle.spawn(match resume {
+        Some(owner) => backend.resume(io, owner),
+        None => backend.run(io),
+    });
+    let inbound_tx = match control.remote.get().and_then(|r| r.take_inbound()) {
+        // The bridge's own queue is unused: its sender closes here.
+        Some(remote) => InboundTx::Remote(remote),
+        None => InboundTx::Local(io_inbound_tx),
+    };
+    let mut rebuilt = None;
+    if resumed {
+        rebuilt = tokio::select! {
+            biased;
+            _ = lifecycle.shutdown.requested() => None,
+            rebuilt = tokio::time::timeout(
+                REBUILD_TIMEOUT,
+                rebuild_from_owner(&mut backend_out_rx, resume_snapshots.clone(), generation),
+            ) => rebuilt.ok().flatten(),
+        };
+        let Some(state) = &rebuilt else {
+            // Fail closed: the client hears a close, and the owner hears the
+            // end when it takes the link (the inbound sender drops here).
+            log::error!("the session owner's replay did not arrive; ending the session");
+            out.extend(conn.close(now));
+            send_all(&socket, &out).await;
+            let _ = done_tx.send(SessionEnded {
+                phase: SessionEndPhase::Final,
+                session_id: conn.session_id(),
+                token,
+                graceful: true,
+            });
+            return;
+        };
+        generation = state.generation;
+    }
+    let mut link = BackendLink::starting_at(inbound_tx, consumption, generation);
     link.channel_output.snapshots = resume_snapshots;
     let mut pending_control = VecDeque::new();
     link.control_delivery = crate::control_budget::ControlLedger::new(
-        0,
+        generation,
         conn.stream_progress(crate::channel::CONTROL_STREAM).queued,
     );
     let mut backend_finished = false;
@@ -4734,6 +5479,7 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     // Never `true` before the loop below runs its first recompute, so the
     // early-return below never needs to decrement.
     let mut was_active = false;
+    let mut liveness_said = now;
     // Every class the backend declared: a class, like a recoverability
     // declaration, lives on `conn`, and a warm reattach brings a connection
     // that never heard it (`apply_control` declares these again).
@@ -4742,13 +5488,36 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     // asked (see `take_delivered`).
     let mut awaiting_delivery: Vec<(u8, u64)> = Vec::new();
     let mut drain_pending = false;
+    // A session taken over from an earlier frontend process: everything
+    // backend-facing is the owner's replay, and this connection is to the
+    // backend what a warm reattach's is (`apply_control`).
+    let mut resume_reset = false;
+    if let Some(state) = rebuilt {
+        link.channel_output = state.channel_output;
+        pending_control = state.pending_control;
+        classes = state.classes;
+        // A backend that heard `Live` hears `ResumeReset` now; one that
+        // never did (its first frontend died first) still starts here.
+        first_live_sent = state.live_seen;
+        resume_reset = state.live_seen;
+        link.channel_output.attach(&conn, generation);
+    }
     // A proven connection: probation's cap does not follow it here.
     adopt_connection(&mut conn, &classes);
+    if resume_reset {
+        let context = AttachmentContext::for_connection(&conn, generation);
+        link.hand_over(
+            &mut conn,
+            now,
+            SessionInbound::ResumeReset(context),
+            &mut out,
+        );
+    }
 
     // Replay what a probation stage consumed off this connection before the
     // bridge got it. ORDER: the backend hears its session started before any
     // byte of it, exactly as it would have from the drain below.
-    if start.saw_live {
+    if start.saw_live && !first_live_sent {
         first_live_sent = true;
         let context = AttachmentContext::for_connection(&conn, link.ledger.generation());
         link.hand_over(&mut conn, now, SessionInbound::Live(context), &mut out);
@@ -4892,14 +5661,16 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
             }
             Wakeup::Terminal => {
                 if let Some(request) = control.take_priority_abort() {
-                    apply_terminal_request(
+                    if apply_terminal_request(
                         &mut conn,
                         link.ledger.generation(),
                         &control_budget,
                         request,
                         now,
                         &mut out,
-                    );
+                    ) {
+                        control.retired_by_bridge(request.origin);
+                    }
                 }
             }
             Wakeup::Backend(Some(SessionOutbound::ReservedControl {
@@ -4954,23 +5725,35 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 // Validate before retirement: stale signals cannot poison the
                 // replacement's budget or change its terminal classification.
                 let request = control.take_abort(fallback);
-                apply_terminal_request(
+                if apply_terminal_request(
                     &mut conn,
                     link.ledger.generation(),
                     &control_budget,
                     request,
                     now,
                     &mut out,
-                );
+                ) {
+                    control.retired_by_bridge(request.origin);
+                }
             }
             // Takes any `Attach` already queued first (see `on_routed_datagram`).
             Wakeup::Dgram(Some((src, bytes))) => {
-                if let AttachResult::Rejected(session_id) = on_routed_datagram(
+                let mut state = BridgeState {
+                    control: &control,
+                    lifecycle: &lifecycle,
+                    backend_out_rx: &mut backend_out_rx,
+                    held_backend: &mut held_backend,
+                    pending_control: &mut pending_control,
+                    classes: &mut classes,
+                    first_live_sent: &mut first_live_sent,
+                    backend_finished,
+                };
+                match on_routed_datagram(
                     &mut conn,
                     &mut parked,
                     &mut control_rx,
                     &mut link,
-                    &classes,
+                    &mut state,
                     now,
                     src,
                     &bytes,
@@ -4978,13 +5761,24 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 )
                 .await
                 {
-                    let _ = done_tx.send(SessionEnded {
-                        phase: SessionEndPhase::Final,
-                        session_id,
+                    AttachResult::Rejected(session_id) => {
+                        let _ = done_tx.send(SessionEnded {
+                            phase: SessionEndPhase::Final,
+                            session_id,
+                            token,
+                            graceful: false,
+                        });
+                        break;
+                    }
+                    AttachResult::Parked(session_id) => park_unattached(
+                        &mut parked,
+                        &mut was_active,
+                        &active_count,
+                        &done_tx,
                         token,
-                        graceful: false,
-                    });
-                    break;
+                        session_id,
+                    ),
+                    AttachResult::Applied | AttachResult::Cancelled => {}
                 }
             }
             // The manager dropped the datagram channel -- shut the backend down.
@@ -5126,6 +5920,21 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 }
                 awaiting_delivery.push((stream_id, token));
             }
+            // The owner link died under a running session (`owner_link`).
+            // What it carried last may never have arrived, so this
+            // connection's streams cannot simply go on: drop it without a
+            // word, as for a stream out of offset space, and park. The
+            // client returns warm, and that reattach brings a new link and
+            // rebuilds this bridge from the owner's custody. Other steps
+            // only come inside a rebuild.
+            Wakeup::Backend(Some(SessionOutbound::Replay(step))) => {
+                if matches!(*step.0, Replay::Lost) {
+                    link.inbound.lose();
+                    if !parked {
+                        conn.abandon();
+                    }
+                }
+            }
             // What the backend took (spec §4.10.3): paid to the connection
             // that delivered it (see `ConsumptionLedger`).
             Wakeup::Backend(Some(SessionOutbound::Consumed { stream_id, n })) => {
@@ -5151,25 +5960,46 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
                 CONTROL_BACKEND_EOF.with(|count| count.set(count.get() + 1));
             }
             // Warm reattach (see `apply_control`); also revives a parked bridge.
-            Wakeup::Control(Some(control)) => {
-                if let AttachResult::Rejected(session_id) = apply_control(
+            Wakeup::Control(Some(attach)) => {
+                let mut state = BridgeState {
+                    control: &control,
+                    lifecycle: &lifecycle,
+                    backend_out_rx: &mut backend_out_rx,
+                    held_backend: &mut held_backend,
+                    pending_control: &mut pending_control,
+                    classes: &mut classes,
+                    first_live_sent: &mut first_live_sent,
+                    backend_finished,
+                };
+                match apply_control(
                     &mut conn,
                     &mut parked,
                     &mut link,
-                    control,
-                    &classes,
+                    attach,
+                    &mut state,
                     now,
                     &mut out,
                 )
                 .await
                 {
-                    let _ = done_tx.send(SessionEnded {
-                        phase: SessionEndPhase::Final,
-                        session_id,
+                    AttachResult::Rejected(session_id) => {
+                        let _ = done_tx.send(SessionEnded {
+                            phase: SessionEndPhase::Final,
+                            session_id,
+                            token,
+                            graceful: false,
+                        });
+                        break;
+                    }
+                    AttachResult::Parked(session_id) => park_unattached(
+                        &mut parked,
+                        &mut was_active,
+                        &active_count,
+                        &done_tx,
                         token,
-                        graceful: false,
-                    });
-                    break;
+                        session_id,
+                    ),
+                    AttachResult::Applied | AttachResult::Cancelled => {}
                 }
             }
             // What waited for the backend went to it: booked to the
@@ -5271,6 +6101,22 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
         // while Live/PathDown, so an active->inactive transition is noticed
         // within ~`ACTIVE_WINDOW` + a tick.
         let now_active = !parked && is_active(conn.idle_duration(Instant::now()));
+        if let Some(directory) = &directory {
+            // When the client was last heard, kept where it outlives this
+            // process: at every change, and while it goes on.
+            if now_active != was_active
+                || (now_active && now.duration_since(liveness_said) >= LIVENESS_EVERY)
+            {
+                liveness_said = now;
+                directory.liveness(
+                    token,
+                    Liveness::Traffic {
+                        idle: conn.idle_duration(Instant::now()),
+                        active: now_active,
+                    },
+                );
+            }
+        }
         if now_active != was_active {
             if now_active {
                 active_count.fetch_add(1, Ordering::SeqCst);
@@ -5404,6 +6250,8 @@ async fn run_backend_bridge(spawn: BridgeSpawn) {
     // Exited via a manager teardown (`Dgram(None)` / parked `Control(None)`).
     if lifecycle.shutdown.is_requested() {
         gates.close_all();
+    } else {
+        end_lost_session(&control);
     }
     // Withdraw this bridge's contribution to the active count -- `deactivate`
     // is a no-op here if a prior exit point (graceful close, or parking on
@@ -5766,10 +6614,15 @@ fn add(m: &mut BTreeMap<u8, u64>, stream_id: u8, n: u64) {
 }
 
 impl ConsumptionLedger {
+    #[cfg(test)]
     fn new(consumption: Consumption) -> Self {
+        Self::starting_at(consumption, 0)
+    }
+
+    fn starting_at(consumption: Consumption, generation: u64) -> Self {
         ConsumptionLedger {
             backend_reports: consumption == Consumption::Explicit,
-            generation: 0,
+            generation,
             outstanding: BTreeMap::new(),
             owed_old: BTreeMap::new(),
             #[cfg(debug_assertions)]
@@ -5798,6 +6651,20 @@ impl ConsumptionLedger {
     /// The generation of the connection this ledger counts for now.
     fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// A fresh ledger for the same backend, counting for the connection of
+    /// attachment `generation`: a session owner pays what earlier ones are
+    /// owed before it forwards a report (`owner_link`'s journal).
+    fn successor(&self, generation: u64) -> Self {
+        ConsumptionLedger {
+            backend_reports: self.backend_reports,
+            generation,
+            outstanding: BTreeMap::new(),
+            owed_old: BTreeMap::new(),
+            #[cfg(debug_assertions)]
+            audit: LedgerAudit::default(),
+        }
     }
 
     /// Stream bytes entered the backend's queue: booked to the connection
@@ -5989,11 +6856,48 @@ impl Waiting {
     }
 }
 
+/// Where the bridge hands inbound events: its backend's own bounded queue,
+/// or an owner link that grants one slot per free place in the owner's queue
+/// (an event is handed over when it is written to the link).
+enum InboundTx {
+    Local(mpsc::Sender<SessionInbound>),
+    Remote(owner_link::CreditSender),
+}
+enum InboundPermit<'a> {
+    Local(mpsc::Permit<'a, SessionInbound>),
+    Remote(owner_link::CreditPermit<'a>),
+}
+impl InboundTx {
+    fn try_send(
+        &self,
+        ev: SessionInbound,
+    ) -> Result<(), mpsc::error::TrySendError<SessionInbound>> {
+        match self {
+            Self::Local(tx) => tx.try_send(ev),
+            Self::Remote(tx) => tx.try_send(ev),
+        }
+    }
+    async fn reserve(&self) -> Result<InboundPermit<'_>, ()> {
+        match self {
+            Self::Local(tx) => tx.reserve().await.map(InboundPermit::Local).map_err(|_| ()),
+            Self::Remote(tx) => tx.reserve().await.map(InboundPermit::Remote),
+        }
+    }
+}
+impl InboundPermit<'_> {
+    fn send(self, ev: SessionInbound) {
+        match self {
+            Self::Local(permit) => permit.send(ev),
+            Self::Remote(permit) => permit.send(ev),
+        }
+    }
+}
+
 /// The bridge's end of its backend's inbound queue (spec §4.10.2). It never
 /// waits: what the queue has no room for waits here, in order, and goes as
 /// room opens -- the bridge's `room` arm.
 struct Inbound {
-    tx: mpsc::Sender<SessionInbound>,
+    tx: InboundTx,
     pending: VecDeque<Waiting>,
     /// Stream bytes in `pending`.
     pending_bytes: usize,
@@ -6001,7 +6905,7 @@ struct Inbound {
 }
 
 impl Inbound {
-    fn new(tx: mpsc::Sender<SessionInbound>) -> Self {
+    fn new(tx: InboundTx) -> Self {
         Inbound {
             tx,
             pending: VecDeque::new(),
@@ -6012,6 +6916,13 @@ impl Inbound {
 
     fn revoke(&mut self) {
         self.revoked = true;
+        self.pending.clear();
+        self.pending_bytes = 0;
+    }
+
+    /// The link to the backend was lost: what waits cannot follow what the
+    /// link may have dropped.
+    fn lose(&mut self) {
         self.pending.clear();
         self.pending_bytes = 0;
     }
@@ -6126,12 +7037,18 @@ struct BackendLink {
 }
 
 impl BackendLink {
+    #[cfg(test)]
     fn new(tx: mpsc::Sender<SessionInbound>, consumption: Consumption) -> Self {
+        Self::starting_at(InboundTx::Local(tx), consumption, 0)
+    }
+
+    /// A link whose first connection is attachment `generation`.
+    fn starting_at(tx: InboundTx, consumption: Consumption, generation: u64) -> Self {
         BackendLink {
             inbound: Inbound::new(tx),
-            ledger: ConsumptionLedger::new(consumption),
-            channel_output: channel_bridge::ChannelBridge::default(),
-            control_delivery: crate::control_budget::ControlLedger::new(0, 0),
+            ledger: ConsumptionLedger::starting_at(consumption, generation),
+            channel_output: channel_bridge::ChannelBridge::starting_at(generation),
+            control_delivery: crate::control_budget::ControlLedger::new(generation, 0),
         }
     }
 
@@ -6226,6 +7143,41 @@ impl BackendLink {
                 }
             }
         });
+    }
+}
+
+/// A warm reattach that could not be given the session just now
+/// ([`AttachResult::Parked`]): as at its connection's death, the bridge parks
+/// and the router retains the session (under the new connection's id, which
+/// the reattach made its route), so the client's next return attaches it.
+fn park_unattached(
+    parked: &mut bool,
+    was_active: &mut bool,
+    active_count: &AtomicUsize,
+    done_tx: &mpsc::UnboundedSender<SessionEnded>,
+    token: [u8; 16],
+    session_id: u64,
+) {
+    if !*parked {
+        *parked = true;
+        deactivate(was_active, active_count);
+    }
+    let _ = done_tx.send(SessionEnded {
+        phase: SessionEndPhase::Parked,
+        session_id,
+        token,
+        graceful: false,
+    });
+}
+
+/// The session ends while its owner's link is lost: the end the inbound
+/// sender says when it drops would go nowhere, and the owner would keep the
+/// session's processes until the daemon stops. A new link carries it.
+fn end_lost_session(control: &SessionControl) {
+    if let Some(remote) = control.remote.get().filter(|remote| remote.lost()) {
+        if let Ok(link) = remote.replacement() {
+            drop(remote.relink_with(link));
+        }
     }
 }
 

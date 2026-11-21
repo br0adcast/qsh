@@ -214,7 +214,10 @@ fn a_new_daemon_under_load_admits_a_client_that_took_an_injected_cookie() {
     assert_eq!(counts.replies, 2, "{counts:?}");
     assert!(sim.now() < 2 * HANDSHAKE_RETRANSMIT, "{:?}", sim.now());
     assert_ne!(sim.conn(Side::Client).cookie_for_test(), Some(FORGED));
-    assert_eq!(sim.conn(Side::Client).features(), Features::SUPPORTED);
+    assert_eq!(
+        sim.conn(Side::Client).features(),
+        Features::SUPPORTED_WITHOUT_RESET
+    );
 }
 
 /// The plain turn against a daemon under load: with the retransmit behind

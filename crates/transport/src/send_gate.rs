@@ -80,6 +80,33 @@ pub(crate) enum ClientAdmission {
     Closed,
 }
 
+/// One byte-count operation a bridge applies to a gate. A mirror gate
+/// forwards each one, in order, to the authoritative gate it stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GateOp {
+    Admit(u64),
+    Withdraw(u64),
+    Transfer {
+        n: u64,
+        tail: u64,
+    },
+    /// A tail refresh. `ready` names the channel scope whose metadata
+    /// producer the bridge would wake if this refresh opened the gate.
+    Update {
+        tail: u64,
+        ready: Option<(u64, u64)>,
+    },
+}
+
+/// Where a mirror gate sends its operations: the process that owns the real
+/// gate applies them there, and only there are its waiters woken.
+pub(crate) trait GateMirror: Send + Sync + std::fmt::Debug {
+    fn apply(&self, op: GateOp);
+    /// A charge transfer the owner applies moved the real gate's tail.
+    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    fn tail_moved(&self, tail: u64);
+}
+
 /// One stream's gate. Shared (`Arc`) between whoever refreshes it and
 /// whoever produces.
 #[derive(Debug)]
@@ -87,6 +114,10 @@ pub struct SendGate {
     kind: GateKind,
     state: Mutex<GateState>,
     changed: Condvar,
+    /// A gate on the frontend side of an owner link has no hysteresis
+    /// authority: every byte operation goes to the owner's real gate, and no
+    /// producer waits on this one.
+    mirror: Option<std::sync::Arc<dyn GateMirror>>,
 }
 
 impl SendGate {
@@ -101,7 +132,44 @@ impl SendGate {
                 metadata_blocked: false,
             }),
             changed: Condvar::new(),
+            mirror: None,
         }
+    }
+
+    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    /// A stand-in for a gate another process owns: admit, withdraw, transfer
+    /// and update go to `mirror` and never report an opening themselves.
+    pub(crate) fn mirror(kind: GateKind, mirror: std::sync::Arc<dyn GateMirror>) -> SendGate {
+        SendGate {
+            mirror: Some(mirror),
+            ..SendGate::new(kind)
+        }
+    }
+
+    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    /// A remote charge moved the owner gate's tail behind this mirror.
+    pub(crate) fn mirror_tail_moved(&self, tail: u64) {
+        if let Some(mirror) = &self.mirror {
+            mirror.tail_moved(tail);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_mirror(&self) -> bool {
+        self.mirror.is_some()
+    }
+
+    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    /// Like [`SendGate::update`], naming the channel scope (`instance`,
+    /// `generation`) a bridge would wake if the refresh opened the gate. A
+    /// local gate ignores the scope; a mirror carries it to the owner, which
+    /// alone can tell whether the gate opened.
+    pub(crate) fn update_scoped(&self, tail: u64, ready: Option<(u64, u64)>) -> bool {
+        if let Some(mirror) = &self.mirror {
+            mirror.apply(GateOp::Update { tail, ready });
+            return false;
+        }
+        self.update(tail)
     }
 
     /// Hold new producer reads for metadata admission independently of byte
@@ -183,6 +251,10 @@ impl SendGate {
     /// A producer handed `n` bytes over; they count until the driver takes
     /// them ([`SendGate::transfer`]).
     pub fn admit(&self, n: u64) {
+        if let Some(mirror) = &self.mirror {
+            mirror.apply(GateOp::Admit(n));
+            return;
+        }
         let mut st = self.state.lock().expect("send gate");
         st.pending += n;
         self.recompute(&mut st);
@@ -210,6 +282,10 @@ impl SendGate {
     /// this stream is now `tail`. In one step, so the gate never sees the
     /// bytes in neither place. Returns whether the gate just opened.
     pub fn transfer(&self, n: u64, tail: u64) -> bool {
+        if let Some(mirror) = &self.mirror {
+            mirror.apply(GateOp::Transfer { n, tail });
+            return false;
+        }
         let mut st = self.state.lock().expect("send gate");
         st.pending = st.pending.saturating_sub(n);
         st.tail = tail;
@@ -219,6 +295,10 @@ impl SendGate {
     /// `n` admitted bytes will never reach the driver -- the hand-over
     /// failed: they stop counting.
     pub fn withdraw(&self, n: u64) {
+        if let Some(mirror) = &self.mirror {
+            mirror.apply(GateOp::Withdraw(n));
+            return;
+        }
         let mut st = self.state.lock().expect("send gate");
         st.pending = st.pending.saturating_sub(n);
         self.recompute(&mut st);
@@ -226,6 +306,10 @@ impl SendGate {
 
     /// The stream's tail is now `tail`. Returns whether the gate just opened.
     pub fn update(&self, tail: u64) -> bool {
+        if let Some(mirror) = &self.mirror {
+            mirror.apply(GateOp::Update { tail, ready: None });
+            return false;
+        }
         let mut st = self.state.lock().expect("send gate");
         st.tail = tail;
         self.recompute(&mut st)

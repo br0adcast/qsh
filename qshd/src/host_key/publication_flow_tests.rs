@@ -167,7 +167,7 @@ fn owned_cleanup_failure_is_reported_for_write_and_losing_publication() {
         let message = format!("{error:#}");
         assert!(message.contains("injected owned unlink failure"));
         assert!(message.contains(if lose {
-            "publishing key"
+            "publishing host key"
         } else {
             "injected partial write"
         }));
