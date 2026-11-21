@@ -200,8 +200,9 @@ impl ResetResponder {
 mod tests {
     use super::*;
 
-    /// The token is the spec's formula, byte for byte: RFC 2104 HMAC over
-    /// the label and the big-endian id, cut to its first 16 bytes.
+    /// The token, byte for byte, worked out here independently of the code
+    /// under test: RFC 2104 HMAC-SHA-256 over the label and the big-endian
+    /// id, cut to its first 16 bytes.
     #[test]
     fn the_token_is_hmac_sha256_of_the_label_and_the_id() {
         use sha2::Digest;

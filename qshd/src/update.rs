@@ -726,15 +726,18 @@ pub const OWNER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// leave them behind as children the new image never heard of, nor go
 /// ahead after one of them ended without proving its cleanup.
 pub trait OwnerStop: Send + Sync {
-    /// Every owner that has ended so far sent its `Drained(Ok)` receipt and
-    /// exited cleanly. An owner that crashed, was killed, or drained with a
-    /// failure may have left its shells to whoever adopts them: that is
-    /// unproved cleanup, for good.
-    fn proved(&self) -> bool;
+    /// Every owner that has ended so far proved its cleanup: it sent its
+    /// `Drained(Ok)` receipt and exited cleanly, or -- one that crashed,
+    /// was killed, or drained with a failure, and may have left processes
+    /// of its sessions to whoever adopted them -- each of its sessions has
+    /// been proved empty since (checked afresh here). `Err` names what is
+    /// not proved. Blocking, for a bounded time.
+    fn proved(&self) -> Result<(), String>;
     /// Refuse new owners, ask every running one to stop, and wait until
-    /// `deadline` for each to send its receipt and be reaped. `true` only
-    /// when none is left and every one of them proved its cleanup.
-    fn stop_all_until(&self, deadline: Instant) -> bool;
+    /// `deadline` for each to send its receipt and be reaped. `Ok` only
+    /// when none is left and every one of them proved its cleanup, as
+    /// [`OwnerStop::proved`]; else why not.
+    fn stop_all_until(&self, deadline: Instant) -> Result<(), String>;
     /// Accept new owners again, and lift the open fence: the exec did not
     /// happen.
     fn reopen(&self);
@@ -1040,10 +1043,10 @@ impl StagedImage {
 
     /// Eligibility only: the authoritative effectful fence still follows.
     fn cleanup_preflight(&self) -> Result<(), UpdateResult> {
-        if self.owners.as_ref().is_some_and(|owners| !owners.proved()) {
+        if let Some(Err(why)) = self.owners.as_ref().map(|owners| owners.proved()) {
             return Err(UpdateResult::Rejected {
                 code: RejectCode::Other,
-                detail: "a session owner process ended without proving its cleanup".into(),
+                detail: why,
             });
         }
         match self.opens.cleanup_snapshot() {
@@ -1371,9 +1374,9 @@ impl UpdateTransfer for StagedImage {
         };
         restart_step(crate::log::Level::Info, RestartStep::ControlGate, "");
         let (stop, reason) = match self.exec_with_handover(&base, &open_exec_permit) {
-            ExecStop::OwnersUnproved => (
+            ExecStop::OwnersUnproved(why) => (
                 RestartStop::CleanupUnproved,
-                "session owner processes did not all stop with proven cleanup".to_string(),
+                format!("session owner processes did not all stop with proven cleanup: {why}"),
             ),
             ExecStop::Failed(reason) => (RestartStop::ExecFailed, reason),
         };
@@ -1397,8 +1400,8 @@ impl UpdateTransfer for StagedImage {
 /// Why [`StagedImage::exec_with_handover`] returned.
 enum ExecStop {
     /// Some session owner did not stop, or ended without proving its
-    /// cleanup: nothing was exec'd.
-    OwnersUnproved,
+    /// cleanup, and why: nothing was exec'd.
+    OwnersUnproved(String),
     /// Handing over or the exec itself failed.
     Failed(String),
 }
@@ -1530,8 +1533,8 @@ impl StagedImage {
         // child is spawned meanwhile (the exec window is open), and stopping
         // them spawns none.
         if let Some(owners) = &self.owners {
-            if !owners.stop_all_until(Instant::now() + OWNER_STOP_TIMEOUT) {
-                return ExecStop::OwnersUnproved;
+            if let Err(why) = owners.stop_all_until(Instant::now() + OWNER_STOP_TIMEOUT) {
+                return ExecStop::OwnersUnproved(why);
             }
             crate::log::info("update", "every session owner stopped with proven cleanup");
         }
@@ -2971,17 +2974,26 @@ mod tests {
         signal: std::sync::OnceLock<tokio::sync::watch::Receiver<RestartSignal>>,
     }
     impl OwnerStop for FakeOwners {
-        fn proved(&self) -> bool {
-            !self.unproved.load(Ordering::SeqCst)
+        fn proved(&self) -> Result<(), String> {
+            if self.unproved.load(Ordering::SeqCst) {
+                return Err("session 4242 of session owner 7 (signal 9, no receipt): \
+                            pid 4250 still runs in it"
+                    .into());
+            }
+            Ok(())
         }
-        fn stop_all_until(&self, _deadline: Instant) -> bool {
+        fn stop_all_until(&self, _deadline: Instant) -> Result<(), String> {
             self.stops.fetch_add(1, Ordering::SeqCst);
             let held = self
                 .control_gate
                 .get()
                 .is_some_and(|gate| gate.try_read().is_err());
             self.gate_held_at_stop.store(held, Ordering::SeqCst);
-            self.proved() && !self.refuse_stop.load(Ordering::SeqCst)
+            self.proved()?;
+            if self.refuse_stop.load(Ordering::SeqCst) {
+                return Err("1 session owner(s) did not stop in time".into());
+            }
+            Ok(())
         }
         fn reopen(&self) {
             self.reopens.fetch_add(1, Ordering::SeqCst);
@@ -3180,7 +3192,10 @@ mod tests {
         owners.unproved.store(true, Ordering::SeqCst);
         match transfer.restart() {
             UpdateResult::Rejected { detail, .. } => {
-                assert!(detail.contains("session owner"), "{detail}")
+                assert!(detail.contains("session owner"), "{detail}");
+                // What keeps it unproved reaches the requester.
+                assert!(detail.contains("session 4242"), "{detail}");
+                assert!(detail.contains("pid 4250"), "{detail}");
             }
             other => panic!("expected a rejection, got {other:?}"),
         }
@@ -3210,6 +3225,7 @@ mod tests {
             UpdateResult::Rejected { code, detail } => {
                 assert_eq!(code, RejectCode::ExecFailed, "{detail}");
                 assert!(detail.contains("session owner"), "{detail}");
+                assert!(detail.contains("did not stop in time"), "{detail}");
             }
             other => panic!("expected a rejection, got {other:?}"),
         }

@@ -572,7 +572,7 @@ impl Rig {
     }
 }
 
-/// [RF 1] A session recovered twice in a row by new frontends keeps its
+/// A session recovered twice in a row by new frontends keeps its
 /// attachment generations growing: each rebuild continues from the highest
 /// generation the owner has seen, so the runner accepts every new
 /// attachment, its origins stay current, and nothing of an earlier one

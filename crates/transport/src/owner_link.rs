@@ -1596,6 +1596,16 @@ async fn run_epochs(io: SessionIo, mut epoch: Epoch, lifecycle: Arc<Lifecycle>) 
                     exited = relinker.exited() => exited,
                 };
                 if exited {
+                    // The owner died without ending its session (an owner
+                    // that ends it says `Finished` first): the session is
+                    // lost, not ended. Its connection goes without a word,
+                    // as at a lost link, so its client does not take the
+                    // end for a close: it returns, and finds no session
+                    // (the existing session-loss flow).
+                    log::warn!("owner link: the session's owner died; the session is lost");
+                    let _ = io
+                        .outbound
+                        .send(SessionOutbound::Replay(ReplayStep::new(Replay::Lost)));
                     return;
                 }
                 // Unless the bridge replaced the link meanwhile: then this
@@ -2169,6 +2179,9 @@ pub enum OwnerExit {
     Shutdown,
     /// The link died without an explicit end, and the backend then finished.
     LinkLost,
+    /// The frontend ended the session, but the backend did not finish within
+    /// the bound it was given ([`OwnerLink::run_and_drain`]): it is stopped.
+    Unfinished,
 }
 
 /// The owner side of a link: a real [`SessionIo`] driven from link frames.
@@ -2574,7 +2587,11 @@ impl OwnerLink {
     /// within `drain_within` is given up on (`drained: Err`): a worker
     /// blocked for good -- a write into a pseudo-terminal whose other side
     /// is gone, say -- must not keep the owner process alive, and it ends
-    /// with the process. Any lifecycle in `init` is replaced.
+    /// with the process. The same bound holds from the frontend's `End` to
+    /// the backend's finish: a backend that does not finish by then is
+    /// stopped and drained as at a shutdown, but the run still counts as an
+    /// end of the session ([`OwnerExit::Unfinished`]). Any lifecycle in
+    /// `init` is replaced.
     pub async fn run_and_drain<L>(
         link: L,
         backend: Arc<dyn SessionBackend>,
@@ -2593,7 +2610,7 @@ impl OwnerLink {
             crate::control_budget::GlobalBudget::envelope(),
         );
         init.lifecycle = Some(lifecycle.clone());
-        let run = Self::run(link, backend, init);
+        let run = Self::run_within(link, backend, init, Some(drain_within));
         tokio::pin!(run);
         // A blocking callback's result is published by the lifecycle's
         // joiner, as the session manager's loop does for a daemon's
@@ -2620,6 +2637,20 @@ impl OwnerLink {
     /// over through [`OwnerInit::relinks`] starts with a replay of it. Only
     /// an explicit `End`, shutdown, or the backend finishing ends the owner.
     pub async fn run<L>(link: L, backend: Arc<dyn SessionBackend>, init: OwnerInit) -> OwnerExit
+    where
+        L: LinkIo,
+    {
+        Self::run_within(link, backend, init, None).await
+    }
+
+    /// [`OwnerLink::run`], giving a backend at most `end_within` (if any)
+    /// from the frontend's `End` to its finish.
+    async fn run_within<L>(
+        link: L,
+        backend: Arc<dyn SessionBackend>,
+        init: OwnerInit,
+        end_within: Option<std::time::Duration>,
+    ) -> OwnerExit
     where
         L: LinkIo,
     {
@@ -2686,6 +2717,8 @@ impl OwnerLink {
         // The current link no longer takes what the owner writes.
         let mut write_dead = false;
         let mut ended = false;
+        // Until when a session its frontend ended may take to finish.
+        let mut end_by: Option<tokio::time::Instant> = None;
         // The backend finished and everything it sent went out; the frontend
         // still holds custody until it closes the link.
         let mut backend_done = false;
@@ -2735,6 +2768,14 @@ impl OwnerLink {
                                 None => std::future::pending().await,
                             }
                         } => OwnerWake::RetireOverdue,
+                        _ = async {
+                            // Only until the backend finished: what it sent
+                            // then is the frontend's to take, unhurried.
+                            match end_by.filter(|_| !backend_done) {
+                                Some(by) => tokio::time::sleep_until(by).await,
+                                None => std::future::pending().await,
+                            }
+                        } => OwnerWake::EndOverdue,
                     }
                 } => wake,
             };
@@ -2764,6 +2805,18 @@ impl OwnerLink {
                     owner.priority = None;
                     write_dead = true;
                 }
+                // The session was ended, but its backend does not finish --
+                // a worker stuck on a process that ignores its hangup, say.
+                // It is stopped, as at a shutdown; the drain that follows is
+                // bounded, and what does not join is killed by the owner.
+                OwnerWake::EndOverdue => {
+                    log::warn!(
+                        "owner link: the session did not finish within {} ms of its end; stopping it",
+                        end_within.map_or(0, |within| within.as_millis())
+                    );
+                    owner.gates.close_all();
+                    return OwnerExit::Unfinished;
+                }
                 // The link that was to be retired did not end in time: its
                 // frontend hangs, or its `Retire` is lost. The link that
                 // waits takes over as after a lost one.
@@ -2778,7 +2831,12 @@ impl OwnerLink {
                     .and_then(|frame| frame.map(|frame| owner.on_frame(&frame)).transpose())
                 {
                     Ok(Some(FrameEffect::None)) => {}
-                    Ok(Some(FrameEffect::Ended)) => ended = true,
+                    Ok(Some(FrameEffect::Ended)) => {
+                        ended = true;
+                        if let Some(within) = end_within {
+                            end_by.get_or_insert(tokio::time::Instant::now() + within);
+                        }
+                    }
                     Ok(Some(FrameEffect::Retired)) => link_over = Some(true),
                     // Every frontend token is gone: custody may go too.
                     Ok(None) | Err(_) if backend_done => return OwnerExit::Finished,
@@ -2881,6 +2939,8 @@ enum OwnerWake {
     Terminal,
     WriteFailed,
     RetireOverdue,
+    /// The session was ended, and its backend has not finished in time.
+    EndOverdue,
     Frame(Result<Option<Frame>, LinkError>),
     Backend(Option<SessionOutbound>),
     Slot(Option<mpsc::OwnedPermit<SessionInbound>>),

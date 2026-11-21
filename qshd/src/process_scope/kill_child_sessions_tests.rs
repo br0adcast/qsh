@@ -1,5 +1,6 @@
 //! `kill_child_sessions`: exact (pinned descriptors only), session-wide,
-//! and never waiting.
+//! and never waiting. And `census_sessions`, a host's check of a dead
+//! owner's sessions over the same census: fail-closed.
 
 use super::*;
 use std::collections::HashMap;
@@ -22,6 +23,18 @@ struct Model {
     dies_when_signalled: bool,
     censuses: usize,
     signals: Vec<(u32, i32)>,
+    /// Process groups other than the session's own (pid -> pgid).
+    groups: HashMap<u32, u32>,
+    /// Whether the kernel signals a whole process group through a
+    /// descriptor (Linux 6.9 and later); `false` refuses it with `EINVAL`.
+    group_signals: bool,
+    /// Group signals asked for, by the pid whose descriptor carried them.
+    group_signalled: Vec<(u32, i32)>,
+    group_attempts: usize,
+    /// The census of that index fails after listing that many processes.
+    census_fails_at: Option<(usize, usize)>,
+    /// Listed, but their status cannot be read.
+    unreadable: Vec<u32>,
 }
 impl Model {
     fn new(procs: &[(u32, u32, u32)]) -> Model {
@@ -39,6 +52,12 @@ impl Model {
             dies_when_signalled: false,
             censuses: 0,
             signals: Vec::new(),
+            groups: HashMap::new(),
+            group_signals: false,
+            group_signalled: Vec::new(),
+            group_attempts: 0,
+            census_fails_at: None,
+            unreadable: Vec::new(),
         }
     }
     fn alive(&self, fd: &OwnedFd) -> Result<u32, Failure> {
@@ -59,18 +78,22 @@ impl Operations for Model {
     fn stat(&mut self, fd: &OwnedFd) -> Result<Vec<u8>, Failure> {
         let pid = self.alive(fd)?;
         let (ppid, sid) = self.procs[&pid];
+        let pgid = self.groups.get(&pid).copied().unwrap_or(sid);
         let state = if self.zombies.contains(&pid) {
             'Z'
         } else {
             'S'
         };
         Ok(
-            format!("{pid} (x) {state} {ppid} {sid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9\n")
+            format!("{pid} (x) {state} {ppid} {pgid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 9\n")
                 .into_bytes(),
         )
     }
     fn status(&mut self, fd: &OwnedFd) -> Result<Vec<u8>, Failure> {
         let pid = self.alive(fd)?;
+        if self.unreadable.contains(&pid) {
+            return Err(Failure::Errno(libc::EACCES));
+        }
         Ok(format!("Name:\tx\nTgid:\t{pid}\nPid:\t{pid}\n").into_bytes())
     }
     fn signal(&mut self, fd: &OwnedFd, signal: i32) -> Result<(), Failure> {
@@ -79,6 +102,15 @@ impl Operations for Model {
         if self.dies_when_signalled && !self.zombies.contains(&pid) {
             self.zombies.push(pid);
         }
+        Ok(())
+    }
+    fn signal_group(&mut self, fd: &OwnedFd, signal: i32) -> Result<(), Failure> {
+        let pid = self.alive(fd)?;
+        self.group_attempts += 1;
+        if !self.group_signals {
+            return Err(Failure::Errno(libc::EINVAL));
+        }
+        self.group_signalled.push((pid, signal));
         Ok(())
     }
 }
@@ -119,7 +151,11 @@ impl scope::ScopeOperations for Model {
         if let Some(sid) = self.forks_forever_in {
             self.procs.insert(1000 + self.censuses as u32, (sid, sid));
         }
-        for pid in pids {
+        for (listed, pid) in pids.into_iter().enumerate() {
+            if self.census_fails_at == Some((self.censuses, listed)) {
+                self.censuses += 1;
+                return Err(Failure::Errno(libc::EIO));
+            }
             visit(self, pid);
         }
         self.censuses += 1;
@@ -243,6 +279,109 @@ fn an_exited_unreaped_process_is_not_counted() {
             settled: true
         }
     );
+}
+
+/// Where the kernel can signal a whole process group through a descriptor
+/// (Linux 6.9 and later), every member that leads its process group has
+/// its group signalled through its own pin -- all at once, so no member of
+/// that group can complete a fork past the kill -- and every member is
+/// still signalled one by one, as before. Nothing else is: no group of a
+/// process that leads none, no group outside the sessions.
+#[test]
+fn group_leaders_of_a_childs_session_have_their_groups_signalled_too() {
+    let me = std::process::id();
+    // 10 leads session and group 10; 11 leads job 11 of that session, with
+    // 12 in it; 13 is in group 11 too but leads nothing; 30 is someone
+    // else's, leading its own session and group.
+    let mut model = Model::new(&[
+        (10, me, 10),
+        (11, 10, 10),
+        (12, 11, 10),
+        (13, 11, 10),
+        (30, 1, 30),
+    ]);
+    model.groups = HashMap::from([(11, 11), (12, 11), (13, 11)]);
+    model.group_signals = true;
+    let kill = kill_child_sessions(&view(), |_| true, &mut model).unwrap();
+    let mut groups: Vec<u32> = model.group_signalled.iter().map(|(pid, _)| *pid).collect();
+    groups.sort();
+    assert_eq!(groups, [10, 11], "each group through its leader, once");
+    assert_eq!(model.group_attempts, 2);
+    assert!(model
+        .group_signalled
+        .iter()
+        .all(|(_, s)| *s == libc::SIGKILL));
+    assert_eq!(model.signalled(), [10, 11, 12, 13]);
+    assert_eq!(
+        kill,
+        SessionKill {
+            killed: 4,
+            settled: true
+        }
+    );
+}
+
+/// A kernel before 6.9 refuses the group flag (`EINVAL`): it is asked once,
+/// and the kill goes on exactly as before -- each member through its own
+/// pin, over repeated lists.
+#[test]
+fn a_kernel_without_group_signals_is_asked_once_and_the_lists_do_the_rest() {
+    let me = std::process::id();
+    let mut model = Model::new(&[(10, me, 10), (11, 10, 10), (20, me, 20)]);
+    model.groups = HashMap::from([(11, 11)]);
+    model.dies_when_signalled = true;
+    model.forks = vec![(1, (12, 11, 10))];
+    let kill = kill_child_sessions(&view(), |_| true, &mut model).unwrap();
+    assert!(model.group_signalled.is_empty());
+    assert_eq!(model.group_attempts, 1, "refused once, not asked again");
+    assert_eq!(model.signalled(), [10, 11, 12, 20]);
+    assert_eq!(
+        kill,
+        SessionKill {
+            killed: 4,
+            settled: true
+        }
+    );
+}
+
+/// Whether the running kernel's release is `major.minor` or later.
+fn kernel_at_least(major: u32, minor: u32) -> bool {
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::uname(&mut name) }, 0);
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) }.to_string_lossy();
+    let mut parts = release
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().unwrap_or(0));
+    let found = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    found >= (major, minor)
+}
+
+/// What the native call is: a group signal through a pinned descriptor
+/// (`PIDFD_SIGNAL_PROCESS_GROUP`), which a kernel before 6.9 refuses with
+/// `EINVAL`, and which never reaches a process outside that group. Signal
+/// 0 only checks.
+#[test]
+fn the_native_group_signal_is_exact_or_refused() {
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let view = qualify_native_proc().unwrap();
+    let pinned = pin(&view, pid, &mut Native).expect("our child, pinned");
+    let result = Native.signal_group(&pinned.fd, 0);
+    if kernel_at_least(6, 9) {
+        assert!(matches!(result, Ok(())), "Linux 6.9 or later: {result:?}");
+    } else {
+        assert!(
+            matches!(result, Err(Failure::Errno(libc::EINVAL))),
+            "before Linux 6.9: {result:?}"
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 struct Exec {
@@ -439,4 +578,256 @@ fn no_member_of_a_forking_session_survives() {
         left, 0,
         "{left} process(es) of the session outlived the kill ({kill:?})"
     );
+}
+
+// ---- census_sessions ----------------------------------------------------------
+
+/// pid 1, which every walk must see.
+const INIT: (u32, u32, u32) = (1, 0, 1);
+
+fn later() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(60)
+}
+
+/// A session with no process left is empty -- after both walks -- and one
+/// with a process in it is not, naming it. The census goes by the session
+/// ID alone: a process of a new session that reused the number (its
+/// leader is not the one the session had) keeps it occupied too. Nothing
+/// is ever signalled.
+#[test]
+fn census_finds_each_session_by_its_id_alone() {
+    // 10: session 10's leftover, its leader gone; 20: a new session that
+    // reused 20, someone else's; 31 and 30: session 30, nothing of 40.
+    let mut model = Model::new(&[INIT, (11, 1, 10), (20, 1, 20), (30, 1, 30), (31, 30, 30)]);
+    let census = census_sessions(&view(), &[10, 20, 40], later(), &mut model);
+    assert_eq!(
+        census,
+        vec![
+            SessionCensus::Occupied(vec![11]),
+            SessionCensus::Occupied(vec![20]),
+            SessionCensus::Empty,
+        ]
+    );
+    assert_eq!(model.censuses, CENSUS_PASSES, "both walks, for session 40");
+    assert!(model.signals.is_empty() && model.group_attempts == 0);
+    // At most CENSUS_NAMED of a session's processes are named.
+    let mut many: Vec<(u32, u32, u32)> = (0..10).map(|n| (50 + n, 1, 50)).collect();
+    many.push(INIT);
+    let census = census_sessions(&view(), &[50], later(), &mut Model::new(&many));
+    assert_eq!(
+        census,
+        vec![SessionCensus::Occupied(
+            (50..50 + CENSUS_NAMED as u32).collect()
+        )]
+    );
+}
+
+/// An exited process (a zombie, nothing of it running) does not keep its
+/// session occupied, nor does one gone between being listed and read.
+#[test]
+fn census_counts_neither_zombies_nor_processes_gone_meanwhile() {
+    let mut model = Model::new(&[INIT, (11, 1, 10), (12, 1, 10)]);
+    model.zombies.push(11);
+    model.gone.push(12);
+    assert_eq!(
+        census_sessions(&view(), &[10], later(), &mut model),
+        vec![SessionCensus::Empty]
+    );
+}
+
+/// One walk can miss a process forked behind it (the PIDs wrapped) by a
+/// parent that exits before the walk reaches it; the second walk finds it.
+#[test]
+fn census_second_walk_finds_a_process_the_first_missed() {
+    let mut model = Model::new(&[INIT]);
+    // Forked during the first walk, after the list was taken.
+    model.forks.push((0, (5, 1, 10)));
+    assert_eq!(
+        census_sessions(&view(), &[10], later(), &mut model),
+        vec![SessionCensus::Occupied(vec![5])]
+    );
+    assert_eq!(model.censuses, 2);
+}
+
+/// Fail-closed: a walk that fails, a process that is listed but cannot be
+/// read (its session cannot be told), or a census past its deadline
+/// leaves every session not already found unknown -- never empty.
+#[test]
+fn census_that_fails_or_times_out_proves_nothing() {
+    let unknown = |census: &[SessionCensus], why: &str| {
+        assert!(
+            matches!(&census[0], SessionCensus::Unknown(text) if text.contains(why)),
+            "{census:?}"
+        );
+    };
+    // The second walk fails: the first one's clean result does not count.
+    let mut model = Model::new(&[INIT, (11, 1, 10), (30, 1, 30)]);
+    model.gone.push(11);
+    model.census_fails_at = Some((1, 1));
+    let census = census_sessions(&view(), &[10, 30], later(), &mut model);
+    unknown(&census, "could not be listed");
+    assert_eq!(
+        census[1],
+        SessionCensus::Occupied(vec![30]),
+        "found stays found"
+    );
+
+    let mut model = Model::new(&[INIT, (7, 1, 7)]);
+    model.unreadable.push(7);
+    unknown(
+        &census_sessions(&view(), &[10], later(), &mut model),
+        "process 7 could not be read",
+    );
+
+    let mut model = Model::new(&[INIT, (7, 1, 7)]);
+    unknown(
+        &census_sessions(&view(), &[10], std::time::Instant::now(), &mut model),
+        "did not finish in time",
+    );
+}
+
+/// On real processes: a session with a process in it is occupied, naming
+/// it; once that process is gone the session is empty.
+#[test]
+fn census_of_a_real_session() {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new("sleep");
+    command.arg("300").stdin(std::process::Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let session = Session(command.spawn().unwrap());
+    let sid = session.0.id();
+    let view = qualify_native_proc().expect("qualified procfs");
+    assert_eq!(
+        census_sessions(&view, &[sid], later(), &mut Native),
+        vec![SessionCensus::Occupied(vec![sid])]
+    );
+    drop(session);
+    assert_eq!(
+        census_sessions(&view, &[sid], later(), &mut Native),
+        vec![SessionCensus::Empty]
+    );
+}
+
+/// A `/proc` that hides processes (`hidepid=invisible`, `ptraceable`) hides
+/// pid 1 from an account that is not root: a walk that does not see it
+/// proves nothing, also when nothing it did see is in the session.
+#[test]
+fn census_without_pid_1_proves_nothing() {
+    let mut model = Model::new(&[(11, 1, 11), (30, 1, 30)]);
+    let census = census_sessions(&view(), &[10, 30, 40], later(), &mut model);
+    assert_eq!(
+        census[1],
+        SessionCensus::Occupied(vec![30]),
+        "found stays found"
+    );
+    for unseen in [&census[0], &census[2]] {
+        assert!(
+            matches!(unseen, SessionCensus::Unknown(why) if why.contains("hides processes")),
+            "{census:?}"
+        );
+    }
+    // Listed but gone by the time it is read: not seen either.
+    let mut model = Model::new(&[INIT]);
+    model.gone.push(1);
+    assert!(matches!(
+        &census_sessions(&view(), &[40], later(), &mut model)[0],
+        SessionCensus::Unknown(_)
+    ));
+}
+
+/// The mount's own options decide too: `hidepid` other than `0`/`off` on
+/// the view's procfs device hides processes; any other entry, another
+/// device's options, or `subset=pid` (which hides no process) do not. An
+/// entry not found, or not procfs, proves nothing.
+#[test]
+fn mount_options_that_hide_processes_are_found() {
+    let mountinfo = |options: &str| {
+        format!(
+            "22 1 0:21 / /sys rw,nosuid shared:7 - sysfs sysfs rw,hidepid=2\n\
+             23 1 0:22 / /proc rw,nosuid,nodev,noexec shared:12 - proc proc {options}\n\
+             24 23 0:23 / /proc/sys/fs/binfmt_misc rw master:3 - autofs systemd-1 rw\n"
+        )
+    };
+    let proc_dev = (0, 22);
+    for shown in [
+        "rw",
+        "rw,hidepid=0",
+        "rw,hidepid=off",
+        "rw,subset=pid",
+        "rw,gid=4",
+    ] {
+        assert_eq!(
+            mount_hides_processes(mountinfo(shown).as_bytes(), proc_dev),
+            None,
+            "{shown}"
+        );
+    }
+    for hidden in [
+        "rw,hidepid=1",
+        "rw,hidepid=2",
+        "rw,hidepid=invisible",
+        "rw,hidepid=ptraceable",
+        "rw,subset=pid,hidepid=noaccess",
+        "rw,hidepid=something-new",
+    ] {
+        let why = mount_hides_processes(mountinfo(hidden).as_bytes(), proc_dev).expect(hidden);
+        assert!(why.contains("hidepid="), "{why}");
+    }
+    assert!(
+        mount_hides_processes(mountinfo("rw").as_bytes(), (0, 99)).is_some(),
+        "no entry"
+    );
+    assert!(
+        mount_hides_processes(mountinfo("rw").as_bytes(), (0, 21)).is_some(),
+        "not procfs"
+    );
+    assert!(
+        mount_hides_processes(b"23 1 0:22 / /proc rw", proc_dev).is_some(),
+        "cut"
+    );
+    // This host's own /proc, as the census reads it.
+    let view = qualify_native_proc().expect("qualified procfs");
+    let hidden = proc_hides_processes(&view);
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let hides = mounts
+        .lines()
+        .any(|l| l.contains(" - proc ") && l.contains("hidepid=") && !l.contains("hidepid=0"));
+    assert_eq!(hidden.is_some(), hides, "{hidden:?}");
+}
+
+/// mountinfo is bytes: a mount point that is not UTF-8 (a user's FUSE
+/// mount) on another line changes nothing, while the procfs line itself must
+/// be UTF-8 and parse whole -- a byte that does not decode there proves
+/// nothing, even where it would decode to an accepted option.
+#[test]
+fn mount_options_are_read_as_bytes() {
+    let mut mountinfo =
+        b"40 1 0:50 / /home/u/caf\xe9 rw shared:20 - fuse.sshfs host:/ rw\n".to_vec();
+    mountinfo.extend_from_slice(b"23 1 0:22 / /proc rw,nosuid shared:12 - proc proc rw\n");
+    assert_eq!(mount_hides_processes(&mountinfo, (0, 22)), None);
+
+    mountinfo.extend_from_slice(b"41 1 0:51 / /mnt/\xff\xfe rw - fuse fuse rw,hidepid=2\n");
+    assert_eq!(
+        mount_hides_processes(&mountinfo, (0, 22)),
+        None,
+        "another device"
+    );
+
+    let procfs = |options: &[u8]| {
+        let mut line = b"23 1 0:22 / /proc rw shared:12 - proc proc ".to_vec();
+        line.extend_from_slice(options);
+        line.push(b'\n');
+        line
+    };
+    for broken in [&b"rw,hidepid=\xff"[..], b"rw,\xe9", b"rw,hidepid=0\xc3"] {
+        let why = mount_hides_processes(&procfs(broken), (0, 22)).expect("proves nothing");
+        assert!(why.contains("cannot be parsed"), "{why}");
+    }
 }

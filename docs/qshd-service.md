@@ -125,7 +125,6 @@ an error right away, without starting anything.
   once that their connection is gone (`docs/protocol.md` §1.1). Two daemons
   must not share one key file: they would share that secret, and one could
   be used to make the other's clients reconnect (never to lose a session);
-
 - admits anyone whose public key is in `--authorized-keys` (default
   `~/.ssh/authorized_keys`) and whose signature checks out; it accepts
   Ed25519, ECDSA (P-256/P-384) and RSA keys signed with
@@ -166,6 +165,99 @@ single-linked winner through that same directory descriptor, even if a parent
 pathname changes. Cleanup removes only the creator's own stage and reports
 failures; a crash may leave a private staging file. This does not promise
 power-loss durability of the containing directory.
+
+## Sessions outlive the network part (Linux, personal mode)
+
+On Linux a personal daemon (`qshd serve` without `--system`, and the daemon
+`qshd transport-ensure` starts) is three kinds of process, all of one
+executable and one account:
+
+- the daemon itself, the **host**: it holds the UDP port, the control
+  socket, the host key, the admitted client keys, the list of sessions and
+  the session limits. It reads no datagram;
+- one **network frontend** (`qshd __qshd-frontend-v1`), a child of the
+  host: handshakes, authentication and connections;
+- one **session owner** per session (`qshd __qshd-session-owner-v1`), a
+  child of the host and the parent of that session's shells.
+
+The host starts the frontend and the owners from the executable it was
+started from, even if the file on disk has been replaced since. What happens
+when one of them goes:
+
+| What ends | Its sessions | The client |
+|---|---|---|
+| the frontend (a crash, a kill -- also a plain `kill` or `SIGINT` --, out of memory, or wedged: see below) | kept: the same shells and processes, the screen repainted | comes back on its own: a current `qsh` within about a second and a half (the session reset, `docs/protocol.md` §1.1), an older one after its 45 s death timer. Keystrokes that were inside the frontend may be lost; none is ever run twice |
+| a session's owner | that one session is lost; the others are not touched | is not told of a close: it comes back as after an outage, finds no session, and `qsh` asks whether to start a new one |
+| the daemon | all lost, as before | the same |
+
+- the host starts a new frontend after 0.1 s, doubling to 5 s while
+  frontends keep dying, and from 0.1 s again after one has run for a
+  minute. A frontend that answers nothing for 20 s (stopped, or a runtime
+  that runs nothing) is killed and replaced the same way;
+- a frontend's death moves no session's time: a session the client left is
+  still kept a day and an hour after its last packet (`docs/protocol.md`
+  §4.2), and the host ends it then even while no frontend runs;
+- the session limits (16 per account, 128 in all) are the host's, once: a
+  session counts from its start until it ends, and at a limit the oldest
+  retained session makes room, as in a single process -- also one that no
+  frontend has seen since the last one died. Owners of sessions that have
+  ended but are still finishing do not count; at most 256 owners in all
+  may be there at once, and one that has not finished 20 s after its
+  session's end, after the daemon told it to stop, or after it closed its
+  channel to the daemon, is killed;
+- after a session is closed, its processes get its terminal's hangup, and
+  about a second later every process still in the terminal's session is
+  killed -- also one that ignores the hangup (`nohup`, a `disown`ed job,
+  `trap '' HUP`). That is the session's own cleanup, and it is proved. A
+  process that has left the terminal's session for one of its own is not
+  part of it and keeps running after the close: a tmux server started in
+  the session (it starts a session of its own) outlives it, with its tmux
+  sessions;
+- only when that cleanup does not finish -- something of the session still
+  keeps it from ending -- is the session killed whole about 10 s after the
+  close (at most about 20 s, when the daemon's own stop of it does not
+  come), and it then counts as a session whose cleanup was not proved
+  (below);
+- when an owner dies, its shells end with their terminal's hangup, but a
+  process of that session that ignores the hangup (`nohup`, a `disown`ed
+  job, `trap '' HUP`) is left running, as when a whole daemon dies. Such
+  an owner -- and one whose session was killed whole as above -- did not
+  prove its cleanup, so the daemon checks its sessions itself: it learned
+  each session's ID from the owner when the session's shell started, and
+  it looks through `/proc` for any process still in that session -- when
+  it reaps the owner, and again at every `STATUS`, every in-place update
+  and every stop. An owner killed with nothing of its sessions left behind
+  costs nothing more than those sessions;
+- while some process is still in such a session, the daemon's cleanup is
+  not proved: its stop says so (`STOP` and the service stop fail), an
+  in-place update is refused, and `STATUS` reports `cleanup` as
+  `unresolved`. Each of them names the session (its ID, as `ps -s <ID>`
+  takes it) and the processes still in it. The daemon kills nothing there
+  itself: end those processes, and the next `STATUS` or update finds the
+  session empty and goes on -- no restart of the daemon is needed. Any
+  process in that session counts, whoever started it, and a check that
+  cannot read `/proc` in time counts as not proved. So does every check
+  where `/proc` hides processes from the daemon's account (mounted with
+  `hidepid=` other than `0`): there such a session stays unproved until
+  the daemon is restarted. The check finds the processes that stay in
+  the session; a process that leaves it (`setsid`, as a tmux server does)
+  is not part of it, and a chain of processes that each start the next
+  and exit at once could slip past it;
+- a session whose ID the daemon never learned -- its owner died in the
+  moment between starting the session's shell and telling the daemon, or
+  more sessions than the daemon keeps -- cannot be checked: it stays
+  unproved until the daemon is restarted;
+- a stop (`STOP`, `SIGTERM`, the service stop) still ends every session and
+  waits for every owner, also while no frontend runs.
+
+macOS and system mode run the router and every session in the daemon's own
+process, as before: there a crash of the daemon's network part ends every
+session.
+
+A released 0.5.0 client cannot use a daemon of this version at all -- it
+speaks protocol 1, and this daemon protocol 2 (`docs/protocol.md` §1.1) --
+so the return after a frontend's death is verified with current clients
+only.
 
 ## System mode
 

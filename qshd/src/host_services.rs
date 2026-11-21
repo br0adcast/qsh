@@ -9,11 +9,18 @@
 //! - **Control budget envelopes** (transport's `GlobalBudget`): at most
 //!   `MAX_SESSIONS_TOTAL` envelope leases, at most `MAX_SESSIONS_PER_OWNER`
 //!   of them per uid. The host takes one ([`HostServices::admit`]) before it
-//!   starts an owner and gives it back when it has reaped that owner, so a
-//!   draining owner keeps its lease, as a retired session kept its custody
-//!   charged in one process. The owner runs its session under a budget of
-//!   exactly one envelope (`OwnerLink::run_and_drain`). Without a free lease
-//!   no owner starts: the session ends at once, as a stopped backend.
+//!   starts an owner. It counts against the caps until the session has
+//!   ended ([`OwnerAccount::end_session`]: the owner's `End`, the router's
+//!   end of the login, or the host's own stop of the owner), as a router
+//!   stops counting a session the moment it ends it, though its backend
+//!   still drains; and if the session never says so, until the host has
+//!   reaped the owner. The owner runs its session under a budget of
+//!   exactly one envelope (`OwnerLink::run_and_drain`), until it exits. A
+//!   draining owner is thus outside the count but within its own envelope,
+//!   and it drains within a bound: the host kills one still there after
+//!   its stop escalation, and starts no owner while
+//!   `owner_process::MAX_OWNERS` are unreaped. Without a free lease no owner starts:
+//!   the session ends at once, as a stopped backend.
 //! - **The screen budget** ([`crate::screen_budget`]): one pool for every
 //!   owner. An owner's `ScreenBudget` charges it by request and reply
 //!   (`acquire`) and refunds it by notice (`release`).
@@ -36,6 +43,7 @@
 //! carries them ([`crate::owner_process::wire`]).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -150,7 +158,22 @@ impl HostServices {
             services: self.clone(),
             uid,
             held: Mutex::default(),
+            envelope: AtomicBool::new(true),
         })
+    }
+
+    /// Whether a new session of `uid` would get an envelope now; if not,
+    /// which cap is reached.
+    pub(crate) fn room(&self, uid: u32) -> Result<(), Cap> {
+        let l = self.limits;
+        let counts = self.counts();
+        if counts.envelopes.of(uid) >= l.envelopes_per_uid {
+            Err(Cap::Account)
+        } else if counts.envelopes.total >= l.envelopes {
+            Err(Cap::Daemon)
+        } else {
+            Ok(())
+        }
     }
 
     #[cfg(test)]
@@ -162,6 +185,15 @@ impl HostServices {
             screen: self.screen.used(),
         }
     }
+}
+
+/// Which session cap a new session would exceed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cap {
+    /// Its account's.
+    Account,
+    /// The daemon's, over all accounts.
+    Daemon,
 }
 
 #[cfg(test)]
@@ -187,11 +219,22 @@ pub(crate) struct OwnerAccount {
     services: Arc<HostServices>,
     uid: u32,
     held: Mutex<Held>,
+    /// The session's envelope still counts against the caps.
+    envelope: AtomicBool,
 }
 
 impl OwnerAccount {
     fn held(&self) -> MutexGuard<'_, Held> {
         self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The session has ended: its envelope no longer counts against the
+    /// caps, though the owner keeps everything else it holds until it is
+    /// reaped. Once; later calls, and the drop, give back nothing more.
+    pub(crate) fn end_session(&self) {
+        if self.envelope.swap(false, Ordering::SeqCst) {
+            self.services.counts().envelopes.give(self.uid, 1);
+        }
     }
 
     fn foreign(&self, uid: u32, what: &str) -> bool {
@@ -311,7 +354,9 @@ impl Drop for OwnerAccount {
         }
         let mut counts = self.services.counts();
         counts.opens.give(self.uid, held.opens);
-        counts.envelopes.give(self.uid, 1);
+        if self.envelope.swap(false, Ordering::SeqCst) {
+            counts.envelopes.give(self.uid, 1);
+        }
     }
 }
 

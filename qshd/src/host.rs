@@ -50,7 +50,19 @@
 //! taken for "no such session" (`Unavailable`: the handshake is dropped,
 //! and a session that may still run is never replaced or ended on a
 //! guess). A frontend that does not take a packet within that time is
-//! killed and replaced.
+//! killed and replaced, and so is one that answers nothing: the host asks
+//! a frontend it has not heard from for [`PROBE_AFTER`] whether it is alive
+//! (`Probe`, answered `Alive`), and one that leaves [`PROBES_UNANSWERED`]
+//! such questions in a row unanswered is taken for wedged. That is a
+//! frontend process that is stopped, or whose runtime runs nothing; one
+//! whose router alone is stuck still answers.
+//!
+//! **Session caps.** A session counts against them from its `Create` until
+//! it ends -- its owner's `End`, its router's end of its login (`Ended`),
+//! or the host's own stop of its owner -- not until its owner is reaped: a
+//! router stops counting a session the moment it ends it. At a cap the
+//! host makes room as a router does, from the sessions no frontend holds
+//! (which no router knows of): the oldest retained one goes.
 
 #[path = "host/allow.rs"]
 mod allow;
@@ -89,6 +101,12 @@ pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(5);
 pub(crate) const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 /// How long a frontend that was told to stop may take before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(2);
+/// A frontend the host has heard nothing from for this long is asked
+/// whether it is alive (`Probe`); its answer, like any packet, says so.
+pub(crate) const PROBE_AFTER: Duration = Duration::from_secs(5);
+/// Probes in a row a frontend may leave unanswered: one more, and it is
+/// taken for wedged -- killed, and replaced like a frontend that died.
+pub(crate) const PROBES_UNANSWERED: u32 = 3;
 /// How long a session the host handed a frontend (`Lookup`) counts as that
 /// frontend's without a word from it: past this, its router never took the
 /// link (a late answer, a refused handshake), and the host keeps the
@@ -207,6 +225,9 @@ pub(crate) struct Catalog {
 /// addition to the allowlist.
 type EarlyKey = (LoginId, ([u8; 32], u64));
 
+/// Keys to scrub off the allowlist, each with the addition it removes.
+type Scrubs = Vec<([u8; 32], u64)>;
+
 /// Most keys kept for a `Create` still to come: one per session the
 /// daemon may have.
 const EARLY_KEYS: usize = transport::session_manager::MAX_SESSIONS_TOTAL;
@@ -307,8 +328,14 @@ impl Catalog {
         self.insert(token, entry);
     }
 
-    /// A report from the running frontend about `entry`: it holds it.
+    /// A report from the running frontend about `entry`: it holds it. Also
+    /// after its takeover lapsed ([`TAKEOVER_CONFIRM`]: a first report lost
+    /// to a full queue, or a host that stalled): only the running frontend
+    /// reports, and only for sessions its router holds, so the report is
+    /// proof enough. Otherwise the host would keep the deadline it had at
+    /// the hand-over, and end a session in use a day later.
     fn confirmed(entry: &mut Entry) {
+        entry.attached = true;
         entry.confirm_by = None;
     }
 
@@ -354,7 +381,7 @@ impl Catalog {
 
     fn traffic(&self, token: LoginId, idle: Duration, active: bool) {
         let mut entries = self.lock();
-        let Some(entry) = entries.get_mut(&token).filter(|e| e.attached) else {
+        let Some(entry) = entries.get_mut(&token) else {
             return;
         };
         Self::confirmed(entry);
@@ -370,7 +397,7 @@ impl Catalog {
 
     fn retained(&self, token: LoginId) {
         let mut entries = self.lock();
-        let Some(entry) = entries.get_mut(&token).filter(|e| e.attached) else {
+        let Some(entry) = entries.get_mut(&token) else {
             return;
         };
         Self::confirmed(entry);
@@ -442,6 +469,54 @@ impl Catalog {
         entry.last_client_recv = Instant::now();
         entry.confirm_by = Some(Instant::now() + TAKEOVER_CONFIRM);
         Found::Owner(front, pidfd)
+    }
+
+    /// Give up the oldest retained session no frontend holds -- `uid`'s
+    /// own, if given -- for a new one, as a router gives up its oldest
+    /// retained backend at a cap: its owner, and the keys to scrub (see
+    /// [`Catalog::scrubbable`]). A live one whose client has been silent
+    /// past [`SERVER_DEATH_AFTER`] counts as retained since then, as its
+    /// router would hold it. `None` when there is none: every such session
+    /// is live, or held by the running frontend, whose router evicts its
+    /// own.
+    fn evict_retained(&self, uid: Option<u32>) -> Option<(u32, Scrubs)> {
+        let mut entries = self.lock();
+        let victim = entries
+            .iter()
+            .filter(|(_, e)| !e.attached && uid.is_none_or(|uid| e.uid == uid))
+            .filter_map(|(token, e)| match e.state {
+                SessionState::Retained { since } => Some((*token, since)),
+                // A router would hold it retained by now: its client's
+                // connection died of silence.
+                SessionState::Live => {
+                    let died = e.last_client_recv + SERVER_DEATH_AFTER;
+                    (died <= Instant::now()).then_some((*token, died))
+                }
+            })
+            .min_by_key(|(_, since)| *since)
+            .map(|(token, _)| token)?;
+        let entry = entries.remove(&victim)?;
+        self.recount(&entries);
+        let keys = Self::scrubbable(&entries, entry.client_key.into_iter().collect());
+        drop(entries);
+        self.changed.notify_one();
+        Some((entry.owner_pid, keys))
+    }
+
+    /// The running frontend's router ended `token`'s login (an explicit
+    /// close, an eviction, its retention's end): the session is over. Its
+    /// owner, taken off the catalog; `None` unless the running frontend
+    /// held it. The router scrubs the session's key itself.
+    fn router_ended(&self, token: LoginId) -> Option<u32> {
+        let mut entries = self.lock();
+        if !entries.get(&token).is_some_and(|e| e.attached) {
+            return None;
+        }
+        let entry = entries.remove(&token)?;
+        self.recount(&entries);
+        drop(entries);
+        self.changed.notify_one();
+        Some(entry.owner_pid)
     }
 
     /// The owner of `token`'s session and its account, if there is one.
@@ -721,6 +796,12 @@ fn kill(pidfd: &OwnedFd) {
 }
 
 impl Host {
+    /// Every session owner this host started, and what is unproved of the
+    /// ones that ended (`STATUS` reports it).
+    pub(crate) fn fleet(&self) -> Arc<crate::owner_process::OwnerFleet> {
+        self.owners.fleet().clone()
+    }
+
     pub(crate) fn new(
         image: SelfImage,
         owners: OwnerHost,
@@ -763,7 +844,7 @@ impl Host {
                 shutdown.clone(),
                 move |owners: &[u32], keys: &[([u8; 32], u64)]| {
                     for pid in owners {
-                        host.owners.fleet().stop_owner(*pid);
+                        host.owners.fleet().end_session(*pid);
                     }
                     for (key, seq) in keys {
                         host.start.allowlist.scrub(key, *seq);
@@ -1007,6 +1088,10 @@ impl Host {
         // When a frontend that was told to stop is killed.
         let mut stop_at: Option<tokio::time::Instant> = None;
         let mut told_to_stop = false;
+        // When the frontend is next asked whether it is alive, and how many
+        // such questions it left unanswered since it was last heard.
+        let mut probe_at = tokio::time::Instant::now() + PROBE_AFTER;
+        let mut unanswered = 0u32;
         if let (Ok(channel), Ok(exited)) = (&channel, &exited) {
             loop {
                 let stopping = stop_at.is_some();
@@ -1040,6 +1125,8 @@ impl Host {
                     packet = channel.receive(), if usable => {
                         let served = match packet {
                             Ok(Some((packet, descriptors))) => {
+                                unanswered = 0;
+                                probe_at = tokio::time::Instant::now() + PROBE_AFTER;
                                 drop(descriptors);
                                 self.serve_request(channel, pid, &packet, &mut sent).await
                             }
@@ -1066,6 +1153,27 @@ impl Host {
                     _ = self.start.admission.changed(), if usable => {
                         let closed = self.start.admission.is_closed();
                         if !self.send(channel, &ToFrontend::Admission { closed }, &[]).await {
+                            kill(&pidfd);
+                            usable = false;
+                        }
+                    }
+                    // Last: a packet that waits is taken first, and answers.
+                    _ = tokio::time::sleep_until(probe_at), if usable && !stopping => {
+                        if unanswered >= PROBES_UNANSWERED {
+                            crate::log::error(
+                                "qshd",
+                                &format!(
+                                    "network frontend {number} pid={pid} answered nothing for {} s; \
+                                     replacing it",
+                                    (PROBE_AFTER * (PROBES_UNANSWERED + 1)).as_secs()
+                                ),
+                            );
+                            kill(&pidfd);
+                            usable = false;
+                        } else if self.send(channel, &ToFrontend::Probe, &[]).await {
+                            unanswered += 1;
+                            probe_at = tokio::time::Instant::now() + PROBE_AFTER;
+                        } else {
                             kill(&pidfd);
                             usable = false;
                         }
@@ -1176,6 +1284,16 @@ impl Host {
                 self.catalog.retained(token);
                 true
             }
+            ToHost::Ended { token } => {
+                if let Some(pid) = self.catalog.router_ended(token) {
+                    // Its bridge sends its owner `End` -- unless its link
+                    // is lost: then only this reaches the owner.
+                    self.owners.fleet().end_session(pid);
+                }
+                true
+            }
+            // Any packet says the frontend is alive (see `run_frontend`).
+            ToHost::Alive => true,
             // Removed unless added again since: then the frontend is sent
             // that addition (it is newer than what `sent` holds).
             ToHost::ForgetKey { key, seq } => {
@@ -1220,9 +1338,33 @@ impl Host {
             }
             // Its `End` takes it off the catalog, unless the new owner's
             // entry is there by then.
-            self.owners.fleet().stop_owner(old);
+            self.owners.fleet().end_session(old);
         }
         let uid = principal.uid;
+        // No session is ended for a start that cannot happen anyway. (A
+        // spawn that fails after the eviction still costs the evicted one.)
+        self.owners.start_check()?;
+        // At a cap, the oldest retained session nobody holds makes room,
+        // as at a router's.
+        if let Err(cap) = self.owners.room(uid) {
+            let of = match cap {
+                crate::host_services::Cap::Account => Some(uid),
+                crate::host_services::Cap::Daemon => None,
+            };
+            if let Some((pid, keys)) = self.catalog.evict_retained(of) {
+                crate::log::warn(
+                    "qshd",
+                    &format!(
+                        "session cap reached; ending the oldest retained session (owner {pid}) \
+                         to make room for a new login"
+                    ),
+                );
+                self.owners.fleet().end_session(pid);
+                for (key, seq) in keys {
+                    self.start.allowlist.scrub(&key, seq);
+                }
+            }
+        }
         let owner = self
             .owners
             .start_raw(OwnerInit::new(principal, token))
@@ -1230,7 +1372,7 @@ impl Host {
         let pidfd = match owner.pidfd.try_clone() {
             Ok(pidfd) => pidfd,
             Err(error) => {
-                self.owners.fleet().stop_owner(owner.pid);
+                self.owners.fleet().end_session(owner.pid);
                 return Err(error.to_string());
             }
         };
@@ -1261,18 +1403,22 @@ pub(crate) struct HostStop {
 }
 
 impl crate::update::OwnerStop for HostStop {
-    fn proved(&self) -> bool {
+    fn proved(&self) -> Result<(), String> {
         self.owners.proved()
     }
 
-    fn stop_all_until(&self, deadline: Instant) -> bool {
+    fn stop_all_until(&self, deadline: Instant) -> Result<(), String> {
         // Owners first: their sessions' ends still reach the clients.
         let owners = self.owners.stop_all_until(deadline);
         let frontend = self.frontend.close_until(deadline);
         if !frontend {
             crate::log::error("qshd", "the network frontend did not stop in time");
         }
-        owners && frontend
+        match (owners, frontend) {
+            (Err(why), _) => Err(why),
+            (Ok(()), false) => Err("the network frontend did not stop in time".into()),
+            (Ok(()), true) => Ok(()),
+        }
     }
 
     fn reopen(&self) {

@@ -713,6 +713,132 @@ fn killing_the_frontend_keeps_the_same_shell() {
     assert!(daemon.stop().success());
 }
 
+/// The command name of `pid` (`/proc/<pid>/comm`), empty once it is gone.
+fn comm(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default()
+        .trim_end()
+        .to_string()
+}
+
+/// One numbered line of a paste: eight digits and a newline.
+fn paste_line(n: u32) -> Vec<u8> {
+    format!("{n:08}\n").into_bytes()
+}
+
+/// The frontend is SIGKILLed in the middle of a paste into the session's
+/// shell, which has become a program that records every byte its terminal
+/// gives it. Input that was inside the dead frontend may be lost, but only
+/// as a tail, and none is delivered twice: what the program received is
+/// exactly a leading part of the first client's paste -- each line once, in
+/// order -- followed by exactly what the returning client sent.
+///
+/// How much of the tail is lost depends on timing (what the frontend had
+/// taken but not yet passed on to the owner when it died), so only its
+/// shape is asserted, never its length.
+#[test]
+fn killing_the_frontend_mid_paste_never_duplicates_input() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let token = [78; 16];
+    let session = Session::connect(&daemon, token);
+    let shell = session.open_shell("kept-78");
+    let owner = owner_of(shell, daemon.pid());
+    let record = daemon.dir.path().join("pasted");
+    session.send(&format!(
+        "stty raw -echo; exec cat > {}\n",
+        record.display()
+    ));
+    assert!(
+        wait_until(Duration::from_secs(15), || comm(shell) == "cat"),
+        "the shell becomes the recording program; saw {:?}",
+        session.shell_text()
+    );
+    let received = || std::fs::read(&record).unwrap_or_default();
+    let frontend = frontend_of(daemon.pid());
+
+    // The first client pastes numbered lines; its frontend is killed once
+    // the program has taken a good part, and the client goes on a little.
+    let mut sent = Vec::new();
+    let mut killed_at = None;
+    for n in 0..4000u32 {
+        let line = paste_line(n);
+        if session
+            .client
+            .send_bytes(FIRST_CHANNEL_STREAM, line.clone())
+            .is_err()
+        {
+            break;
+        }
+        sent.extend(line);
+        if killed_at.is_none() && received().len() >= 4096 {
+            kill_frontend(daemon.pid(), frontend);
+            killed_at = Some(n);
+        }
+        if killed_at.is_some_and(|at| n >= at + 200) {
+            break;
+        }
+        if n % 64 == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert!(
+        killed_at.is_some(),
+        "the program takes the paste: {} bytes of {} sent; log: {}",
+        received().len(),
+        sent.len(),
+        daemon.log()
+    );
+    frontend_after(daemon.pid(), frontend);
+    session.client.detach();
+    assert!(
+        running(shell) && running(owner),
+        "the session outlived its frontend"
+    );
+
+    // The returning client pastes lines of its own.
+    let back = Session::come_back(&daemon, token);
+    let mut later = Vec::new();
+    for n in 0..300u32 {
+        let line = paste_line(900_000 + n);
+        back.client
+            .send_bytes(FIRST_CHANNEL_STREAM, line.clone())
+            .expect("input admitted on the new connection");
+        later.extend(line);
+    }
+    assert!(
+        wait_until(Duration::from_secs(20), || received().ends_with(&later)),
+        "the returning client's paste arrives whole; the program has {} bytes; log: {}",
+        received().len(),
+        daemon.log()
+    );
+    // Nothing trails in later.
+    std::thread::sleep(Duration::from_millis(500));
+    let got = received();
+    assert!(
+        got.ends_with(&later),
+        "nothing arrived after the second paste"
+    );
+    let first = &got[..got.len() - later.len()];
+    assert!(
+        sent.starts_with(first),
+        "what arrived of the first paste is a leading part of it, each byte once: \
+         {} bytes arrived, {} sent",
+        first.len(),
+        sent.len()
+    );
+    assert!(
+        first.len() >= 4096,
+        "what the program had taken before the kill stays taken ({} bytes)",
+        first.len()
+    );
+    assert_eq!(ppid(shell), Some(owner), "the same program, the same owner");
+
+    back.client.close();
+    let status = daemon.stop();
+    assert!(status.success(), "{status:?}; log: {}", daemon.log());
+}
+
 /// A frontend that dies as soon as it is up does not make the host spin:
 /// each next one comes after a wait that doubles from 0.1 s. Nothing of
 /// this reaches the session: its owner and shell run on, and when a
@@ -761,7 +887,7 @@ fn frontend_crash_loop_backs_off_and_keeps_sessions() {
     assert!(daemon.stop().success());
 }
 
-/// [RF 5] The daemon is stopped while no frontend runs (the host is waiting
+/// The daemon is stopped while no frontend runs (the host is waiting
 /// out its backoff after a crash loop): the stop still ends every session,
 /// reaps every owner and shell, starts no other frontend, and reports
 /// success.
@@ -1159,4 +1285,530 @@ fn a_session_the_host_ends_takes_its_key_with_it() {
 
     drop(guard);
     assert_no_child_left(&mark);
+}
+
+// ---- hardening ---------------------------------------------------------------------
+
+/// The host's children that have exited and are not reaped: zombies.
+fn zombies_of(host: u32) -> Vec<u32> {
+    pids()
+        .into_iter()
+        .filter(|pid| ppid(*pid) == Some(host) && !running(*pid) && !reaped(*pid))
+        .collect()
+}
+
+/// The session owners the host `host` runs.
+fn owners_of(host: u32) -> Vec<u32> {
+    pids()
+        .into_iter()
+        .filter(|pid| {
+            ppid(*pid) == Some(host)
+                && role_of(*pid).as_deref() == Some(OWNER_ROLE)
+                && running(*pid)
+        })
+        .collect()
+}
+
+/// How often `needle` is in `log`.
+fn count(log: &str, needle: &str) -> usize {
+    log.matches(needle).count()
+}
+
+/// An owner killed under a live session: that session is lost, as every
+/// session of a single-process daemon is when it dies. The host reaps the
+/// owner -- no zombie of its own -- and takes the session off its catalog;
+/// the shell goes with its terminal's hangup. The client is told of no
+/// close: its session did not end, it was lost, and it finds that out when
+/// it returns and lands in a fresh session (the existing session-loss
+/// flow). The daemon and its frontend serve on.
+#[test]
+fn killed_owner_gives_session_loss_and_no_zombies() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let token = [73; 16];
+    let session = Session::connect(&daemon, token);
+    let shell = session.open_shell("kept-73");
+    let owner = owner_of(shell, daemon.pid());
+    let frontend = frontend_of(daemon.pid());
+
+    assert_eq!(unsafe { libc::kill(owner as i32, libc::SIGKILL) }, 0);
+    assert!(
+        wait_until(Duration::from_secs(10), || reaped(owner)),
+        "the host reaps the killed owner"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || reaped(shell)),
+        "its shell ends with its terminal"
+    );
+    assert_eq!(zombies_of(daemon.pid()), Vec::<u32>::new());
+    assert!(
+        wait_until(Duration::from_secs(10), || session.client.is_gone()),
+        "the client hears that its connection is gone; log: {}",
+        daemon.log()
+    );
+    assert!(
+        !session.client.closed_gracefully(),
+        "a lost session is not closed; log: {}",
+        daemon.log()
+    );
+    session.client.detach();
+
+    let back = Session::come_back(&daemon, token);
+    assert!(!back.client.resumed(), "the session is lost");
+    let fresh = back.open_shell("fresh-73");
+    assert_ne!(fresh, shell);
+    assert_eq!(
+        frontends_of(daemon.pid()),
+        [frontend],
+        "the frontend served on"
+    );
+    let log = daemon.log();
+    assert!(
+        log.contains(&format!("session owner {owner} exited (signal 9)")),
+        "log: {log}"
+    );
+    back.client.close();
+    assert!(wait_until(Duration::from_secs(20), || reaped(fresh)));
+    // The killed owner sent no receipt, but nothing of its session is left:
+    // the host proves that itself, so the stop is clean -- and leaves
+    // nothing behind.
+    assert!(daemon.stop().success(), "log: {}", daemon.log());
+    assert_eq!(zombies_of(daemon.pid()), Vec::<u32>::new());
+}
+
+/// Sessions up to an account's cap across a frontend death: every
+/// one comes back to its own shell; while the new frontend's router knows
+/// none of them yet, the host still refuses a session over the cap (the
+/// caps are the host's, once, not each frontend's or owner's); and once
+/// they are all closed, every lease is back: the account starts as many
+/// sessions again, and the stop proves every owner's cleanup.
+#[test]
+fn many_sessions_survive_frontend_death_with_budgets_intact() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let cap = transport::session_manager::MAX_SESSIONS_PER_OWNER as u8;
+    let tokens: Vec<[u8; 16]> = (0..cap).map(|i| [100 + i; 16]).collect();
+    let mut shells = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let session = Session::connect(&daemon, *token);
+        shells.push(session.open_shell(&format!("many-{i}")));
+        session.client.detach();
+    }
+    assert_eq!(owners_of(daemon.pid()).len(), cap as usize);
+
+    let frontend = frontend_of(daemon.pid());
+    kill_frontend(daemon.pid(), frontend);
+    frontend_after(daemon.pid(), frontend);
+
+    // The new router has heard of none of them: the host refuses.
+    let refused = "no session owner for";
+    if let Some(extra) = Session::start_within(
+        daemon.port,
+        daemon.server_pub,
+        Proof::Signature(&daemon.key_path),
+        [99; 16],
+        StartKind::Cold,
+        Duration::from_secs(5),
+    ) {
+        assert!(wait_until(Duration::from_secs(10), || extra
+            .client
+            .is_gone()));
+    }
+    assert!(
+        wait_until(Duration::from_secs(5), || count(&daemon.log(), refused)
+            == 1),
+        "the host refused a session over the cap; log: {}",
+        daemon.log()
+    );
+    assert_eq!(owners_of(daemon.pid()).len(), cap as usize);
+
+    let mut back = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let session = Session::come_back(&daemon, *token);
+        assert_eq!(session.same_shell(&format!("many-{i}")), shells[i]);
+        back.push(session);
+    }
+    for session in &back {
+        session.client.close();
+    }
+    assert!(
+        wait_until(Duration::from_secs(30), || shells
+            .iter()
+            .all(|pid| reaped(*pid))
+            && owners_of(daemon.pid()).is_empty()),
+        "every closed session is reaped; log: {}",
+        daemon.log()
+    );
+
+    // Every lease is back: a full account's worth of sessions again.
+    let mut again = Vec::new();
+    for i in 0..cap {
+        again.push(Session::connect(&daemon, [120 + i; 16]));
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || owners_of(daemon.pid()).len()
+            == cap as usize),
+        "each has its owner; log: {}",
+        daemon.log()
+    );
+    assert_eq!(count(&daemon.log(), refused), 1, "none refused");
+    for session in &again {
+        session.client.close();
+    }
+    assert!(daemon.stop().success(), "log: {}", daemon.log());
+}
+
+/// `cap` sessions of one account, the first two with a shell: their
+/// sessions and those two shells.
+fn full_account(daemon: &Daemon, first: u8) -> (Vec<Session>, [u32; 2]) {
+    let cap = transport::session_manager::MAX_SESSIONS_PER_OWNER as u8;
+    let mut sessions = Vec::new();
+    let mut shells = [0; 2];
+    for i in 0..cap {
+        let session = Session::connect(daemon, [first + i; 16]);
+        if (i as usize) < shells.len() {
+            shells[i as usize] = session.open_shell(&format!("full-{i}"));
+        }
+        sessions.push(session);
+    }
+    (sessions, shells)
+}
+
+/// A host whose account is full after a frontend death evicts the oldest
+/// retained session for a new one, as a router does: the session nobody
+/// came back for goes, with its owner and shell; the new one starts; every
+/// other session is kept.
+#[test]
+fn a_full_host_evicts_its_oldest_retained_session_for_a_new_one() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let (sessions, [victim, kept]) = full_account(&daemon, 140);
+    let victim_owner = owner_of(victim, daemon.pid());
+    let kept_owner = owner_of(kept, daemon.pid());
+    // The first session loses its link: retained, at the host too.
+    sever_first_link(victim_owner, &daemon);
+    let retained = format!("session owner={victim_owner} retained since=");
+    assert!(
+        wait_until(Duration::from_secs(10), || daemon.log().contains(&retained)),
+        "log: {}",
+        daemon.log()
+    );
+    for session in &sessions {
+        session.client.detach();
+    }
+    let frontend = frontend_of(daemon.pid());
+    kill_frontend(daemon.pid(), frontend);
+    frontend_after(daemon.pid(), frontend);
+
+    let new = Session::connect(&daemon, [170; 16]);
+    let shell = new.open_shell("evicting");
+    assert!(
+        wait_until(Duration::from_secs(20), || reaped(victim)
+            && reaped(victim_owner)),
+        "the retained session went; log: {}",
+        daemon.log()
+    );
+    assert!(running(kept) && running(kept_owner), "the others are kept");
+    assert!(!daemon.log().contains("every session envelope is taken"));
+    let back = Session::come_back(&daemon, [141; 16]);
+    assert_eq!(back.same_shell("full-1"), kept);
+    new.client.close();
+    back.client.close();
+    assert!(wait_until(Duration::from_secs(20), || reaped(shell)));
+    assert!(daemon.stop().success(), "log: {}", daemon.log());
+}
+
+/// A router at its account's cap evicts its own oldest retained session
+/// for a new one; the host gives that session's lease back as soon as the
+/// router has ended it -- not once its owner is reaped -- so the new
+/// session starts at once. The evicted session's owner ends too, though
+/// its link is lost and no `End` reaches it.
+#[test]
+fn a_session_the_router_evicts_frees_its_lease_at_once() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let (sessions, [victim, kept]) = full_account(&daemon, 180);
+    let victim_owner = owner_of(victim, daemon.pid());
+    sever_first_link(victim_owner, &daemon);
+    sessions[0].client.detach();
+
+    let new = Session::connect(&daemon, [210; 16]);
+    let shell = new.open_shell("evicting");
+    assert!(
+        wait_until(Duration::from_secs(20), || reaped(victim)
+            && reaped(victim_owner)),
+        "the evicted session's owner ends; log: {}",
+        daemon.log()
+    );
+    assert!(running(kept));
+    assert!(!daemon.log().contains("every session envelope is taken"));
+    new.client.close();
+    for session in &sessions {
+        session.client.close();
+    }
+    assert!(wait_until(Duration::from_secs(20), || reaped(shell) && reaped(kept)));
+    assert!(daemon.stop().success(), "log: {}", daemon.log());
+}
+
+/// A frontend that is alive but answers nothing -- here stopped -- is found
+/// out by the host within a bounded time and replaced like a dead one; the
+/// session it served survives and its client comes back to the same shell.
+/// An idle frontend that answers is kept, however long it is idle.
+#[test]
+fn a_wedged_frontend_is_replaced_and_its_sessions_survive() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let token = [74; 16];
+    let session = Session::connect(&daemon, token);
+    let shell = session.open_shell("kept-74");
+    let owner = owner_of(shell, daemon.pid());
+    let frontend = frontend_of(daemon.pid());
+    session.client.detach();
+    // Longer than the host waits for an answer: asked, and answering.
+    std::thread::sleep(Duration::from_secs(25));
+    assert_eq!(
+        frontends_of(daemon.pid()),
+        [frontend],
+        "an idle frontend is kept"
+    );
+
+    let stopped = Instant::now();
+    assert_eq!(unsafe { libc::kill(frontend as i32, libc::SIGSTOP) }, 0);
+    let mut next = Vec::new();
+    assert!(
+        wait_until(Duration::from_secs(60), || {
+            next = frontends_of(daemon.pid());
+            next.len() == 1 && next[0] != frontend
+        }),
+        "the host replaces its wedged frontend; log: {}",
+        daemon.log()
+    );
+    let found = stopped.elapsed();
+    assert!(reaped(frontend), "and reaps it");
+    assert!(
+        found >= Duration::from_secs(10) && found < Duration::from_secs(40),
+        "not on a moment's silence, and within its bound: {found:?}"
+    );
+    assert!(running(shell) && running(owner));
+    let back = Session::come_back(&daemon, token);
+    assert_eq!(back.same_shell("kept-74"), shell);
+    back.client.close();
+    assert!(daemon.stop().success(), "log: {}", daemon.log());
+}
+
+/// Signal exactly the frontend `pid` of `host` (checked to still be it).
+fn signal_frontend(host: u32, pid: u32, signal: i32) {
+    assert_eq!(
+        (ppid(pid), role_of(pid).as_deref()),
+        (Some(host), Some(FRONTEND_ROLE)),
+        "pid {pid} is the daemon's frontend"
+    );
+    assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0);
+}
+
+/// A frontend told to go by `SIGTERM` or `SIGINT` -- a plain `kill`, or a
+/// `^C` that reaches it -- shuts down in order, and still ends no session:
+/// its router's last sweep is no end of a login. The client comes back to
+/// the same shell, each time.
+#[test]
+fn a_frontend_stopped_by_sigterm_or_sigint_keeps_every_session() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let token = [75; 16];
+    let session = Session::connect(&daemon, token);
+    let shell = session.open_shell("kept-75");
+    let owner = owner_of(shell, daemon.pid());
+    session.client.detach();
+    let mut frontend = frontend_of(daemon.pid());
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        signal_frontend(daemon.pid(), frontend, signal);
+        frontend = frontend_after(daemon.pid(), frontend);
+        assert!(
+            running(shell) && running(owner),
+            "signal {signal}: the session outlived its frontend; log: {}",
+            daemon.log()
+        );
+        let back = Session::come_back(&daemon, token);
+        assert_eq!(back.same_shell("kept-75"), shell);
+        back.client.detach();
+    }
+    let back = Session::come_back(&daemon, token);
+    back.client.close();
+    assert!(wait_until(Duration::from_secs(20), || reaped(shell)));
+    assert!(daemon.stop().success(), "log: {}", daemon.log());
+}
+
+/// An owner the host told to stop that does not -- here stopped itself --
+/// is killed through its pidfd after the host's stop escalation, and
+/// reaped: no owner outlives its session's end for long, counted or not.
+#[test]
+fn an_owner_that_does_not_stop_when_told_is_killed() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let session = Session::connect(&daemon, [76; 16]);
+    let shell = session.open_shell("kept-76");
+    let owner = owner_of(shell, daemon.pid());
+    assert_eq!(unsafe { libc::kill(owner as i32, libc::SIGSTOP) }, 0);
+    let closed = Instant::now();
+    // The router ends the login; the host tells the owner to stop.
+    session.client.close();
+    assert!(
+        wait_until(Duration::from_secs(40), || reaped(owner)),
+        "the host kills and reaps the owner; log: {}",
+        daemon.log()
+    );
+    let took = closed.elapsed();
+    assert!(
+        took >= Duration::from_secs(15),
+        "not before the escalation: {took:?}"
+    );
+    assert!(wait_until(Duration::from_secs(10), || reaped(shell)));
+    assert!(
+        daemon
+            .log()
+            .contains(&format!("session owner {owner} did not stop")),
+        "log: {}",
+        daemon.log()
+    );
+    // It sent no receipt, but nothing of its session is left (its shell
+    // ended with its terminal): the host proves that, and the stop is clean.
+    assert!(daemon.stop().success(), "log: {}", daemon.log());
+}
+
+/// The processes whose whole command line is `args`.
+fn processes_running(args: &[&str]) -> Vec<u32> {
+    let want: Vec<u8> = args
+        .iter()
+        .flat_map(|a| [a.as_bytes(), b"\0"].concat())
+        .collect();
+    pids()
+        .into_iter()
+        .filter(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == want))
+        .collect()
+}
+
+/// A process the test left running, pinned by a pidfd when it was found:
+/// SIGKILLed through it when dropped, so a failing test leaves nothing
+/// behind -- never signalled by a bare number.
+struct Leftover {
+    pid: u32,
+    pidfd: OwnedFd,
+}
+
+impl Leftover {
+    /// The one process running `args`.
+    fn find(args: &[&str]) -> Leftover {
+        let mut found = Vec::new();
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                found = processes_running(args);
+                found.len() == 1
+            }),
+            "one process runs {args:?}: {found:?}"
+        );
+        let pid = found[0];
+        let pidfd = pidfd_open(pid);
+        // Still that process now that it is pinned.
+        assert_eq!(processes_running(args), [pid]);
+        Leftover { pid, pidfd }
+    }
+}
+
+impl Drop for Leftover {
+    fn drop(&mut self) {
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+    }
+}
+
+/// While a process that a dead owner left in its session still runs --
+/// here a job that ignores the hangup, in the shell's own session -- the
+/// host proves nothing: the stop is not clean, and the daemon's log names
+/// the session and the process still in it.
+#[test]
+fn a_dead_owners_leftover_fails_the_stop() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let session = Session::connect(&daemon, [78; 16]);
+    let shell = session.open_shell("kept-78");
+    let owner = owner_of(shell, daemon.pid());
+    let marker = format!("{}.528", daemon.port);
+    session.send(&format!("(trap '' HUP TERM INT; exec sleep {marker}) &\n"));
+    // Dropped before the daemon: declared after it.
+    let job = Leftover::find(&["sleep", marker.as_str()]);
+    assert_eq!(unsafe { libc::kill(owner as i32, libc::SIGKILL) }, 0);
+    assert!(
+        wait_until(Duration::from_secs(10), || reaped(owner)),
+        "the host reaps the killed owner"
+    );
+    session.client.detach();
+    assert!(running(job.pid), "the job outlives its owner");
+
+    assert!(
+        !daemon.stop().success(),
+        "a stop while the job runs is not clean; log: {}",
+        daemon.log()
+    );
+    let log = daemon.log();
+    let named = format!("session {shell} of session owner {owner} ");
+    assert!(
+        log.lines()
+            .any(|line| line.contains(&named) && line.contains(&job.pid.to_string())),
+        "the log names the session and the job; log: {log}"
+    );
+    assert!(running(job.pid), "the host kills nothing there");
+}
+
+/// An owner whose host channel closes (here: severed, while the owner is
+/// stopped) but whose process lives on is not waited for without end:
+/// the host kills it through its pidfd after the stop escalation, and
+/// reaps it.
+#[test]
+fn an_owner_that_closes_its_host_channel_but_lives_is_killed() {
+    let _serial = serialised();
+    let mut daemon = start_daemon();
+    let session = Session::connect(&daemon, [77; 16]);
+    let shell = session.open_shell("kept-77");
+    let owner = owner_of(shell, daemon.pid());
+    assert_eq!(unsafe { libc::kill(owner as i32, libc::SIGSTOP) }, 0);
+    // Descriptor 4 is the owner's end of its host channel.
+    let pidfd = pidfd_open(owner);
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), 4, 0) };
+    assert!(raw >= 0, "pidfd_getfd: {}", std::io::Error::last_os_error());
+    let channel = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    let severed = Instant::now();
+    assert_eq!(
+        unsafe { libc::shutdown(channel.as_raw_fd(), libc::SHUT_RDWR) },
+        0
+    );
+    drop(channel);
+    assert!(
+        wait_until(Duration::from_secs(40), || reaped(owner)),
+        "the host kills and reaps the owner; log: {}",
+        daemon.log()
+    );
+    let took = severed.elapsed();
+    assert!(
+        took >= Duration::from_secs(15),
+        "not before the escalation: {took:?}"
+    );
+    assert!(
+        daemon
+            .log()
+            .contains(&format!("session owner {owner} closed its host channel")),
+        "log: {}",
+        daemon.log()
+    );
+    session.client.detach();
+    assert!(wait_until(Duration::from_secs(10), || reaped(shell)));
+    // Nothing of its session is left: the host proves that, and the stop
+    // is clean.
+    assert!(daemon.stop().success(), "log: {}", daemon.log());
 }

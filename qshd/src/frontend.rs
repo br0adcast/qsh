@@ -28,7 +28,9 @@
 //! [`HOST_QUEUE`] entries. Each request waits for its answer (at most
 //! [`HOST_SERVICE_TIMEOUT`]), and there is at most one per bridge and one
 //! for the router; a session reports its liveness at most every ten
-//! seconds and at each change, and a scrubbed key once. A request that
+//! seconds and at each change, its end and a scrubbed key once, and the
+//! host's probes are answered one each (the host sends the next only after
+//! [`crate::host::PROBE_AFTER`]). A request that
 //! finds the queue full is refused at once (fail-closed, as an unanswered
 //! one); a notice is dropped and logged. Log records have a queue of their
 //! own of [`LOG_QUEUE`] records, past which new ones are counted, dropped
@@ -212,7 +214,7 @@ pub(crate) struct HostLink {
     out: mpsc::Sender<ToHost>,
     /// Log records on their way to the host.
     logs: mpsc::Sender<ToHost>,
-    logs_dropped: AtomicU64,
+    logs_dropped: crate::log::dropped::DroppedRecords,
     pending: Mutex<HashMap<u64, oneshot::Sender<Answer>>>,
     next: AtomicU64,
     /// The logins that had a session when this frontend started.
@@ -224,12 +226,15 @@ pub(crate) struct HostLink {
     additions: Mutex<HashMap<[u8; 32], u64>>,
     /// The host's session-reset secret, as `Init` handed it.
     reset: Option<transport::session_reset::SessionResetSecret>,
+    /// This process is shutting down (see [`HostLink::login_ended`]).
+    shutdown: Shutdown,
 }
 
 impl HostLink {
     fn new(
         known: Vec<LoginId>,
         reset: Option<transport::session_reset::SessionResetSecret>,
+        shutdown: Shutdown,
     ) -> (
         Arc<HostLink>,
         mpsc::Receiver<ToHost>,
@@ -241,13 +246,14 @@ impl HostLink {
             this: this.clone(),
             out,
             logs,
-            logs_dropped: AtomicU64::new(0),
+            logs_dropped: Default::default(),
             pending: Mutex::default(),
             next: AtomicU64::new(1),
             known: known.into_iter().collect(),
             allowlist: Arc::new(Mutex::new(Vec::new())),
             additions: Mutex::default(),
             reset,
+            shutdown,
         });
         (link, out_rx, logs_rx)
     }
@@ -297,6 +303,8 @@ impl HostLink {
                 ToHost::ForgetKey { .. } => "a scrubbed key",
                 ToHost::ClientKey { .. } => "a session's key",
                 ToHost::KeysTaken { .. } => "an allowlist receipt",
+                ToHost::Ended { .. } => "a session's end",
+                ToHost::Alive => "an answer to the host's probe",
                 _ => "a notice",
             };
             crate::log::error(
@@ -349,8 +357,7 @@ impl HostLink {
 
     /// One log record for the daemon's log.
     fn record(&self, level: log::Level, component: &str, message: &str) {
-        let dropped = self.logs_dropped.load(Ordering::SeqCst);
-        if dropped > 0 {
+        let reported = self.logs_dropped.report(|dropped| {
             let summary = ToHost::Log {
                 level: log::Level::Warn,
                 component: "frontend".into(),
@@ -358,11 +365,11 @@ impl HostLink {
                     "{dropped} frontend log record(s) dropped: the queue to the host was full"
                 ),
             };
-            if self.logs.try_send(summary).is_err() {
-                self.logs_dropped.fetch_add(1, Ordering::SeqCst);
-                return;
-            }
-            self.logs_dropped.fetch_sub(dropped, Ordering::SeqCst);
+            self.logs.try_send(summary).is_ok()
+        });
+        if !reported {
+            self.logs_dropped.add(1);
+            return;
         }
         let record = ToHost::Log {
             level,
@@ -370,7 +377,7 @@ impl HostLink {
             message: message.to_owned(),
         };
         if self.logs.try_send(record).is_err() {
-            self.logs_dropped.fetch_add(1, Ordering::SeqCst);
+            self.logs_dropped.add(1);
         }
     }
 
@@ -389,6 +396,24 @@ impl HostLink {
             link: Box::new(stream(link)?),
             relink: Arc::new(HostRelink { host, token, pidfd }),
         })
+    }
+}
+
+/// The router's ends of logins: each is a session that is over, and that
+/// no longer counts against the host's session caps. Its owner hears of it
+/// over its link -- unless that link is lost, so the host tells it too.
+///
+/// Except once this process is shutting down: then the router's last sweep
+/// reports every login it held, and none of them ended -- a frontend's
+/// exit, orderly or not, parks every session for the next frontend. An end
+/// that races the shutdown is left to its owner's own `End`, or to the
+/// host's expiry.
+impl transport::LoginSink for HostLink {
+    fn login_ended(&self, login: LoginId) {
+        if self.shutdown.is_requested() {
+            return;
+        }
+        self.notify(ToHost::Ended { token: login });
     }
 }
 
@@ -585,9 +610,13 @@ async fn run_frontend(
         known,
     } = init;
     let channel = Arc::new(Channel::new(channel).context("watching the channel to the host")?);
+    // Whatever stops this process -- the host's `Stop`, a signal, a broken
+    // channel -- requests it: from then on no session's end is reported.
+    let shutdown = Shutdown::default();
     let (host, out_rx, logs_rx) = HostLink::new(
         known,
         reset_secret.map(transport::session_reset::SessionResetSecret::from_bytes),
+        shutdown.clone(),
     );
     // Only the host writes (and rotates) the daemon's log.
     {
@@ -599,7 +628,6 @@ async fn run_frontend(
     let (last_words, stop_writer) = oneshot::channel();
     let writer = tokio::spawn(write_to_host(channel.clone(), out_rx, logs_rx, stop_writer));
 
-    let shutdown = Shutdown::default();
     // Applied before anything is served; the host hears up to where.
     host.allow(keys);
     let allowlist = host.allowlist.clone();
@@ -638,6 +666,7 @@ async fn run_frontend(
                         }
                     }
                     Ok(ToFrontend::Stop) => shutdown.request(),
+                    Ok(ToFrontend::Probe) => host.notify(ToHost::Alive),
                     _ => {
                         crate::log::error(
                             "qshd",
@@ -685,7 +714,7 @@ async fn run_frontend(
             Arc::new(crate::RandomNonces),
             admission,
         )),
-        logins: Arc::new(crate::ForgetNothing),
+        logins: host.clone(),
     };
     // The channel backend only answers for the features and the consumption
     // model of the sessions the owners run.
@@ -732,7 +761,7 @@ mod tests {
     /// unanswered one) and a notice is dropped, and nothing more is queued.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_full_queue_to_the_host_refuses_requests_at_once_and_drops_notices() {
-        let (host, out_rx, _logs_rx) = HostLink::new(Vec::new(), None);
+        let (host, out_rx, _logs_rx) = HostLink::new(Vec::new(), None, Shutdown::default());
         for _ in 0..HOST_QUEUE {
             host.liveness([1; 16], Liveness::Retained);
         }
@@ -763,6 +792,22 @@ mod tests {
         assert_eq!(out_rx.len(), HOST_QUEUE);
     }
 
+    /// A frontend that is shutting down -- told to by the host, by a
+    /// signal, or because its channel broke -- reports no session's end:
+    /// its router's last sweep ends no login, and the host must not stop
+    /// the owners (they park, and the next frontend takes them over).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutting_down_frontend_reports_no_sessions_end() {
+        use transport::LoginSink;
+        let shutdown = Shutdown::default();
+        let (host, out_rx, _logs) = HostLink::new(Vec::new(), None, shutdown.clone());
+        host.login_ended([1; 16]);
+        assert_eq!(out_rx.len(), 1, "a router's end of a login is reported");
+        shutdown.request();
+        host.login_ended([2; 16]);
+        assert_eq!(out_rx.len(), 1, "not once the frontend is shutting down");
+    }
+
     /// A host that does not answer is never taken for "no such session":
     /// a lookup without an answer is `Unavailable` (the router then drops
     /// the handshake instead of starting a fresh session, which would have
@@ -770,7 +815,7 @@ mod tests {
     /// one is "not now" (the session is kept), not "the owner is gone".
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_host_that_does_not_answer_is_never_taken_for_no_session() {
-        let (host, _requests, _logs) = HostLink::new(vec![[1; 16]], None);
+        let (host, _requests, _logs) = HostLink::new(vec![[1; 16]], None, Shutdown::default());
         let asked = std::time::Instant::now();
         let found = host.lookup([1; 16], 1000).await;
         assert!(matches!(found, Lookup::Unavailable), "not Unknown");

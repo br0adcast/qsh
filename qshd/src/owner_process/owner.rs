@@ -32,7 +32,14 @@ const FAREWELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// drain still running then is given up on (a failed receipt). With the
 /// last-resort kill (no waits), the farewell (`FAREWELL_TIMEOUT`) and the
 /// runtime's 2 s shutdown, at most 17 s: below the host's 20 s stop
-/// escalation, so a stopping daemon hears the receipt first.
+/// escalation, so a stopping daemon hears the receipt first. A session its
+/// frontend ended (`End`) gets the same bound before that for its backend
+/// to finish; past it, it is stopped as at a `Stop`
+/// (`OwnerLink::run_and_drain`). So a session whose processes keep its
+/// terminal open after a close is killed whole (`end_children`) with a
+/// failed receipt: about 10 s after the close, since the host's `Stop`
+/// follows the router's end of the login at once and the drain bound runs
+/// from there; at most about 20 s, when only the link's `End` ends it.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Log records waiting for the host channel; more are dropped.
 const LOG_QUEUE: usize = 256;
@@ -454,13 +461,15 @@ pub(crate) struct OwnerBackend {
 /// The owner's channel backend: every daemon-wide limit is the host's,
 /// shared by all of the daemon's owners (`crate::host_services`) -- the
 /// screen pool and the open count by request through `client`; the control
-/// budget is one envelope (`OwnerLink::run_and_drain`). With `updates`, it
-/// speaks for the host's update service.
+/// budget is one envelope (`OwnerLink::run_and_drain`). Every session
+/// leader it starts is told to the host ([`HostLeaders`]). With `updates`,
+/// it speaks for the host's update service.
 pub(crate) fn owner_backend(client: &Arc<HostClient>, updates: bool) -> OwnerBackend {
     let limits = Arc::new(RemoteLimits(client.clone()));
     let screens = Arc::new(crate::screen_budget::ScreenBudget::remote(limits.clone()));
-    let spawner =
-        crate::channel_backend::PtyChannelSpawner::new(screens.clone()).with_open_admission(limits);
+    let spawner = crate::channel_backend::PtyChannelSpawner::new(screens.clone())
+        .with_open_admission(limits)
+        .with_leader_reports(Arc::new(HostLeaders(client.clone())));
     let mut backend =
         crate::channel_backend::ChannelSessionBackend::with_spawner(Arc::new(spawner));
     if updates {
@@ -476,7 +485,7 @@ pub(crate) fn owner_backend(client: &Arc<HostClient>, updates: bool) -> OwnerBac
 /// record go to standard error.
 pub(super) struct LogRelay {
     tx: mpsc::Sender<ToHost>,
-    dropped: std::sync::atomic::AtomicU64,
+    dropped: crate::log::dropped::DroppedRecords,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -507,13 +516,12 @@ impl LogRelay {
         if self.closed.load(Ordering::SeqCst) {
             return stderr_record(level, component, message);
         }
-        let dropped = self.dropped.load(Ordering::SeqCst);
-        if dropped > 0 {
-            if self.tx.try_send(Self::summary(dropped)).is_err() {
-                self.dropped.fetch_add(1, Ordering::SeqCst);
-                return;
-            }
-            self.dropped.fetch_sub(dropped, Ordering::SeqCst);
+        if !self
+            .dropped
+            .report(|n| self.tx.try_send(Self::summary(n)).is_ok())
+        {
+            self.dropped.add(1);
+            return;
         }
         let record = ToHost::Log {
             level,
@@ -522,16 +530,14 @@ impl LogRelay {
         };
         match self.tx.try_send(record) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, Ordering::SeqCst);
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => self.dropped.add(1),
             Err(mpsc::error::TrySendError::Closed(_)) => stderr_record(level, component, message),
         }
     }
 
     /// The report owed for dropped records, if any; taken.
     fn take_summary(&self) -> Option<ToHost> {
-        match self.dropped.swap(0, std::sync::atomic::Ordering::SeqCst) {
+        match self.dropped.take() {
             0 => None,
             n => Some(Self::summary(n)),
         }
@@ -901,7 +907,8 @@ impl HostClient {
             | ToOwner::Verified { id, .. }
             | ToOwner::Restarted { id, .. }
             | ToOwner::ScreenAcquired { id, .. }
-            | ToOwner::OpenAcquired { id, .. } => *id,
+            | ToOwner::OpenAcquired { id, .. }
+            | ToOwner::SpawnNoted { id, .. } => *id,
             _ => return,
         };
         let mut pending = self.lock();
@@ -917,6 +924,7 @@ impl HostClient {
             reply,
             ToOwner::ScreenAcquired { result: Ok(()), .. }
                 | ToOwner::OpenAcquired { granted: true, .. }
+                | ToOwner::SpawnNoted { admitted: true, .. }
         );
         if granted {
             self.notify(undo);
@@ -978,6 +986,48 @@ impl OpenAdmission for RemoteLimits {
 
     fn release(&self, uid: u32) {
         self.0.notify(ToHost::OpenRelease { uid });
+    }
+}
+
+/// The session's leaders, told to the host: a start is announced and
+/// answered before anything starts (no answer within
+/// [`HOST_SERVICE_TIMEOUT`]: the open is refused, and a late answer is
+/// given back with `NotStarted`), then its outcome -- who leads the new
+/// session -- and, once the session was proved empty, its end. All on the
+/// owner's one queue to the host, in order. If this owner dies without
+/// proving its cleanup, the host checks each session it was told of and
+/// not told the end of (see the parent module, "Receipts").
+pub(crate) struct HostLeaders(pub(crate) Arc<HostClient>);
+
+impl crate::process_scope::LeaderReports for HostLeaders {
+    fn starting(&self) -> Result<(), String> {
+        let reply = self.0.call_within(
+            |id| ToHost::Spawning { id },
+            ToHost::Leader(crate::process_scope::LeaderStart::NotStarted),
+        );
+        match reply {
+            Some(ToOwner::SpawnNoted { admitted: true, .. }) => Ok(()),
+            Some(_) => Err(
+                "the daemon refused the new session: this session already has as many \
+                 shells and commands, starting or running, as the daemon keeps track of"
+                    .into(),
+            ),
+            // `call_within` answers nothing once the session is ending, the
+            // host is gone, or no answer came in time.
+            None => Err(
+                "the daemon did not note the new session's start: the session is ending, \
+                 or the daemon did not answer in time"
+                    .into(),
+            ),
+        }
+    }
+
+    fn started(&self, leader: crate::process_scope::LeaderStart) {
+        self.0.notify(ToHost::Leader(leader));
+    }
+
+    fn ended(&self, pid: u32) {
+        self.0.notify(ToHost::LeaderGone { pid });
     }
 }
 
@@ -1355,7 +1405,88 @@ mod tests {
         // record goes to standard error instead.
         relay.close();
         relay.record(log::Level::Info, "test", "after the end");
-        assert_eq!(relay.dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(relay.dropped.owed(), 0);
+    }
+
+    /// Records from several threads race each other, a reader that empties
+    /// the queue, and the writer's own taking of the count: every record is
+    /// accounted for exactly once -- it reached the queue, or it is in
+    /// exactly one dropped-count report, or it is still owed -- and no
+    /// report counts more records than there ever were (a wrapped count).
+    #[test]
+    fn racing_log_records_are_each_counted_once_and_the_count_never_wraps() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        const WRITERS: u64 = 4;
+        const EACH: u64 = 20_000;
+        const ALL: u64 = WRITERS * EACH;
+        let (relay, mut logs) = LogRelay::new(2);
+        let writing = Arc::new(AtomicBool::new(true));
+        let reported = Arc::new(AtomicU64::new(0));
+        let count = |n: u64, reported: &AtomicU64| {
+            assert!(n <= ALL, "a report of {n} dropped records, of {ALL} in all");
+            reported.fetch_add(n, Ordering::SeqCst);
+        };
+        let reader = {
+            let (writing, reported) = (writing.clone(), reported.clone());
+            std::thread::spawn(move || {
+                let mut queued = 0u64;
+                loop {
+                    match logs.try_recv() {
+                        Ok(ToHost::Log { message, .. }) => {
+                            match message.strip_suffix(
+                                " owner log record(s) dropped: the queue to the daemon was full",
+                            ) {
+                                Some(n) => count(n.parse().unwrap(), &reported),
+                                None => queued += 1,
+                            }
+                        }
+                        Ok(other) => panic!("not a log record: {other:?}"),
+                        Err(_) if writing.load(Ordering::SeqCst) => std::thread::yield_now(),
+                        Err(_) => return queued,
+                    }
+                }
+            })
+        };
+        let taker = {
+            let (relay, writing, reported) = (relay.clone(), writing.clone(), reported.clone());
+            std::thread::spawn(move || {
+                while writing.load(Ordering::SeqCst) {
+                    if let Some(ToHost::Log { message, .. }) = relay.take_summary() {
+                        let n = message.split(' ').next().unwrap().parse().unwrap();
+                        count(n, &reported);
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|w| {
+                let relay = relay.clone();
+                std::thread::spawn(move || {
+                    for n in 0..EACH {
+                        relay.record(log::Level::Info, "test", &format!("{w}/{n}"));
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        writing.store(false, Ordering::SeqCst);
+        taker.join().unwrap();
+        let queued = reader.join().unwrap();
+        if let Some(ToHost::Log { message, .. }) = relay.take_summary() {
+            count(
+                message.split(' ').next().unwrap().parse().unwrap(),
+                &reported,
+            );
+        }
+        assert_eq!(
+            queued + reported.load(Ordering::SeqCst),
+            ALL,
+            "{queued} queued and {} reported dropped, of {ALL}",
+            reported.load(Ordering::SeqCst)
+        );
     }
 
     /// Everything `link` carries until it has been quiet for `quiet`, or

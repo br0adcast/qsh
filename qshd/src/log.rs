@@ -35,6 +35,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod dropped;
 #[cfg(feature = "system")]
 pub(crate) mod relay;
 

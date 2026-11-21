@@ -839,14 +839,102 @@ fn an_image_that_fails_its_self_check_leaves_the_running_daemon_as_it_was() {
     client.close();
 }
 
-/// A session owner that died without its receipt (#529) may have left its
-/// shells to whoever adopted them: the daemon no longer proves that its
-/// sessions' processes are gone, and refuses to replace itself. The
-/// requester hears why -- a `Rejected` result, and no `Restarting` -- and
-/// its own session goes on with the same daemon.
+/// The `STATUS` line as JSON, for the fields a test reads by name.
+fn status_json(sock: &Path) -> Option<serde_json::Value> {
+    match client_request(sock, &ControlRequest::Status) {
+        Ok(ControlReply::Answered(line)) => serde_json::from_str(&line).ok(),
+        _ => None,
+    }
+}
+
+/// `pid`'s state, parent and session, as its `stat` reads.
+fn stat_of(pid: u32) -> Option<(char, u32, u32)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+    Some((
+        fields.first()?.chars().next()?,
+        fields.get(1)?.parse().ok()?,
+        fields.get(3)?.parse().ok()?,
+    ))
+}
+
+/// The processes whose whole command line is `args`.
+fn processes_running(args: &[&str]) -> Vec<u32> {
+    let want: Vec<u8> = args
+        .iter()
+        .flat_map(|a| [a.as_bytes(), b"\0"].concat())
+        .collect();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == want))
+        .collect()
+}
+
+/// A process the test left running, pinned by a pidfd opened while it
+/// still ran `args`: SIGKILLed through that pidfd by [`Leftover::kill`] or
+/// when dropped, so a failing test leaves nothing behind -- never by a bare
+/// number.
+struct Leftover {
+    pid: u32,
+    pidfd: std::os::fd::OwnedFd,
+}
+
+impl Leftover {
+    fn pin(pid: u32, args: &[&str]) -> Leftover {
+        let raw = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
+        assert!(raw >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+        let pidfd =
+            unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw as i32) };
+        assert_eq!(
+            processes_running(args)
+                .iter()
+                .filter(|p| **p == pid)
+                .count(),
+            1
+        );
+        Leftover { pid, pidfd }
+    }
+
+    fn signal(&self) -> i64 {
+        unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                nix::libc::SIGKILL,
+                std::ptr::null::<nix::libc::siginfo_t>(),
+                0,
+            )
+        }
+    }
+
+    fn kill(&self) {
+        assert_eq!(
+            self.signal(),
+            0,
+            "pidfd_send_signal: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+impl Drop for Leftover {
+    fn drop(&mut self) {
+        self.signal();
+    }
+}
+
+/// A session owner that died (#529) may leave processes of its session
+/// running under whoever adopted them -- here a job that ignores the
+/// terminal's hangup. While one runs, the daemon does not prove its
+/// cleanup: `STATUS` says so, naming the session and what still runs in
+/// it, and a replacement is refused with the same reason -- the requester
+/// hears why, and its own session goes on with the same daemon. Once the
+/// user has ended that process, the next `STATUS` reports a completed
+/// cleanup and the replacement goes ahead, without a restart of the daemon.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_session_owner_that_died_refuses_the_replacement() {
+fn a_dead_owners_leftover_refuses_the_replacement_until_it_is_ended() {
     let _serial = serialised();
     let bins = stripped_qshd();
     let home = private_temp_home().expect("home");
@@ -868,14 +956,63 @@ fn a_session_owner_that_died_refuses_the_replacement() {
     client_request(&sock, &ControlRequest::AddClient(requester.public)).expect("ADD-CLIENT");
     let before = status(&sock).expect("STATUS");
 
-    let (victim, _victim_events) = connect(home.path(), port, server_pub, key.private, [7; 16]);
+    // The victim's shell starts a job that ignores the hangup, in the
+    // shell's own session (no `setsid`).
+    let (victim, victim_events) = connect(home.path(), port, server_pub, key.private, [7; 16]);
+    victim
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            })),
+        )
+        .expect("fixture input admitted");
+    assert!(wait_for(Duration::from_secs(15), || victim_events.has(
+        |r| *r
+            == ServerRecord::Opened {
+                stream: FIRST_CHANNEL_STREAM
+            }
+    )));
     let mut owners = Vec::new();
     assert!(wait_for(Duration::from_secs(15), || {
         owners = owners_of(before.pid);
         !owners.is_empty()
     }));
-    let owner: i32 = owners[0].parse().expect("a pid");
-    assert_eq!(unsafe { nix::libc::kill(owner, nix::libc::SIGKILL) }, 0);
+    let owner: u32 = owners[0].parse().expect("a pid");
+    let shell: u32 = children_of(owner)[0].parse().expect("the shell's pid");
+    let marker = format!("{port}.529");
+    let leftover_args = ["sleep", marker.as_str()];
+    victim
+        .send_bytes(
+            FIRST_CHANNEL_STREAM,
+            format!("(trap '' HUP TERM INT; exec sleep {marker}) &\n").into_bytes(),
+        )
+        .expect("fixture input admitted");
+    let mut leftover = Vec::new();
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            leftover = processes_running(&leftover_args);
+            leftover.len() == 1
+        }),
+        "the job starts"
+    );
+    let job = Leftover::pin(leftover[0], &leftover_args);
+    let leftover = job.pid;
+    assert_eq!(
+        stat_of(leftover).map(|(_, _, sid)| sid),
+        Some(shell),
+        "the job is in the shell's session"
+    );
+
+    assert_eq!(
+        unsafe { nix::libc::kill(owner as i32, nix::libc::SIGKILL) },
+        0
+    );
     assert!(
         wait_for(Duration::from_secs(15), || owners_of(before.pid).is_empty()),
         "the daemon reaps its killed owner"
@@ -883,6 +1020,21 @@ fn a_session_owner_that_died_refuses_the_replacement() {
     victim.detach();
     assert!(wait_for(Duration::from_secs(20), || status(&sock)
         .is_some_and(|s| s.total_connections == 0)));
+    assert!(
+        stat_of(leftover).is_some_and(|(state, _, _)| state != 'Z'),
+        "the job outlives its owner and its shell"
+    );
+
+    // STATUS names the session and what still runs in it.
+    let unresolved = status_json(&sock).expect("STATUS");
+    let cleanup = &unresolved["cleanup"];
+    assert_eq!(cleanup["phase"], "unresolved", "{unresolved}");
+    let sessions = cleanup["unproved"].as_array().expect("unproved sessions");
+    assert_eq!(sessions.len(), 1, "{unresolved}");
+    assert_eq!(sessions[0]["session"], shell, "{unresolved}");
+    assert_eq!(sessions[0]["owner"], owner, "{unresolved}");
+    let reason = sessions[0]["reason"].as_str().expect("a reason");
+    assert!(reason.contains(&format!("pid {leftover}")), "{reason}");
 
     let (client, events) = connect(home.path(), port, server_pub, requester.private, [8; 16]);
     offer(&client, &new_image, new_build);
@@ -894,11 +1046,12 @@ fn a_session_owner_that_died_refuses_the_replacement() {
         daemon_log(home.path())
     );
     send_image(&client, &new_image);
+    let session = format!("session {shell}");
     assert!(
         wait_for(Duration::from_secs(60), || events.has(|r| matches!(
             r,
             ServerRecord::UpdateResult(UpdateResult::Rejected { detail, .. })
-                if detail.contains("session owner")
+                if detail.contains("session owner") && detail.contains(&session)
         ))),
         "{:?}; log:\n{}",
         events.control(),
@@ -920,6 +1073,151 @@ fn a_session_owner_that_died_refuses_the_replacement() {
         "the requester's session goes on with the same daemon"
     );
     client.close();
+
+    // The user ends the leftover: the cleanup is proved, with no restart.
+    job.kill();
+    let mut completed = None;
+    assert!(
+        wait_for(Duration::from_secs(15), || {
+            completed = status_json(&sock);
+            completed
+                .as_ref()
+                .is_some_and(|s| s["cleanup"]["phase"] == "completed")
+        }),
+        "STATUS: {completed:?}"
+    );
+    let completed = completed.unwrap();
+    assert!(
+        completed["cleanup"].get("unproved").is_none(),
+        "{completed}"
+    );
+    // The requester's key went with its session: the update comes over a
+    // key of its own.
+    let updater = generate_keypair();
+    client_request(&sock, &ControlRequest::AddClient(updater.public)).expect("ADD-CLIENT");
+    update_once(
+        home.path(),
+        port,
+        server_pub,
+        updater.private,
+        [9; 16],
+        &new_image,
+        new_build,
+    );
+    let replaced = status(&sock).expect("STATUS");
+    assert_eq!(replaced.pid, before.pid, "replaced in place");
+    assert_eq!(replaced.checksum, hex::encode(sha256(&new_image)));
+}
+
+/// An owner killed with nothing of its session left behind (#529) costs
+/// nothing more than its session: the daemon proves at once that the
+/// session is empty, `STATUS` reports a completed cleanup, and an in-place
+/// update goes ahead without a restart.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_owner_killed_with_nothing_left_still_lets_the_daemon_update() {
+    let _serial = serialised();
+    let bins = stripped_qshd();
+    let home = private_temp_home().expect("home");
+    let sock = home.path().join("qsh").join("control.sock");
+    let old_build = self_check(&bins.bin).build;
+    let mut new_image = bins.old.clone();
+    new_image.extend_from_slice(b"\0qshd-update-test-clean-death\0");
+    let new_build = old_build + 1;
+    let labels = format!("{}={new_build}", hex::encode(sha256(&new_image)));
+
+    let key = generate_keypair();
+    let port = free_udp_port();
+    let _guard = DaemonGuard::new(sock.clone());
+    let server_pub = start_daemon(&bins.bin, home.path(), port, key.public, &labels);
+    assert!(wait_for(Duration::from_secs(15), || status(&sock).is_some()));
+    let requester = generate_keypair();
+    client_request(&sock, &ControlRequest::AddClient(requester.public)).expect("ADD-CLIENT");
+    let before = status(&sock).expect("STATUS");
+
+    let (victim, _victim_events) = connect(home.path(), port, server_pub, key.private, [7; 16]);
+    let mut owners = Vec::new();
+    assert!(wait_for(Duration::from_secs(15), || {
+        owners = owners_of(before.pid);
+        !owners.is_empty()
+    }));
+    let owner: i32 = owners[0].parse().expect("a pid");
+    assert_eq!(unsafe { nix::libc::kill(owner, nix::libc::SIGKILL) }, 0);
+    assert!(
+        wait_for(Duration::from_secs(15), || owners_of(before.pid).is_empty()),
+        "the daemon reaps its killed owner"
+    );
+    victim.detach();
+    assert!(wait_for(Duration::from_secs(20), || status(&sock)
+        .is_some_and(|s| s.total_connections == 0)));
+    let completed = status_json(&sock).expect("STATUS");
+    assert_eq!(completed["cleanup"]["phase"], "completed", "{completed}");
+    update_once(
+        home.path(),
+        port,
+        server_pub,
+        requester.private,
+        [8; 16],
+        &new_image,
+        new_build,
+    );
+    assert!(
+        daemon_log(home.path()).contains(&format!("session owner {owner} exited (signal 9)")),
+        "the owner died unproved; log:\n{}",
+        daemon_log(home.path())
+    );
+}
+
+/// `STATUS` of a hosted daemon reports its owners' cleanup (#529): each
+/// session's channels are held by its owner, a process of its own, and
+/// the host knows whether every owner that ended proved its cleanup. It is
+/// `completed` before a session, while an owner holds one, and after it
+/// ended in order -- and never carries the host's own (always empty)
+/// channel registry's counts.
+#[test]
+fn a_hosted_daemon_reports_its_owners_cleanup() {
+    use qshd::control::CleanupPhase;
+    let _serial = serialised();
+    let bins = stripped_qshd();
+    let home = private_temp_home().expect("home");
+    let sock = home.path().join("qsh").join("control.sock");
+    let key = generate_keypair();
+    let port = free_udp_port();
+    let _guard = DaemonGuard::new(sock.clone());
+    let server_pub = start_daemon(&bins.bin, home.path(), port, key.public, "");
+    assert!(wait_for(Duration::from_secs(15), || status(&sock).is_some()));
+    let completed = |when: &str| {
+        let status = status(&sock).expect("STATUS");
+        let cleanup = status
+            .cleanup
+            .as_ref()
+            .unwrap_or_else(|| panic!("{when}: STATUS has no cleanup"));
+        assert_eq!(
+            cleanup.phase,
+            CleanupPhase::Completed,
+            "{when}: {cleanup:?}"
+        );
+        assert_eq!(cleanup.counts, None, "{when}: {cleanup:?}");
+        status
+    };
+    let before = completed("before any session");
+
+    let (client, _events) = connect(home.path(), port, server_pub, key.private, [9; 16]);
+    assert!(
+        wait_for(Duration::from_secs(15), || !owners_of(before.pid)
+            .is_empty()),
+        "the session runs in an owner; log:\n{}",
+        daemon_log(home.path())
+    );
+    completed("while an owner holds a session");
+
+    client.close();
+    assert!(
+        wait_for(Duration::from_secs(20), || owners_of(before.pid).is_empty()),
+        "the closed session's owner is reaped; log:\n{}",
+        daemon_log(home.path())
+    );
+    completed("after the session ended");
 }
 
 /// A file holding `contents`, open on a descriptor a child inherits.

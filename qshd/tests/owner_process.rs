@@ -684,11 +684,11 @@ fn stop_reaps_every_owner_and_reports_drained() {
     drop((one, two));
 }
 
-/// An owner that dies without its receipt -- its shells may live on under
-/// whoever adopted them -- makes the daemon's later STOP a failure, as a
-/// failed session worker did when sessions ran in the daemon.
+/// An owner killed before the stop sends no receipt; the shell of its
+/// session ends with its terminal, so nothing of the session is left, and
+/// the host proves that itself: the stop is clean.
 #[test]
-fn an_owner_killed_before_stop_fails_the_stop() {
+fn an_owner_killed_with_nothing_left_still_stops_clean() {
     let _serial = serialised();
     let mut daemon = start_daemon();
     let session = Session::connect(&daemon, [29; 16]);
@@ -706,10 +706,14 @@ fn an_owner_killed_before_stop_fails_the_stop() {
         "log: {}",
         daemon.log()
     );
+    assert!(
+        wait_until(Duration::from_secs(10), || reaped(shell)),
+        "its shell ends with its terminal"
+    );
     let status = daemon.stop();
     assert!(
-        !status.success(),
-        "a stop after an owner died without its receipt is not clean: {status:?}; log: {}",
+        status.success(),
+        "nothing of the killed owner's session is left: {status:?}; log: {}",
         daemon.log()
     );
     drop(session);
@@ -842,7 +846,7 @@ fn sever_first_link(owner: u32, daemon: &Daemon) {
     );
 }
 
-/// [RF 2] The shell prints its last output and exits while the link between
+/// The shell prints its last output and exits while the link between
 /// the frontend and its owner is dead. The owner keeps both; the client's
 /// warm return brings a new link, and over it the client sees that output
 /// and then the exit, from the same owner.
@@ -951,7 +955,7 @@ fn paste_line(n: u32) -> Vec<u8> {
     format!("{n:08}\n").into_bytes()
 }
 
-/// [RF 3] The link dies in the middle of a paste into a program that
+/// The link dies in the middle of a paste into a program that
 /// records every byte the terminal gives it. Whatever the dead link lost
 /// stays lost; nothing is delivered twice. What the program received is
 /// exactly a leading part of what the first client sent -- at least

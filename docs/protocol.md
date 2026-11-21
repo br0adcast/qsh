@@ -1235,6 +1235,52 @@ resume costs nothing when there is nothing to resume, whereas asking cold
 would *replace* a session that is still there — precisely the one it came
 back for.
 
+### 4.4 Behind a Linux personal daemon: host, frontend and owners
+
+Nothing on the wire changes; this is where the parts of §4 run. On Linux a
+personal daemon runs the router (§4.1, §4.2) in a **frontend** process, and
+each backend in an **owner** process of its own, the parent of that
+session's shells. Both are children of the **host**, the daemon process
+itself, which holds the socket, the static key, the allowlist, the session
+caps and a catalog of every session: its token, its account, its owner,
+when its client was last heard, and whether and since when it is retained.
+A bridge speaks to its owner over a link (`owner_link.rs`) that the host
+hands out and replaces; the owner keeps everything the session's
+connections may need again.
+
+- **The frontend dies.** Each owner sees its link end and parks its
+  backend, as at an unexpected death (§4.2). The host starts another
+  frontend, which knows no connection. A client's datagram for a
+  `session_id` it does not route is answered with a `SessionReset` (§1.1);
+  the client returns warm, and its token -- unknown to the new router --
+  is looked up in the host's catalog: the same account gets its session's
+  owner on a new link, and the return goes on exactly as a `WarmReattach`
+  (msg2 `resumed: true`, `ResumeReset`, the snapshot). Retention is the
+  host's: `SERVER_DEATH_AFTER` and `RETAIN_AFTER_DEATH` run from the
+  client's last packet, and a frontend's death neither starts nor restarts
+  them; the host ends a session no frontend holds when a router would have.
+- **An owner dies.** Its session is lost, not ended: its connection is
+  dropped without a `Close` (as for a stream out of offset space), so the
+  client does not take it for a deliberate end. Its warm return finds no
+  session and gets `resumed: false` (§2.2). The host takes the session off
+  its catalog when it reaps the owner.
+- **The caps** of §4.2 are the host's, counted once over all frontends and
+  owners: a session counts from its creation until it ends (its backend's
+  end, its router's end of the login, or the host's own stop of its owner),
+  not until its owner process is gone. At a cap the host makes room with
+  the same rule as a router, among the sessions no frontend holds: the
+  oldest `Retained` one (or one whose client has been silent past
+  `SERVER_DEATH_AFTER`), of the caller's account at its own cap, else of
+  any. Owners that are still finishing an ended session are bounded apart:
+  at most twice `MAX_SESSIONS_TOTAL` owner processes at once, each killed
+  if it has not exited 20 s after its session's end.
+- **A frontend exits in order** (the host's `Stop`, `SIGTERM`, `SIGINT`):
+  as at its death. Its router's last sweep ends no session.
+
+The process roles, the frontend's restart backoff, and what each failure
+costs a user are in `docs/qshd-service.md` ("Sessions outlive the network
+part"). macOS and `--system` keep one process.
+
 ---
 
 ## 5. Roaming
@@ -2710,12 +2756,30 @@ process identities or arbitrary backend text. Healthy pending Opens report
 `pending` but do not block preparation. Observed unconfirmed owners report
 `unresolved` until exact completion. Contention or an inconsistent observation
 reports `unknown` with counts omitted. A missing `cleanup` field (including an
-older daemon's reply) also means unknown, not completed. `completed` proves
-only that no pending Opens or retained cleanup debt is reported in this
-registered personal-channel domain; healthy installed sessions may still be
-running. It does not prove global process-tree or privileged-helper/PAM cleanup. The
+older daemon's reply) also means unknown, not completed. Where `counts` are
+reported, `completed` proves only that no pending Opens or retained cleanup
+debt is reported in this registered personal-channel domain; healthy installed
+sessions may still be running. A hosted daemon's `completed` (below) means
+less: no session owner that ended left anything unproved; its running owners'
+pending Opens are not reported. It does not prove global process-tree or privileged-helper/PAM cleanup. The
 projection is available on every supported personal-daemon platform and does
 not change protocol negotiation or the final exec fence.
+
+On Linux a personal daemon runs each session in a session owner process of
+its own (`docs/qshd-service.md`, "Sessions outlive the network part"), and its
+own registry holds no session's channels. Its `cleanup` reports instead
+whether every owner that ended proved its cleanup, checked afresh for the
+reply: `completed`, or `unresolved` while a session of an owner that died
+without its receipt still has a process in it, could not be checked (`/proc`
+unreadable in time, or mounted to hide processes), or was never identified.
+`counts` is omitted. `unproved` lists up to eight such sessions, each with
+`session` (the session ID, absent when the daemon never learned it),
+`leader_start` (the leader's start time in clock ticks after boot, field 22 of
+its `/proc/<pid>/stat`, when known), `owner` (the owner's pid) and `reason`
+(how the owner ended, and the processes still in the session or why it could
+not be checked); `unproved_more` counts the rest. Both are omitted when
+empty. Unlike the counts above, these name processes: the reply goes only to
+the daemon's own account.
 
 Otherwise the decision is made. The daemon answers `UPDATE_RESULT
 Restarting`, requests `RESTARTING` for every session (the offering one

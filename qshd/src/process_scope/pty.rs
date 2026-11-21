@@ -4,6 +4,7 @@ use super::{scope, Failure, Native, QualifiedProc, Unavailable};
 use nix::libc;
 use portable_pty::Child;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use transport::channel_open::{CleanupAuthority, CleanupStatus};
 use transport::channel_server::{ChannelWait, ChildStatus, LeaderStatus};
@@ -92,21 +93,105 @@ impl scope::ChildCustody for PtyChild {
     }
 }
 
+/// Who hears of every session leader a spawner starts (#529: a session
+/// owner tells its host, so that the host can check the session itself if
+/// the owner dies).
+pub(crate) trait LeaderReports: Send + Sync {
+    /// A leader is about to be started. `Err` with why it may not be (it
+    /// was not noted), and the open is refused before anything starts.
+    /// Each `Ok` is followed by exactly one [`LeaderReports::started`].
+    fn starting(&self) -> Result<(), String>;
+    /// The outcome of the start the last `starting` announced:
+    /// [`LeaderStart::Started`] with the leader's pid and start time (if
+    /// procfs gave it), [`LeaderStart::Unidentified`] if it has no exact
+    /// identity, or [`LeaderStart::NotStarted`].
+    fn started(&self, leader: LeaderStart);
+    /// Its session was proved empty and the leader reaped (its pid is free).
+    fn ended(&self, pid: u32);
+}
+
+/// How the start of one announced leader went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaderStart {
+    Started { pid: u32, start: Option<u64> },
+    Unidentified,
+    NotStarted,
+}
+
+/// One announced leader start, until its outcome is told: dropped untold,
+/// it tells `NotStarted` -- the spawn failed before a process existed.
+pub(crate) struct LeaderWindow {
+    reports: Option<Arc<dyn LeaderReports>>,
+}
+
+impl LeaderWindow {
+    /// Announce a leader start to `reports`; `Err` with why it may not
+    /// happen.
+    pub(crate) fn open(reports: &Arc<dyn LeaderReports>) -> Result<LeaderWindow, String> {
+        reports.starting()?;
+        Ok(LeaderWindow {
+            reports: Some(reports.clone()),
+        })
+    }
+
+    fn tell(&mut self, leader: LeaderStart) -> Option<Arc<dyn LeaderReports>> {
+        let reports = self.reports.take()?;
+        reports.started(leader);
+        Some(reports)
+    }
+}
+
+impl Drop for LeaderWindow {
+    fn drop(&mut self) {
+        self.tell(LeaderStart::NotStarted);
+    }
+}
+
 struct NativeWait {
     scope: Option<scope::Scope<PtyChild>>,
     // A backend without an exact PID is retained as Unknown, never downgraded
     // to a numeric kill or treated as a refusal before child creation.
     _unproved_child: Option<Box<dyn Child + Send + Sync>>,
     stop_started: Option<Instant>,
+    /// Who hears that the leader's session was proved empty and the leader
+    /// reaped, and the leader's pid; told once.
+    reported: Option<(Arc<dyn LeaderReports>, u32)>,
 }
 pub(crate) fn own_child(
     child: Box<dyn Child + Send + Sync>,
     view: QualifiedProc,
 ) -> Box<dyn ChannelWait> {
+    own_reported_child(child, view, None)
+}
+/// [`own_child`], telling `window`'s reports who leads the new session --
+/// its pid and its start time, read through its own pin while it is this
+/// process's unreaped child -- and, once the scope has proved the session
+/// empty and reaped the leader, that it ended.
+pub(crate) fn own_reported_child(
+    child: Box<dyn Child + Send + Sync>,
+    view: QualifiedProc,
+    window: Option<LeaderWindow>,
+) -> Box<dyn ChannelWait> {
     let pid = child
         .process_id()
         .filter(|pid| *pid <= i32::MAX as u32)
         .and_then(NonZeroU32::new);
+    let reported = match (window, pid) {
+        (Some(mut window), Some(pid)) => {
+            let start = super::pin(&view, pid.get(), &mut Native).map(|leader| leader.start);
+            window
+                .tell(LeaderStart::Started {
+                    pid: pid.get(),
+                    start,
+                })
+                .map(|reports| (reports, pid.get()))
+        }
+        (Some(mut window), None) => {
+            window.tell(LeaderStart::Unidentified);
+            None
+        }
+        (None, _) => None,
+    };
     let (scope, unproved_child) = match pid {
         Some(pid) => (Some(scope::Scope::new(PtyChild { child, pid }, view)), None),
         None => (None, Some(child)),
@@ -115,6 +200,7 @@ pub(crate) fn own_child(
         scope,
         _unproved_child: unproved_child,
         stop_started: None,
+        reported,
     })
 }
 impl NativeWait {
@@ -136,7 +222,12 @@ impl NativeWait {
             scope::Progress::Unknown => {
                 ChildStatus::Unknown("native process scope cleanup is unconfirmed".into())
             }
-            scope::Progress::Complete(code) => ChildStatus::Reaped { code: Some(code) },
+            scope::Progress::Complete(code) => {
+                if let Some((reports, pid)) = self.reported.take() {
+                    reports.ended(pid);
+                }
+                ChildStatus::Reaped { code: Some(code) }
+            }
         }
     }
 }
@@ -399,5 +490,75 @@ mod tests {
         });
         assert!(matches!(result, Err(Failure::Errno(libc::ECHILD))));
         assert_eq!(calls, 1);
+    }
+
+    /// What a leader's reports heard, in order.
+    #[derive(Default)]
+    struct Heard(std::sync::Mutex<Vec<String>>, AtomicUsize);
+    impl LeaderReports for Heard {
+        fn starting(&self) -> Result<(), String> {
+            self.0.lock().unwrap().push("starting".into());
+            match self.1.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(()),
+                _ => Err("refused".into()),
+            }
+        }
+        fn started(&self, leader: LeaderStart) {
+            self.0.lock().unwrap().push(format!("{leader:?}"));
+        }
+        fn ended(&self, pid: u32) {
+            self.0.lock().unwrap().push(format!("ended {pid}"));
+        }
+    }
+
+    /// A leader start is announced first and its outcome told once: who
+    /// leads the new session -- its pid and start time, read while it is
+    /// unreaped -- and, once its session was proved empty and it was
+    /// reaped, its end. A start nobody noted does not open, and one dropped
+    /// untold tells that nothing started.
+    #[test]
+    fn a_reported_leader_is_announced_identified_and_ended_once() {
+        use std::os::unix::process::CommandExt;
+        let heard = Arc::new(Heard::default());
+        let reports: Arc<dyn LeaderReports> = heard.clone();
+        let window = LeaderWindow::open(&reports).expect("noted");
+        assert!(LeaderWindow::open(&reports).is_err(), "not noted: no start");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 3"]);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let mut wait = own_reported_child(Box::new(child), prepare().unwrap(), Some(window));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let code = loop {
+            if let ChildStatus::Reaped { code } = wait.poll_exit() {
+                break code;
+            }
+            assert!(Instant::now() < deadline, "the leader did not end");
+            std::thread::sleep(OBSERVE_INTERVAL);
+        };
+        assert_eq!(code, Some(3));
+        assert!(matches!(wait.poll_exit(), ChildStatus::Reaped { .. }));
+        drop(wait);
+        let heard = heard.0.lock().unwrap().clone();
+        assert_eq!(heard.len(), 4, "{heard:?}");
+        assert_eq!(heard[..2], ["starting", "starting"]);
+        assert!(
+            heard[2].starts_with(&format!("Started {{ pid: {pid}, start: Some(")),
+            "{heard:?}"
+        );
+        assert_eq!(heard[3], format!("ended {pid}"), "once");
+
+        let heard = Arc::new(Heard::default());
+        let reports: Arc<dyn LeaderReports> = heard.clone();
+        drop(LeaderWindow::open(&reports).expect("noted"));
+        assert_eq!(*heard.0.lock().unwrap(), ["starting", "NotStarted"]);
     }
 }

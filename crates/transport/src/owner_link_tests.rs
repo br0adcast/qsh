@@ -1204,3 +1204,61 @@ async fn an_owner_drain_gives_up_on_a_worker_that_never_returns() {
     assert!(error.to_string().contains("within"), "{error}");
     let _ = release.send(());
 }
+
+/// A session its frontend ended (`End`) whose backend then never finishes
+/// does not keep its owner process forever: past the drain bound the
+/// session is stopped and drained -- a failure, when something of it still
+/// does not join, which makes the owner kill what is left of its shells --
+/// and the owner still says its session ended (not `Shutdown`), so its host
+/// hears of it (#529).
+#[tokio::test]
+async fn an_ended_session_whose_backend_never_finishes_is_given_up_on_too() {
+    use tokio::io::AsyncWriteExt;
+    struct Stuck(Mutex<Option<std::sync::mpsc::Receiver<()>>>);
+    impl SessionBackend for Stuck {
+        fn run(&self, io: SessionIo) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let held = self.0.lock().unwrap().take().unwrap();
+            let _receipt = io.spawn_blocking_owned(move || {
+                let _ = held.recv();
+            });
+            // Deaf to the end of its input: it never returns.
+            Box::pin(async move {
+                std::future::pending::<()>().await;
+                drop(io);
+            })
+        }
+    }
+    let (front, _queue, _out) = SessionIo::test_pair();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (mut front_end, owner_end) = loopback();
+    let run = tokio::spawn(OwnerLink::run_and_drain(
+        owner_end,
+        Arc::new(Stuck(Mutex::new(Some(held)))),
+        OwnerInit::new(front.principal().clone(), front.login()),
+        Shutdown::default(),
+        Duration::from_millis(200),
+    ));
+    let mut end = Vec::new();
+    encode(&ToOwner::End(EndKind::Graceful), &mut end).unwrap();
+    front_end.write_all(&end).await.unwrap();
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("the end of a session is bounded")
+        .unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "not before the bound: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        outcome.exit,
+        OwnerExit::Unfinished,
+        "the session ended (not Shutdown): the host hears it"
+    );
+    let error = outcome
+        .drained
+        .expect_err("an unjoined worker is a failed drain");
+    assert!(error.to_string().contains("within"), "{error}");
+    let _ = release.send(());
+}

@@ -1792,7 +1792,6 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
                 vec![start.port],
                 active_count,
                 actions,
-                Some(opens),
                 signals.requested(),
             )
             .await;

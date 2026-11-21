@@ -49,6 +49,10 @@ pub struct PtyChannelSpawner {
     opens: Arc<ChannelOpenRegistry>,
     budget: Arc<ScreenBudget>,
     retained_screens: Option<Arc<crate::session_owner::screen_owner::RetainedScreenFactory>>,
+    /// Who hears of every session leader this spawner starts: a session
+    /// owner's host (#529).
+    #[cfg(target_os = "linux")]
+    leaders: Option<Arc<dyn crate::process_scope::LeaderReports>>,
     #[cfg(all(test, target_os = "linux"))]
     fixture_leader_observer: Option<fixture_leader_observation::FixtureLeaderObserver>,
     #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
@@ -60,6 +64,8 @@ impl PtyChannelSpawner {
         Self {
             budget,
             retained_screens: None,
+            #[cfg(target_os = "linux")]
+            leaders: None,
             #[cfg(all(test, target_os = "linux"))]
             fixture_leader_observer: None,
             #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
@@ -74,6 +80,19 @@ impl PtyChannelSpawner {
         admission: Arc<dyn transport::channel_open::OpenAdmission>,
     ) -> Self {
         self.opens = ChannelOpenRegistry::with_admission(Default::default(), admission);
+        self
+    }
+    /// Tell `leaders` of every session leader this spawner starts -- before
+    /// it starts (an open whose start `leaders` does not note is refused
+    /// before anything is created), who it is once started, and when its
+    /// session was proved empty and it was reaped: a session owner's, whose
+    /// host checks those sessions itself if the owner dies (#529).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_leader_reports(
+        mut self,
+        leaders: Arc<dyn crate::process_scope::LeaderReports>,
+    ) -> Self {
+        self.leaders = Some(leaders);
         self
     }
     /// Explicit retained-owner configuration; ordinary constructors keep their pool.
@@ -198,6 +217,8 @@ impl ChannelSpawner for PtyChannelSpawner {
             screen,
             #[cfg(target_os = "linux")]
             process_view,
+            #[cfg(target_os = "linux")]
+            self.leaders.as_ref(),
             #[cfg(all(test, target_os = "linux"))]
             fixture_observation,
         )
@@ -205,6 +226,7 @@ impl ChannelSpawner for PtyChannelSpawner {
 }
 
 /// Portable PTY creation for a selected modern/Linux owner.
+#[allow(clippy::too_many_arguments)]
 fn spawn_personal_pty(
     req: &OpenRequest,
     size: PtySize,
@@ -213,6 +235,7 @@ fn spawn_personal_pty(
     screen: Box<dyn SessionScreen>,
     #[cfg(target_os = "linux")] process_view: crate::process_scope::QualifiedProc,
     #[cfg(target_os = "macos")] process_view: crate::darwin_process_scope::QualifiedDarwin,
+    #[cfg(target_os = "linux")] leaders: Option<&Arc<dyn crate::process_scope::LeaderReports>>,
     #[cfg(all(test, target_os = "linux"))] fixture_observation: Option<
         fixture_leader_observation::Registration,
     >,
@@ -220,6 +243,18 @@ fn spawn_personal_pty(
     if custody.is_cancelled() {
         return Err(custody.refuse_before_creation("channel startup was cancelled".into()));
     }
+    // Announced before anything starts, and before the spawn permit: the
+    // host knows of every leader that may exist before it can. Dropped
+    // without an outcome (the spawn below failed), it tells that nothing
+    // started.
+    #[cfg(target_os = "linux")]
+    let window = match leaders {
+        Some(leaders) => Some(
+            crate::process_scope::LeaderWindow::open(leaders)
+                .map_err(|why| custody.refuse_before_creation(why))?,
+        ),
+        None => None,
+    };
     // Never inside a replacement's exec window: this child would inherit
     // the descriptors it makes inheritable (see `crate::update`). Held
     // until the spawn has returned -- the child has exec'd by then.
@@ -247,7 +282,7 @@ fn spawn_personal_pty(
     // portable-pty has completed its owned setsid/exec handshake. Retain
     // the unreaped leader before any fallible descriptor preparation.
     #[cfg(target_os = "linux")]
-    let wait = crate::process_scope::own_child(child, process_view);
+    let wait = crate::process_scope::own_reported_child(child, process_view, window);
     #[cfg(target_os = "macos")]
     let wait = crate::darwin_process_scope::own_child(child, process_view);
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

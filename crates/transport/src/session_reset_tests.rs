@@ -573,10 +573,10 @@ async fn full_daemon_restart_tells_client_session_is_gone() {
 }
 
 /// A warm return inside a running frontend whose owner link cannot be
-/// replaced just now parks the session (Task 6's residual: a client that
-/// already holds msg2 then waited out its death timer). Its connection is
-/// no longer routed, so the next datagram it sends is answered with a
-/// reset, and the client tries again at once.
+/// replaced just now parks the session. Its connection is no longer
+/// routed, so the next datagram it sends is answered with a reset, and the
+/// client tries again at once -- rather than, holding msg2 already, waiting
+/// out its death timer.
 #[tokio::test]
 async fn a_parked_return_is_reset_and_comes_back_at_once() {
     tokio::time::timeout(Duration::from_secs(20), async {

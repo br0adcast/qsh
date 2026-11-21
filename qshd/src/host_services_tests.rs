@@ -125,7 +125,7 @@ fn open_request(session: &SessionOpenLedger, uid: u32, instance: u64) -> OpenReq
     }
 }
 
-/// [RF 4] One uid's screens count once for the daemon however many owners
+/// One uid's screens count once for the daemon however many owners
 /// they are spread over: the 17th is refused, and everything comes back
 /// when the owners exit, even with their leases never given back.
 #[test]
@@ -411,5 +411,31 @@ fn a_stalled_host_that_recovers_leaves_no_grant_once_the_owner_is_gone() {
     // Reaped: nothing is left counted against the account.
     drop(account);
     assert_eq!(services.in_use().opens, 0);
+    assert_eq!(services.in_use().envelopes, 0);
+}
+
+/// A session that has ended no longer counts against the session caps,
+/// though its owner, still draining, keeps its account until it is reaped
+/// -- as a router stops counting a session the moment it ends it. The
+/// envelope is given back once, whenever the account then goes.
+#[test]
+fn an_ended_sessions_envelope_is_free_before_its_owner_is_reaped() {
+    let services = HostServices::new(HostLimits {
+        envelopes: 3,
+        envelopes_per_uid: 2,
+        ..Default::default()
+    });
+    let first = services.admit(UID).unwrap();
+    let second = services.admit(UID).unwrap();
+    assert!(services.admit(UID).is_err(), "at the account's cap");
+    first.end_session();
+    first.end_session();
+    assert_eq!(services.in_use().envelopes, 1, "given back once");
+    let third = services.admit(UID).expect("the ended session's place");
+    let other = services.admit(UID + 1).unwrap();
+    assert!(services.admit(UID + 2).is_err(), "at the daemon's cap");
+    drop(first);
+    assert_eq!(services.in_use().envelopes, 3, "not given back twice");
+    drop((second, third, other));
     assert_eq!(services.in_use().envelopes, 0);
 }

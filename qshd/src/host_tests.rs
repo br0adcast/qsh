@@ -62,6 +62,12 @@ fn a_frontend_death_leaves_every_retention_time_as_it_was() {
     let SessionState::Retained { since } = state_of(&catalog, retained) else {
         panic!("retained")
     };
+    // A second report of the same retention does not move it.
+    catalog.retained(retained);
+    assert_eq!(
+        state_of(&catalog, retained),
+        SessionState::Retained { since }
+    );
     let heard = catalog.lock().get(&live).unwrap().last_client_recv;
     assert_eq!(
         catalog.next_deadline(),
@@ -83,15 +89,6 @@ fn a_frontend_death_leaves_every_retention_time_as_it_was() {
     assert_eq!(
         catalog.lock().get(&live).unwrap().deadline(),
         Some(heard + SERVER_DEATH_AFTER + RETAIN_AFTER_DEATH)
-    );
-
-    // A second report of the same retention does not move it either, and a
-    // report about a session nobody holds is not taken.
-    catalog.retained(retained);
-    catalog.traffic(retained, Duration::ZERO, true);
-    assert_eq!(
-        state_of(&catalog, retained),
-        SessionState::Retained { since }
     );
 
     assert!(catalog
@@ -251,6 +248,52 @@ fn a_takeover_nobody_confirms_lapses_back_to_the_host() {
     );
 }
 
+/// A takeover that lapsed (its frontend's first report did not reach the
+/// host within `TAKEOVER_CONFIRM`) is the frontend's again on its next
+/// report: only the running frontend reports, and only for sessions its
+/// router holds, so a report is proof enough. Without that the host would
+/// keep the deadline of the `Lookup` time for good, and end a session in
+/// use a day later.
+#[test]
+fn a_lapsed_takeover_is_held_again_on_the_frontends_next_report() {
+    let catalog = Catalog::new(Arc::default());
+    let (traffic, retained) = ([6; 16], [7; 16]);
+    let mut owner_ends = Vec::new();
+    for (token, pid) in [(traffic, 71), (retained, 72)] {
+        let (host_end, owner_end) = relink_pair();
+        owner_ends.push(owner_end);
+        let mut kept = entry(pid, false);
+        kept.relink = host_end;
+        catalog.insert(token, kept);
+        assert!(matches!(catalog.lookup(token, 1000), Found::Owner(..)));
+    }
+    let confirm_by = catalog.next_deadline().expect("a confirmation deadline");
+    let (stopped, _) = catalog.take_expired(confirm_by + Duration::from_millis(1));
+    assert!(stopped.is_empty(), "lapsed, not ended");
+    assert!(catalog.lock().values().all(|entry| !entry.attached));
+
+    catalog.traffic(traffic, Duration::from_secs(2), true);
+    catalog.retained(retained);
+    {
+        let entries = catalog.lock();
+        for token in [traffic, retained] {
+            let entry = entries.get(&token).unwrap();
+            assert!(entry.attached, "the frontend holds it again");
+            assert_eq!(entry.deadline(), None, "no confirmation pending");
+        }
+    }
+    assert_eq!(
+        catalog.next_deadline(),
+        None,
+        "the frontend's router decides"
+    );
+    assert!(matches!(
+        state_of(&catalog, retained),
+        SessionState::Retained { .. }
+    ));
+    assert_eq!(state_of(&catalog, traffic), SessionState::Live);
+}
+
 /// An owner whose relink channel does not take a link just now is busy,
 /// not gone: `Lookup` says `Unavailable` (never `Unknown`, which would
 /// have a fresh session replace it) and `Relink` says so too. An owner
@@ -344,4 +387,81 @@ fn a_key_reported_before_its_create_is_the_created_sessions() {
         catalog.owner_ended(82).is_empty(),
         "its frontend died first"
     );
+}
+
+/// What a full host gives up for a new session is what a router would:
+/// the oldest retained session -- here among the sessions no frontend
+/// holds, which no router knows of. At the account's own cap only its own;
+/// otherwise anyone's. Never a live one, never one a frontend holds.
+#[test]
+fn a_full_host_gives_up_its_oldest_retained_unheld_session() {
+    let catalog = Catalog::new(Arc::default());
+    let at = Instant::now();
+    let retained = |pid, uid, attached, ago: u64| {
+        let mut entry = entry(pid, attached);
+        entry.uid = uid;
+        entry.state = SessionState::Retained {
+            since: at - Duration::from_secs(ago),
+        };
+        entry
+    };
+    catalog.insert([1; 16], retained(51, 1000, false, 10));
+    // Older, but held by the running frontend: its router's to evict.
+    catalog.insert([2; 16], retained(52, 1000, true, 50));
+    // Older, but another account's.
+    catalog.insert([3; 16], retained(53, 2000, false, 40));
+    catalog.insert([4; 16], entry(54, false));
+    let mut key = retained(55, 1000, false, 5);
+    key.client_key = Some(([5; 32], 9));
+    catalog.insert([5; 16], key);
+
+    // At its own cap, an account gives up only one of its own.
+    assert_eq!(catalog.evict_retained(Some(1000)), Some((51, Vec::new())));
+    assert_eq!(catalog.owner_of([1; 16]), None, "taken off");
+    // At the daemon's cap, the oldest of anyone's.
+    assert_eq!(catalog.evict_retained(None), Some((53, Vec::new())));
+    assert_eq!(
+        catalog.evict_retained(Some(1000)),
+        Some((55, vec![([5; 32], 9)])),
+        "with its key, which no other session has"
+    );
+    assert_eq!(
+        catalog.evict_retained(None),
+        None,
+        "only live or held ones left"
+    );
+    // A live session nobody holds whose client has been silent past the
+    // server's death timer is one a router holds retained by now -- since
+    // that death.
+    let mut silent = entry(56, false);
+    silent.last_client_recv = at - SERVER_DEATH_AFTER - Duration::from_secs(1);
+    catalog.insert([6; 16], silent);
+    let mut later = retained(57, 1000, false, 0);
+    later.state = SessionState::Retained {
+        since: at - Duration::from_millis(1),
+    };
+    catalog.insert([7; 16], later);
+    assert_eq!(
+        catalog.evict_retained(None),
+        Some((56, Vec::new())),
+        "the older death"
+    );
+    assert_eq!(catalog.evict_retained(None), Some((57, Vec::new())));
+    assert!(catalog.owner_of([2; 16]).is_some() && catalog.owner_of([4; 16]).is_some());
+}
+
+/// The running frontend's router ended a session (`Ended`): the host takes
+/// it off the catalog at once and gives back its owner -- also one whose
+/// link was lost, which no `End` from that router reaches. A frontend's
+/// word about a session it does not hold changes nothing.
+#[test]
+fn a_session_the_router_ended_leaves_the_catalog_at_once() {
+    let catalog = Catalog::new(Arc::default());
+    catalog.insert([1; 16], entry(61, true));
+    catalog.insert([2; 16], entry(62, false));
+    assert_eq!(catalog.router_ended([1; 16]), Some(61));
+    assert_eq!(catalog.owner_of([1; 16]), None);
+    assert_eq!(catalog.router_ended([1; 16]), None, "once");
+    assert_eq!(catalog.router_ended([2; 16]), None, "not the frontend's");
+    assert!(catalog.owner_of([2; 16]).is_some());
 }

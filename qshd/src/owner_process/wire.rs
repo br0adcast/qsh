@@ -12,6 +12,7 @@ use transport::channel::{About, DaemonMode, RejectCode, UpdateAnswer, UpdateOffe
 use transport::channel_server::{RestartPhase, RestartSignal};
 use transport::Principal;
 
+use crate::process_scope::LeaderStart;
 use crate::screen_budget::BackingSlots;
 
 /// Largest frame body (kind and payload).
@@ -77,6 +78,12 @@ pub(crate) enum ToOwner {
     },
     /// The replacement did not happen: open channels again.
     ReopenOpens,
+    /// The answer to `Spawning`: the host noted the session leader's start
+    /// (`admitted`), or refuses it.
+    SpawnNoted {
+        id: u64,
+        admitted: bool,
+    },
 }
 
 /// Owner to host.
@@ -154,6 +161,18 @@ pub(crate) enum ToHost {
     OpensFenced {
         fence: u64,
         result: Result<(), String>,
+    },
+    /// A session leader is about to be started; answered `SpawnNoted`. No
+    /// leader starts unless the host noted it.
+    Spawning {
+        id: u64,
+    },
+    /// What became of the start the last noted `Spawning` announced: one
+    /// per noted `Spawning`.
+    Leader(LeaderStart),
+    /// The session `pid` led was proved empty, and its leader reaped.
+    LeaderGone {
+        pid: u32,
     },
 }
 
@@ -409,6 +428,7 @@ const O_SCREEN_ACQUIRED: u8 = 9;
 const O_OPEN_ACQUIRED: u8 = 10;
 const O_FENCE_OPENS: u8 = 11;
 const O_REOPEN_OPENS: u8 = 12;
+const O_SPAWN_NOTED: u8 = 13;
 
 const H_ABOUT: u8 = 1;
 const H_OFFER: u8 = 2;
@@ -427,6 +447,9 @@ const H_OPEN_ACQUIRE: u8 = 14;
 const H_OPEN_CHARGE: u8 = 15;
 const H_OPEN_RELEASE: u8 = 16;
 const H_OPENS_FENCED: u8 = 17;
+const H_SPAWNING: u8 = 18;
+const H_LEADER: u8 = 19;
+const H_LEADER_GONE: u8 = 20;
 
 pub(crate) fn level_wire(level: log::Level) -> u8 {
     match level {
@@ -547,6 +570,10 @@ impl ToOwner {
                 e.u64(*fence);
             }
             ToOwner::ReopenOpens => e = Enc::new(O_REOPEN_OPENS),
+            ToOwner::SpawnNoted { id, admitted } => {
+                e = Enc::new(O_SPAWN_NOTED);
+                e.u64(*id).u8(*admitted as u8);
+            }
         }
         e.finish()
     }
@@ -630,6 +657,10 @@ impl ToOwner {
             },
             O_FENCE_OPENS => ToOwner::FenceOpens { fence: d.u64()? },
             O_REOPEN_OPENS => ToOwner::ReopenOpens,
+            O_SPAWN_NOTED => ToOwner::SpawnNoted {
+                id: d.u64()?,
+                admitted: d.bool()?,
+            },
             _ => return Err(WireError::BadKind),
         };
         d.end()?;
@@ -731,6 +762,26 @@ impl ToHost {
                 e = Enc::new(H_OPENS_FENCED);
                 e.u64(*fence).outcome(result);
             }
+            ToHost::Spawning { id } => {
+                e = Enc::new(H_SPAWNING);
+                e.u64(*id);
+            }
+            ToHost::Leader(leader) => {
+                e = Enc::new(H_LEADER);
+                match leader {
+                    LeaderStart::NotStarted => e.u8(0),
+                    LeaderStart::Unidentified => e.u8(1),
+                    LeaderStart::Started { pid, start: None } => e.u8(2).u32(*pid),
+                    LeaderStart::Started {
+                        pid,
+                        start: Some(start),
+                    } => e.u8(3).u32(*pid).u64(*start),
+                };
+            }
+            ToHost::LeaderGone { pid } => {
+                e = Enc::new(H_LEADER_GONE);
+                e.u32(*pid);
+            }
         }
         e.finish()
     }
@@ -801,6 +852,21 @@ impl ToHost {
                 fence: d.u64()?,
                 result: d.outcome()?,
             },
+            H_SPAWNING => ToHost::Spawning { id: d.u64()? },
+            H_LEADER => ToHost::Leader(match d.u8()? {
+                0 => LeaderStart::NotStarted,
+                1 => LeaderStart::Unidentified,
+                2 => LeaderStart::Started {
+                    pid: d.u32()?,
+                    start: None,
+                },
+                3 => LeaderStart::Started {
+                    pid: d.u32()?,
+                    start: Some(d.u64()?),
+                },
+                _ => return Err(WireError::BadValue),
+            }),
+            H_LEADER_GONE => ToHost::LeaderGone { pid: d.u32()? },
             _ => return Err(WireError::BadKind),
         };
         d.end()?;
@@ -990,6 +1056,30 @@ mod tests {
             fence: 4,
             result: Err("cleanup pending".into()),
         });
+        owner_round_trip(ToOwner::SpawnNoted {
+            id: 13,
+            admitted: true,
+        });
+        owner_round_trip(ToOwner::SpawnNoted {
+            id: 14,
+            admitted: false,
+        });
+        host_round_trip(ToHost::Spawning { id: 15 });
+        for leader in [
+            LeaderStart::NotStarted,
+            LeaderStart::Unidentified,
+            LeaderStart::Started {
+                pid: 4242,
+                start: None,
+            },
+            LeaderStart::Started {
+                pid: 4242,
+                start: Some(123_456_789),
+            },
+        ] {
+            host_round_trip(ToHost::Leader(leader));
+        }
+        host_round_trip(ToHost::LeaderGone { pid: 4242 });
     }
 
     #[test]
@@ -997,6 +1087,11 @@ mod tests {
         assert_eq!(ToHost::decode(&[]), Err(WireError::Truncated));
         assert_eq!(ToHost::decode(&[99]), Err(WireError::BadKind));
         assert_eq!(ToHost::decode(&[H_JOINED, 0, 0]), Err(WireError::Truncated));
+        assert_eq!(ToHost::decode(&[H_LEADER, 4]), Err(WireError::BadValue));
+        assert_eq!(
+            ToHost::decode(&[H_LEADER, 3, 0, 0, 0, 1]),
+            Err(WireError::Truncated)
+        );
         let mut trailing = ToHost::End.encode().unwrap();
         trailing.push(0);
         assert_eq!(ToHost::decode(&trailing[4..]), Err(WireError::BadValue));

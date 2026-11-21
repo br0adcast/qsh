@@ -168,6 +168,58 @@ impl ControlAllowlist {
     }
 }
 
+/// Where `STATUS` takes its cleanup from.
+#[derive(Clone)]
+pub(crate) enum CleanupSource {
+    /// This process's channel registry: its sessions run here.
+    Registry(Arc<ChannelOpenRegistry>),
+    /// A host's session owners (#529): each holds its session's channels,
+    /// and the host knows what is unproved of those that ended.
+    #[cfg(target_os = "linux")]
+    Owners(Arc<crate::owner_process::OwnerFleet>),
+}
+
+impl CleanupSource {
+    fn registry(&self) -> Option<&ChannelOpenRegistry> {
+        match self {
+            CleanupSource::Registry(registry) => Some(registry),
+            #[cfg(target_os = "linux")]
+            CleanupSource::Owners(_) => None,
+        }
+    }
+}
+
+/// [`transport_status_response`] with its cleanup from `cleanup`: a host's
+/// owners checked afresh (a bounded census, on a blocking thread).
+async fn status_with(
+    ports: &[u16],
+    total_connections: u64,
+    cleanup: Option<&CleanupSource>,
+) -> Result<StatusResponse> {
+    let mut response = transport_status_response(
+        ports,
+        total_connections,
+        cleanup.and_then(CleanupSource::registry),
+    )?;
+    #[cfg(target_os = "linux")]
+    if let Some(CleanupSource::Owners(fleet)) = cleanup {
+        let fleet = fleet.clone();
+        // A check that did not finish proves nothing, and STATUS still
+        // answers: the cleanup is unknown.
+        let cleanup = tokio::task::spawn_blocking(move || fleet.cleanup_status())
+            .await
+            .unwrap_or_else(|error| {
+                log::error(
+                    "qshd",
+                    &format!("checking the session owners' cleanup failed: {error}"),
+                );
+                control::CleanupStatusResponse::from_snapshot(None)
+            });
+        response.cleanup = Some(cleanup);
+    }
+    Ok(response)
+}
+
 /// Builds the transport daemon's `STATUS` response: the same
 /// [`StatusResponse`] shape as qsh (read by `version::reconcile` and the
 /// `transport-ensure` client). `total_connections` is the LIVE active-session
@@ -411,7 +463,6 @@ pub async fn run_hosted_transport_daemon_until_stop(
     ports: Vec<u16>,
     active_count: Arc<AtomicUsize>,
     actions: Arc<Actions>,
-    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
     stop: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     let control_gate = actions.control_gate.clone();
@@ -420,6 +471,10 @@ pub async fn run_hosted_transport_daemon_until_stop(
         .context("switching the control socket to non-blocking mode")?;
     let listener = tokio::net::UnixListener::from_std(listener)
         .context("adopting the control socket into tokio")?;
+    // Each session's channels are held by its owner, in a process of its
+    // own: `STATUS` reports the owners' cleanup, never this process's own
+    // (always empty) registry.
+    let cleanup = Some(CleanupSource::Owners(host.fleet()));
     run_daemon(
         Router::Frontend {
             host,
@@ -431,7 +486,7 @@ pub async fn run_hosted_transport_daemon_until_stop(
         ports,
         active_count,
         control_gate,
-        cleanup_registry,
+        cleanup,
         stop,
         Some(actions),
     )
@@ -494,7 +549,7 @@ async fn run_transport_daemon_with_acceptor(
         ports,
         active_count,
         control_gate,
-        cleanup_registry,
+        cleanup_registry.map(CleanupSource::Registry),
         stop,
         actions,
     )
@@ -508,7 +563,7 @@ async fn run_daemon(
     ports: Vec<u16>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
-    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    cleanup: Option<CleanupSource>,
     stop: impl std::future::Future<Output = Result<()>>,
     actions: Option<Arc<Actions>>,
 ) -> Result<()> {
@@ -618,7 +673,7 @@ async fn run_daemon(
                     retry_delay = CONTROL_ACCEPT_RETRY_INITIAL;
                     spawn_control_handler(&mut handlers, stream,
                         shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                        active_count.clone(), control_gate.clone(), cleanup_registry.clone(), Some(running_info.clone()), actions.clone());
+                        active_count.clone(), control_gate.clone(), cleanup.clone(), Some(running_info.clone()), actions.clone());
                 }
                 Err(error) if recoverable_control_accept(&error) => {
                     let now = tokio::time::Instant::now();
@@ -820,7 +875,7 @@ pub async fn serve_transport_control(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => spawn_control_handler(&mut handlers, stream,
                     shared_allowlist.clone(), ports.clone(), stop_tx.clone(),
-                    active_count.clone(), control_gate.clone(), cleanup_registry.clone(), None, None),
+                    active_count.clone(), control_gate.clone(), cleanup_registry.clone().map(CleanupSource::Registry), None, None),
                 Err(error) => log::warn("qshd", &format!("error accepting transport control connection: {error}")),
             },
             result = handlers.join_next(), if !handlers.is_empty() => {
@@ -841,7 +896,7 @@ fn spawn_control_handler(
     stop_tx: mpsc::Sender<()>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
-    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    cleanup: Option<CleanupSource>,
     running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
     actions: Option<Arc<Actions>>,
 ) {
@@ -855,7 +910,7 @@ fn spawn_control_handler(
             stop_tx,
             active_count,
             control_gate,
-            cleanup_registry,
+            cleanup,
             deadline,
             running_info,
             actions,
@@ -930,7 +985,7 @@ async fn handle_transport_control_connection(
         stop_tx,
         active_count,
         control_gate,
-        cleanup_registry,
+        cleanup_registry.map(CleanupSource::Registry),
         deadline,
         None,
         None,
@@ -946,7 +1001,7 @@ async fn handle_transport_control_connection_with_info(
     stop_tx: mpsc::Sender<()>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
-    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    cleanup: Option<CleanupSource>,
     deadline: tokio::time::Instant,
     running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
     actions: Option<Arc<Actions>>,
@@ -959,7 +1014,7 @@ async fn handle_transport_control_connection_with_info(
         stop_tx,
         active_count,
         control_gate,
-        cleanup_registry,
+        cleanup,
         deadline,
         running_info,
         actions,
@@ -994,7 +1049,7 @@ async fn handle_transport_control_connection_with_peer_check(
         stop_tx,
         active_count,
         control_gate,
-        cleanup_registry,
+        cleanup_registry.map(CleanupSource::Registry),
         deadline,
         None,
         None,
@@ -1011,7 +1066,7 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
     stop_tx: mpsc::Sender<()>,
     active_count: Arc<AtomicUsize>,
     control_gate: Arc<tokio::sync::RwLock<()>>,
-    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
+    cleanup: Option<CleanupSource>,
     deadline: tokio::time::Instant,
     running_info: Option<Arc<crate::server_info::RunningServerInfo>>,
     actions: Option<Arc<Actions>>,
@@ -1064,7 +1119,7 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
             }
             ControlRequest::RegistrationInfo(challenge) => {
                 if let Some(info) = &running_info {
-                    let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup_registry.as_deref())?;
+                    let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup.as_ref().and_then(CleanupSource::registry))?;
                     let response = control::RegistrationInfoResponse { schema:1, challenge:hex::encode(challenge), conditional_add_client:true, identity:daemon_bootstrap_protocol::BusyDaemonIdentity {
                         version:status.version, build:status.build, checksum:status.checksum, pid:status.pid, generation:Some(hex::encode(info.info.generation)),
                     }};
@@ -1073,7 +1128,7 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
                 }
             }
             ControlRequest::AddClientIf { generation, build, checksum, pid, key } => {
-                let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup_registry.as_deref())?;
+                let status = transport_status_response(&ports, active_count.load(Ordering::SeqCst) as u64, cleanup.as_ref().and_then(CleanupSource::registry))?;
                 if running_info.as_ref().is_some_and(|info| info.info.generation == generation)
                     && status.build == build && status.checksum == hex::encode(checksum) && status.pid == pid {
                     shared_allowlist.add(key).await;
@@ -1081,29 +1136,32 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
                 } else { write_half.write_all(b"{\"error\":\"daemon identity changed; rediscover before registering\"}\n").await?; }
             }
             ControlRequest::Status => {
-                let response = transport_status_response(
+                let response = status_with(
                     &ports,
                     active_count.load(Ordering::SeqCst) as u64,
-                    cleanup_registry.as_deref(),
-                )?;
+                    cleanup.as_ref(),
+                )
+                .await?;
                 write_half.write_all(response.to_line()?.as_bytes()).await?;
             }
             ControlRequest::AddClient(pubkey) => {
                 shared_allowlist.add(pubkey).await;
-                let response = transport_status_response(
+                let response = status_with(
                     &ports,
                     active_count.load(Ordering::SeqCst) as u64,
-                    cleanup_registry.as_deref(),
-                )?;
+                    cleanup.as_ref(),
+                )
+                .await?;
                 write_half.write_all(response.to_line()?.as_bytes()).await?;
             }
             ControlRequest::AddPort(_) => {
                 // The transport has no live port addition -- reply with status.
-                let response = transport_status_response(
+                let response = status_with(
                     &ports,
                     active_count.load(Ordering::SeqCst) as u64,
-                    cleanup_registry.as_deref(),
-                )?;
+                    cleanup.as_ref(),
+                )
+                .await?;
                 write_half.write_all(response.to_line()?.as_bytes()).await?;
             }
             ControlRequest::Stop => {

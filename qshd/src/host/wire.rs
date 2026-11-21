@@ -87,6 +87,8 @@ pub(crate) enum ToFrontend {
     },
     /// Stop in order and exit.
     Stop,
+    /// Whether the frontend is alive: answered `Alive`.
+    Probe,
     Reply {
         id: u64,
         reply: Reply,
@@ -117,6 +119,10 @@ pub(crate) enum ToHost {
     },
     /// `token`'s client died now: the session is retained.
     Retained { token: [u8; 16] },
+    /// The router ended `token`'s login: the session is over.
+    Ended { token: [u8; 16] },
+    /// The answer to a `Probe`.
+    Alive,
     /// A key the router scrubbed, under the addition the frontend had.
     ForgetKey { key: [u8; 32], seq: u64 },
     /// `token`'s session is its client's under `key`.
@@ -138,6 +144,7 @@ const F_STOP: u8 = 4;
 const F_REPLY: u8 = 5;
 const F_REVOKE: u8 = 6;
 const F_SERVE: u8 = 7;
+const F_PROBE: u8 = 8;
 
 const H_LOOKUP: u8 = 1;
 const H_CREATE: u8 = 2;
@@ -148,6 +155,8 @@ const H_FORGET: u8 = 6;
 const H_LOG: u8 = 7;
 const H_CLIENT_KEY: u8 = 8;
 const H_KEYS_TAKEN: u8 = 9;
+const H_ENDED: u8 = 10;
+const H_ALIVE: u8 = 11;
 
 fn finish(e: Enc) -> Result<Vec<u8>, WireError> {
     let packet = e.finish()?;
@@ -219,6 +228,7 @@ impl ToFrontend {
                 e
             }
             ToFrontend::Stop => Enc::new(F_STOP),
+            ToFrontend::Probe => Enc::new(F_PROBE),
             ToFrontend::Reply { id, reply } => {
                 let mut e = Enc::new(F_REPLY);
                 e.u64(*id);
@@ -292,6 +302,7 @@ impl ToFrontend {
             F_SERVE => ToFrontend::Serve,
             F_ADMISSION => ToFrontend::Admission { closed: d.bool()? },
             F_STOP => ToFrontend::Stop,
+            F_PROBE => ToFrontend::Probe,
             F_REPLY => {
                 let id = d.u64()?;
                 let reply = match d.u8()? {
@@ -361,6 +372,11 @@ impl ToHost {
                 e = Enc::new(H_RETAINED);
                 e.raw(token);
             }
+            ToHost::Ended { token } => {
+                e = Enc::new(H_ENDED);
+                e.raw(token);
+            }
+            ToHost::Alive => e = Enc::new(H_ALIVE),
             ToHost::ForgetKey { key, seq } => {
                 e = Enc::new(H_FORGET);
                 e.raw(key).u64(*seq);
@@ -415,6 +431,8 @@ impl ToHost {
                 active: d.bool()?,
             },
             H_RETAINED => ToHost::Retained { token: d.array()? },
+            H_ENDED => ToHost::Ended { token: d.array()? },
+            H_ALIVE => ToHost::Alive,
             H_FORGET => ToHost::ForgetKey {
                 key: d.array()?,
                 seq: d.u64()?,
@@ -630,6 +648,7 @@ mod tests {
             ToFrontend::Serve,
             ToFrontend::Admission { closed: true },
             ToFrontend::Stop,
+            ToFrontend::Probe,
             ToFrontend::Reply {
                 id: 9,
                 reply: Reply::Owner,
@@ -688,6 +707,8 @@ mod tests {
                 active: true,
             },
             ToHost::Retained { token: [6; 16] },
+            ToHost::Ended { token: [7; 16] },
+            ToHost::Alive,
             ToHost::ForgetKey {
                 key: [9; 32],
                 seq: 4,
