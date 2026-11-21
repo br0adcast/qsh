@@ -32,6 +32,11 @@ pub enum Kind {
     /// msg1 again, behind the cookie a `CookieReply` handed out:
     /// `cookie(16) | Noise msg1`. Sent only to a daemon that sent one.
     HandshakeInitCookie = 0x06,
+    /// A daemon's answer to a `Transport` datagram whose `session_id` it does
+    /// not route: `session_id(8, big-endian) | token(16)`, the token msg2
+    /// gave that connection's client when both negotiated `session-reset`.
+    /// Never larger than the datagram it answers. See `crate::session_reset`.
+    SessionReset = 0x07,
 }
 
 /// Wire format version, fixed for the whole project.
@@ -225,6 +230,33 @@ pub fn split_cookie_init(body: &[u8]) -> Option<([u8; COOKIE_LEN], &[u8])> {
     Some((cookie, &body[COOKIE_LEN..]))
 }
 
+/// A whole `SessionReset` datagram: header, session id, token.
+pub const SESSION_RESET_LEN: usize = 2 + 8 + crate::session_reset::SESSION_RESET_TOKEN_LEN;
+
+/// A `SessionReset` datagram: `0x02 | 0x07 | session_id (8, BE) | token (16)`.
+pub fn encode_session_reset(
+    session_id: u64,
+    token: &[u8; crate::session_reset::SESSION_RESET_TOKEN_LEN],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(SESSION_RESET_LEN - 2);
+    body.extend_from_slice(&session_id.to_be_bytes());
+    body.extend_from_slice(token);
+    encode_handshake(Kind::SessionReset, &body)
+}
+
+/// The session id and the token of a `SessionReset` body, or `None` for one
+/// of another length (the datagram is fixed-size).
+pub fn parse_session_reset(
+    body: &[u8],
+) -> Option<(u64, [u8; crate::session_reset::SESSION_RESET_TOKEN_LEN])> {
+    let body: &[u8; SESSION_RESET_LEN - 2] = body.try_into().ok()?;
+    let (id, token) = body.split_at(8);
+    Some((
+        u64::from_be_bytes(id.try_into().ok()?),
+        token.try_into().ok()?,
+    ))
+}
+
 /// Parse a datagram received from the network. Checks length and version
 /// before reading fields; returns a `WireError` on malformed input rather
 /// than panicking.
@@ -258,6 +290,10 @@ pub fn parse(bytes: &[u8]) -> Result<Frame<'_>, WireError> {
         }),
         x if x == Kind::HandshakeInitCookie as u8 => Ok(Frame::Handshake {
             kind: Kind::HandshakeInitCookie,
+            body: &bytes[2..],
+        }),
+        x if x == Kind::SessionReset as u8 => Ok(Frame::Handshake {
+            kind: Kind::SessionReset,
             body: &bytes[2..],
         }),
         x if x == Kind::Transport as u8 => {
@@ -404,6 +440,29 @@ mod tests {
             }
             _ => panic!("expected Transport"),
         }
+    }
+
+    /// `0x02 | 0x07 | session_id (BE) | token`: 26 bytes, parsed back only
+    /// whole.
+    #[test]
+    fn session_reset_round_trips_and_has_one_size() {
+        let token = [0x5a; 16];
+        let dg = encode_session_reset(0x0102_0304_0506_0708, &token);
+        assert_eq!(dg.len(), SESSION_RESET_LEN);
+        assert_eq!(dg[..10], [0x02, 0x07, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let Ok(Frame::Handshake {
+            kind: Kind::SessionReset,
+            body,
+        }) = parse(&dg)
+        else {
+            panic!("a SessionReset");
+        };
+        assert_eq!(
+            parse_session_reset(body),
+            Some((0x0102_0304_0506_0708, token))
+        );
+        assert_eq!(parse_session_reset(&body[..body.len() - 1]), None);
+        assert_eq!(parse_session_reset(&[body, &[0]].concat()), None);
     }
 
     /// The header a sender seals under is the header the datagram carries

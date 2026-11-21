@@ -39,6 +39,11 @@ impl Features {
     /// Bit 6 is reserved for retained-session contracts. Runtime support is not
     /// implemented yet, so this bit is deliberately excluded from SUPPORTED.
     pub const SESSION_RESUME: Features = Features(1 << 6);
+    /// Bit 7: msg2 gives the client a token, and a daemon that no longer
+    /// routes the connection says so with a `SessionReset` datagram carrying
+    /// it (`crate::session_reset`). A server enables it only when it holds a
+    /// reset secret.
+    pub const SESSION_RESET: Features = Features(1 << 7);
     /// What this build implements: what it offers as a client and may
     /// enable as a server.
     pub const SUPPORTED: Features = Features(
@@ -47,11 +52,12 @@ impl Features {
             | Features::OFFSET_WRAP.0
             | Features::AUTH_ACCEPTED.0
             | Features::CHANNEL_GEOMETRY.0
-            | Features::RESOURCE_LIMITS.0,
+            | Features::RESOURCE_LIMITS.0
+            | Features::SESSION_RESET.0,
     );
 
     /// The names the logs and `qshd self-check` use, bit by bit.
-    const NAMES: [(Features, &'static str); 7] = [
+    const NAMES: [(Features, &'static str); 8] = [
         (Features::HEADER_AAD, "header-aad"),
         (Features::STREAM_CREDIT, "stream-credit"),
         (Features::OFFSET_WRAP, "offset-wrap"),
@@ -59,6 +65,7 @@ impl Features {
         (Features::CHANNEL_GEOMETRY, "channel-geometry"),
         (Features::RESOURCE_LIMITS, "resource-limits"),
         (Features::SESSION_RESUME, "session-resume"),
+        (Features::SESSION_RESET, "session-reset"),
     ];
 
     /// The set these bits say, known or not.
@@ -75,6 +82,17 @@ impl Features {
     pub const fn contains(self, other: Features) -> bool {
         self.0 & other.0 == other.0
     }
+
+    /// This set less the bits of `other`.
+    pub const fn without(self, other: Features) -> Features {
+        Features(self.0 & !other.0)
+    }
+
+    /// What two ends of this build agree on when the server holds no
+    /// session-reset secret -- every server but the Linux personal daemon's
+    /// frontend (`crate::session_reset`).
+    pub const SUPPORTED_WITHOUT_RESET: Features =
+        Features::SUPPORTED.without(Features::SESSION_RESET);
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -136,7 +154,7 @@ mod tests {
     fn session_resume_reservation_is_named_but_never_advertised_or_negotiated() {
         let reserved = Features::from_bits(0x40);
         assert_eq!(reserved.names(), vec!["session-resume"]);
-        assert_eq!(Features::SUPPORTED.bits(), 0x3f);
+        assert_eq!(Features::SUPPORTED.bits(), 0xbf);
         assert!(!Features::SUPPORTED.contains(reserved));
         assert_eq!(Features::negotiate(reserved, reserved), Features::NONE);
         assert_eq!(
@@ -199,6 +217,7 @@ mod tests {
                 | Features::AUTH_ACCEPTED
                 | Features::CHANNEL_GEOMETRY
                 | Features::RESOURCE_LIMITS
+                | Features::SESSION_RESET
         );
     }
 
@@ -264,5 +283,26 @@ mod geometry_feature_tests {
                 .contains(Features::RESOURCE_LIMITS)
         );
         assert_eq!(Features::RESOURCE_LIMITS.names(), vec!["resource-limits"]);
+    }
+}
+
+#[cfg(test)]
+mod session_reset_feature_tests {
+    use super::*;
+
+    /// Bit 7, offered by this build and enabled only where both sides have
+    /// it: a peer built before it never negotiates it.
+    #[test]
+    fn session_reset_is_bit_7_and_needs_both_peers() {
+        assert_eq!(Features::SESSION_RESET.bits(), 0x80);
+        assert!(Features::SUPPORTED.contains(Features::SESSION_RESET));
+        assert_eq!(Features::SESSION_RESET.names(), vec!["session-reset"]);
+        let before = Features::from_bits(0x3f);
+        assert!(!Features::negotiate(before, Features::SUPPORTED).contains(Features::SESSION_RESET));
+        assert!(!Features::negotiate(Features::SUPPORTED, before).contains(Features::SESSION_RESET));
+        assert!(
+            Features::negotiate(Features::SUPPORTED, Features::SUPPORTED)
+                .contains(Features::SESSION_RESET)
+        );
     }
 }

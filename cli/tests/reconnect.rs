@@ -1710,6 +1710,23 @@ fn frontend_of(host: u32, not: Option<u32>) -> u32 {
     found.expect("checked above")
 }
 
+/// The session owners `host` runs now: its children in the owner role.
+#[cfg(target_os = "linux")]
+fn owners_of(host: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            parent_of(*pid) == Some(host)
+                && std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                    cmdline.split(|&b| b == 0).nth(1) == Some(b"__qshd-session-owner-v1".as_slice())
+                })
+        })
+        .collect()
+}
+
 /// Kill the frontend `pid` of `host`, and wait for the one that replaces it.
 #[cfg(target_os = "linux")]
 fn kill_the_frontend(host: u32, pid: u32) -> u32 {
@@ -1718,12 +1735,13 @@ fn kill_the_frontend(host: u32, pid: u32) -> u32 {
     frontend_of(host, Some(pid))
 }
 
-/// The daemon's network frontend is killed under a running `qsh`. Nobody
-/// tells the client: its packets go unanswered until its own death timer
-/// (45 s) ends the link, and the round it then starts by itself -- a fresh
-/// signed handshake with a frontend that never heard of it -- is back in
-/// the SAME shell: same pid, same variable, same owner, and no question
-/// about a new session.
+/// The daemon's network frontend is killed under a running `qsh`. The next
+/// datagram the client sends reaches the frontend that replaced it, which
+/// does not know the connection and says so with a session reset carrying
+/// the token the client's msg2 gave it: the client lets the link go at once
+/// -- not after its 45 s death timer -- and the round it starts by itself, a
+/// fresh signed handshake, is back in the SAME shell: same pid, same
+/// variable, same owner, and no question about a new session.
 #[cfg(target_os = "linux")]
 #[test]
 fn killing_the_frontend_keeps_the_same_shell() {
@@ -1747,27 +1765,32 @@ fn killing_the_frontend_keeps_the_same_shell() {
         Some(host),
         "the owner is the host's child"
     );
+    assert!(
+        verbose_log(config.path()).contains("session-reset"),
+        "the connection negotiated the session reset: {}",
+        verbose_log(config.path())
+    );
 
     let frontend = frontend_of(host, None);
     let killed = Instant::now();
     let next = kill_the_frontend(host, frontend);
     assert_ne!(next, frontend);
-    assert!(
-        !verbose_log(config.path()).contains("reconnected at address"),
-        "the client has not reconnected yet: {}",
-        verbose_log(config.path())
-    );
 
-    // The death timer, a round, and the shell's answer.
+    // A PING is never more than 1.5 s away, then the reset and a round.
     assert!(
-        wait_for(Duration::from_secs(100), || verbose_log(config.path())
+        wait_for(Duration::from_secs(30), || verbose_log(config.path())
             .contains("reconnected at address 0")),
-        "the client must reconnect by itself once its link is dead; the verbose log: {}\n\
-         daemon: {}",
+        "the client must reconnect by itself once the new frontend resets its link; \
+         the verbose log: {}\ndaemon: {}",
         verbose_log(config.path()),
         daemon.output_text()
     );
     let reconnected = killed.elapsed();
+    assert!(
+        verbose_log(config.path()).contains("(session reset)"),
+        "the reset ended the link, not the death timer: {}",
+        verbose_log(config.path())
+    );
     assert!(
         the_marked_shell_answers(&mut client, &screen, &pid, Duration::from_secs(30)),
         "after the frontend died the run must be back in the SAME shell; client saw: {}\n\
@@ -1776,9 +1799,9 @@ fn killing_the_frontend_keeps_the_same_shell() {
         daemon.output_text()
     );
     assert!(
-        reconnected >= Duration::from_secs(40) && reconnected < Duration::from_secs(90),
-        "the client came back by its death timer (45 s), not sooner and not much later: \
-         {reconnected:?}"
+        reconnected < Duration::from_secs(10),
+        "the client came back on the reset, about a second after the kill, not on its \
+         death timer (45 s): {reconnected:?}"
     );
     assert_eq!(parent_of(shell), Some(owner), "the shell keeps its owner");
     assert_eq!(parent_of(owner), Some(host));
@@ -1794,6 +1817,85 @@ fn killing_the_frontend_keeps_the_same_shell() {
         daemon.output_text()
     );
     eprintln!("killing_the_frontend: the client was back {reconnected:?} after the kill");
+}
+
+/// The whole daemon restarts under a running `qsh`, and its sessions with it.
+/// The session-reset secret beside its host key does not change, so the new
+/// daemon's first answer to the client's old connection is a reset the
+/// client trusts: it returns at once, and hears at once that its session is
+/// gone -- the question about a new session comes within seconds, nobody
+/// pressing anything, instead of after the 45 s death timer.
+#[cfg(target_os = "linux")]
+#[test]
+fn full_daemon_restart_tells_client_session_is_gone() {
+    let _serial = serialised();
+    let (mut daemon, key_path) = start_daemon();
+    let config = tempfile::tempdir().expect("tempdir");
+    let mut client = spawn_client_with(
+        &daemon,
+        &key_path,
+        config.path(),
+        &["--verbose", "--status", "off"],
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    let shell: u32 = mark_with_pid(&mut client, &screen).parse().expect("a pid");
+    let owner = parent_of(shell).expect("the shell is alive");
+    assert_eq!(parent_of(owner), Some(daemon.child.id()), "under the host");
+    assert_eq!(
+        owners_of(daemon.child.id()),
+        [owner],
+        "what the leak check sees"
+    );
+    let (secret, mode) = daemon
+        .session_reset_secret()
+        .expect("the daemon keeps a session-reset secret beside its key");
+    assert_eq!((secret.len(), mode), (32, 0o600));
+
+    let restarted = Instant::now();
+    daemon.restart();
+    assert!(
+        wait_for(Duration::from_secs(40), || screen
+            .has("Start a new session? [Y/n]")),
+        "the client hears of the lost session by itself; client saw: {}\nlog: {}\ndaemon: {}",
+        screen.text(),
+        verbose_log(config.path()),
+        daemon.output_text()
+    );
+    let asked = restarted.elapsed();
+    let gone = |pid: u32| !std::path::Path::new(&format!("/proc/{pid}")).exists();
+    assert!(
+        wait_for(Duration::from_secs(20), || gone(owner) && gone(shell)),
+        "the killed daemon leaves neither its session's owner nor its shell; daemon: {}",
+        daemon.output_text()
+    );
+    assert!(
+        verbose_log(config.path()).contains("(session reset)"),
+        "the reset ended the link: {}",
+        verbose_log(config.path())
+    );
+    assert!(
+        asked < Duration::from_secs(15),
+        "asked about a new session within seconds of the restart: {asked:?}"
+    );
+    assert_eq!(
+        daemon.session_reset_secret(),
+        Some((secret, 0o600)),
+        "the restarted daemon kept its secret"
+    );
+    client.master.write_all(b"no\n").unwrap();
+    assert_eq!(
+        wait_for_exit(&mut client.child).unwrap().code(),
+        Some(13),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        owners_of(daemon.child.id()).is_empty(),
+        "the restarted daemon started no session for the declined run; daemon: {}",
+        daemon.output_text()
+    );
+    eprintln!("full_daemon_restart: asked {asked:?} after the restart");
 }
 
 /// What a person sees on the client's terminal: every cell's character and

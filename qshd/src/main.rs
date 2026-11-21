@@ -1764,6 +1764,9 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
             qshd::host::HostStart {
                 server_priv: start.keypair.private,
                 server_pub: start.keypair.public,
+                reset_secret: qshd::host::reset_secret_beside(&default_transport_key_path(
+                    &start.cache_dir,
+                )),
                 authorized_keys: keys.as_ref().map(|keys| keys.path.clone()),
                 account: account_name(),
                 allowlist: Arc::clone(&host_allowlist),

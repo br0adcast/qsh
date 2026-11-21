@@ -31,6 +31,14 @@ const MSG2_BASE_LEN: usize = 26;
 /// The features field after either base: a `u32`, big-endian.
 const FEATURES_LEN: usize = 4;
 
+/// msg2 through `enabled` ([`encode_msg2`]): where its tagged extensions
+/// start.
+pub const MSG2_LEN: usize = MSG2_BASE_LEN + FEATURES_LEN;
+
+/// The generation extension of msg2 ([`append_generation`]): tag and
+/// generation.
+pub const GENERATION_EXT_LEN: usize = GENERATION_TAG.len() + 16;
+
 /// The kind of handshake start (initiator state).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StartKind {
@@ -577,11 +585,11 @@ pub fn parse_generation(payload: &[u8], offset: usize) -> Result<Option<[u8; 16]
     if tail.is_empty() || !GENERATION_TAG.starts_with(tail) && !tail.starts_with(GENERATION_TAG) {
         return Ok(None);
     }
-    if tail.len() < 20 {
+    if tail.len() < GENERATION_EXT_LEN {
         return Err(HsPayloadError::TooShort);
     }
     Ok(Some(
-        tail[4..20]
+        tail[GENERATION_TAG.len()..GENERATION_EXT_LEN]
             .try_into()
             .map_err(|_| HsPayloadError::TooShort)?,
     ))
@@ -633,5 +641,60 @@ pub fn parse_expected_generation(
             ),
         )),
         _ => Err(HsPayloadError::TooShort),
+    }
+}
+
+/// Tagged session-reset extension of msg2 (`crate::session_reset`): the
+/// connection's token, written after the generation extension when the
+/// connection enables `session-reset`, and only then.
+const SESSION_RESET_TAG: &[u8; 4] = b"QRST";
+
+/// Append `token` to a msg2 payload.
+pub fn append_session_reset_token(
+    payload: &mut Vec<u8>,
+    token: &[u8; crate::session_reset::SESSION_RESET_TOKEN_LEN],
+) {
+    payload.extend_from_slice(SESSION_RESET_TAG);
+    payload.extend_from_slice(token);
+}
+
+/// The session-reset token at `offset` of a msg2 payload: `None` when the
+/// payload has no such extension there, an error when it is cut short.
+pub fn parse_session_reset_token(
+    payload: &[u8],
+    offset: usize,
+) -> Result<Option<[u8; crate::session_reset::SESSION_RESET_TOKEN_LEN]>, HsPayloadError> {
+    let tail = payload.get(offset..).unwrap_or_default();
+    if tail.is_empty()
+        || !SESSION_RESET_TAG.starts_with(tail) && !tail.starts_with(SESSION_RESET_TAG)
+    {
+        return Ok(None);
+    }
+    tail.get(4..4 + crate::session_reset::SESSION_RESET_TOKEN_LEN)
+        .map(|token| Some(token.try_into().expect("sixteen bytes")))
+        .ok_or(HsPayloadError::TooShort)
+}
+
+#[cfg(test)]
+mod session_reset_token_tests {
+    use super::*;
+
+    /// After the generation, if any; read back only whole, and invisible to
+    /// the generation's parser (a client built before it reads its msg2 as
+    /// before).
+    #[test]
+    fn the_token_follows_the_generation_and_is_read_only_whole() {
+        for generation in [None, Some([9; 16])] {
+            let mut payload = encode_msg2(7, false, &[0; 16], Features::SUPPORTED);
+            append_generation(&mut payload, generation);
+            let at = payload.len();
+            assert_eq!(parse_session_reset_token(&payload, at), Ok(None));
+            append_session_reset_token(&mut payload, &[5; 16]);
+            assert_eq!(parse_generation(&payload, 30), Ok(generation));
+            assert_eq!(parse_session_reset_token(&payload, at), Ok(Some([5; 16])));
+            for end in at + 1..payload.len() {
+                assert!(parse_session_reset_token(&payload[..end], at).is_err());
+            }
+        }
     }
 }

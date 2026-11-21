@@ -101,6 +101,16 @@ impl Daemon {
         self.restart();
     }
 
+    /// The daemon's session-reset secret file beside its host key, if it
+    /// made one: its bytes and its permission bits.
+    pub fn session_reset_secret(&self) -> Option<(Vec<u8>, u32)> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.home.path().join("host_key.session-reset");
+        let bytes = std::fs::read(&path).ok()?;
+        let mode = std::fs::metadata(&path).ok()?.permissions().mode() & 0o777;
+        Some((bytes, mode))
+    }
+
     /// Record real shell starts without changing the daemon's transport behavior.
     pub fn track_shell_starts(&self) {
         use std::os::unix::fs::PermissionsExt;

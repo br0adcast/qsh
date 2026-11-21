@@ -396,6 +396,11 @@ pub enum Event {
         required: Features,
         enabled: Features,
     },
+    /// Client-side: the server no longer routes this connection and said so
+    /// with the token msg2 gave it (`crate::session_reset`). Reported once,
+    /// before the `Closed` it brings: closed without a `Close`, as by the
+    /// death timer, so the owner returns warm at once.
+    SessionReset,
 }
 
 /// Outgoing datagram: where to send it and what to send.
@@ -632,6 +637,11 @@ pub struct Connection {
     server_nonce: Option<[u8; AUTH_NONCE_LEN]>,
     server_generation: Option<[u8; 16]>,
     expected_generation: Option<[u8; 16]>,
+    /// Client: the token msg2 gave this connection when both negotiated
+    /// `session-reset`; a `SessionReset` naming this connection and carrying
+    /// it ends the connection (`crate::session_reset`). `None` otherwise, and
+    /// always on a server.
+    reset_token: Option<[u8; crate::session_reset::SESSION_RESET_TOKEN_LEN]>,
     peer: Option<SocketAddr>,
     /// Daemon probation accepts transport only from its handshake's source.
     /// Noise possession alone must not redirect replies before admission.
@@ -972,6 +982,7 @@ impl Connection {
             server_nonce: None,
             server_generation: None,
             expected_generation: None,
+            reset_token: None,
             peer: None,
             probation_source: None,
             peer_static: None,
@@ -1106,6 +1117,22 @@ impl Connection {
         resolve: &mut dyn FnMut(&Msg1Payload) -> Option<Msg2Resolution>,
         generation: Option<[u8; 16]>,
     ) -> ResolvedAccept {
+        Self::accept_resolved_with_extensions(cfg, now, src, msg1_bytes, resolve, generation, None)
+    }
+
+    /// [`Connection::accept_resolved_with_generation`] for a server that
+    /// holds a session-reset secret: a connection whose client offers
+    /// `session-reset` gets it, and its token in msg2. Without a secret the
+    /// bit is never enabled.
+    pub(crate) fn accept_resolved_with_extensions(
+        cfg: ConnectionConfig,
+        now: Instant,
+        src: SocketAddr,
+        msg1_bytes: &[u8],
+        resolve: &mut dyn FnMut(&Msg1Payload) -> Option<Msg2Resolution>,
+        generation: Option<[u8; 16]>,
+        reset: Option<&crate::session_reset::SessionResetSecret>,
+    ) -> ResolvedAccept {
         let mut conn = Connection::new(cfg);
         let payload_bytes = {
             let hs = match conn.handshake.as_mut() {
@@ -1141,7 +1168,11 @@ impl Connection {
         if msg1.method != conn.auth.method() {
             return ResolvedAccept::Rejected;
         }
-        let features = Features::negotiate(msg1.offered, conn.allowed_features);
+        let mut features = Features::negotiate(msg1.offered, conn.allowed_features);
+        if reset.is_none() {
+            // Nothing to derive a token from: this server sends no resets.
+            features = features.without(Features::SESSION_RESET);
+        }
         if !features.contains(conn.required_features) {
             return ResolvedAccept::Rejected;
         }
@@ -1156,7 +1187,10 @@ impl Connection {
         // Spec §5.2: on when offered, allowed and implemented. The decision
         // is a function of msg1 and the configuration, so a retransmit twin
         // that went through probation on its own decides the same.
-        let session_id = fresh_session_id();
+        let session_id = crate::session_reset::session_id_for(
+            fresh_session_id(),
+            features.contains(Features::SESSION_RESET),
+        );
         conn.session_id = session_id;
         let msg2 = conn
             .handshake
@@ -1165,6 +1199,12 @@ impl Connection {
             .write_msg(&{
                 let mut payload = encode_msg2(session_id, resumed, &nonce, features);
                 crate::handshake_payload::append_generation(&mut payload, generation);
+                if let Some(reset) = reset.filter(|_| features.contains(Features::SESSION_RESET)) {
+                    crate::handshake_payload::append_session_reset_token(
+                        &mut payload,
+                        &reset.token(session_id),
+                    );
+                }
                 payload
             });
         let hs = conn.handshake.take().expect("handshake still present");
@@ -1427,6 +1467,10 @@ impl Connection {
                 kind: Kind::CookieReply,
                 body,
             } => self.on_cookie_reply(now, src, body),
+            Frame::Handshake {
+                kind: Kind::SessionReset,
+                body,
+            } => self.on_session_reset(body),
             // What a `Connection` never answers: a msg1 behind a cookie
             // (`HandshakeInitCookie` -- the session manager takes the cookie
             // off and hands `accept` the plain msg1, spec §4.16) and
@@ -1442,6 +1486,30 @@ impl Connection {
                 aad,
             } => self.on_transport(now, src, session_id, counter, aad, aead),
         }
+    }
+
+    /// A `SessionReset`: the end of this connection when it names this
+    /// connection's `session_id` and carries the token its msg2 gave it
+    /// (compared in constant time), and nothing at all otherwise -- above all
+    /// for a connection that did not negotiate `session-reset`, which has no
+    /// token. No `Close` is sent or recorded: the owner returns warm, as
+    /// after its death timer.
+    fn on_session_reset(&mut self, body: &[u8]) -> Vec<Datagram> {
+        let Some(expected) = self.reset_token else {
+            return Vec::new();
+        };
+        let Some((session_id, token)) = crate::wire::parse_session_reset(body) else {
+            return Vec::new();
+        };
+        if self.keys.is_none()
+            || session_id != self.session_id
+            || !crate::session_reset::tokens_match(&expected, &token)
+        {
+            return Vec::new();
+        }
+        self.events.push(Event::SessionReset);
+        self.set_state(LinkState::Closed);
+        Vec::new()
     }
 
     /// Register the current typed owner without carrying a predecessor's loss.
@@ -2577,6 +2645,15 @@ impl Connection {
         self.expected_generation = generation;
     }
 
+    /// The token this client's msg2 carried, if the connection negotiated
+    /// `session-reset`.
+    #[cfg(all(test, feature = "tokio-driver"))]
+    pub(crate) fn session_reset_token(
+        &self,
+    ) -> Option<[u8; crate::session_reset::SESSION_RESET_TOKEN_LEN]> {
+        self.reset_token
+    }
+
     pub fn server_generation(&self) -> Option<[u8; 16]> {
         self.server_generation
     }
@@ -2695,7 +2772,8 @@ impl Connection {
         let features = if self.legacy_peer {
             Features::NONE
         } else {
-            Features::negotiate(offered, self.allowed_features)
+            // No reset secret behind this entry point: no session reset.
+            Features::negotiate(offered, self.allowed_features).without(Features::SESSION_RESET)
         };
         if !features.contains(self.required_features) {
             self.handshake = None;
@@ -2703,7 +2781,8 @@ impl Connection {
             return out;
         }
         // Random session id in the authenticated, versioned msg2 payload.
-        let session_id = fresh_session_id();
+        // Bit 63 clear: this connection never negotiates the session reset.
+        let session_id = crate::session_reset::session_id_for(fresh_session_id(), false);
         self.session_id = session_id;
         // Fresh per handshake, and never reused: it is what stops a proof
         // made for one handshake from being presented for another.
@@ -2833,7 +2912,10 @@ impl Connection {
         }
         self.session_id = msg2.session_id;
         self.resumed = msg2.resumed;
-        self.server_generation = match crate::handshake_payload::parse_generation(&payload, 30) {
+        self.server_generation = match crate::handshake_payload::parse_generation(
+            &payload,
+            crate::handshake_payload::MSG2_LEN,
+        ) {
             Ok(generation) => generation,
             Err(reason) => {
                 self.handshake = None;
@@ -2847,6 +2929,26 @@ impl Connection {
             self.handshake = None;
             self.set_state(LinkState::Closed);
             return out;
+        }
+        if msg2.enabled.contains(Features::SESSION_RESET) {
+            // Enabled, so the server wrote its token after the generation.
+            use crate::handshake_payload::{GENERATION_EXT_LEN, MSG2_LEN};
+            let at = MSG2_LEN
+                + if self.server_generation.is_some() {
+                    GENERATION_EXT_LEN
+                } else {
+                    0
+                };
+            match crate::handshake_payload::parse_session_reset_token(&payload, at) {
+                Ok(Some(token)) => self.reset_token = Some(token),
+                Ok(None) | Err(_) => {
+                    let reason = HsPayloadError::TooShort;
+                    self.handshake = None;
+                    self.events.push(Event::InvalidHandshakeResponse { reason });
+                    self.set_state(LinkState::Closed);
+                    return out;
+                }
+            }
         }
         self.server_nonce = msg2.nonce;
         let hs = self.handshake.take().expect("handshake still present");

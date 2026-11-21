@@ -648,6 +648,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
     let host_start = |allowlist: Arc<crate::host::HostAllowlist>| crate::host::HostStart {
         server_priv: keypair.private,
         server_pub: keypair.public,
+        reset_secret: crate::host::reset_secret_beside(&parsed.host_key),
         authorized_keys: parsed.authorized_keys.clone(),
         account: name.clone(),
         allowlist,

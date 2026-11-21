@@ -6434,7 +6434,7 @@ async fn a_session_logs_what_its_connection_agreed() {
         vec![format!(
             "session {:016x}: transport features {}",
             client.conn.session_id(),
-            crate::Features::SUPPORTED.describe()
+            crate::Features::SUPPORTED_WITHOUT_RESET.describe()
         )]
     );
 }
@@ -6476,7 +6476,7 @@ async fn the_manager_agrees_with_each_client_on_what_its_msg1_offered() {
     assert_eq!(legacy_msg1.len(), 19);
     old.handshake_with(&legacy_msg1).await;
     for (client, agreed, header) in [
-        (&mut new, crate::Features::SUPPORTED, true),
+        (&mut new, crate::Features::SUPPORTED_WITHOUT_RESET, true),
         (&mut old, crate::Features::NONE, false),
     ] {
         assert_eq!(client.conn.features(), agreed);
@@ -6490,7 +6490,7 @@ async fn the_manager_agrees_with_each_client_on_what_its_msg1_offered() {
             format!(
                 "session {:016x}: transport features {}",
                 new.conn.session_id(),
-                crate::Features::SUPPORTED.describe()
+                crate::Features::SUPPORTED_WITHOUT_RESET.describe()
             ),
             format!(
                 "session {:016x}: transport features none",
@@ -6536,12 +6536,12 @@ async fn a_warm_reattach_logs_what_its_new_connection_agreed() {
             format!(
                 "session {:016x}: transport features {}",
                 first.conn.session_id(),
-                crate::Features::SUPPORTED.describe()
+                crate::Features::SUPPORTED_WITHOUT_RESET.describe()
             ),
             format!(
                 "session {:016x}: transport features {}",
                 second.conn.session_id(),
-                crate::Features::SUPPORTED.describe()
+                crate::Features::SUPPORTED_WITHOUT_RESET.describe()
             ),
         ]
     );
@@ -12545,6 +12545,8 @@ struct TakeoverHost {
     asked: AtomicUsize,
     /// Relinks fail as "not now" while set.
     relink_unavailable: Arc<std::sync::atomic::AtomicBool>,
+    /// The session-reset secret every frontend of this host is handed.
+    reset: Option<crate::session_reset::SessionResetSecret>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -12586,7 +12588,18 @@ impl TakeoverHost {
             released: tokio::sync::Notify::new(),
             asked: AtomicUsize::new(0),
             relink_unavailable: Arc::default(),
+            reset: None,
         })
+    }
+
+    /// A host that keeps a session-reset secret for its frontends.
+    fn with_reset(
+        backend: Arc<dyn SessionBackend>,
+        secret: crate::session_reset::SessionResetSecret,
+    ) -> Arc<TakeoverHost> {
+        let mut host = Arc::into_inner(TakeoverHost::new(backend)).expect("not shared yet");
+        host.reset = Some(secret);
+        Arc::new(host)
     }
 
     /// The backend a frontend process of this host runs its router with.
@@ -12652,6 +12665,9 @@ impl SessionDirectory for TakeoverHost {
     }
     fn key_scrubbed(&self, key: [u8; 32]) {
         self.scrubbed.lock().unwrap().push(key);
+    }
+    fn session_reset(&self) -> Option<crate::session_reset::SessionResetSecret> {
+        self.reset.clone()
     }
 }
 
@@ -12977,3 +12993,6 @@ async fn a_stalled_lookup_does_not_hold_up_other_sessions() {
     .await
     .expect("timed out");
 }
+
+#[path = "session_reset_tests.rs"]
+mod session_reset_tests;

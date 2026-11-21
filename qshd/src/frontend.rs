@@ -222,11 +222,14 @@ pub(crate) struct HostLink {
     /// Each key's addition, as the host numbered it; held while the list
     /// changes, so a scrub and an addition of one key are ordered.
     additions: Mutex<HashMap<[u8; 32], u64>>,
+    /// The host's session-reset secret, as `Init` handed it.
+    reset: Option<transport::session_reset::SessionResetSecret>,
 }
 
 impl HostLink {
     fn new(
         known: Vec<LoginId>,
+        reset: Option<transport::session_reset::SessionResetSecret>,
     ) -> (
         Arc<HostLink>,
         mpsc::Receiver<ToHost>,
@@ -244,6 +247,7 @@ impl HostLink {
             known: known.into_iter().collect(),
             allowlist: Arc::new(Mutex::new(Vec::new())),
             additions: Mutex::default(),
+            reset,
         });
         (link, out_rx, logs_rx)
     }
@@ -446,6 +450,10 @@ impl SessionDirectory for HostLink {
         self.known.contains(&login)
     }
 
+    fn session_reset(&self) -> Option<transport::session_reset::SessionResetSecret> {
+        self.reset.clone()
+    }
+
     fn liveness(&self, login: LoginId, liveness: Liveness) {
         self.notify(match liveness {
             Liveness::Traffic { idle, active } => ToHost::Traffic {
@@ -569,6 +577,7 @@ async fn run_frontend(
         server_priv,
         server_pub,
         generation,
+        reset_secret,
         authorized_keys,
         account,
         admission_closed,
@@ -576,7 +585,10 @@ async fn run_frontend(
         known,
     } = init;
     let channel = Arc::new(Channel::new(channel).context("watching the channel to the host")?);
-    let (host, out_rx, logs_rx) = HostLink::new(known);
+    let (host, out_rx, logs_rx) = HostLink::new(
+        known,
+        reset_secret.map(transport::session_reset::SessionResetSecret::from_bytes),
+    );
     // Only the host writes (and rotates) the daemon's log.
     {
         let host = host.clone();
@@ -720,7 +732,7 @@ mod tests {
     /// unanswered one) and a notice is dropped, and nothing more is queued.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_full_queue_to_the_host_refuses_requests_at_once_and_drops_notices() {
-        let (host, out_rx, _logs_rx) = HostLink::new(Vec::new());
+        let (host, out_rx, _logs_rx) = HostLink::new(Vec::new(), None);
         for _ in 0..HOST_QUEUE {
             host.liveness([1; 16], Liveness::Retained);
         }
@@ -758,7 +770,7 @@ mod tests {
     /// one is "not now" (the session is kept), not "the owner is gone".
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_host_that_does_not_answer_is_never_taken_for_no_session() {
-        let (host, _requests, _logs) = HostLink::new(vec![[1; 16]]);
+        let (host, _requests, _logs) = HostLink::new(vec![[1; 16]], None);
         let asked = std::time::Instant::now();
         let found = host.lookup([1; 16], 1000).await;
         assert!(matches!(found, Lookup::Unavailable), "not Unknown");

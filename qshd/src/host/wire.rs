@@ -31,6 +31,10 @@ pub(crate) struct FrontendInit {
     pub(crate) server_pub: [u8; 32],
     /// The daemon's generation: every frontend of one host answers with it.
     pub(crate) generation: [u8; 16],
+    /// The host's session-reset secret (`transport::session_reset`), if it
+    /// has one: every frontend answers connections it does not route with
+    /// tokens derived from it.
+    pub(crate) reset_secret: Option<[u8; 32]>,
     /// The `authorized_keys` file of the signature gate, if there is one.
     pub(crate) authorized_keys: Option<PathBuf>,
     /// The account's name, for the log and the allowlist path's principal.
@@ -176,6 +180,10 @@ impl ToFrontend {
                 e.raw(&init.server_priv)
                     .raw(&init.server_pub)
                     .raw(&init.generation);
+                match &init.reset_secret {
+                    Some(secret) => e.u8(1).raw(secret),
+                    None => e.u8(0),
+                };
                 match &init.authorized_keys {
                     Some(path) => e.u8(1).bytes(path.as_os_str().as_bytes()),
                     None => e.u8(0),
@@ -237,6 +245,7 @@ impl ToFrontend {
                 let server_priv = d.array()?;
                 let server_pub = d.array()?;
                 let generation = d.array()?;
+                let reset_secret = if d.bool()? { Some(d.array()?) } else { None };
                 let authorized_keys = if d.bool()? {
                     Some(PathBuf::from(std::ffi::OsString::from_vec(d.bytes()?)))
                 } else {
@@ -257,6 +266,7 @@ impl ToFrontend {
                     server_priv,
                     server_pub,
                     generation,
+                    reset_secret,
                     authorized_keys,
                     account,
                     admission_closed,
@@ -594,6 +604,7 @@ mod tests {
             server_priv: [1; 32],
             server_pub: [2; 32],
             generation: [3; 16],
+            reset_secret: Some([6; 32]),
             authorized_keys: Some(PathBuf::from("/home/me/.ssh/authorized_keys")),
             account: "me".into(),
             admission_closed: true,
@@ -608,6 +619,7 @@ mod tests {
             ToFrontend::Init(Box::new(init())),
             ToFrontend::Init(Box::new(FrontendInit {
                 authorized_keys: None,
+                reset_secret: None,
                 admission_closed: false,
                 known: Vec::new(),
                 ..init()

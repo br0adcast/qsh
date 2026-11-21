@@ -61,6 +61,7 @@ Configured SSH recovery is separate (§2.6). `Kind` is one of:
 | `0x04` | `KeyOffer` | the answer to `KeyRequest` |
 | `0x05` | `CookieReply` | under load, a cookie for a msg1 (§2.7) |
 | `0x06` | `HandshakeInitCookie` | msg1 again, behind a cookie (§2.7) |
+| `0x07` | `SessionReset` | `session_id` (u64, big-endian) and a 16-byte token: "this daemon no longer has that connection" (below) |
 
 A `Transport` datagram — every datagram after the handshake — carries a
 fixed 18-byte header, then the AEAD ciphertext with its tag:
@@ -90,6 +91,30 @@ the AEAD is `chacha20poly1305` itself — `snow` runs the handshake and nothing
 after it. Each side counts its own outgoing datagrams from 1
 (`Connection::new` sets `next_counter: 1`) and the two directions have
 separate keys, so both may use the same counter values.
+
+A `SessionReset` is always 26 bytes: `0x02 | 0x07 | session_id | token`. A
+daemon sends one only in answer to a `Transport` datagram whose `session_id`
+it does not route — its network frontend was replaced, the daemon restarted,
+or the connection ended there — and only when the daemon holds a
+session-reset secret (Linux personal mode, `session_reset.rs`). Bit 63 of a
+`session_id` the daemon mints says whether that connection negotiated
+`session-reset` (the other 63 bits are random); a daemon answers only an id
+with that bit set. An id minted elsewhere — by a daemon built before the
+reset, or by a server that never offers it (those clear the bit) — may still
+carry it by chance and draw a reset, but a reset is never acted on by a
+client that did not negotiate the feature. It never
+answers a datagram shorter than 26 bytes, nor any other kind, nor a reset;
+it answers at most 10 a second per source (an IPv4 host or an IPv6 /64)
+after a burst of 10, and at most 128 a second in all after a burst of 128,
+with bounded state (1024 sources). The token is
+`HMAC-SHA256(secret, "qsh/session-reset/v1" || session_id_be)[..16]`, the one
+msg2 gave that connection's client when both negotiated `session-reset`
+(§2.6). A client acts on a reset only when its connection negotiated the
+feature and both the `session_id` and the token (compared in constant time)
+are its own: it then drops the connection without a `Close` — as its death
+timer would, but at once — and makes its ordinary warm return. Any other
+reset is ignored silently. A client that did not negotiate the feature
+(including every build before it) never acts on one.
 
 `parse` is the only entry point for network bytes. It rejects a datagram
 shorter than two bytes (`TooShort`), a wrong version byte (`BadVersion`), an
@@ -344,8 +369,10 @@ and cannot establish an application channel session, which requires the
   | enabled(u32, big-endian)
 ```
 
-`session_id` is a fresh random `u64` (`rand::thread_rng().gen()`) minted per
-handshake, and is what the datagram header carries afterwards. `resumed`
+`session_id` is a fresh random `u64` minted per handshake (bit 63 set
+exactly when the connection negotiated `session-reset` and clear otherwise
+on this build; a reset is never acted on by a client that did not negotiate
+it, §1.1), and is what the datagram header carries afterwards. `resumed`
 says whether this handshake landed on the session the client asked for by
 token rather than on a new one. The client cannot work that out for itself:
 an unknown token is answered with a new session and no complaint, which is
@@ -450,7 +477,8 @@ connection will do (`enabled`, §2.2).
 | 4 (`0x0000_0010`) | `channel-geometry` | ordered geometry and atomic channel lifecycle discovery; required by application channel peers |
 | 5 (`0x0000_0020`) | `resource-limits` | authenticated terminal session abort and explicit daemon capacity/provider failures |
 | 6 (`0x0000_0040`) | `session-resume` | reserved retained-session contracts (§8.2); inactive and excluded from `Features::SUPPORTED` |
-| 7–31 | — | reserved, sent as zero |
+| 7 (`0x0000_0080`) | `session-reset` | msg2 carries this connection's reset token, and the daemon answers a connection it no longer routes with a `SessionReset` (§1.1) |
+| 8–31 | — | reserved, sent as zero |
 
 - A client offers what it implements (`Features::SUPPORTED`).
 - A server turns a bit on exactly when msg1 offered it, its configuration
@@ -471,8 +499,17 @@ Generic transport-only profiles can explicitly require `Features::NONE`; this
 does not relax the application channel profile. Raw echo/shell diagnostic owners
 exclude `auth-accepted` because they do not implement the session acknowledgement.
 
-`Features::SUPPORTED` is `0x3f`: header AAD, credits, offset wrapping, explicit
-authentication acceptance, channel geometry and resource-limit failures. Protocol 1 datagrams are ignored at the outer parser; silence alone
+`Features::SUPPORTED` is `0xbf`: header AAD, credits, offset wrapping, explicit
+authentication acceptance, channel geometry, resource-limit failures and the
+session reset. A server enables `session-reset` only when it holds a reset
+secret: the Linux personal daemon's host keeps one beside the static key
+(`<key file>.session-reset`, 32 random bytes, under the key file's rules) and
+hands it to every network frontend it starts, so each frontend, and the daemon
+after a restart, derives the same tokens. macOS, `--system` and the diagnostic
+servers hold none and never enable it. When it is enabled, msg2 carries
+`QRST | token(16)` after the generation extension (or right after `enabled`
+when there is none); a msg2 that enables the bit without a whole token is an
+invalid handshake response. Protocol 1 datagrams are ignored at the outer parser; silence alone
 does not identify a peer's version. The CLI reports that protocol 2 is required
 when no compatible reply arrives. Configured SSH installation/recovery remains
 a separate path, not a protocol-1 QSH session.
@@ -2755,7 +2792,7 @@ checksum counts as updated.
 `transport::session_resume` and `qshd::session_owner::protocol` define pure
 contracts for future retained-session support. They do not preserve sessions,
 create owners, replace a frontend, or change current transport cleanup.
-`Features::SUPPORTED` remains `0x3f`: negotiation strips the reserved
+`Features::SUPPORTED` (§2.6) excludes it: negotiation strips the reserved
 `SESSION_RESUME` bit even when both supplied masks contain it. Existing channel
 protocol 2, Noise payloads and strict authenticated bootstrap codecs are
 unchanged. No production dispatcher sends or consumes these new records.
@@ -3631,6 +3668,35 @@ same reason.
   `qshd serve` does not use that path at all. Note that this does not make
   `transport-ensure` the laxer of the two: it runs the signature gate as
   well, against the same `authorized_keys`, so both gates guard it (§3.1.1).
+- **A session reset ends a connection, never a session.** Only the daemon's
+  host secret makes a valid token, and a token appears in the clear only in
+  the reset that ends its connection, which is already gone on the daemon's
+  side; a token for one connection says nothing about another (§1.1). An
+  observer on the path who sees a reset learns nothing it can use, and one
+  who forges a reset changes nothing: the client ignores it. Someone who has
+  the secret (read from the server account's files) can make a client drop a
+  live connection early — the same as dropping its packets, which anyone on
+  the path can — and the client then returns warm through a fresh
+  authenticated handshake to the session it had. A reset never authenticates
+  anyone, never ends or replaces a session, and is never acted on by a
+  client that did not negotiate it. Its answers are rate-limited and never
+  larger than the datagram they answer, so it is no amplifier.
+- **Two daemons must not share a key file.** The secret lives beside the
+  static key (`<key file>.session-reset`) and a token depends on the secret
+  and the `session_id` alone. Two daemons started with the same key file —
+  two `qshd serve` on different ports with one `--host-key`, say — derive the
+  same tokens, so an observer on the path who reads a live connection's id
+  from one daemon's traffic can send that id to the other, receive a valid
+  reset for it, and replay it to the first daemon's client, which then
+  drops a healthy connection. The consequence is a forced warm reconnect —
+  a fresh authenticated handshake back into the same session — never a lost
+  session. Give each daemon its own key file.
+- **The reset is a shortcut, not a guarantee.** Its budgets are the
+  daemon's, not a client's: about 128 spoofed `Transport` datagrams a second
+  with bit 63 set (from enough sources to fill the 1024-entry source table)
+  spend the global budget, and genuine clients that lost their frontend
+  meanwhile get no reset; they fall back to their death timer (45 s) and
+  return warm as they did before the reset existed.
 - **Neither end is defended against its own host.** Someone who controls the
   server can read every session on it; someone who controls your machine can
   control your terminal and use credentials available to the client. Nothing

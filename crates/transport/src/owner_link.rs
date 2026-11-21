@@ -231,6 +231,13 @@ pub trait SessionDirectory: Send + Sync + 'static {
     fn client_key(&self, login: LoginId, key: [u8; 32]) {
         let _ = (login, key);
     }
+    /// The secret this process answers connections it does not route with
+    /// (`crate::session_reset`): kept by the host, so every frontend -- and
+    /// the daemon after a restart -- derives the same tokens. `None`: no
+    /// resets, and the feature is not offered in msg2.
+    fn session_reset(&self) -> Option<crate::session_reset::SessionResetSecret> {
+        None
+    }
 }
 
 /// What the directory knows of a login the router does not.

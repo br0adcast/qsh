@@ -19,6 +19,12 @@ getrandom = { version = "0.4", features = ["sys_rng"] }
 # Keyed BLAKE2s for the return-address cookie (cookie.rs), as WireGuard's MAC.
 # The tests also hash the long reference ciphertexts with it (handshake.rs).
 blake2 = "0.11"
+# The session-reset token (session_reset.rs): HMAC-SHA256 under the host's
+# secret, compared in constant time by the client. All three were already in
+# the tree (the client's `hmac`/`sha2`, `subtle` under the digest crates).
+hmac = "0.13"
+sha2 = "0.11"
+subtle = { version = "2.6", default-features = false }
 # Socket buffer sizes (spec §4.12): set, and read back what the OS granted.
 socket2 = "0.6"
 # Wakeable socket readiness and producer notifications in the std driver.

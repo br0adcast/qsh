@@ -570,6 +570,12 @@ impl FrontendControl {
 pub struct HostStart {
     pub server_priv: [u8; 32],
     pub server_pub: [u8; 32],
+    /// The session-reset secret, kept beside the static key
+    /// (`load_or_create_session_reset_secret`): every frontend is handed it,
+    /// so each derives the same reset tokens, and so does the daemon after a
+    /// restart. `None` (it could not be read or made): no frontend offers
+    /// the session reset.
+    pub reset_secret: Option<transport::session_reset::SessionResetSecret>,
     /// The signature gate's `authorized_keys`, if the daemon has one.
     pub authorized_keys: Option<PathBuf>,
     /// The account's name: a log label, and the allowlist path's principal.
@@ -581,6 +587,26 @@ pub struct HostStart {
     /// The gate a replacement of the daemon closes.
     pub admission: Arc<AdmissionGate>,
     pub runtime_threads: Option<NonZeroUsize>,
+}
+
+/// The session-reset secret kept beside the static key at `key_path`, made
+/// on first use. A daemon whose secret cannot be read or made still serves,
+/// only without the session reset: its clients learn of a lost connection
+/// by their death timer, as before (said in the log).
+pub fn reset_secret_beside(
+    key_path: &std::path::Path,
+) -> Option<transport::session_reset::SessionResetSecret> {
+    let path = crate::session_reset_secret_path(key_path);
+    match crate::load_or_create_session_reset_secret(&path) {
+        Ok(secret) => Some(secret),
+        Err(error) => {
+            crate::log::warn(
+                "qshd",
+                &format!("no session reset: {error:#}; clients notice a lost connection late"),
+            );
+            None
+        }
+    }
 }
 
 /// The host side of a personal daemon: see the module documentation.
@@ -857,12 +883,17 @@ impl Host {
         )
     }
 
-    /// Send `init`, and wipe the copies of the static key made for it.
+    /// Send `init`, and wipe the copies of the static key and the reset
+    /// secret made for it.
     async fn send_init(&self, channel: &Channel, mut init: ToFrontend) -> bool {
         let encoded = init.encode();
         if let ToFrontend::Init(init) = &mut init {
             init.server_priv.fill(0);
             std::hint::black_box(&init.server_priv);
+            if let Some(secret) = &mut init.reset_secret {
+                secret.fill(0);
+                std::hint::black_box(secret);
+            }
         }
         let Ok(mut packet) = encoded else {
             return false;
@@ -950,6 +981,7 @@ impl Host {
                     server_priv: self.start.server_priv,
                     server_pub: self.start.server_pub,
                     generation,
+                    reset_secret: self.start.reset_secret.as_ref().map(|s| *s.expose()),
                     authorized_keys: self.start.authorized_keys.clone(),
                     account: self.start.account.clone(),
                     admission_closed: self.start.admission.is_closed(),

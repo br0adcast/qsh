@@ -100,7 +100,7 @@ qshd serve [--port N] [--authorized-keys PATH] [--host-key PATH] [--runtime-thre
 |---|---|---|
 | `--port` | `60022` | UDP port the daemon listens on for connections. |
 | `--authorized-keys` | `~/.ssh/authorized_keys` | File with the public keys of clients allowed to log in. |
-| `--host-key` | `~/.config/qshd/host_key` | The daemon's persistent host key (created on first run, mode `0600`). |
+| `--host-key` | `~/.config/qshd/host_key` | The daemon's persistent host key (created on first run, mode `0600`), with its session-reset secret beside it (`<key file>.session-reset`). Give every daemon its own. |
 | `--runtime-threads` | one per CPU | Async worker threads of the daemon's runtime, 1 to 256 — see "Runtime worker threads" below. |
 
 An unknown flag, or a port that isn't a number, makes the daemon exit with
@@ -119,7 +119,13 @@ an error right away, without starting anything.
 - keeps a persistent host key at `--host-key` (default
   `~/.config/qshd/host_key`, mode `0600`) — creates it on first run and
   reuses it afterward, so the daemon's address can be recognized again,
-  the same way an SSH host key works;
+  the same way an SSH host key works. On Linux it also keeps the
+  session-reset secret beside it (`<key file>.session-reset`, 32 bytes,
+  the same file rules), with which a restarted daemon tells its clients at
+  once that their connection is gone (`docs/protocol.md` §1.1). Two daemons
+  must not share one key file: they would share that secret, and one could
+  be used to make the other's clients reconnect (never to lose a session);
+
 - admits anyone whose public key is in `--authorized-keys` (default
   `~/.ssh/authorized_keys`) and whose signature checks out; it accepts
   Ed25519, ECDSA (P-256/P-384) and RSA keys signed with

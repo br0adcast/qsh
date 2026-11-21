@@ -2124,6 +2124,11 @@ struct Router {
     lookups: std::collections::HashSet<LoginId>,
     /// Where an answered lookup comes back to the loop.
     lookup_done: Option<mpsc::UnboundedSender<LookupDone>>,
+    /// What answers a `Transport` datagram for a connection this router does
+    /// not route, when the directory holds a session-reset secret
+    /// (`crate::session_reset`). `None`: such a datagram is dropped, and no
+    /// connection negotiates `session-reset`.
+    reset: Option<crate::session_reset::ResetResponder>,
 }
 
 /// Warm starts that wait for the directory at once: as many as probation
@@ -2143,6 +2148,7 @@ impl Router {
             directory: None,
             lookups: std::collections::HashSet::new(),
             lookup_done: None,
+            reset: None,
             personal_observer: None,
             bootstrap: None,
             server_generation: None,
@@ -3029,6 +3035,11 @@ impl SessionManager {
         let mut router = Router::new();
         router.personal_observer = personal_observer;
         router.directory = factory.0.directory();
+        router.reset = router
+            .directory
+            .as_ref()
+            .and_then(|directory| directory.session_reset())
+            .map(|secret| crate::session_reset::ResetResponder::new(secret, Instant::now()));
         // Answers of the directory, which is asked off this loop.
         let (lookup_tx, mut lookup_rx) = mpsc::unbounded_channel::<LookupDone>();
         router.lookup_done = Some(lookup_tx);
@@ -3258,6 +3269,7 @@ impl SessionManager {
                 // key), which must stay silent as they always have.
                 let mut nonce_failure: Option<String> = None;
                 let server_generation = router.server_generation;
+                let reset_secret = router.reset.as_ref().map(|reset| reset.secret().clone());
                 let mut resolve_for_msg2 = |msg1: &Msg1Payload| -> Option<Msg2Resolution> {
                     let d = router.resolve(&msg1.token, body, msg1.start_kind);
                     if matches!(d, AcceptDecision::ResendMsg2) {
@@ -3300,7 +3312,7 @@ impl SessionManager {
                 } else {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
-                    Connection::accept_resolved_with_generation(
+                    Connection::accept_resolved_with_extensions(
                         ConnectionConfig {
                             required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
@@ -3314,12 +3326,13 @@ impl SessionManager {
                         body,
                         &mut resolve_for_msg2,
                         server_generation,
+                        reset_secret.as_ref(),
                     )
                 };
                 if matches!(outcome, ResolvedAccept::Rejected) && ctx.auth.verifier.is_some() {
                     #[cfg(test)]
                     ACCEPT_ATTEMPTS.with(|n| n.set(n.get() + 1));
-                    outcome = Connection::accept_resolved_with_generation(
+                    outcome = Connection::accept_resolved_with_extensions(
                         ConnectionConfig {
                             required_features: ctx.factory.0.required_features(),
                             features: crate::Features::SUPPORTED,
@@ -3333,6 +3346,7 @@ impl SessionManager {
                         body,
                         &mut resolve_for_msg2,
                         server_generation,
+                        reset_secret.as_ref(),
                     );
                 }
                 match outcome {
@@ -3417,8 +3431,16 @@ impl SessionManager {
                     // has ended; its `SessionEnded` signal (or an
                     // already-drained one) reclaims the entry.
                     let _ = tx.send(src, buf[..len].to_vec());
+                } else if let Some(reset) = &mut router.reset {
+                    // No matching session: this router does not have the
+                    // connection (an earlier frontend, or daemon, had it, or
+                    // it ended here). Say so, within the reset's budgets and
+                    // never with more bytes than came in.
+                    if let Some(reply) = reset.answer(Instant::now(), src, len, session_id) {
+                        let _ = ctx.socket.send_to(&reply, src).await;
+                    }
                 }
-                // No matching session -- drop.
+                // Otherwise no matching session -- drop.
             }
             // HandshakeResp on the server side, or malformed input from the
             // network -- silently ignored.

@@ -692,8 +692,9 @@ fn features_are_on_only_when_offered_and_allowed() {
     for offer in [Features::NONE, Features::SUPPORTED] {
         for allow in [Features::NONE, Features::SUPPORTED] {
             for via_accept in [false, true] {
+                // Neither entry point here holds a session-reset secret.
                 let want = if offer == Features::SUPPORTED && allow == Features::SUPPORTED {
-                    Features::SUPPORTED
+                    Features::SUPPORTED_WITHOUT_RESET
                 } else {
                     Features::NONE
                 };
@@ -870,14 +871,56 @@ fn response_fixture(payload: &[u8]) -> (Connection, Vec<u8>, Instant, SocketAddr
     (client, response, now, peer)
 }
 
+/// A msg2 that enables `session-reset` must carry the connection's whole
+/// token, read right after `enabled` or after the generation extension when
+/// there is one: without it, or cut short anywhere, the response is refused
+/// as invalid and the spent attempt closes; whole, the token is kept.
+#[test]
+fn a_msg2_enabling_the_session_reset_must_carry_its_whole_token() {
+    use crate::handshake_payload::{
+        append_generation, append_session_reset_token, GENERATION_EXT_LEN, MSG2_LEN,
+    };
+    for (generation, at) in [
+        (None, MSG2_LEN),
+        (Some([4; 16]), MSG2_LEN + GENERATION_EXT_LEN),
+    ] {
+        let mut base = encode_msg2(9, false, &[0; AUTH_NONCE_LEN], Features::SUPPORTED);
+        append_generation(&mut base, generation);
+        assert_eq!(
+            base.len(),
+            at,
+            "the token's offset: 30, or 50 after a generation"
+        );
+        let mut whole = base.clone();
+        append_session_reset_token(&mut whole, &[6; 16]);
+        for cut in [at, at + 1, at + 4, at + 5, whole.len() - 1] {
+            let (mut client, response, now, peer) = response_fixture(&whole[..cut]);
+            client.on_datagram(now, peer, &response);
+            assert_eq!(client.state(), LinkState::Closed, "cut at {cut}");
+            assert!(
+                client
+                    .poll_events()
+                    .contains(&Event::InvalidHandshakeResponse {
+                        reason: HsPayloadError::TooShort
+                    }),
+                "cut at {cut}"
+            );
+            assert!(client.keys.is_none() && client.reset_token.is_none());
+        }
+        let (mut client, response, now, peer) = response_fixture(&whole);
+        client.on_datagram(now, peer, &response);
+        assert_eq!(client.state(), LinkState::Live);
+        assert_eq!(client.server_generation, generation);
+        assert_eq!(client.reset_token, Some([6; 16]));
+    }
+}
+
 #[test]
 fn shared_recovery_unrequested_source_cannot_consume_the_initiator() {
-    let (mut client, response, now, peer) = response_fixture(&encode_msg2(
-        9,
-        false,
-        &[0; AUTH_NONCE_LEN],
-        Features::SUPPORTED,
-    ));
+    // Every feature this build has, the session reset's token included.
+    let mut msg2 = encode_msg2(9, false, &[0; AUTH_NONCE_LEN], Features::SUPPORTED);
+    crate::handshake_payload::append_session_reset_token(&mut msg2, &[3; 16]);
+    let (mut client, response, now, peer) = response_fixture(&msg2);
     assert!(client.send(now, 16, b"queued until selection").is_empty());
     let stranger = addr("198.51.100.99:41000");
     assert!(client.on_datagram(now, stranger, &response).is_empty());
@@ -7576,7 +7619,7 @@ fn credit_frames(reader: &Connection, out: &[Datagram]) -> usize {
 #[test]
 fn two_ends_of_this_build_run_with_credits() {
     let (mut client, server, _caddr, _saddr) = established_pair();
-    assert_eq!(client.features(), Features::SUPPORTED);
+    assert_eq!(client.features(), Features::SUPPORTED_WITHOUT_RESET);
     assert!(server.features().contains(Features::STREAM_CREDIT));
     let _ = client.send(client.handshake_at, 20, b"x");
     assert_eq!(client.credit_limit_for_test(20), Some(STREAM_WINDOW));

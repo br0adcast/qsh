@@ -12,9 +12,7 @@ fn a_client_says_what_its_handshake_agreed() {
     let (client, _arrivals) = crate::test_peer::client_whose_server_stops_acknowledging();
     assert_eq!(
         client.features(),
-        Some(crate::Features::from_bits(
-            crate::Features::SUPPORTED.bits() & !crate::Features::AUTH_ACCEPTED.bits(),
-        ))
+        Some(crate::Features::SUPPORTED_WITHOUT_RESET.without(crate::Features::AUTH_ACCEPTED))
     );
     client.detach();
     assert_eq!(StdClient::dead().features(), None);
@@ -2947,9 +2945,7 @@ fn the_owner_hears_the_agreed_features_once_before_live() {
     assert_eq!(
         heard,
         vec![
-            Heard::Features(Features::from_bits(
-                Features::SUPPORTED.bits() & !Features::AUTH_ACCEPTED.bits()
-            )),
+            Heard::Features(Features::SUPPORTED_WITHOUT_RESET.without(Features::AUTH_ACCEPTED)),
             Heard::Live
         ],
         "the agreed features, once, then Live"
