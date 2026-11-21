@@ -1394,3 +1394,457 @@ fn ensure_after_a_rollback_registers_with_the_old_daemon_and_warns() {
     back.client.close();
     daemon.finish();
 }
+
+// ---- `qshd reload`, against a `serve` daemon ------------------------------------
+
+/// A personal `qshd serve` daemon run from the path P of copy A, as the
+/// systemd user unit runs `/usr/bin/qshd`: `qshd reload --port` asks it to
+/// replace its frontend from P, whatever a package manager renamed onto it
+/// since. Stopped with `SIGTERM`, and its children checked for, at the end.
+struct Served {
+    child: std::process::Child,
+    mark: String,
+    home: tempfile::TempDir,
+    /// The path the daemon was started from.
+    path: PathBuf,
+    port: u16,
+    server_pub: [u8; 32],
+    key_path: PathBuf,
+    host: u32,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        assert_no_child_left(&self.mark);
+    }
+}
+
+fn serve(images: &Images, labels: &str, faults: &str) -> Served {
+    use std::io::{BufRead, BufReader, Read};
+    let home = private_temp_home();
+    let (key, key_path) = write_key(home.path());
+    let authorized_keys = home.path().join("authorized_keys");
+    std::fs::write(
+        &authorized_keys,
+        format!("{}\n", key.public_key().to_openssh().expect("openssh")),
+    )
+    .unwrap();
+    let port = free_udp_port();
+    let mark = new_daemon_mark();
+    let mut child = Command::new(&images.a.path)
+        .args([
+            "serve",
+            "--port",
+            &port.to_string(),
+            "--authorized-keys",
+            authorized_keys.to_str().expect("utf-8 path"),
+            "--host-key",
+            home.path().join("host_key").to_str().expect("utf-8 path"),
+        ])
+        .env("XDG_CACHE_HOME", home.path())
+        .env("HOME", home.path())
+        .env(MARK_ENV, &mark)
+        .env("HISTFILE", "/dev/null")
+        .env("SHELL", "/bin/sh")
+        .env("TMUX_TMPDIR", home.path())
+        .env_remove("TMUX")
+        .env_remove("ENV")
+        .env_remove("BASH_ENV")
+        .env(TEST_BUILD_LABELS_ENV, labels)
+        .env(TEST_IMAGE_FAULTS_ENV, faults)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("`qshd serve` spawns");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("server-pubkey line");
+    let encoded = line
+        .strip_prefix("server-pubkey: ")
+        .unwrap_or_else(|| panic!("expected a server-pubkey line, got {line:?}"))
+        .trim_end();
+    let mut server_pub = [0u8; 32];
+    server_pub.copy_from_slice(&BASE64.decode(encoded).expect("base64 key"));
+    // Drain the rest so the daemon never blocks on a full pipe.
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = reader.read_to_end(&mut sink);
+    });
+    let host = child.id();
+    let daemon = Served {
+        child,
+        mark,
+        home,
+        path: images.a.path.clone(),
+        port,
+        server_pub,
+        key_path,
+        host,
+    };
+    assert!(runs(frontend_of(host), &images.a), "A serves first");
+    // The reload socket is bound once the daemon serves.
+    let sock = daemon.reload_socket();
+    assert!(
+        wait_until(Duration::from_secs(15), || sock.exists()),
+        "the daemon binds {}; log: {}",
+        sock.display(),
+        daemon.log()
+    );
+    daemon
+}
+
+/// What one `qshd reload` printed, and how it exited.
+struct Reloaded {
+    code: Option<i32>,
+    output: String,
+}
+
+impl Served {
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.home.path().join("qsh").join("qshd.log")).unwrap_or_default()
+    }
+
+    fn reload_socket(&self) -> PathBuf {
+        self.home
+            .path()
+            .join("qsh")
+            .join(format!("qshd-serve-{}.sock", self.port))
+    }
+
+    fn connect(&self, token: [u8; 16]) -> Session {
+        Session::start(
+            self.port,
+            self.server_pub,
+            Proof::Signature(&self.key_path),
+            token,
+            StartKind::Cold,
+        )
+        .unwrap_or_else(|| panic!("the handshake must complete; log: {}", self.log()))
+    }
+
+    fn come_back(&self, token: [u8; 16]) -> Session {
+        Session::start(
+            self.port,
+            self.server_pub,
+            Proof::Signature(&self.key_path),
+            token,
+            StartKind::Warm,
+        )
+        .unwrap_or_else(|| panic!("the warm return must complete; log: {}", self.log()))
+    }
+
+    /// `<qshd> reload --port <port>`, run from `qshd`, in the daemon's home.
+    fn reload_with(&self, qshd: &Path) -> Reloaded {
+        reload_in(qshd, self.home.path(), self.port)
+    }
+
+    /// `P reload --port <port>`: the installed binary asks, as `ExecReload`.
+    fn reload(&self) -> Reloaded {
+        self.reload_with(&self.path)
+    }
+
+    /// Rename `image` onto P, as a package manager installs a file.
+    fn install(&self, image: &Image) {
+        std::fs::rename(&image.path, &self.path).expect("rename onto P");
+    }
+
+    /// SIGTERM; the daemon exits on its own and reaps every child.
+    fn finish(mut self) {
+        assert_eq!(zombies_of(self.host), Vec::<u32>::new(), "no zombie");
+        assert_eq!(frontends_of(self.host).len(), 1, "one frontend");
+        let owners = owners_of(self.host);
+        unsafe { libc::kill(self.host as i32, libc::SIGTERM) };
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().expect("waiting for the daemon") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon did not stop; log: {}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "{status:?}; log: {}", self.log());
+        assert!(owners.iter().all(|o| reaped(*o)), "every owner is reaped");
+        assert!(
+            !self.reload_socket().exists(),
+            "the reload socket goes with the daemon"
+        );
+        assert_no_child_left(&self.mark);
+    }
+}
+
+fn reload_in(qshd: &Path, home: &Path, port: u16) -> Reloaded {
+    let out = Command::new(qshd)
+        .args(["reload", "--port", &port.to_string()])
+        .env("XDG_CACHE_HOME", home)
+        .env("HOME", home)
+        .env("HISTFILE", "/dev/null")
+        .env_remove(TEST_BUILD_LABELS_ENV)
+        .env_remove(TEST_IMAGE_FAULTS_ENV)
+        .stdin(Stdio::null())
+        .output()
+        .expect("`qshd reload` runs");
+    Reloaded {
+        code: out.status.code(),
+        output: format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    }
+}
+
+/// sha256 of the image `pid` runs, read through `/proc/<pid>/exe`.
+fn image_of(pid: u32) -> String {
+    sha256_hex(&std::fs::read(format!("/proc/{pid}/exe")).unwrap_or_default())
+}
+
+/// A session with a shell under `marker`, whose client then lets go.
+fn served_shell(daemon: &Served, token: [u8; 16], marker: &str) -> (u32, u32) {
+    let session = daemon.connect(token);
+    let shell = session.open_shell(marker);
+    let owner = owner_of(shell, daemon.host);
+    session.client.detach();
+    (shell, owner)
+}
+
+/// After a package upgrade renamed B onto P, `P reload` replaces the
+/// frontend with B -- read from P, the path the daemon was started from,
+/// not from its own (now deleted) image -- and the same shell answers.
+#[test]
+fn reload_replaces_the_frontend_from_the_start_path() {
+    let _serial = serialised();
+    let images = images();
+    let b = images.newer("qshd-b", b"\0reload-b\0", images.a.build + 1);
+    let daemon = serve(&images, &labels(&[&b]), "");
+    let token = [120; 16];
+    let (shell, owner) = served_shell(&daemon, token, "kept-120");
+    let old = frontend_of(daemon.host);
+
+    daemon.install(&b);
+    let reloaded = daemon.reload();
+    assert_eq!(
+        reloaded.code,
+        Some(0),
+        "{}; log: {}",
+        reloaded.output,
+        daemon.log()
+    );
+    assert!(
+        reloaded.output.contains(&format!(
+            "qshd frontend replaced by build {}; sessions kept",
+            b.build
+        )),
+        "{}",
+        reloaded.output
+    );
+    let next = frontend_after(daemon.host, old);
+    assert!(reaped(old), "the old frontend is reaped");
+    assert_eq!(image_of(next), b.checksum, "the new frontend runs B");
+    assert_eq!(exe_of(next), daemon.path.to_string_lossy(), "from P");
+    assert!(running(daemon.host), "the host is the same process");
+
+    let back = daemon.come_back(token);
+    assert_eq!(back.same_shell("kept-120"), shell, "the same shell answers");
+    assert_eq!(ppid(shell), Some(owner), "under the same owner");
+    back.client.close();
+    daemon.finish();
+}
+
+/// A reinstall of the same bytes, and a reload with nothing installed at
+/// all, are successful no-ops: the frontend keeps running.
+#[test]
+fn reload_with_an_identical_binary_is_a_no_op() {
+    let _serial = serialised();
+    let images = images();
+    let same = images.newer("qshd-same", b"", images.a.build);
+    assert_eq!(same.checksum, images.a.checksum);
+    let daemon = serve(&images, "", "");
+    let (shell, _) = served_shell(&daemon, [121; 16], "kept-121");
+    let frontend = frontend_of(daemon.host);
+    for installed in [false, true] {
+        if installed {
+            daemon.install(&same);
+        }
+        let reloaded = daemon.reload();
+        assert_eq!(reloaded.code, Some(0), "{}", reloaded.output);
+        assert!(
+            reloaded.output.contains("qshd is up to date"),
+            "{}",
+            reloaded.output
+        );
+        assert_eq!(frontends_of(daemon.host), [frontend], "the same frontend");
+    }
+    assert!(running(shell));
+    daemon.finish();
+}
+
+/// An older binary at P (a package downgrade), an unreadable one, and none
+/// at all: each reload exits 1, names why, and leaves the frontend as it
+/// was.
+#[test]
+fn reload_refuses_an_older_or_missing_or_unreadable_binary() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = serialised();
+    let images = images();
+    let older = images.newer("qshd-older", b"\0reload-older\0", images.a.build - 1);
+    let locked = images.newer("qshd-locked", b"\0reload-locked\0", images.a.build + 1);
+    let daemon = serve(&images, &labels(&[&older, &locked]), "");
+    let token = [122; 16];
+    let (shell, _) = served_shell(&daemon, token, "kept-122");
+    let frontend = frontend_of(daemon.host);
+    let built = Path::new(env!("CARGO_BIN_EXE_qshd"));
+
+    daemon.install(&older);
+    let reloaded = daemon.reload();
+    assert_eq!(reloaded.code, Some(1), "{}", reloaded.output);
+    assert!(reloaded.output.contains("older"), "{}", reloaded.output);
+    assert_eq!(frontends_of(daemon.host), [frontend], "after the older one");
+
+    std::fs::set_permissions(&locked.path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    daemon.install(&locked);
+    let reloaded = daemon.reload_with(built);
+    assert_eq!(reloaded.code, Some(1), "{}", reloaded.output);
+    assert!(
+        reloaded.output.contains("cannot open"),
+        "{}",
+        reloaded.output
+    );
+    assert_eq!(
+        frontends_of(daemon.host),
+        [frontend],
+        "after the unreadable one"
+    );
+
+    std::fs::remove_file(&daemon.path).unwrap();
+    let reloaded = daemon.reload_with(built);
+    assert_eq!(reloaded.code, Some(1), "{}", reloaded.output);
+    assert!(
+        reloaded.output.contains("cannot open"),
+        "{}",
+        reloaded.output
+    );
+    assert_eq!(
+        frontends_of(daemon.host),
+        [frontend],
+        "after the missing one"
+    );
+
+    let back = daemon.come_back(token);
+    assert_eq!(back.same_shell("kept-122"), shell);
+    back.client.close();
+    daemon.finish();
+}
+
+/// Another client is attached: the user's reload is the consent to
+/// disconnect it briefly. The frontend is replaced, and the client's
+/// session is kept.
+#[test]
+fn reload_performs_a_soft_outcome() {
+    let _serial = serialised();
+    let images = images();
+    let b = images.newer("qshd-b", b"\0reload-b\0", images.a.build + 1);
+    let daemon = serve(&images, &labels(&[&b]), "");
+    let token = [123; 16];
+    let session = daemon.connect(token);
+    let shell = session.open_shell("kept-123");
+    let old = frontend_of(daemon.host);
+
+    daemon.install(&b);
+    let reloaded = daemon.reload();
+    assert_eq!(
+        reloaded.code,
+        Some(0),
+        "{}; log: {}",
+        reloaded.output,
+        daemon.log()
+    );
+    assert!(
+        daemon.log().contains("(Soft { attached: 1 })"),
+        "the reload disconnected the attached client; log: {}",
+        daemon.log()
+    );
+    let next = frontend_after(daemon.host, old);
+    assert_eq!(image_of(next), b.checksum);
+    session.client.detach();
+    let back = daemon.come_back(token);
+    assert_eq!(back.same_shell("kept-123"), shell);
+    back.client.close();
+    daemon.finish();
+}
+
+/// B serves none of the session profiles: the retained session's client
+/// could not reach it through B. A reload never does that; it refuses,
+/// says how to update deliberately, and logs the outcome.
+#[test]
+fn reload_refuses_an_unreachable_outcome() {
+    let _serial = serialised();
+    let images = images();
+    let b = images.newer("qshd-b", b"\0reload-b\0", images.a.build + 1);
+    let daemon = serve(
+        &images,
+        &labels(&[&b]),
+        &format!("{}=no-profiles", b.checksum),
+    );
+    let token = [124; 16];
+    let (shell, _) = served_shell(&daemon, token, "kept-124");
+    let frontend = frontend_of(daemon.host);
+
+    daemon.install(&b);
+    let reloaded = daemon.reload();
+    assert_eq!(reloaded.code, Some(1), "{}", reloaded.output);
+    assert!(
+        reloaded.output.contains("systemctl --user restart qshd"),
+        "{}",
+        reloaded.output
+    );
+    assert!(
+        daemon.log().contains("Unreachable {"),
+        "the outcome is logged; log: {}",
+        daemon.log()
+    );
+    assert_eq!(
+        frontends_of(daemon.host),
+        [frontend],
+        "A's frontend serves on"
+    );
+    let back = daemon.come_back(token);
+    assert_eq!(back.same_shell("kept-124"), shell);
+    back.client.close();
+    daemon.finish();
+}
+
+/// A daemon that has no reload socket -- here a `transport-ensure` daemon,
+/// which never binds one; an older `serve` is the same -- is not touched:
+/// `reload` says it cannot reload and exits 1, and the daemon serves on.
+#[test]
+fn reload_against_a_daemon_without_the_socket_fails_and_leaves_it_running() {
+    let _serial = serialised();
+    let images = images();
+    let daemon = start(&images, "", "");
+    let token = [125; 16];
+    let (shell, _) = retained_shell(&daemon, token, "kept-125");
+    let frontend = frontend_of(daemon.host);
+
+    let reloaded = reload_in(&images.a.path, daemon.home.path(), daemon.port);
+    assert_eq!(reloaded.code, Some(1), "{}", reloaded.output);
+    assert!(
+        reloaded.output.contains(
+            "the running qshd cannot reload; restart it with `systemctl --user restart qshd`"
+        ),
+        "{}",
+        reloaded.output
+    );
+    assert_eq!(frontends_of(daemon.host), [frontend], "the same frontend");
+    assert_eq!(status(&daemon.sock).map(|s| s.pid), Some(daemon.host));
+    let back = daemon.come_back(token);
+    assert_eq!(back.same_shell("kept-125"), shell);
+    back.client.close();
+    daemon.finish();
+}

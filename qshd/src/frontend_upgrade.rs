@@ -31,6 +31,11 @@ pub const PREPARE_CLIENT_TIMEOUT: Duration = Duration::from_secs(25);
 pub const COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a client waits for that answer.
 pub const COMMIT_CLIENT_TIMEOUT: Duration = Duration::from_secs(35);
+/// How long the daemon may take to answer `RELOAD-FRONTEND`: a prepare and
+/// a commit, each within its own bound.
+pub const RELOAD_TIMEOUT: Duration = Duration::from_secs(50);
+/// How long `qshd reload` waits for that answer.
+pub const RELOAD_CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `PREPARE-FRONTEND-UPGRADE`: replace the serving frontend with the
 /// executable at `path`, which the caller expects to be `size` bytes with
@@ -95,6 +100,27 @@ pub enum CommitResponse {
     },
 }
 
+/// The answer to `RELOAD-FRONTEND` (`systemctl --user reload qshd`): the
+/// serving frontend replaced by the file the daemon was started from, or
+/// why not. In every case but `Replaced` the frontend serves on as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReloadResponse {
+    /// That file's frontend serves now, as `build`.
+    Replaced { build: u64 },
+    /// That file is the serving frontend's image.
+    UpToDate,
+    /// Nothing was replaced: `reason` says why, and `outcome` what the
+    /// replacement would have come to, when it came that far.
+    Refused {
+        reason: String,
+        outcome: Option<Outcome>,
+    },
+    /// The new frontend did not come up, for `reason`; the previous image
+    /// serves again.
+    RolledBack { reason: String },
+}
+
 /// Why a prepare or a commit was refused: nothing changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -123,10 +149,14 @@ pub enum Refusal {
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// What the control server of a hosted daemon hands the two upgrade
-/// requests to. A daemon without one answers neither, as an older daemon.
+/// requests to, and a hosted `serve` daemon its reload. A daemon without
+/// one answers none of them, as an older daemon.
 pub trait FrontendUpgrades: Send + Sync {
     fn prepare(&self, request: PrepareRequest) -> BoxFuture<'_, PrepareResponse>;
     fn commit(&self, receipt: [u8; 16]) -> BoxFuture<'_, CommitResponse>;
+    /// Replace the serving frontend with the file at the path the daemon
+    /// was started from, if [`reload_permits`] what that comes to.
+    fn reload(&self) -> BoxFuture<'_, ReloadResponse>;
 }
 
 /// One session of the running daemon, as the host's catalog keeps it.
@@ -655,6 +685,19 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PrepareResponse::UpToDate).unwrap(),
             serde_json::json!({"status": "up_to_date"})
+        );
+        assert_eq!(
+            serde_json::to_value(ReloadResponse::Refused {
+                reason: "older".into(),
+                outcome: Some(Outcome::Older),
+            })
+            .unwrap(),
+            serde_json::json!({"status": "refused", "reason": "older",
+                "outcome": {"case": "older"}})
+        );
+        assert_eq!(
+            serde_json::to_value(ReloadResponse::Replaced { build: 7 }).unwrap(),
+            serde_json::json!({"status": "replaced", "build": 7})
         );
         let rolled = CommitResponse::RolledBack {
             reason: "it exited".into(),

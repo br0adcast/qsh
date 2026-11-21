@@ -2849,6 +2849,99 @@ nothing for a while, or saw the link close — logs in again to the same
 address with the same pinned key and asks `ABOUT` once more; only a matching
 checksum counts as updated.
 
+#### 8.1.1 Replacing only the frontend of a hosted daemon
+
+`qshd/src/frontend_upgrade.rs`, `qshd/src/host/upgrade.rs`,
+`qshd/src/ensure_upgrade.rs`.
+
+A Linux personal daemon whose `STATUS` names a `host` (§4.4) can have its
+network frontend replaced by a newer image. The host, every owner and every
+session stay. Three compatibilities are checked, each on its own: the session
+profiles, between clients and the frontend; `HOST_REVISION`, between the host
+and its frontend and owners; and the owner link versions, between the
+frontend and every live owner. The candidate's `self-check` reports
+`host_revision` and `link_versions` for this.
+
+Two requests on the personal control socket serve this. They are taken from
+same-account peers only, and each frame is at most 4096 bytes.
+
+- `PREPARE-FRONTEND-UPGRADE <base64 JSON>`, the JSON being
+  `{path, size, checksum, build, identity, consent?}`. `identity` is the
+  serving frontend the caller saw (`REGISTRATION-INFO`). `consent` is an
+  optional `FrontendUpgradeConsent`: `attempt`, `identity`,
+  `candidate: {build, checksum}`, `case` (`"soft"` or `"unreachable"`) and
+  `action: "replace_frontend"`. The host opens the file and holds it by
+  descriptor from then on. It checks the size (at most `MAX_UPDATE_SIZE`),
+  the sha256, and the build its `self-check` reports; the self-check runs on
+  the held image (`/proc/self/fd/N`). It then classifies the replacement over
+  every session of its catalog, attached or retained. Within 20 s (a client
+  waits 25 s) it answers one JSON line, tagged by `status`:
+  - `ready {receipt, outcome}`: a random 128-bit receipt, in hex, good for one
+    commit within 120 s. Only the newest prepare's candidate is held.
+  - `needs_consent {outcome}`: the outcome is `soft` or `unreachable`, and no
+    consent covers it. A consent covers an outcome at most as disruptive as
+    its case (`silent` < `soft` < `unreachable`), and only if it names exactly
+    the serving identity, pid and generation included, and the held
+    candidate.
+  - `not_preservable {outcome}`: `destructive` or `full_restart`. Only a full
+    restart installs this candidate.
+  - `up_to_date`, or `refused {reason}`, where `reason.kind` is `mismatch`,
+    `candidate {detail}`, `older`, `busy`, `expired`, `unknown`,
+    `changed {outcome}` or `stopping`.
+
+  An `outcome` is tagged by `case`: `up_to_date`, `older`, `silent`,
+  `soft {attached}`, `unreachable {attached, sessions, stranded}`,
+  `destructive {attached, sessions}` or `full_restart`.
+- `COMMIT-FRONTEND-UPGRADE <receipt hex>` runs under the exclusive control
+  gate and the replacement lease, so no other request and no update of the
+  whole daemon runs meanwhile. Admission of new handshakes closes, and the
+  census is taken again: a receipt that no longer covers what the upgrade
+  comes to is `refused` with `changed`. Otherwise the host stops the frontend
+  in order, as at its death (§4.4), starts the candidate on the same sockets,
+  and waits at most 10 s for it to report `Ready`. Within 30 s (a client waits
+  35 s) it answers one line:
+  - `replaced {identity}`: the new frontend's identity, under the host's pid
+    and a new generation. `STATUS`, `REGISTRATION-INFO`, `ADD-CLIENT-IF`,
+    `DESTRUCTIVE-RESTART-INFO` and `SERVER-INFO` describe it from then on.
+  - `rolled_back {reason}`: the candidate exited or stayed silent. It was
+    killed through its pidfd, and the previous image serves again under its
+    previous identity.
+  - `refused {reason}`.
+
+  The commit runs to its end even if its caller goes away. No `Restarting` is
+  sent and no channel ends: clients come back through the session reset
+  (§1.1).
+
+A daemon without a host answers neither request, as an older daemon does. A
+host always answers, so `transport-ensure` never takes its silence as a
+reason to start a second daemon.
+
+**`TRANSPORT-BUSY` schema 3.** The record that asks the user now says
+`sessions`: every session of the daemon, attached or retained. It is never
+less than `active_connections`, and a record where both are 0 is invalid.
+`preservation: "preserves_sessions"` comes with an `upgrade` offer
+`{case, attached, sessions, stranded}`, and never without it. A `soft` offer
+has attached clients and no stranded session; an `unreachable` one has
+stranded sessions. Its `attached` and `sessions` are the record's own. To
+upgrade, the client runs ensure again with
+`--frontend-upgrade-consent <FrontendUpgradeConsent JSON>`, bound to the
+record's attempt, identity, candidate and case, and ensure hands it to the
+prepare. A schema 2 record is refused.
+
+**`RELOAD-FRONTEND`** (no argument) is asked on the reload socket of a hosted
+`serve` daemon, `<cache>/qshd-serve-<port>.sock`; `serve` has no control
+socket. It is taken from same-account peers only, one request per
+connection. The daemon prepares the file at the path it was started from,
+recorded at its start: the caller describes nothing, and size, sha256 and
+build are what the host reads. The identity is the serving one, and the
+request is consent to `soft` and to nothing more. A `silent` or `soft`
+outcome is committed; every other is refused and logged. Within 50 s
+(`qshd reload` waits 60 s) the daemon answers one line, tagged by `status`:
+`replaced {build}`, `up_to_date`, `refused {reason, outcome}` (`outcome` is
+`null` when the request never got that far) or `rolled_back {reason}`.
+Anything else on that socket gets no answer, and so does `RELOAD-FRONTEND` on
+a control socket.
+
 ---
 
 ### 8.2 Reserved retained-session and owner IPC contracts

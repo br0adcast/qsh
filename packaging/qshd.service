@@ -5,12 +5,16 @@
 # carries a system-wide unit of the same name (qshd-system.service in this
 # directory, installed to /usr/lib/systemd/system/) which is the multi-user
 # one. Installing the package enables neither.
+# `systemctl --user reload qshd`, after a package upgrade, makes the running
+# daemon (Linux) serve from the upgraded /usr/bin/qshd and keeps every
+# session; it refuses, and changes nothing, when that is not possible.
 [Unit]
 Description=qshd — a resilient terminal daemon
 Documentation=https://github.com/br0adcast/qsh
 
 [Service]
 ExecStart=/usr/bin/qshd serve --port 60022
+ExecReload=/usr/bin/qshd reload --port 60022
 Restart=on-failure
 RestartSec=2
 

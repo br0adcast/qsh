@@ -142,6 +142,10 @@ fn help_text() -> String {
         "                    Long-lived daemon for a service manager (systemd/launchd); \
          see docs/qshd-service.md."
             .to_string(),
+        "  reload            [--port <P>]".to_string(),
+        "                    Replace the running personal `serve` daemon's network frontend \
+         with the installed binary; sessions are kept (Linux, `ExecReload`)."
+            .to_string(),
         "  bootstrap-capabilities  Report executable bootstrap API support.".to_owned(),
         "  server-info       --challenge <hex> [--socket <PATH>]  Query running daemon metadata."
             .to_string(),
@@ -221,6 +225,7 @@ fn main() -> Result<()> {
         Some("transport-shell") => run_transport_shell_command(&args),
         Some("transport-ensure") => run_transport_ensure(&args, service_stage),
         Some("serve") => serve::run_serve_command_os(&args),
+        Some("reload") => run_reload_command(&args),
         Some("server-info") => qshd::server_info::run_command(&args),
         Some("helper-status") => qshd::helper_status::run_command(&args),
         Some("bootstrap-capabilities") => {
@@ -247,6 +252,78 @@ fn main() -> Result<()> {
              `serve` or `self-check` (or the `--version`/`--help` flags), got: {:?}",
             other
         ),
+    }
+}
+
+/// What `qshd reload` says when no daemon answers its reload request: an
+/// older daemon, one without a host, or none at all. Nothing was changed.
+const CANNOT_RELOAD: &str =
+    "the running qshd cannot reload; restart it with `systemctl --user restart qshd`";
+
+/// The `reload` command, the personal unit's `ExecReload`: ask the running
+/// `serve` daemon on `--port` to replace its frontend with the installed
+/// binary, and say in one line what came of it. Exits 0 when the installed
+/// binary serves (replaced, or already), 1 otherwise. It never starts or
+/// stops a daemon: one that cannot reload is left as it is.
+fn run_reload_command(args: &[OsString]) -> Result<()> {
+    let port = parse_reload_args(args)?;
+    let (line, ok) = reload_line(serve::reload_socket_path(port).and_then(|sock| {
+        control::client_request_with_timeout(
+            &sock,
+            &control::ControlRequest::ReloadFrontend,
+            qshd::frontend_upgrade::RELOAD_CLIENT_TIMEOUT,
+        )
+    }));
+    if ok {
+        println!("{line}");
+        Ok(())
+    } else {
+        eprintln!("{line}");
+        std::process::exit(1)
+    }
+}
+
+/// `reload [--port <P>]`: the port of the `serve` daemon to ask.
+fn parse_reload_args(args: &[OsString]) -> Result<u16> {
+    let mut port = serve::DEFAULT_SERVE_PORT;
+    let mut rest = args.iter().enumerate().skip(1);
+    while let Some((at, arg)) = rest.next() {
+        // Numbered as `main` numbers them: the command is argument 1.
+        match argument_text(arg, at + 1)? {
+            "--port" => {
+                let (at, value) = rest.next().context("--port needs a value")?;
+                port = argument_text(value, at + 1)?
+                    .parse()
+                    .ok()
+                    .filter(|port| *port != 0)
+                    .context("port must be a number 1..65535")?;
+            }
+            other => bail!("reload: unexpected argument {other:?}"),
+        }
+    }
+    Ok(port)
+}
+
+/// The one line `qshd reload` prints for what its request came to, and
+/// whether that is success.
+fn reload_line(reply: Result<control::ControlReply>) -> (String, bool) {
+    use qshd::frontend_upgrade::ReloadResponse;
+    let answer = match reply {
+        Ok(control::ControlReply::Answered(line)) => serde_json::from_str(&line).ok(),
+        _ => None,
+    };
+    match answer {
+        Some(ReloadResponse::Replaced { build }) => (
+            format!("qshd frontend replaced by build {build}; sessions kept"),
+            true,
+        ),
+        Some(ReloadResponse::UpToDate) => ("qshd is up to date".into(), true),
+        Some(ReloadResponse::Refused { reason, .. }) => (reason, false),
+        Some(ReloadResponse::RolledBack { reason }) => (
+            format!("{reason}; the previous version keeps serving"),
+            false,
+        ),
+        None => (CANNOT_RELOAD.into(), false),
     }
 }
 
@@ -1976,11 +2053,19 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
         )
     });
     // A host's frontend can be replaced by a newer image (#529 M2); the
-    // control server hands the two upgrade requests to this.
+    // control server hands the two upgrade requests to this. Its reload
+    // would install the file this daemon runs from, but only `serve` has a
+    // reload socket: here `transport-ensure` brings the newer image.
     #[cfg(target_os = "linux")]
     let upgrades = host.as_ref().map(|host| {
-        qshd::host::upgrade::Upgrader::new(host.clone(), serving.clone(), Some(actions.clone()))
-            as Arc<dyn qshd::frontend_upgrade::FrontendUpgrades>
+        let start_path =
+            (!start.binary_path.as_os_str().is_empty()).then(|| start.binary_path.clone());
+        qshd::host::upgrade::Upgrader::new(
+            host.clone(),
+            serving.clone(),
+            Some(actions.clone()),
+            start_path,
+        ) as Arc<dyn qshd::frontend_upgrade::FrontendUpgrades>
     });
 
     let runtime =
@@ -2238,13 +2323,14 @@ fn control_sock_path(cache_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ask_status_with, control, help_text, load_or_create_transport_key,
+        ask_status_with, control, help_text, load_or_create_transport_key, parse_reload_args,
         parse_transport_echo_args, parse_transport_ensure_args, parse_transport_shell_args,
-        personal_server_auth, ready_ports, state, update, validate_add_client_reply, version_text,
-        write_transport_ready,
+        personal_server_auth, ready_ports, reload_line, serve, state, update,
+        validate_add_client_reply, version_text, write_transport_ready, CANNOT_RELOAD,
     };
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
+    use std::ffi::OsString;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -3145,6 +3231,84 @@ mod tests {
         assert!(text.contains("-V"));
         assert!(text.contains("--help"));
         assert!(text.contains("-h"));
+    }
+
+    #[test]
+    fn reload_takes_only_a_port() {
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            parse_reload_args(&args(&["reload"])).unwrap(),
+            serve::DEFAULT_SERVE_PORT
+        );
+        assert_eq!(
+            parse_reload_args(&args(&["reload", "--port", "60023"])).unwrap(),
+            60023
+        );
+        for bad in [
+            &["reload", "--port"][..],
+            &["reload", "--port", "0"],
+            &["reload", "--port", "x"],
+            &["reload", "--system"],
+        ] {
+            assert!(parse_reload_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// One line for each answer, and success only when the installed
+    /// binary serves; no answer at all names the deliberate way.
+    #[test]
+    fn reload_says_one_line_per_answer() {
+        let answered = |json: &str| Ok(control::ControlReply::Answered(json.into()));
+        assert_eq!(
+            reload_line(answered(r#"{"status":"replaced","build":7}"#)),
+            (
+                "qshd frontend replaced by build 7; sessions kept".into(),
+                true
+            )
+        );
+        assert_eq!(
+            reload_line(answered(r#"{"status":"up_to_date"}"#)),
+            ("qshd is up to date".into(), true)
+        );
+        assert_eq!(
+            reload_line(answered(
+                r#"{"status":"refused","reason":"it is older","outcome":{"case":"older"}}"#
+            )),
+            ("it is older".into(), false)
+        );
+        assert_eq!(
+            reload_line(answered(r#"{"status":"rolled_back","reason":"it exited"}"#)),
+            (
+                "it exited; the previous version keeps serving".into(),
+                false
+            )
+        );
+        for reply in [
+            Ok(control::ControlReply::NoDaemon),
+            Ok(control::ControlReply::TimedOut),
+            answered("not json"),
+            Err(anyhow::anyhow!("an unsafe endpoint")),
+        ] {
+            assert_eq!(reload_line(reply), (CANNOT_RELOAD.into(), false));
+        }
+    }
+
+    /// `ExecReload` of the personal unit runs `qshd reload`: the help says
+    /// what it does, and that it keeps sessions.
+    #[test]
+    fn the_help_text_names_reload() {
+        let text = help_text();
+        let line = text
+            .lines()
+            .position(|line| line.trim_start().starts_with("reload "))
+            .expect("a reload entry");
+        assert!(text.lines().nth(line).unwrap().contains("--port"));
+        assert!(
+            text.lines()
+                .nth(line + 1)
+                .is_some_and(|next| next.contains("frontend") && next.contains("sessions")),
+            "{text}"
+        );
     }
 
     /// Runs [`ask_status_with`] over a scripted sequence of replies and

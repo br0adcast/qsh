@@ -64,6 +64,11 @@ pub enum ControlRequest {
     /// Carry out the prepared frontend upgrade the receipt names
     /// ([`crate::frontend_upgrade::CommitResponse`]).
     CommitFrontendUpgrade([u8; 16]),
+    /// Replace a hosted `serve` daemon's frontend with the file it was
+    /// started from ([`crate::frontend_upgrade::ReloadResponse`]), on its
+    /// reload socket only: `qshd reload`, the personal unit's `ExecReload`.
+    /// A daemon without that socket, or a control socket, answers nothing.
+    ReloadFrontend,
     /// Exact-generation executable identity guard, checked atomically with insertion.
     AddClientIf {
         generation: [u8; 16],
@@ -379,6 +384,12 @@ pub fn parse_request(line: &str) -> Option<ControlRequest> {
             }
             Some(ControlRequest::CommitFrontendUpgrade(receipt))
         }
+        "RELOAD-FRONTEND" => {
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(ControlRequest::ReloadFrontend)
+        }
         "SERVER-INFO" => {
             let text = parts.next()?;
             if text.len() != 64 {
@@ -470,6 +481,7 @@ pub fn format_request(req: &ControlRequest) -> String {
         ControlRequest::CommitFrontendUpgrade(receipt) => {
             format!("COMMIT-FRONTEND-UPGRADE {}\n", hex::encode(receipt))
         }
+        ControlRequest::ReloadFrontend => "RELOAD-FRONTEND\n".to_string(),
         ControlRequest::ServerInfo(challenge) => {
             format!("SERVER-INFO {}\n", hex::encode(challenge))
         }
@@ -629,6 +641,7 @@ fn client_request_at(
             | ControlRequest::CommitDestructiveStop { .. }
             | ControlRequest::PrepareFrontendUpgrade(_)
             | ControlRequest::CommitFrontendUpgrade(_)
+            | ControlRequest::ReloadFrontend
     ) {
         std::io::Read::take(&mut reader, 4097).read_line(&mut line)
     } else {
@@ -643,6 +656,7 @@ fn client_request_at(
             | ControlRequest::CommitDestructiveStop { .. }
             | ControlRequest::PrepareFrontendUpgrade(_)
             | ControlRequest::CommitFrontendUpgrade(_)
+            | ControlRequest::ReloadFrontend
     ) && line.len() > 4096
     {
         anyhow::bail!("server-info response exceeds limit");
@@ -1250,6 +1264,7 @@ mod tests {
         for request in [
             ControlRequest::PrepareFrontendUpgrade(prepare),
             ControlRequest::CommitFrontendUpgrade([7; 16]),
+            ControlRequest::ReloadFrontend,
         ] {
             let line = format_request(&request);
             assert!(line.len() <= 4096);
@@ -1261,6 +1276,7 @@ mod tests {
             "COMMIT-FRONTEND-UPGRADE".to_string(),
             format!("PREPARE-FRONTEND-UPGRADE {}", BASE64.encode(b"{}")),
             "PREPARE-FRONTEND-UPGRADE not-base64!".to_string(),
+            "RELOAD-FRONTEND now".to_string(),
         ] {
             assert!(parse_request(&line).is_none(), "{line}");
         }

@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use crate::destructive_restart::Actions;
 use crate::frontend_upgrade::{
-    FrontendUpgrades, PrepareResponse, Refusal, COMMIT_TIMEOUT, PREPARE_TIMEOUT,
+    FrontendUpgrades, PrepareResponse, Refusal, COMMIT_TIMEOUT, PREPARE_TIMEOUT, RELOAD_TIMEOUT,
 };
 use crate::server_info::{FrontendIdentity, Serving};
 use anyhow::{Context, Result};
@@ -535,30 +535,166 @@ pub async fn run_hosted_transport_daemon_until_stop(
 }
 
 /// A host without a control socket (`serve`): frontends of `host` on
-/// `socket` until `stop`, then until the last one is reaped.
+/// `socket` until `stop`, then until the last one is reaped. `reloads`, if
+/// bound, is served meanwhile, and goes at the stop.
 #[cfg(target_os = "linux")]
 pub async fn run_host_until_stop(
     host: Arc<crate::host::Host>,
     socket: std::net::UdpSocket,
+    reloads: Option<ReloadSocket>,
     stop: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     let shutdown = transport::Shutdown::default();
     let serving = host.serve(socket, shutdown.clone());
     tokio::pin!(serving);
     tokio::pin!(stop);
+    // A reload socket that cannot be served costs the reload, never the
+    // daemon: `qshd reload` then finds nobody, and says so.
+    let mut reloads = reloads.and_then(|reloads| {
+        reloads
+            .serve()
+            .map_err(|error| {
+                log::warn(
+                    "qshd",
+                    &format!("cannot serve the reload socket ({error:#}); reload is off"),
+                )
+            })
+            .ok()
+    });
     let (result, stop_error) = tokio::select! {
         biased;
         stopped = &mut stop => {
+            // No reload begins once the daemon stops, and its socket goes.
+            drop(reloads.take());
             shutdown.request();
             (serving.await, stopped.err())
         }
         result = &mut serving => (result, None),
     };
+    drop(reloads);
     result?;
     match stop_error {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// The reload socket of a hosted `serve` daemon,
+/// `<cache>/qshd-serve-<port>.sock` (`crate::serve::reload_socket_path`):
+/// `RELOAD-FRONTEND`, from a peer of this daemon's account, handed to
+/// `upgrades`. `serve` has no control socket; this one takes nothing else.
+#[cfg(target_os = "linux")]
+pub struct ReloadSocket {
+    pub listener: std::os::unix::net::UnixListener,
+    pub cleanup: control::SocketCleanup,
+    pub upgrades: Arc<dyn FrontendUpgrades>,
+}
+
+/// A reload socket being served: dropped, it stops accepting, gives up the
+/// reloads it is handling (a commit under way runs on to its end on a task
+/// of its own) and removes the socket file.
+#[cfg(target_os = "linux")]
+struct ServedReloads {
+    task: tokio::task::JoinHandle<()>,
+    _cleanup: control::SocketCleanup,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ServedReloads {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ReloadSocket {
+    fn serve(self) -> Result<ServedReloads> {
+        self.listener
+            .set_nonblocking(true)
+            .context("switching the reload socket to non-blocking mode")?;
+        let listener = tokio::net::UnixListener::from_std(self.listener)
+            .context("adopting the reload socket into tokio")?;
+        Ok(ServedReloads {
+            task: tokio::spawn(accept_reloads(listener, self.upgrades)),
+            _cleanup: self.cleanup,
+        })
+    }
+}
+
+/// Accept reload connections, one request each, until aborted.
+#[cfg(target_os = "linux")]
+async fn accept_reloads(listener: tokio::net::UnixListener, upgrades: Arc<dyn FrontendUpgrades>) {
+    let mut handlers = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let upgrades = upgrades.clone();
+                    handlers.spawn(async move {
+                        let check = |stream: &tokio::net::UnixStream| {
+                            control::require_same_account(
+                                control::peer_uid(stream),
+                                nix::unistd::geteuid().as_raw(),
+                            )
+                        };
+                        if let Err(error) =
+                            handle_reload_connection(stream, upgrades.as_ref(), check).await
+                        {
+                            log::warn("qshd", &format!("reload request: {error:#}"));
+                        }
+                    });
+                }
+                Err(error) => {
+                    // Out of descriptors, say: the next accept may do.
+                    log::warn(
+                        "qshd",
+                        &format!("error accepting a reload connection; retrying in 1 s: {error}"),
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            },
+        }
+    }
+}
+
+/// One reload connection: a peer `check` accepts, whose one line is
+/// `RELOAD-FRONTEND`, gets one JSON line
+/// ([`crate::frontend_upgrade::ReloadResponse`]). Anything else is answered
+/// with nothing, as a daemon that does not know the request.
+#[cfg(target_os = "linux")]
+async fn handle_reload_connection(
+    stream: tokio::net::UnixStream,
+    upgrades: &dyn FrontendUpgrades,
+    check: impl FnOnce(&tokio::net::UnixStream) -> Result<()>,
+) -> Result<()> {
+    check(&stream)?;
+    let (read_half, mut write_half) = stream.into_split();
+    let line = tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, async {
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let mut line = String::new();
+        (&mut reader)
+            .take(4097)
+            .read_line(&mut line)
+            .await
+            .context("reading the request from the reload socket")?;
+        anyhow::ensure!(
+            line.len() <= 4096 && line.ends_with('\n'),
+            "reload request exceeds limit or is incomplete"
+        );
+        Ok(line)
+    })
+    .await
+    .context("the reload request did not arrive in time")??;
+    if control::parse_request(line.trim_end_matches('\n')) != Some(ControlRequest::ReloadFrontend) {
+        return Ok(());
+    }
+    // Past its bound the outcome is not known here: no answer is better
+    // than a wrong one.
+    let response = tokio::time::timeout(RELOAD_TIMEOUT, upgrades.reload())
+        .await
+        .context("the reload exceeded its bound")?;
+    write_answer(&mut write_half, &response).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1181,6 +1317,9 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
                 .context("the frontend upgrade's commit exceeded its bound")?;
             return write_answer(&mut write_half, &response).await;
         }
+        // A reload is asked on a `serve` daemon's reload socket, never here:
+        // this daemon is upgraded by `transport-ensure`.
+        ControlRequest::ReloadFrontend => return Ok(()),
         _ => {}
     }
 
@@ -1196,7 +1335,8 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
         match request {
             ControlRequest::CommitDestructiveStop {..}
             | ControlRequest::PrepareFrontendUpgrade(_)
-            | ControlRequest::CommitFrontendUpgrade(_) => unreachable!("handled before read gate"),
+            | ControlRequest::CommitFrontendUpgrade(_)
+            | ControlRequest::ReloadFrontend => unreachable!("handled before read gate"),
             ControlRequest::DestructiveRestartInfo(challenge)=> {
                 if let Some(actions)=&actions {
                     if let Some(identity)=actions.receipt_identity() {

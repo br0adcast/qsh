@@ -25,8 +25,16 @@
 //! pidfd and the previous image started again at once; nothing that
 //! describes the daemon changes. The commit runs on a task of its own, so a
 //! caller that goes away never leaves it half done.
+//!
+//! **Reload** (`RELOAD-FRONTEND`, `systemctl --user reload qshd`): a prepare
+//! of the file at the path the daemon was started from -- recorded at its
+//! start, as a package upgrade leaves `/proc/self/exe` naming the deleted
+//! old file -- whatever that file is, with the user's command as consent to
+//! a soft case and to nothing worse, then its commit. Anything else
+//! [`reload_permits`] refuses is refused and logged; a full restart stays
+//! the user's deliberate `systemctl --user restart qshd`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,8 +47,9 @@ use super::images::{FrontendImage, ImageIdentity, ImageInfo};
 use super::{kill, FrontendChild, Host};
 use crate::destructive_restart::{Actions, Rejected, ReplacementLease, RECEIPT_TTL};
 use crate::frontend_upgrade::{
-    classify, consented_case, receipt_covers, BoxFuture, CandidateFacts, CommitResponse,
-    DaemonFacts, FrontendUpgrades, Outcome, PrepareRequest, PrepareResponse, Refusal, UpgradeCase,
+    classify, consented_case, receipt_covers, reload_permits, BoxFuture, CandidateFacts,
+    CommitResponse, DaemonFacts, FrontendUpgrades, Outcome, PrepareRequest, PrepareResponse,
+    Refusal, ReloadResponse, UpgradeCase, PREPARE_TIMEOUT,
 };
 use crate::owner_process::SelfImage;
 use crate::server_info::{FrontendIdentity, Serving};
@@ -286,13 +295,18 @@ impl Book {
 // ---- the upgrader ------------------------------------------------------------
 
 /// The frontend upgrades of one hosted daemon: what its control server
-/// hands `PREPARE-FRONTEND-UPGRADE` and `COMMIT-FRONTEND-UPGRADE` to.
+/// hands `PREPARE-FRONTEND-UPGRADE` and `COMMIT-FRONTEND-UPGRADE` to, and
+/// its reload socket `RELOAD-FRONTEND`.
 pub struct Upgrader(Arc<Inner>);
 
 struct Inner {
     host: Arc<Host>,
     serving: Arc<Serving>,
     actions: Option<Arc<Actions>>,
+    /// The file the daemon was started from, as it was named at the start:
+    /// what a reload installs. `None`: it could not be told, and a reload
+    /// is refused.
+    start_path: Option<PathBuf>,
     /// The gate every other control request holds for reading.
     gate: Arc<tokio::sync::RwLock<()>>,
     book: Mutex<Book>,
@@ -300,11 +314,15 @@ struct Inner {
 
 impl Upgrader {
     /// Upgrades of `host`'s frontend, which `serving` describes to every
-    /// identity surface and `actions` names in its receipts.
+    /// identity surface and `actions` names in its receipts; a reload
+    /// installs the file at `start_path`. `actions` is `None` for a daemon
+    /// without a control socket (`serve`), which has no other control
+    /// requests to keep out of a commit, and for tests.
     pub fn new(
         host: Arc<Host>,
         serving: Arc<Serving>,
         actions: Option<Arc<Actions>>,
+        start_path: Option<PathBuf>,
     ) -> Arc<Upgrader> {
         let gate = actions
             .as_ref()
@@ -313,6 +331,7 @@ impl Upgrader {
             host,
             serving,
             actions,
+            start_path,
             gate,
             book: Mutex::default(),
         })))
@@ -325,20 +344,36 @@ impl FrontendUpgrades for Upgrader {
     }
 
     fn commit(&self, receipt: [u8; 16]) -> BoxFuture<'_, CommitResponse> {
-        let inner = self.0.clone();
-        Box::pin(async move {
-            // A task of its own: a caller that goes away, or a handler that
-            // gives up, never leaves the transaction half done.
-            tokio::spawn(inner.commit(receipt))
-                .await
-                .unwrap_or_else(|error| {
-                    crate::log::error("qshd", &format!("the frontend upgrade failed: {error}"));
-                    CommitResponse::RolledBack {
-                        reason: format!("the upgrade failed: {error}"),
-                    }
-                })
-        })
+        Box::pin(commit_detached(self.0.clone(), receipt))
     }
+
+    fn reload(&self) -> BoxFuture<'_, ReloadResponse> {
+        Box::pin(self.0.clone().reload())
+    }
+}
+
+/// The commit of `receipt` on a task of its own: a caller that goes away,
+/// or a handler that gives up, never leaves the transaction half done.
+async fn commit_detached(inner: Arc<Inner>, receipt: [u8; 16]) -> CommitResponse {
+    tokio::spawn(inner.commit(receipt))
+        .await
+        .unwrap_or_else(|error| {
+            crate::log::error("qshd", &format!("the frontend upgrade failed: {error}"));
+            CommitResponse::RolledBack {
+                reason: format!("the upgrade failed: {error}"),
+            }
+        })
+}
+
+/// What a caller of `PREPARE-FRONTEND-UPGRADE` says the candidate is: the
+/// host checks it against what it reads. A reload says nothing, and takes
+/// the file as the host finds it.
+struct Expected {
+    size: u64,
+    checksum: String,
+    build: u64,
+    /// The serving frontend the caller saw.
+    identity: daemon_bootstrap_protocol::BusyDaemonIdentity,
 }
 
 /// What a prepare's checks found.
@@ -347,7 +382,15 @@ struct Checked {
     image: FrontendImage,
     identity: FrontendIdentity,
     facts: CandidateFacts,
-    consented: Option<UpgradeCase>,
+}
+
+/// A prepare whose candidate passed its checks: what replacing the serving
+/// frontend with it comes to now.
+struct Examined {
+    /// The prepare's place in the book: only the newest is held.
+    seq: u64,
+    checked: Checked,
+    outcome: Outcome,
 }
 
 /// Cleared when the commit that set it ends, however it ends.
@@ -414,6 +457,59 @@ fn sha256_of(image: &SelfImage, size: u64) -> Result<String, Refusal> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// How `systemctl --user restart qshd` is named to a user whose reload was
+/// refused: the deliberate way, which ends every session.
+const RESTART: &str = "restart it with `systemctl --user restart qshd` to install it anyway, \
+                       which ends every session";
+
+/// A refused reload, logged with what it would have come to.
+fn reload_refused(reason: String, outcome: Option<Outcome>) -> ReloadResponse {
+    crate::log::warn(
+        "qshd",
+        &format!("reload refused ({outcome:?}): {reason}; the frontend serves on"),
+    );
+    ReloadResponse::Refused { reason, outcome }
+}
+
+/// Why a reload that came to `outcome` is refused, in the user's words:
+/// the installed file is build `build`, the serving frontend `serving`.
+fn outcome_text(outcome: &Outcome, build: u64, serving: u64) -> String {
+    match outcome {
+        Outcome::Older => format!(
+            "the installed qshd (build {build}) is older than the running one (build {serving})"
+        ),
+        Outcome::Unreachable {
+            sessions, stranded, ..
+        } => format!(
+            "the installed qshd cannot serve the clients of {stranded} of {sessions} session(s), \
+             which would become unreachable; {RESTART}"
+        ),
+        Outcome::Destructive { sessions, .. } => format!(
+            "the installed qshd cannot take over the running daemon's {sessions} session(s); \
+             {RESTART}"
+        ),
+        Outcome::FullRestart => format!(
+            "the installed qshd cannot replace only the running daemon's network part; {RESTART}"
+        ),
+        Outcome::UpToDate | Outcome::Silent | Outcome::Soft { .. } => format!("{outcome:?}"),
+    }
+}
+
+/// A refused prepare or commit, in the user's words.
+fn refusal_text(reason: &Refusal) -> String {
+    match reason {
+        Refusal::Mismatch => "the running frontend changed meanwhile".into(),
+        Refusal::Candidate { detail } => format!("the installed qshd cannot serve: {detail}"),
+        Refusal::Older => "the installed qshd is older than the running one".into(),
+        Refusal::Busy => "another upgrade of the daemon is under way".into(),
+        Refusal::Expired | Refusal::Unknown => "another upgrade took the reload's place".into(),
+        Refusal::Changed { outcome } => format!(
+            "the daemon's sessions changed meanwhile, and the upgrade would come to {outcome:?}"
+        ),
+        Refusal::Stopping => STOPPING.into(),
+    }
+}
+
 impl Inner {
     fn book(&self) -> std::sync::MutexGuard<'_, Book> {
         self.book.lock().unwrap_or_else(|e| e.into_inner())
@@ -433,44 +529,91 @@ impl Inner {
         )
     }
 
-    async fn prepare(self: Arc<Self>, request: PrepareRequest) -> PrepareResponse {
-        let refused = |reason| PrepareResponse::Refused { reason };
-        let seq = match self.book().begin() {
-            Ok(seq) => seq,
-            Err(reason) => return refused(reason),
-        };
+    /// Begin a prepare of the file at `path`, which the caller may describe
+    /// (`expected`), and check it: what replacing the serving frontend with
+    /// it comes to.
+    async fn examine(
+        self: &Arc<Self>,
+        path: PathBuf,
+        expected: Option<Expected>,
+    ) -> Result<Examined, Refusal> {
+        let seq = self.book().begin()?;
         // Hashing and the self-check block: off the runtime.
         let inner = self.clone();
-        let checked = match tokio::task::spawn_blocking(move || inner.check(request)).await {
-            Ok(Ok(checked)) => checked,
-            Ok(Err(reason)) => return refused(reason),
-            Err(error) => return refused(candidate(format!("its checks failed: {error}"))),
-        };
+        let checked = tokio::task::spawn_blocking(move || inner.check(&path, expected.as_ref()))
+            .await
+            .map_err(|error| candidate(format!("its checks failed: {error}")))??;
         let outcome = self.outcome(&checked.serving, &checked.facts);
+        Ok(Examined {
+            seq,
+            checked,
+            outcome,
+        })
+    }
+
+    /// Hold the candidate `examined` found, for a commit within
+    /// [`RECEIPT_TTL`] that carries out at most what `consented` covers:
+    /// its receipt.
+    fn hold(
+        &self,
+        examined: Examined,
+        consented: Option<UpgradeCase>,
+    ) -> Result<[u8; 16], Refusal> {
+        let mut receipt = [0u8; 16];
+        getrandom::fill(&mut receipt).map_err(|_| Refusal::Busy)?;
+        let held = Held {
+            receipt,
+            expires: Instant::now() + RECEIPT_TTL,
+            image: examined.checked.image,
+            identity: examined.checked.identity,
+            consented,
+        };
+        self.book().hold(examined.seq, held)?;
+        Ok(receipt)
+    }
+
+    async fn prepare(self: Arc<Self>, request: PrepareRequest) -> PrepareResponse {
+        let refused = |reason| PrepareResponse::Refused { reason };
+        let PrepareRequest {
+            path,
+            size,
+            checksum,
+            build,
+            identity,
+            consent,
+        } = request;
+        let expected = Expected {
+            size,
+            checksum,
+            build,
+            identity: identity.clone(),
+        };
+        let examined = match self.examine(PathBuf::from(path), Some(expected)).await {
+            Ok(examined) => examined,
+            Err(reason) => return refused(reason),
+        };
+        let consented = consented_case(
+            consent.as_ref(),
+            &identity,
+            &CandidateImageIdentity {
+                build: examined.checked.identity.build,
+                checksum: examined.checked.identity.checksum.clone(),
+            },
+        );
+        let outcome = examined.outcome.clone();
         match outcome {
             Outcome::UpToDate => return PrepareResponse::UpToDate,
             Outcome::Older => return refused(Refusal::Older),
             Outcome::Destructive { .. } | Outcome::FullRestart => {
                 return PrepareResponse::NotPreservable { outcome }
             }
-            _ if !receipt_covers(checked.consented, &outcome) => {
+            _ if !receipt_covers(consented, &outcome) => {
                 return PrepareResponse::NeedsConsent { outcome }
             }
             _ => {}
         }
-        let mut receipt = [0u8; 16];
-        if getrandom::fill(&mut receipt).is_err() {
-            return refused(Refusal::Busy);
-        }
-        let held = Held {
-            receipt,
-            expires: Instant::now() + RECEIPT_TTL,
-            image: checked.image,
-            identity: checked.identity,
-            consented: checked.consented,
-        };
-        match self.book().hold(seq, held) {
-            Ok(()) => PrepareResponse::Ready {
+        match self.hold(examined, consented) {
+            Ok(receipt) => PrepareResponse::Ready {
                 receipt: hex::encode(receipt),
                 outcome,
             },
@@ -478,48 +621,115 @@ impl Inner {
         }
     }
 
-    /// The checks of a prepare, blocking: the serving frontend is the one
-    /// the request names, and the file at its path -- held from the open
-    /// on -- is the candidate it describes and can serve.
-    fn check(&self, request: PrepareRequest) -> Result<Checked, Refusal> {
+    /// `RELOAD-FRONTEND`: a prepare of the start path, as it is now, and its
+    /// commit, if [`reload_permits`] what it comes to.
+    async fn reload(self: Arc<Self>) -> ReloadResponse {
+        let Some(path) = self.start_path.clone() else {
+            return reload_refused(
+                "the daemon does not know the file it was started from".into(),
+                None,
+            );
+        };
+        let examined = match tokio::time::timeout(PREPARE_TIMEOUT, self.examine(path, None)).await {
+            Ok(Ok(examined)) => examined,
+            Ok(Err(reason)) => return reload_refused(refusal_text(&reason), None),
+            Err(_) => {
+                return reload_refused(
+                    format!(
+                        "the checks of the installed qshd did not finish within {} s",
+                        PREPARE_TIMEOUT.as_secs()
+                    ),
+                    None,
+                )
+            }
+        };
+        let (serving, build) = (
+            examined.checked.serving.build,
+            examined.checked.identity.build,
+        );
+        let outcome = examined.outcome.clone();
+        match &outcome {
+            Outcome::UpToDate => return ReloadResponse::UpToDate,
+            permitted if reload_permits(permitted) => {}
+            refused => {
+                return reload_refused(outcome_text(refused, build, serving), Some(outcome));
+            }
+        }
+        // The user's command consents to disconnecting attached clients
+        // briefly, and to nothing worse: the commit refuses a census that
+        // has come to more meanwhile.
+        let receipt = match self.hold(examined, Some(UpgradeCase::Soft)) {
+            Ok(receipt) => receipt,
+            Err(reason) => return reload_refused(refusal_text(&reason), None),
+        };
+        crate::log::info(
+            "qshd",
+            &format!("reload: replacing the network frontend with build {build} ({outcome:?})"),
+        );
+        match commit_detached(self.clone(), receipt).await {
+            CommitResponse::Replaced { identity } => ReloadResponse::Replaced {
+                build: identity.build,
+            },
+            CommitResponse::RolledBack { reason } => ReloadResponse::RolledBack { reason },
+            CommitResponse::Refused { reason } => {
+                let outcome = match &reason {
+                    Refusal::Changed { outcome } => Some(outcome.clone()),
+                    _ => None,
+                };
+                reload_refused(refusal_text(&reason), outcome)
+            }
+        }
+    }
+
+    /// The checks of a prepare, blocking: the file at `path` -- held from
+    /// the open on -- can serve, and is the candidate `expected` describes,
+    /// while the serving frontend is the one it names.
+    fn check(&self, path: &Path, expected: Option<&Expected>) -> Result<Checked, Refusal> {
         // Hashes this binary on the first ask: a blocking call.
         let serving = self.serving.identity().map_err(|_| Refusal::Mismatch)?;
-        if serving.busy_identity() != request.identity {
-            return Err(Refusal::Mismatch);
-        }
-        if request.size > crate::update::MAX_UPDATE_SIZE {
-            return Err(candidate(format!(
-                "{} bytes is more than {}",
-                request.size,
+        let too_large = |size: u64| {
+            candidate(format!(
+                "{size} bytes is more than {}",
                 crate::update::MAX_UPDATE_SIZE
-            )));
+            ))
+        };
+        if let Some(expected) = expected {
+            if serving.busy_identity() != expected.identity {
+                return Err(Refusal::Mismatch);
+            }
+            if expected.size > crate::update::MAX_UPDATE_SIZE {
+                return Err(too_large(expected.size));
+            }
         }
-        let image = SelfImage::open(Path::new(&request.path))
-            .map_err(|error| candidate(format!("cannot open {}: {error}", request.path)))?;
+        let image = SelfImage::open(path)
+            .map_err(|error| candidate(format!("cannot open {}: {error}", path.display())))?;
         let size = image
             .size()
             .map_err(|error| candidate(format!("cannot read it: {error}")))?;
-        if size != request.size {
+        if size > crate::update::MAX_UPDATE_SIZE {
+            return Err(too_large(size));
+        }
+        if let Some(expected) = expected.filter(|e| e.size != size) {
             return Err(candidate(format!(
                 "it is {size} bytes, not {}",
-                request.size
+                expected.size
             )));
         }
         let checksum = sha256_of(&image, size)?;
-        if checksum != request.checksum {
+        if let Some(expected) = expected.filter(|e| e.checksum != checksum) {
             return Err(candidate(format!(
                 "its sha256 is {checksum}, not {}",
-                request.checksum
+                expected.checksum
             )));
         }
         // The held image itself, through this process's descriptor of it.
         let check =
             crate::update::run_self_check(&image.proc_path(), crate::update::SELF_CHECK_TIMEOUT)
                 .map_err(candidate)?;
-        if check.build != request.build {
+        if let Some(expected) = expected.filter(|e| e.build != check.build) {
             return Err(candidate(format!(
                 "it is build {}, not {}",
-                check.build, request.build
+                check.build, expected.build
             )));
         }
         let version = check
@@ -552,14 +762,6 @@ impl Inner {
             session_protocols: identity.profiles.clone(),
         })
         .map_err(|_| candidate("its version or session profiles exceed the server information"))?;
-        let consented = consented_case(
-            request.consent.as_ref(),
-            &request.identity,
-            &CandidateImageIdentity {
-                build: identity.build,
-                checksum: identity.checksum.clone(),
-            },
-        );
         let facts = CandidateFacts {
             build: identity.build,
             checksum: identity.checksum.clone(),
@@ -583,7 +785,6 @@ impl Inner {
             image,
             identity,
             facts,
-            consented,
         })
     }
 

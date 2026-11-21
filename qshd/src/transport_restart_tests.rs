@@ -367,6 +367,61 @@ impl FrontendUpgrades for Answering {
             }
         })
     }
+    fn reload(
+        &self,
+    ) -> crate::frontend_upgrade::BoxFuture<'_, crate::frontend_upgrade::ReloadResponse> {
+        Box::pin(async { crate::frontend_upgrade::ReloadResponse::UpToDate })
+    }
+}
+
+/// `RELOAD-FRONTEND` is a `serve` daemon's reload socket's: a control
+/// socket never answers it, not even a hosted daemon's.
+#[tokio::test]
+async fn a_control_socket_never_answers_a_reload() {
+    let upgrades: Option<Arc<dyn FrontendUpgrades>> = Some(Arc::new(Answering));
+    for upgrades in [None, upgrades] {
+        assert_eq!(
+            upgrade_answer(&ControlRequest::ReloadFrontend, upgrades).await,
+            ""
+        );
+    }
+}
+
+/// One line through the reload socket's handler, from a peer `accepted`
+/// or not: what it answers, if anything.
+#[cfg(target_os = "linux")]
+async fn reload_answer(line: &str, accepted: bool) -> String {
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    client.write_all(line.as_bytes()).await.unwrap();
+    let handled = handle_reload_connection(server, &Answering, |_| {
+        if accepted {
+            Ok(())
+        } else {
+            anyhow::bail!("control peer belongs to a different effective account")
+        }
+    })
+    .await;
+    assert_eq!(handled.is_ok(), accepted, "{handled:?}");
+    // A refused peer's request is never read: its close resets the
+    // connection, which is no answer too.
+    let mut answer = String::new();
+    let _ = client.read_to_string(&mut answer).await;
+    answer
+}
+
+/// The reload socket answers `RELOAD-FRONTEND` from its own account with
+/// one line, and nothing else: no other request, and no other account.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_reload_socket_answers_only_a_reload_from_its_account() {
+    assert_eq!(
+        reload_answer("RELOAD-FRONTEND\n", true).await,
+        "{\"status\":\"up_to_date\"}\n"
+    );
+    assert_eq!(reload_answer("RELOAD-FRONTEND\n", false).await, "");
+    for other in ["STATUS\n", "STOP\n", "RELOAD-FRONTEND now\n"] {
+        assert_eq!(reload_answer(other, true).await, "", "{other}");
+    }
 }
 
 /// A hosted daemon hands both requests to its upgrades and answers with
