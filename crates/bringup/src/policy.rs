@@ -10,6 +10,8 @@ pub enum InstallPolicy {
     /// Recovery may reuse/restart an installed daemon with its existing identity.
     /// Never install, create an identity, or replace a live daemon.
     RestartOnly,
+    /// A foreground login: asks before installing `version` when qshd is
+    /// missing, or when the found cached copy is older than `version`.
     AskIfMissing {
         version: String,
     },
@@ -25,6 +27,10 @@ pub struct InstallOffer {
     pub ssh_port: u16,
     pub image: ImageRequest,
     pub remote_path: String,
+    /// The older cached qshd version this install supersedes, when one was
+    /// found; `None` when qshd is missing. Declining an upgrade still runs
+    /// the found copy. It is printed by SemVer, so it is plain ASCII.
+    pub replaces: Option<String>,
 }
 
 pub trait InstallApproval: Send + Sync {

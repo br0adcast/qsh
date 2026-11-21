@@ -661,6 +661,34 @@ fn on_session(
         }
         check_cancel(cancel)?;
     }
+    // A foreground login whose found cached copy is older than this client's
+    // own qshd offers the bundled one, so that the running daemon can update
+    // from it. Background and recovery logins never ask, and a qshd on
+    // `PATH` has no version to compare.
+    let replaces = match (&policy, &probe.located, &probe.found_version) {
+        (InstallPolicy::AskIfMissing { version }, locate::Located::Found(_), Some(found))
+            if crate::image::valid_version(version)
+                .is_some_and(|bundled| locate::older_than_bundled(found, &bundled)) =>
+        {
+            Some(found.to_string())
+        }
+        _ => None,
+    };
+    // The found copy is checked before the offer, as an unsafe selected
+    // daemon never leads to an installation question; declining then runs
+    // it without a second check.
+    if let (Some(_), None, locate::Located::Found(found)) =
+        (&replaces, &trusted_found, &probe.located)
+    {
+        let trusted = session.trusted_path(
+            found,
+            probe.platform.os,
+            trust::Purpose::Execute,
+            &hooks,
+            cancel,
+        )?;
+        trusted_found = Some((found.clone(), trusted));
+    }
     let mut verified_candidate_digest = None;
     let path = match (&policy, probe.located) {
         (
@@ -668,11 +696,14 @@ fn on_session(
             | InstallPolicy::RestartOnly
             | InstallPolicy::AskIfMissing { .. },
             locate::Located::Found(path),
-        ) => path,
+        ) if replaces.is_none() => path,
         (InstallPolicy::ExistingOnly | InstallPolicy::RestartOnly, _) => {
             return Err(BringUpError::InstallRequired)
         }
-        (InstallPolicy::AskIfMissing { version } | InstallPolicy::EnsureBundled { version }, _) => {
+        (
+            InstallPolicy::AskIfMissing { version } | InstallPolicy::EnsureBundled { version },
+            located,
+        ) => 'install: {
             let request = ImageRequest::new(probe.platform, version.clone())?;
             request.validate()?;
             let path = probe
@@ -689,11 +720,17 @@ fn on_session(
                     ssh_port,
                     image: request.clone(),
                     remote_path: path.clone(),
+                    replaces: replaces.clone(),
                 };
                 let accepted = hooks.approval.approve(&offer, cancel)?;
                 check_cancel(cancel)?;
                 if !accepted {
-                    return Err(BringUpError::Declined);
+                    // Declining an upgrade keeps today's login: the found
+                    // copy runs, after the same trust check below.
+                    match located {
+                        locate::Located::Found(found) => break 'install found,
+                        _ => return Err(BringUpError::Declined),
+                    }
                 }
             }
             let source = hooks.source.as_ref().ok_or_else(|| {

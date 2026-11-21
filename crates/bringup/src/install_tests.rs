@@ -15,6 +15,10 @@ fn mode(path: &Path, value: u32) {
 struct Hooks {
     loads: AtomicUsize,
     approvals: AtomicUsize,
+    /// Every offer the approval hook saw, in order.
+    offers: std::sync::Mutex<Vec<InstallOffer>>,
+    /// Whether the approval hook refuses every offer.
+    declines: AtomicBool,
 }
 impl crate::ImageSource for Hooks {
     fn load(
@@ -35,9 +39,10 @@ impl crate::ImageSource for Hooks {
     }
 }
 impl crate::InstallApproval for Hooks {
-    fn approve(&self, _: &InstallOffer, _: &knock::Cancel) -> Result<bool, BringUpError> {
+    fn approve(&self, offer: &InstallOffer, _: &knock::Cancel) -> Result<bool, BringUpError> {
         self.approvals.fetch_add(1, Ordering::SeqCst);
-        Ok(true)
+        self.offers.lock().unwrap().push(offer.clone());
+        Ok(!self.declines.load(Ordering::SeqCst))
     }
 }
 impl BringUpObserver for Hooks {
@@ -47,6 +52,8 @@ fn hooks() -> (Arc<Hooks>, BringUpHooks) {
     let h = Arc::new(Hooks {
         loads: 0.into(),
         approvals: 0.into(),
+        offers: Default::default(),
+        declines: false.into(),
     });
     (
         h.clone(),
@@ -1443,4 +1450,235 @@ fn probed_service_restart_cancellation_after_trust_never_spends_consent() {
     assert_eq!(fixture.steps(), ["the qshd lookup", "qshd path trust"]);
     assert_eq!(fixture.starts(), 0);
     assert_eq!(fixture.uploads, 0);
+}
+
+fn ask(version: &str) -> InstallPolicy {
+    InstallPolicy::AskIfMissing {
+        version: version.into(),
+    }
+}
+/// A trusted cached copy named for `version`, the only lookup result.
+fn cache(fixture: &mut Fixture, version: &str) -> PathBuf {
+    let path = fixture.root.path().join(
+        crate::Platform::from_uname("Linux", std::env::consts::ARCH)
+            .unwrap()
+            .file_name(version),
+    );
+    fs::write(&path, b"cached build never execute").unwrap();
+    mode(&path, 0o700);
+    fixture.cached = Some(path.clone());
+    path
+}
+fn ensure_script(fixture: &Fixture) -> &str {
+    &fixture
+        .commands
+        .iter()
+        .find(|(what, _)| what == "qshd transport-ensure")
+        .unwrap()
+        .1
+}
+fn quoted(path: &Path) -> String {
+    shell::quote(path.to_str().unwrap())
+}
+#[test]
+fn an_older_cached_qshd_offers_the_bundled_version() {
+    let mut f = Fixture::new();
+    let old = cache(&mut f, "0.4.0");
+    f.server_info = true;
+    let gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| gate.call(info);
+    let (h, hooks) = hooks();
+    f.run_probed(
+        ask("0.5.0"),
+        hooks,
+        Some(probe(&before)),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    let offers = h.offers.lock().unwrap();
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0].replaces.as_deref(), Some("0.4.0"));
+    assert_eq!(offers[0].image.version, "0.5.0");
+    assert_eq!(offers[0].remote_path, f.final_path().to_str().unwrap());
+    // The running daemon's server info is read once, before the offer,
+    // through the trusted found copy, exactly as before this change.
+    assert_eq!(*gate.seen.borrow(), [Some([3; 16])]);
+    let query = &f
+        .commands
+        .iter()
+        .find(|(what, _)| what == "qshd server-info")
+        .unwrap()
+        .1;
+    assert!(query.starts_with(&format!("{} server-info ", quoted(&old))));
+    // The bundled copy is installed and verified like a missing qshd, and
+    // trusted again before it runs; the older copy never starts.
+    assert_eq!(h.loads.load(Ordering::SeqCst), 1);
+    assert_eq!(f.uploads, 1);
+    assert_eq!(
+        fs::read(f.final_path()).unwrap(),
+        b"owned fixture; never execute"
+    );
+    let steps = f.steps();
+    let published = steps.iter().position(|s| *s == "qshd publication").unwrap();
+    let started = steps
+        .iter()
+        .position(|s| *s == "qshd transport-ensure")
+        .unwrap();
+    assert!(steps[..published].contains(&"qshd verification"));
+    assert!(steps[published..started].contains(&"qshd path trust"));
+    assert_eq!(f.starts(), 1);
+    assert!(ensure_script(&f).starts_with(&quoted(&f.final_path())));
+    assert_eq!(
+        f.selected_helpers,
+        [f.final_path().to_str().unwrap().to_owned()]
+    );
+}
+#[test]
+fn declining_the_upgrade_runs_the_found_qshd() {
+    for probed in [false, true] {
+        let mut f = Fixture::new();
+        let old = cache(&mut f, "0.4.0");
+        f.server_info = true;
+        let gate = Gate::new(true);
+        let before = |info: Option<&ssh::VerifiedSshServerInfo>| gate.call(info);
+        let (h, hooks) = hooks();
+        h.declines.store(true, Ordering::SeqCst);
+        let ready = f
+            .run_probed(
+                ask("0.5.0"),
+                hooks,
+                probed.then(|| probe(&before)),
+                &knock::Cancel::new(),
+            )
+            .unwrap();
+        assert_eq!(ready.version, "custom-actual");
+        assert_eq!(h.approvals.load(Ordering::SeqCst), 1);
+        assert_eq!(h.loads.load(Ordering::SeqCst), 0);
+        assert_eq!(f.uploads, 0);
+        assert!(!f.final_path().exists());
+        assert!(ensure_script(&f).starts_with(&quoted(&old)));
+        if probed {
+            // The proof taken through the found copy still applies, and one
+            // trust check serves both the query and the startup.
+            assert_eq!(*gate.seen.borrow(), [Some([3; 16])]);
+            assert_eq!(
+                f.steps(),
+                [
+                    "the qshd lookup",
+                    "qshd path trust",
+                    "qshd server-info",
+                    "qshd transport-ensure"
+                ]
+            );
+        } else {
+            assert_eq!(
+                f.steps(),
+                [
+                    "the qshd lookup",
+                    "qshd path trust",
+                    "qshd transport-ensure"
+                ]
+            );
+        }
+    }
+}
+#[test]
+fn an_equal_or_newer_cached_qshd_is_run_without_an_offer() {
+    for (bundled, found) in [
+        ("0.5.0", "0.5.0"),
+        ("0.5.0", "0.5.1"),
+        ("0.5.0", "1.0.0"),
+        ("0.6.0-alpha.1", "0.6.0-alpha.1"),
+        ("0.6.0-alpha.1", "0.6.0-alpha.2"),
+        ("0.6.0-alpha.1", "0.6.0-beta.1"),
+        ("0.6.0-alpha.1", "0.6.0-rc.1"),
+        ("0.6.0-alpha.1", "0.6.0"),
+        // A misspelled prerelease of a later release is still newer.
+        ("0.5.0", "0.6.0-rc1"),
+    ] {
+        let mut f = Fixture::new();
+        let found_path = cache(&mut f, found);
+        let (h, hooks) = hooks();
+        f.run(ask(bundled), hooks, &knock::Cancel::new()).unwrap();
+        assert_eq!(h.approvals.load(Ordering::SeqCst), 0, "{bundled} {found}");
+        assert_eq!(h.loads.load(Ordering::SeqCst), 0, "{bundled} {found}");
+        assert_eq!(f.uploads, 0);
+        assert!(ensure_script(&f).starts_with(&quoted(&found_path)));
+    }
+}
+#[test]
+fn the_withdrawn_rc1_counts_as_older_than_alpha_1() {
+    // SemVer alone orders `rc1` above `alpha.1`.
+    let rc1 = semver::Version::parse("0.6.0-rc1").unwrap();
+    let alpha1 = semver::Version::parse("0.6.0-alpha.1").unwrap();
+    assert!(rc1 > alpha1);
+    for (found, bundled, older) in [
+        ("0.6.0-rc1", "0.6.0-alpha.1", true),
+        ("0.6.0-rc1", "0.6.0", true),
+        ("0.6.0-rc1", "0.6.1-alpha.1", true),
+        ("0.6.0-rc", "0.6.0-alpha.1", true),
+        ("0.6.0-rc.1.1", "0.6.0-alpha.1", true),
+        ("0.6.0-preview.1", "0.6.0-alpha.1", true),
+        ("0.6.0-rc.x", "0.6.0-alpha.1", true),
+        ("0.6.0-rc1", "0.5.9", false),
+        ("0.6.0-rc.1", "0.6.0-alpha.1", false),
+        ("0.6.0-alpha.1", "0.6.0-alpha.1", false),
+        ("0.5.9", "0.6.0-alpha.1", true),
+    ] {
+        assert_eq!(
+            crate::locate::older_than_bundled(
+                &semver::Version::parse(found).unwrap(),
+                &semver::Version::parse(bundled).unwrap()
+            ),
+            older,
+            "{found} against {bundled}"
+        );
+    }
+    let mut f = Fixture::new();
+    cache(&mut f, "0.6.0-rc1");
+    let (h, hooks) = hooks();
+    f.run(ask("0.6.0-alpha.1"), hooks, &knock::Cancel::new())
+        .unwrap();
+    let offers = h.offers.lock().unwrap();
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0].replaces.as_deref(), Some("0.6.0-rc1"));
+    assert_eq!(offers[0].image.version, "0.6.0-alpha.1");
+    assert_eq!(f.uploads, 1);
+}
+#[test]
+fn background_and_recovery_never_offer_an_upgrade() {
+    for policy in [InstallPolicy::ExistingOnly, InstallPolicy::RestartOnly] {
+        let mut f = Fixture::new();
+        let old = cache(&mut f, "0.4.0");
+        let (h, mut hooks) = hooks();
+        hooks.source = None;
+        f.run(policy.clone(), hooks, &knock::Cancel::new()).unwrap();
+        assert_eq!(h.approvals.load(Ordering::SeqCst), 0, "{policy:?}");
+        assert_eq!(h.loads.load(Ordering::SeqCst), 0);
+        assert_eq!(f.uploads, 0);
+        assert_eq!(f.starts(), 1);
+        assert!(ensure_script(&f).starts_with(&quoted(&old)));
+    }
+    // A qshd found on `PATH` has no version to compare: a login runs it.
+    let mut f = Fixture::new();
+    let installed = f.daemon(0o700);
+    let (h, hooks) = hooks();
+    f.run(ask("0.5.0"), hooks, &knock::Cancel::new()).unwrap();
+    assert_eq!(h.approvals.load(Ordering::SeqCst), 0);
+    assert!(ensure_script(&f).starts_with(&quoted(&installed)));
+}
+#[test]
+fn an_unsafe_older_cached_qshd_is_refused_without_an_offer() {
+    // As for any unsafe selected daemon, no approval is asked and nothing is
+    // downloaded over it.
+    let mut f = Fixture::new();
+    let old = cache(&mut f, "0.4.0");
+    mode(&old, 0o777);
+    let (h, hooks) = hooks();
+    let result = f.run(ask("0.5.0"), hooks, &knock::Cancel::new());
+    assert!(matches!(result, Err(BringUpError::Verify(_))), "{result:?}");
+    assert_eq!(h.approvals.load(Ordering::SeqCst), 0);
+    assert_eq!(h.loads.load(Ordering::SeqCst), 0);
+    assert_eq!(f.uploads, 0);
+    assert_eq!(f.starts(), 0);
 }

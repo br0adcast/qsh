@@ -663,18 +663,33 @@ impl bringup::InstallApproval for InstallQuestion {
 }
 
 /// The installation question: the account and host shown by `identity`'s
-/// rules, the remote path by the general text policy.
+/// rules, the remote path by the general text policy. An upgrade offer names
+/// the older found version, and says that the running daemon is then asked to
+/// update, because installing alone does not change what serves.
 fn install_question(offer: &bringup::InstallOffer) -> String {
+    let user = crate::identity::show(&offer.username);
+    let host = crate::identity::show(&offer.host);
+    let version = &offer.image.version;
+    let (heading, after) = match &offer.replaces {
+        None => (
+            format!("qshd is not installed on {user}@{host}:{}.", offer.ssh_port),
+            String::new(),
+        ),
+        Some(old) => (
+            format!(
+                "qshd {} on {user}@{host}:{} is older than this client's {version}.",
+                crate::report::printable(old),
+                offer.ssh_port,
+            ),
+            " A running qshd is asked to update afterwards; it keeps its sessions or asks first."
+                .into(),
+        ),
+    };
     crate::identity::with_note(
         format!(
-            "\nqshd is not installed on {}@{}:{}.\n\n  Version   {}\n  Platform  {}\n  Location  {}\n  Source    GitHub Releases\n\nInstall qshd {}?",
-            crate::identity::show(&offer.username),
-            crate::identity::show(&offer.host),
-            offer.ssh_port,
-            offer.image.version,
+            "\n{heading}\n\n  Version   {version}\n  Platform  {}\n  Location  {}\n  Source    GitHub Releases\n\nInstall qshd {version}?{after}",
             offer.image.platform.target(),
             crate::report::printable(&offer.remote_path),
-            offer.image.version,
         ),
         &[&offer.username, &offer.host],
     )
@@ -748,6 +763,7 @@ mod tests {
             )
             .unwrap(),
             remote_path: "/fixture/qshd".into(),
+            replaces: None,
         };
         let result = InstallQuestion(Tty::at("/nonexistent/qsh-confirmation-fixture"))
             .approve(&offer, &cancel);
@@ -1097,6 +1113,7 @@ mod tests {
             )
             .unwrap(),
             remote_path: "/home/ali\u{3164}ce/.local/bin/qshd".into(),
+            replaces: None,
         };
         let question = install_question(&offer);
         assert!(
@@ -1118,6 +1135,39 @@ mod tests {
         let question = install_question(&plain);
         assert!(question.contains("not installed on алиса@пример.рф:22."));
         assert!(!question.contains(crate::identity::NOTE));
+    }
+
+    #[test]
+    fn the_upgrade_question_names_both_versions() {
+        let platform = bringup::Platform::from_uname("Linux", "x86_64").unwrap();
+        let offer = bringup::InstallOffer {
+            username: "fixture".into(),
+            host: "host.invalid".into(),
+            ssh_port: 2222,
+            image: bringup::ImageRequest::new(platform, "0.6.0-alpha.1").unwrap(),
+            remote_path: "/home/fixture/.cache/qsh/qshd-0.6.0-alpha.1-x86_64".into(),
+            replaces: Some("0.6.0-rc1".into()),
+        };
+        assert_eq!(
+            install_question(&offer),
+            format!(
+                "\nqshd 0.6.0-rc1 on fixture@host.invalid:2222 is older than this client's 0.6.0-alpha.1.\n\n  Version   0.6.0-alpha.1\n  Platform  {}\n  Location  /home/fixture/.cache/qsh/qshd-0.6.0-alpha.1-x86_64\n  Source    GitHub Releases\n\nInstall qshd 0.6.0-alpha.1? A running qshd is asked to update afterwards; it keeps its sessions or asks first.",
+                platform.target()
+            )
+        );
+        // Escaped names keep their note just above the question.
+        let hidden = bringup::InstallOffer {
+            host: "host\u{202E}.example".into(),
+            ..offer
+        };
+        let question = install_question(&hidden);
+        assert!(question.starts_with(
+            "\nqshd 0.6.0-rc1 on fixture@host\\u{202E}.example:2222 is older than this client's 0.6.0-alpha.1.\n"
+        ));
+        assert!(question.ends_with(&format!(
+            "\n{}\nInstall qshd 0.6.0-alpha.1? A running qshd is asked to update afterwards; it keeps its sessions or asks first.",
+            crate::identity::NOTE
+        )));
     }
 
     #[test]

@@ -247,7 +247,11 @@ can therefore be completed only while no newer tag of its version exists.
 `v0.6.0-rc1` was published before this rule. The owner withdrew it and deleted
 its release and tag, because it orders above every `0.6.0-rc.N` and its tag
 would refuse each of them. A host that still caches
-`~/.cache/qsh/qshd-0.6.0-rc1-<arch>` (with a `-darwin` suffix on macOS) keeps
+`~/.cache/qsh/qshd-0.6.0-rc1-<arch>` (with a `-darwin` suffix on macOS) is
+handled by spelling: `qsh` ranks a cached prerelease not spelled `alpha.N`,
+`beta.N` or `rc.N` below every cached copy of the same `0.6.0`, and an
+interactive login counts it as older than the client's `0.6.0` prerelease or
+release and offers to install the client's version. Older clients keep
 selecting it over a later `0.6.0-rc.N` until that file is removed. Distribution
 packages are unaffected: `dpkg` and `rpm` order `0.6.0~rc.2` above `0.6.0~rc1`.
 

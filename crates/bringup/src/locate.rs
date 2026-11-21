@@ -64,6 +64,7 @@ pub(crate) struct Probe {
     pub(crate) platform: crate::Platform,
     pub(crate) home: std::path::PathBuf,
     pub(crate) located: Located,
+    pub(crate) found_version: Option<semver::Version>,
 }
 
 /// A failed or malformed lookup is never evidence that qshd is missing.
@@ -121,20 +122,68 @@ pub(crate) fn probe(code: i32, out: &str) -> Result<Probe, crate::BringUpError> 
     let newest = cached
         .into_iter()
         .filter_map(|path| cached_version(path, &platform).map(|version| (version, path)))
-        .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(_, path)| path);
-    let located = if let Some(service) = service {
-        Located::Service(service)
+        .max_by(|a, b| release_order(&a.0, &b.0));
+    let (located, found_version) = if let Some(service) = service {
+        (Located::Service(service), None)
+    } else if let Some((version, path)) = newest {
+        (Located::Found(path.into()), Some(version))
     } else {
-        newest
-            .or(on_path)
-            .map_or(Located::Missing, |path| Located::Found(path.into()))
+        // A qshd on `PATH` is an administrator's or a package's binary: its
+        // name carries no version, and `systemctl --user reload` updates it.
+        (
+            on_path.map_or(Located::Missing, |path| Located::Found(path.into())),
+            None,
+        )
     };
     Ok(Probe {
         platform,
         home: home.into(),
         located,
+        found_version,
     })
+}
+
+/// Whether `version` is a release or a prerelease spelled as release tags
+/// spell it: `alpha.N`, `beta.N` or `rc.N` (`scripts/check-release-version.py`).
+/// SemVer compares an attached number as text, so the withdrawn `0.6.0-rc1`
+/// orders above `0.6.0-alpha.1` and every later `0.6.0-rc.N`; its spelling is
+/// what tells it apart.
+fn release_spelled(version: &semver::Version) -> bool {
+    if version.pre.is_empty() {
+        return true;
+    }
+    let mut identifiers = version.pre.as_str().split('.');
+    matches!(
+        (identifiers.next(), identifiers.next(), identifiers.next()),
+        (Some("alpha" | "beta" | "rc"), Some(number), None)
+            if !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+    )
+}
+
+/// SemVer precedence, except that a version whose prerelease is not
+/// [`release_spelled`] orders below every version with the same
+/// major.minor.patch. Ranking the cache by it keeps a cached `0.6.0-rc1`
+/// from being chosen over a `0.6.0-alpha.1` installed after it, which would
+/// offer the same upgrade at every login.
+fn release_order(a: &semver::Version, b: &semver::Version) -> std::cmp::Ordering {
+    let core = |v: &semver::Version| (v.major, v.minor, v.patch);
+    core(a)
+        .cmp(&core(b))
+        .then_with(|| release_spelled(a).cmp(&release_spelled(b)))
+        .then_with(|| a.cmp(b))
+}
+
+/// Whether the found cached copy is older than this client's bundled qshd:
+/// SemVer order, except that a found prerelease not [`release_spelled`]
+/// counts as older than any bundled version with the same major.minor.patch
+/// or higher.
+pub(crate) fn older_than_bundled(found: &semver::Version, bundled: &semver::Version) -> bool {
+    let core = |v: &semver::Version| (v.major, v.minor, v.patch);
+    if release_spelled(found) {
+        found < bundled
+    } else {
+        core(found) <= core(bundled)
+    }
 }
 
 fn cached_version(path: &str, platform: &crate::Platform) -> Option<semver::Version> {
@@ -339,6 +388,53 @@ mod tests {
             "garbage\n",
         ] {
             assert!(probe(0, &output(line)).is_err(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn the_probe_reports_the_found_cached_version() {
+        let out = output(
+            "cached /h/qshd-0.4.0-x86_64\ncached /h/qshd-0.6.0-rc1-x86_64\npath /usr/bin/qshd\n",
+        );
+        let found = probe(0, &out).unwrap();
+        assert_eq!(
+            found.located,
+            Located::Found("/h/qshd-0.6.0-rc1-x86_64".into())
+        );
+        assert_eq!(
+            found.found_version,
+            Some(semver::Version::parse("0.6.0-rc1").unwrap())
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_rc1_ranks_below_a_release_spelled_copy() {
+        // Otherwise a login that installed 0.6.0-alpha.1 over a cached
+        // 0.6.0-rc1 would find rc1 again and offer the same upgrade.
+        let out = output("cached /h/qshd-0.6.0-rc1-x86_64\ncached /h/qshd-0.6.0-alpha.1-x86_64\n");
+        let found = probe(0, &out).unwrap();
+        assert_eq!(
+            found.located,
+            Located::Found("/h/qshd-0.6.0-alpha.1-x86_64".into())
+        );
+        let out = output("cached /h/qshd-0.6.0-rc1-x86_64\ncached /h/qshd-0.5.9-x86_64\n");
+        assert_eq!(
+            probe(0, &out).unwrap().located,
+            Located::Found("/h/qshd-0.6.0-rc1-x86_64".into())
+        );
+    }
+
+    #[test]
+    fn a_qshd_on_path_has_no_version() {
+        for extra in [
+            // A cached name that does not parse is never a version.
+            "cached /h/qshd-9.0-x86_64\npath /home/test/.local/bin/qshd\n",
+            "path /usr/bin/qshd\n",
+            "",
+            "service user\ncached /h/qshd-0.4.0-x86_64\n",
+        ] {
+            let found = probe(0, &output(extra)).unwrap();
+            assert_eq!(found.found_version, None, "{extra:?}");
         }
     }
 

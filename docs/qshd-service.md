@@ -263,7 +263,14 @@ when one of them goes:
 
 When `qsh` logs in over SSH and brings a newer `qshd` than the running
 daemon's, `transport-ensure` asks the daemon to replace only its frontend
-with the newer binary. The host keeps its own binary, each session's owner
+with the newer binary. An interactive login brings its own `qshd` when the
+newest copy cached in `~/.cache/qsh` is older than the client: it asks, as
+it does when `qshd` is missing, and installs and verifies the client's
+version the same way. Declining runs the cached copy, as before; a `qshd`
+found on `PATH` (a package's or an administrator's) is run without asking,
+and background or recovery logins never ask. A cached prerelease not spelled
+`alpha.N`, `beta.N` or `rc.N`, such as the withdrawn `0.6.0-rc1`, counts as
+older than every release of its version. The host keeps its own binary, each session's owner
 keeps the one it was started from, and sessions started afterwards run the
 new one. What happens depends on the daemon's sessions, attached or not:
 
