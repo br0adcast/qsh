@@ -733,7 +733,8 @@ impl PersonalSessions {
     }
 
     /// The backend a router in this process runs every session with, when
-    /// this daemon is no host ([`PersonalSessions::host`] gave `None`):
+    /// this daemon is no host ([`PersonalSessions::host_images`] gave
+    /// `None`):
     /// `backend` speaking for `daemon`, driven here.
     pub fn backend(
         &self,

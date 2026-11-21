@@ -63,6 +63,9 @@
 //!
 //! [`update`] -- the personal daemon's side of an update over qsh: the
 //! decision, the staged image, the self-check and the replacement.
+//!
+//! [`frontend_upgrade`] -- whether a newer qshd may replace only the
+//! frontend of a hosted daemon, and what that would cost its sessions.
 
 #[cfg(feature = "system")]
 mod ancillary;
@@ -87,6 +90,7 @@ mod modern_restart;
 pub use modern_restart::{interrupt_selected, RestartOutcome};
 #[cfg(target_os = "linux")]
 pub mod frontend;
+pub mod frontend_upgrade;
 #[cfg(target_os = "linux")]
 pub mod host;
 #[cfg(target_os = "linux")]

@@ -1149,7 +1149,9 @@ impl crate::update::OwnerStop for OwnerFleet {
 /// ([`OwnerHost::start_raw`], when the frontend asks the host for one) and
 /// serves each one's host channel.
 pub struct OwnerHost {
-    image: SelfImage,
+    /// What the next owner starts from: this daemon's image, until a
+    /// frontend replacement sets another ([`OwnerHost::set_image`]).
+    image: Mutex<SelfImage>,
     log_dir: Option<PathBuf>,
     daemon: Option<Arc<dyn DaemonUpdates>>,
     fleet: Arc<OwnerFleet>,
@@ -1182,7 +1184,7 @@ impl OwnerHost {
         services: Arc<HostServices>,
     ) -> OwnerHost {
         OwnerHost {
-            image,
+            image: Mutex::new(image),
             log_dir,
             daemon,
             fleet,
@@ -1200,6 +1202,14 @@ impl OwnerHost {
 
     pub(crate) fn fleet(&self) -> &Arc<OwnerFleet> {
         &self.fleet
+    }
+
+    /// Start every owner from `image` from now on. An owner that runs keeps
+    /// its own image: it is the parent of its session's shells.
+    // Not called until the frontend upgrade (#529 M2) is in.
+    #[allow(dead_code)]
+    pub(crate) fn set_image(&self, image: SelfImage) {
+        *self.image.lock().unwrap_or_else(|e| e.into_inner()) = image;
     }
 
     /// Whether a new session of `uid` would get its envelope now.
@@ -1251,6 +1261,11 @@ impl OwnerHost {
             io::Error::other(why)
         })?;
         let account = Arc::new(account);
+        let image = self
+            .image
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_clone()?;
         let (child, slot) = {
             // The permit first, then the fleet: a replacement holds the
             // spawn gate for writing while it stops the fleet, so the other
@@ -1260,7 +1275,7 @@ impl OwnerHost {
             // fleet either sees this owner or this start sees it closed.
             let mut state = self.fleet.lock();
             Self::may_start(&state).map_err(io::Error::other)?;
-            let child = spawn_owner(&self.image, &host_init, &permit)?;
+            let child = spawn_owner(&image, &host_init, &permit)?;
             drop(permit);
             let pidfd = match child.pidfd.try_clone() {
                 Ok(pidfd) => pidfd,

@@ -75,6 +75,9 @@ const HOST_QUEUE: usize = 1024;
 const FAREWELL_TIMEOUT: Duration = Duration::from_secs(2);
 /// The exit status of a frontend whose host is gone.
 const HOST_GONE_EXIT: i32 = 3;
+/// The exit status of a frontend given the test fault `frontend-exit`
+/// ([`crate::state::ImageFault::FrontendExit`]).
+const FAULT_EXIT: i32 = 3;
 
 /// The frontend role, if `args` asks for it: dispatched before every other
 /// command. Refused unless this process was started the way a host starts a
@@ -305,6 +308,7 @@ impl HostLink {
                 ToHost::KeysTaken { .. } => "an allowlist receipt",
                 ToHost::Ended { .. } => "a session's end",
                 ToHost::Alive => "an answer to the host's probe",
+                ToHost::Ready => "the report that this frontend serves",
                 _ => "a notice",
             };
             crate::log::error(
@@ -721,7 +725,8 @@ async fn run_frontend(
     let inner = crate::channel_backend::ChannelSessionBackend::new(Arc::new(
         crate::screen_budget::ScreenBudget::new(crate::screen_budget::BudgetLimits::default()),
     ));
-    let backend = RemoteBackend::with_owners(Arc::new(inner), host.clone()).with_directory(host);
+    let backend =
+        RemoteBackend::with_owners(Arc::new(inner), host.clone()).with_directory(host.clone());
     let socket = std::net::UdpSocket::from(socket);
     socket
         .set_nonblocking(true)
@@ -731,6 +736,15 @@ async fn run_frontend(
         generation,
         ..crate::server_info::current()
     };
+    // The last step of the start: the host replacing a frontend waits for
+    // this word. A test image may be made to fail here.
+    match crate::state::image_fault() {
+        Some(crate::state::ImageFault::FrontendExit) => std::process::exit(FAULT_EXIT),
+        Some(crate::state::ImageFault::FrontendSilent) => {
+            crate::log::warn("qshd", "test fault: this frontend never reports ready");
+        }
+        _ => host.notify(ToHost::Ready),
+    }
     crate::log::info("qshd", "network frontend serving");
     let served = SessionManager::serve_with_server_info(
         Arc::new(socket),

@@ -530,17 +530,15 @@ pub async fn run_hosted_transport_daemon_until_stop(
 }
 
 /// A host without a control socket (`serve`): frontends of `host` on
-/// `socket`, under the generation `serving` names, until `stop`, then until
-/// the last one is reaped.
+/// `socket` until `stop`, then until the last one is reaped.
 #[cfg(target_os = "linux")]
 pub async fn run_host_until_stop(
     host: Arc<crate::host::Host>,
     socket: std::net::UdpSocket,
-    serving: &Serving,
     stop: impl std::future::Future<Output = Result<()>>,
 ) -> Result<()> {
     let shutdown = transport::Shutdown::default();
-    let serving = host.serve(socket, shutdown.clone(), serving.generation());
+    let serving = host.serve(socket, shutdown.clone());
     tokio::pin!(serving);
     tokio::pin!(stop);
     let (result, stop_error) = tokio::select! {
@@ -670,9 +668,7 @@ async fn run_daemon(
                 Box::pin(async move { serving.await.map_err(anyhow::Error::new) })
             }
             #[cfg(target_os = "linux")]
-            Router::Frontend { host, socket, .. } => {
-                Box::pin(host.serve(socket, shutdown.clone(), running_info.serving.generation()))
-            }
+            Router::Frontend { host, socket, .. } => Box::pin(host.serve(socket, shutdown.clone())),
         };
 
     tokio::pin!(stop);

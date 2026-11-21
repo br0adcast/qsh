@@ -703,14 +703,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
     let daemon = managed_daemon(&backend);
     let runtime = serve_runtime(parsed.runtime_threads)?;
     #[cfg(target_os = "linux")]
-    let host_images = sessions.host_images();
-    // This daemon's one description of the frontend that serves. A hosted
-    // `serve` has no control socket to answer from it yet; its frontends
-    // take their generation from it.
-    #[cfg(target_os = "linux")]
-    let serving = crate::server_info::Serving::own(host_images.is_some());
-    #[cfg(target_os = "linux")]
-    let host = host_images.map(|images| {
+    let host = sessions.host_images().map(|images| {
         sessions.host(
             images,
             Some(daemon.clone()),
@@ -723,8 +716,7 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         #[cfg(target_os = "linux")]
         if let Some(host) = host {
             let result =
-                transport_daemon::run_host_until_stop(host, socket, &serving, signals.requested())
-                    .await;
+                transport_daemon::run_host_until_stop(host, socket, signals.requested()).await;
             // No frontend is left; every session's owner now stops and is
             // reaped before the daemon exits, as below.
             let owners = sessions.stop_all().await;

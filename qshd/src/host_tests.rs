@@ -16,6 +16,8 @@ fn entry(owner_pid: u32, attached: bool) -> Entry {
         confirm_by: None,
         active: false,
         client_key: None,
+        links: Arc::new([]),
+        profiles: Arc::new([]),
     }
 }
 
@@ -118,10 +120,10 @@ fn an_ended_owner_leaves_the_catalog_unless_its_login_was_replaced() {
 fn a_lookup_from_another_account_is_foreign() {
     let catalog = Catalog::new(Arc::default());
     catalog.insert([4; 16], entry(31, false));
-    assert!(matches!(catalog.lookup([4; 16], 1001), Found::Foreign));
-    assert!(matches!(catalog.lookup([5; 16], 1000), Found::Unknown));
+    assert!(matches!(catalog.lookup([4; 16], 1001, &[]), Found::Foreign));
+    assert!(matches!(catalog.lookup([5; 16], 1000, &[]), Found::Unknown));
     // Its owner's relink channel leads nowhere here: the owner is gone.
-    assert!(matches!(catalog.lookup([4; 16], 1000), Found::Unknown));
+    assert!(matches!(catalog.lookup([4; 16], 1000, &[]), Found::Unknown));
 }
 
 /// A replacement stops the frontend and waits until it is reaped; while it
@@ -217,7 +219,10 @@ fn a_takeover_nobody_confirms_lapses_back_to_the_host() {
     let mut kept = entry(51, false);
     kept.relink = host_end;
     catalog.insert([5; 16], kept);
-    assert!(matches!(catalog.lookup([5; 16], 1000), Found::Owner(..)));
+    assert!(matches!(
+        catalog.lookup([5; 16], 1000, &[]),
+        Found::Owner(..)
+    ));
     let handed = Instant::now();
     let confirm_by = catalog.next_deadline().expect("a confirmation deadline");
     assert!(confirm_by >= handed + TAKEOVER_CONFIRM - Duration::from_secs(1));
@@ -239,7 +244,10 @@ fn a_takeover_nobody_confirms_lapses_back_to_the_host() {
     }
 
     // Confirmed by the frontend's first report: no lapse.
-    assert!(matches!(catalog.lookup([5; 16], 1000), Found::Owner(..)));
+    assert!(matches!(
+        catalog.lookup([5; 16], 1000, &[]),
+        Found::Owner(..)
+    ));
     catalog.traffic([5; 16], Duration::ZERO, true);
     assert_eq!(
         catalog.next_deadline(),
@@ -265,7 +273,7 @@ fn a_lapsed_takeover_is_held_again_on_the_frontends_next_report() {
         let mut kept = entry(pid, false);
         kept.relink = host_end;
         catalog.insert(token, kept);
-        assert!(matches!(catalog.lookup(token, 1000), Found::Owner(..)));
+        assert!(matches!(catalog.lookup(token, 1000, &[]), Found::Owner(..)));
     }
     let confirm_by = catalog.next_deadline().expect("a confirmation deadline");
     let (stopped, _) = catalog.take_expired(confirm_by + Duration::from_millis(1));
@@ -322,12 +330,15 @@ fn a_busy_owner_is_unavailable_and_a_closed_one_is_gone() {
         }
         assert!(filled, "the relink channel fills up");
     }
-    assert!(matches!(catalog.lookup([6; 16], 1000), Found::Unavailable));
+    assert!(matches!(
+        catalog.lookup([6; 16], 1000, &[]),
+        Found::Unavailable
+    ));
     assert!(matches!(catalog.relink([6; 16]), Relinked::Unavailable));
     assert!(!catalog.lock().get(&[6; 16]).unwrap().attached);
     drop(owner_end);
     assert!(matches!(catalog.relink([6; 16]), Relinked::Gone));
-    assert!(matches!(catalog.lookup([6; 16], 1000), Found::Unknown));
+    assert!(matches!(catalog.lookup([6; 16], 1000, &[]), Found::Unknown));
 }
 
 /// The keys of the sessions the host ends: scrubbed when no other session
@@ -464,4 +475,136 @@ fn a_session_the_router_ended_leaves_the_catalog_at_once() {
     assert_eq!(catalog.router_ended([1; 16]), None, "once");
     assert_eq!(catalog.router_ended([2; 16]), None, "not the frontend's");
     assert!(catalog.owner_of([2; 16]).is_some());
+}
+
+/// A host whose frontends would start from `image`, with no frontend and
+/// no owner running.
+fn host_serving(image: FrontendImage) -> Arc<Host> {
+    let owners = OwnerHost::new(
+        SelfImage::hold().unwrap(),
+        None,
+        None,
+        crate::owner_process::OwnerFleet::new(),
+        crate::host_services::HostServices::new(Default::default()),
+    );
+    let host = Host::new(
+        SelfImage::hold().unwrap(),
+        owners,
+        Catalog::new(Arc::default()),
+        Arc::default(),
+        HostStart {
+            server_priv: [1; 32],
+            server_pub: [2; 32],
+            reset_secret: None,
+            authorized_keys: None,
+            account: "me".into(),
+            allowlist: HostAllowlist::new(Arc::default()),
+            admission: Arc::default(),
+            runtime_threads: None,
+        },
+    );
+    host.set_current(image);
+    host
+}
+
+/// An image other than this binary, with its own links and profiles.
+fn image(build: u64, links: Vec<u16>, profiles: Vec<[u8; 3]>) -> FrontendImage {
+    FrontendImage {
+        image: SelfImage::hold().unwrap(),
+        info: Arc::new(ImageInfo {
+            identity: ImageIdentity::Known(crate::server_info::FrontendIdentity {
+                version: format!("0.{build}.0"),
+                build,
+                checksum: format!("{build:064x}"),
+                profiles: Vec::new(),
+                generation: [build as u8; 16],
+            }),
+            host_revision: crate::state::HOST_REVISION,
+            link_versions: links,
+            profiles,
+        }),
+    }
+}
+
+/// An owner as `start_raw` gives it, with `relink` as its relink channel.
+fn raw_owner(pid: u32, relink: OwnedFd) -> crate::owner_process::RawOwner {
+    crate::owner_process::RawOwner {
+        pid,
+        pidfd: descriptor(),
+        link: descriptor(),
+        relink,
+    }
+}
+
+/// What the census says of a session: which links its owner speaks (those
+/// of the image it was started from) and which profiles its client may
+/// speak (those of the frontend it was last handed to). A switch of the
+/// image changes a session's profiles only once a frontend of the new image
+/// is handed the session, and never its links: its owner runs on.
+#[test]
+fn the_census_reports_each_sessions_owner_links_and_client_profiles() {
+    let host = host_serving(image(1, vec![1], vec![[1, 1, 1]]));
+    let (looked_up, kept) = ([1; 16], [2; 16]);
+    let (relink, _owner_end) = relink_pair();
+    let started = host.current();
+    host.created(looked_up, 1000, raw_owner(91, relink), &started)
+        .unwrap();
+    host.created(kept, 1000, raw_owner(92, descriptor()), &started)
+        .unwrap();
+    host.catalog.traffic(kept, Duration::ZERO, true);
+
+    host.set_current(image(2, vec![2], vec![[2, 2, 2]]));
+    // The running frontend dies; the next one, started from B, is handed
+    // one of the sessions.
+    host.catalog.detach_all();
+    assert!(matches!(host.lookup(looked_up, 1000), Found::Owner(..)));
+    host.catalog.traffic(looked_up, Duration::ZERO, true);
+
+    let mut facts = host.catalog.census();
+    facts.sort_by_key(|f| f.profiles.clone());
+    assert_eq!(
+        facts,
+        [
+            crate::frontend_upgrade::SessionFacts {
+                attached: false,
+                profiles: vec![[1, 1, 1]],
+                links: vec![1],
+            },
+            crate::frontend_upgrade::SessionFacts {
+                attached: true,
+                profiles: vec![[2, 2, 2]],
+                links: vec![1],
+            },
+        ],
+        "B's profiles, A's links; the frontend's death detached the other"
+    );
+}
+
+/// A frontend's `Ready` is recorded for whoever waits for it, and is
+/// otherwise just a packet that says the frontend is alive.
+#[tokio::test]
+async fn a_frontends_ready_is_recorded_for_whoever_waits() {
+    let host = host_serving(image(1, vec![1], vec![[1, 1, 1]]));
+    let (host_end, _front_end) = relink_pair();
+    let channel = Channel::new(host_end).unwrap();
+    let ready = Readiness::default();
+    let wait = Duration::from_millis(50);
+    assert!(
+        tokio::time::timeout(wait, ready.reported()).await.is_err(),
+        "not before it says so"
+    );
+    let alive = ToHost::Alive.encode().unwrap();
+    assert!(
+        host.serve_request(&channel, 7, &alive, &mut HashMap::new(), &ready)
+            .await
+    );
+    assert!(tokio::time::timeout(wait, ready.reported()).await.is_err());
+    let packet = ToHost::Ready.encode().unwrap();
+    assert!(
+        host.serve_request(&channel, 7, &packet, &mut HashMap::new(), &ready)
+            .await
+    );
+    tokio::time::timeout(wait, ready.reported())
+        .await
+        .expect("reported");
 }

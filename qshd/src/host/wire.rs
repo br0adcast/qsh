@@ -123,6 +123,11 @@ pub(crate) enum ToHost {
     Ended { token: [u8; 16] },
     /// The answer to a `Probe`.
     Alive,
+    /// The frontend serves from now on: sent once, after its start, right
+    /// before its router takes the first datagram. A replacement of the
+    /// frontend waits for it; otherwise it is one more packet that says the
+    /// frontend is alive.
+    Ready,
     /// A key the router scrubbed, under the addition the frontend had.
     ForgetKey { key: [u8; 32], seq: u64 },
     /// `token`'s session is its client's under `key`.
@@ -157,6 +162,7 @@ const H_CLIENT_KEY: u8 = 8;
 const H_KEYS_TAKEN: u8 = 9;
 const H_ENDED: u8 = 10;
 const H_ALIVE: u8 = 11;
+const H_READY: u8 = 12;
 
 fn finish(e: Enc) -> Result<Vec<u8>, WireError> {
     let packet = e.finish()?;
@@ -377,6 +383,7 @@ impl ToHost {
                 e.raw(token);
             }
             ToHost::Alive => e = Enc::new(H_ALIVE),
+            ToHost::Ready => e = Enc::new(H_READY),
             ToHost::ForgetKey { key, seq } => {
                 e = Enc::new(H_FORGET);
                 e.raw(key).u64(*seq);
@@ -433,6 +440,7 @@ impl ToHost {
             H_RETAINED => ToHost::Retained { token: d.array()? },
             H_ENDED => ToHost::Ended { token: d.array()? },
             H_ALIVE => ToHost::Alive,
+            H_READY => ToHost::Ready,
             H_FORGET => ToHost::ForgetKey {
                 key: d.array()?,
                 seq: d.u64()?,
@@ -709,6 +717,7 @@ mod tests {
             ToHost::Retained { token: [6; 16] },
             ToHost::Ended { token: [7; 16] },
             ToHost::Alive,
+            ToHost::Ready,
             ToHost::ForgetKey {
                 key: [9; 32],
                 seq: 4,
@@ -727,6 +736,19 @@ mod tests {
         for msg in to_host {
             assert_eq!(ToHost::decode(&msg.encode().unwrap()), Ok(msg));
         }
+    }
+
+    /// `Ready`, the frontend's word that it serves, crosses as itself and
+    /// is no other report.
+    #[test]
+    fn ready_round_trips_on_the_frontend_channel() {
+        let packet = ToHost::Ready.encode().unwrap();
+        assert_eq!(ToHost::decode(&packet), Ok(ToHost::Ready));
+        assert_ne!(packet, ToHost::Alive.encode().unwrap());
+        let mut longer = packet.clone();
+        longer[3] += 1;
+        longer.push(0);
+        assert!(ToHost::decode(&longer).is_err(), "it carries nothing");
     }
 
     #[test]
