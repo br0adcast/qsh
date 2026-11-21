@@ -409,7 +409,8 @@ An unsafe selected daemon stops startup with a verification error. qsh does not
 try a lower-priority candidate, request installation approval, or download a
 replacement. Correct the reported ownership/permissions or install qshd in a
 private directory owned by your account. Custom builds do not need a published
-release hash or a matching filename version: cache filenames only rank candidates,
+release hash or a matching filename version: cache filenames rank candidates and
+decide whether an interactive login offers to install the client's newer qshd,
 and the running command reports its actual version. Protocol and capability
 negotiation still determine compatibility.
 

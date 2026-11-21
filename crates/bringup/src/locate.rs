@@ -176,10 +176,13 @@ fn release_order(a: &semver::Version, b: &semver::Version) -> std::cmp::Ordering
 /// Whether the found cached copy is older than this client's bundled qshd:
 /// SemVer order, except that a found prerelease not [`release_spelled`]
 /// counts as older than any bundled version with the same major.minor.patch
-/// or higher.
+/// or higher. A version is never older than itself, so a source build with
+/// a version such as `0.7.0-dev` is not offered over its own copy.
 pub(crate) fn older_than_bundled(found: &semver::Version, bundled: &semver::Version) -> bool {
     let core = |v: &semver::Version| (v.major, v.minor, v.patch);
-    if release_spelled(found) {
+    if found == bundled {
+        false
+    } else if release_spelled(found) {
         found < bundled
     } else {
         core(found) <= core(bundled)

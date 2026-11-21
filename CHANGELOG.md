@@ -14,11 +14,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - On Linux, let a login with a newer `qsh` replace only the network part of a
   running personal `qshd`, keeping every session. When the server's cached
   `qshd` is older than the client's, an interactive login offers to install
-  the client's version, as for a missing `qshd`; declining runs the cached
-  one. The running daemon then updates its frontend: `qsh` asks first when
-  other clients would be disconnected briefly, or when some sessions' clients
-  could no longer reach them. If the new version does not start, the running
-  one serves again.
+  the client's version, as for a missing `qshd`, and the running daemon then
+  updates its frontend: `qsh` asks first when other clients would be
+  disconnected briefly, or when some sessions' clients could no longer reach
+  them. Declining runs the cached one. If the new version does not start, the
+  running one serves again.
 - Add `qshd reload` and `ExecReload` to the personal systemd unit:
   `systemctl --user reload qshd` makes the running daemon serve from the
   upgraded `/usr/bin/qshd` and keeps every session. It refuses a downgrade, a

@@ -664,11 +664,13 @@ fn on_session(
     // A foreground login whose found cached copy is older than this client's
     // own qshd offers the bundled one, so that the running daemon can update
     // from it. Background and recovery logins never ask, and a qshd on
-    // `PATH` has no version to compare.
+    // `PATH` has no version to compare. A busy retry runs the helper the
+    // first attempt chose, so it never asks again.
     let replaces = match (&policy, &probe.located, &probe.found_version) {
         (InstallPolicy::AskIfMissing { version }, locate::Located::Found(_), Some(found))
-            if crate::image::valid_version(version)
-                .is_some_and(|bundled| locate::older_than_bundled(found, &bundled)) =>
+            if pending_busy_target.is_none()
+                && crate::image::valid_version(version)
+                    .is_some_and(|bundled| locate::older_than_bundled(found, &bundled)) =>
         {
             Some(found.to_string())
         }
@@ -743,7 +745,11 @@ fn on_session(
             check_cancel(cancel)?;
             validate_image(&request, &image, cancel)?;
             verified_candidate_digest = Some(hex(&image.sha256));
-            session.install(&path, image, &hooks, cancel)?
+            let installed = session.install(&path, image, &hooks, cancel)?;
+            // The installed file is new, even at the found copy's path: a
+            // trust result taken before it was written never applies to it.
+            trusted_found = None;
+            installed
         }
     };
     let path = match trusted_found {

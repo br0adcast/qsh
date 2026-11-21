@@ -1682,3 +1682,95 @@ fn an_unsafe_older_cached_qshd_is_refused_without_an_offer() {
     assert_eq!(f.uploads, 0);
     assert_eq!(f.starts(), 0);
 }
+#[test]
+fn a_nonstandard_version_is_not_older_than_itself() {
+    for version in ["0.7.0-dev", "0.6.0-rc1"] {
+        let parsed = semver::Version::parse(version).unwrap();
+        assert!(!crate::locate::older_than_bundled(&parsed, &parsed));
+        let mut f = Fixture::new();
+        let found = cache(&mut f, version);
+        let (h, hooks) = hooks();
+        f.run(ask(version), hooks, &knock::Cancel::new()).unwrap();
+        assert_eq!(h.approvals.load(Ordering::SeqCst), 0, "{version}");
+        assert_eq!(f.uploads, 0);
+        assert!(ensure_script(&f).starts_with(&quoted(&found)));
+    }
+}
+#[test]
+fn an_installed_qshd_is_trusted_again_even_at_the_found_path() {
+    // The found copy sits where the bundled one is installed, and the
+    // server-info query trusted it; the file that replaced it is checked anew.
+    let mut f = Fixture::new();
+    fs::create_dir_all(f.final_path().parent().unwrap()).unwrap();
+    fs::write(f.final_path(), b"replaced build never execute").unwrap();
+    mode(&f.final_path(), 0o700);
+    f.cached = Some(f.final_path());
+    f.server_info = true;
+    let gate = Gate::new(true);
+    let before = |info: Option<&ssh::VerifiedSshServerInfo>| gate.call(info);
+    let (_, hooks) = hooks();
+    f.run_probed(
+        bundled(),
+        hooks,
+        Some(probe(&before)),
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(*gate.seen.borrow(), [Some([3; 16])]);
+    assert_eq!(f.uploads, 1);
+    let steps = f.steps();
+    let published = steps
+        .iter()
+        .rposition(|s| *s == "qshd publication")
+        .unwrap();
+    let started = steps
+        .iter()
+        .position(|s| *s == "qshd transport-ensure")
+        .unwrap();
+    assert!(
+        steps[published..started].contains(&"qshd path trust"),
+        "{steps:?}"
+    );
+}
+#[test]
+fn a_busy_retry_runs_the_chosen_qshd_without_a_second_offer() {
+    let mut f = Fixture::new();
+    let old = cache(&mut f, "0.4.0");
+    let target = crate::BusySshTarget {
+        host: "fixture.invalid".into(),
+        port: 22,
+        username: "fixture".into(),
+        host_key: ssh::HostKeyInfo {
+            key_type: "ssh-ed25519".into(),
+            key: vec![1; 32],
+            fingerprint: "SHA256:fixture".into(),
+        },
+        helper_path: old.to_str().unwrap().into(),
+    };
+    let (h, hooks) = hooks();
+    on_session(
+        &mut f,
+        "fixture".into(),
+        60022,
+        [7; 32],
+        false,
+        None,
+        None,
+        None,
+        None,
+        Some(&target),
+        "fixture.invalid".into(),
+        "fixture".into(),
+        22,
+        ask("0.5.0"),
+        hooks,
+        None,
+        &knock::Cancel::new(),
+    )
+    .unwrap();
+    assert_eq!(h.approvals.load(Ordering::SeqCst), 0);
+    assert_eq!(h.loads.load(Ordering::SeqCst), 0);
+    assert_eq!(f.uploads, 0);
+    assert_eq!(f.selected_helpers, [old.to_str().unwrap().to_owned()]);
+    assert!(ensure_script(&f).starts_with(&quoted(&old)));
+}

@@ -270,9 +270,9 @@ version the same way. Declining runs the cached copy, as before; a `qshd`
 found on `PATH` (a package's or an administrator's) is run without asking,
 and background or recovery logins never ask. A cached prerelease not spelled
 `alpha.N`, `beta.N` or `rc.N`, such as the withdrawn `0.6.0-rc1`, counts as
-older than every release of its version. The host keeps its own binary, each session's owner
-keeps the one it was started from, and sessions started afterwards run the
-new one. What happens depends on the daemon's sessions, attached or not:
+older than this client's version, including its prereleases. The host keeps
+its own binary, each session's owner keeps the one it was started from, and
+sessions started afterwards run the new one. What happens depends on the daemon's sessions, attached or not:
 
 | The daemon's sessions | What happens |
 |---|---|
