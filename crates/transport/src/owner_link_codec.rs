@@ -11,7 +11,7 @@ use crate::channel::CHANNEL_SNAPSHOT_MAX;
 use crate::shell_frame::CONTROL_RECORD_MAX;
 use std::collections::VecDeque;
 
-pub(crate) const LINK_VERSION: u16 = 1;
+pub const LINK_VERSION: u16 = 1;
 const MAGIC: [u8; 4] = *b"QSHL";
 pub(crate) const HEADER_LEN: usize = 12;
 /// Slack a frame payload may carry on top of its largest content: the fixed

@@ -593,6 +593,10 @@ mod selected_stage_tests {
                     protocols: vec![transport::channel::PROTOCOL_VERSION],
                     handover_versions: vec![],
                     transport_features: vec![],
+                    version: None,
+                    host_revision: None,
+                    link_versions: vec![],
+                    session_profiles: vec![],
                 })
             },
         )

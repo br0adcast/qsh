@@ -10,6 +10,10 @@ fn check() -> SelfCheck {
         protocols: vec![1],
         handover_versions: vec![],
         transport_features: vec![],
+        version: None,
+        host_revision: None,
+        link_versions: vec![],
+        session_profiles: vec![],
     }
 }
 struct Fixture {
