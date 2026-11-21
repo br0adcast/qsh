@@ -6,9 +6,11 @@
 //! The daemon decides what an upgrade would cost (`PREPARE-FRONTEND-UPGRADE`)
 //! and carries it out (`COMMIT-FRONTEND-UPGRADE`); this side only asks,
 //! within bounds, and never reads a missing answer as permission to start a
-//! second daemon. A daemon without a host, or one older than M2, answers
-//! neither request, and is handled as before ([`EnsureUpgrade::Legacy`]).
-//! That is every daemon off Linux, so this module builds everywhere.
+//! second daemon. A daemon whose `STATUS` names no host is never asked, and
+//! is handled as before ([`EnsureUpgrade::Legacy`]); that is every daemon
+//! off Linux, so this module builds everywhere. A host always answers both
+//! requests, so its silence means a reset or a dying daemon: an error, never
+//! a reason to fall back to today's restart.
 
 use std::time::Duration;
 
@@ -24,9 +26,10 @@ use crate::frontend_upgrade::{
 };
 use crate::state;
 
-/// The answer of a commit that never came: the upgrade may or may not have
-/// happened, so nothing is decided on it.
-pub const COMMIT_UNANSWERED: &str =
+/// The answer of a host's prepare or commit that never came: the daemon may
+/// be dying, or the upgrade may or may not have happened, so nothing is
+/// decided on it.
+pub const UNANSWERED: &str =
     "the daemon's frontend upgrade did not answer; rediscover before choosing again";
 
 /// What `transport-ensure` goes on to do about the running daemon.
@@ -35,8 +38,8 @@ pub const COMMIT_UNANSWERED: &str =
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnsureUpgrade {
-    /// No frontend upgrade applies: the daemon is no host, answered as an
-    /// older one, or already serves this image. Decide as before M2.
+    /// No frontend upgrade applies: the daemon is no host, or already
+    /// serves this image. Decide as before M2.
     Legacy,
     /// This image's frontend serves now, as the daemon's `STATUS` says.
     Replaced(StatusResponse),
@@ -108,7 +111,8 @@ pub fn step(
     )
 }
 
-/// [`step`] over any control channel `ask`, for `candidate`.
+/// [`step`] over any control channel `ask`, for `candidate`, to a daemon
+/// known to be a host.
 pub fn step_with(
     mut ask: impl FnMut(&ControlRequest, Duration) -> Result<ControlReply>,
     candidate: &Candidate,
@@ -129,10 +133,9 @@ pub fn step_with(
             consent: consent.cloned(),
         });
         let response: PrepareResponse = match ask(&request, PREPARE_CLIENT_TIMEOUT)? {
-            ControlReply::NoDaemon => return Ok(EnsureUpgrade::Legacy),
-            ControlReply::TimedOut => {
-                bail!("the daemon's frontend upgrade check did not answer; rediscover before choosing again")
-            }
+            // A host answers every prepare (ruling R6): no line is no
+            // permission to stop it and start another.
+            ControlReply::NoDaemon | ControlReply::TimedOut => bail!(UNANSWERED),
             ControlReply::Answered(line) => {
                 serde_json::from_str(&line).context("invalid frontend upgrade answer")?
             }
@@ -176,7 +179,7 @@ pub fn step_with(
                 serde_json::from_str(&line).context("invalid frontend upgrade commit answer")?
             }
             // The daemon was told to commit: no answer is not "no daemon".
-            ControlReply::NoDaemon | ControlReply::TimedOut => bail!(COMMIT_UNANSWERED),
+            ControlReply::NoDaemon | ControlReply::TimedOut => bail!(UNANSWERED),
         };
         return match response {
             CommitResponse::Replaced { identity: serving } => {
@@ -409,11 +412,20 @@ mod tests {
     }
 
     #[test]
-    fn a_daemon_without_upgrades_or_already_current_is_legacy() {
-        for reply in [ControlReply::NoDaemon, json(&PrepareResponse::UpToDate)] {
-            let (result, sent) = run(vec![reply], None, true);
-            assert_eq!(result.unwrap(), EnsureUpgrade::Legacy);
-            assert_eq!(sent, ["prepare"]);
+    fn a_daemon_already_current_is_legacy() {
+        let (result, sent) = run(vec![json(&PrepareResponse::UpToDate)], None, true);
+        assert_eq!(result.unwrap(), EnsureUpgrade::Legacy);
+        assert_eq!(sent, ["prepare"]);
+    }
+
+    #[test]
+    fn a_host_that_does_not_answer_the_prepare_is_an_error_never_legacy() {
+        for silence in [ControlReply::NoDaemon, ControlReply::TimedOut] {
+            for report_busy in [false, true] {
+                let (result, sent) = run(vec![silence.clone()], None, report_busy);
+                assert_eq!(result.unwrap_err().to_string(), UNANSWERED);
+                assert_eq!(sent, ["prepare"], "nothing else is sent");
+            }
         }
     }
 
@@ -452,11 +464,9 @@ mod tests {
     fn an_unanswered_commit_is_an_error_never_a_fallback() {
         for silence in [ControlReply::NoDaemon, ControlReply::TimedOut] {
             let (result, sent) = run(vec![ready(), silence], None, false);
-            assert_eq!(result.unwrap_err().to_string(), COMMIT_UNANSWERED);
+            assert_eq!(result.unwrap_err().to_string(), UNANSWERED);
             assert_eq!(sent, ["prepare", "commit"]);
         }
-        let (result, _) = run(vec![ControlReply::TimedOut], None, false);
-        assert!(result.is_err(), "a prepare that timed out is not legacy");
     }
 
     #[test]

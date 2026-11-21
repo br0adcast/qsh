@@ -259,6 +259,7 @@ impl BusyDaemonInfo {
             && self.identity.valid()
             && self.candidate.valid()
             && (self.active_connections > 0 || self.sessions > 0)
+            && self.sessions >= self.active_connections
             && self.serving_profiles.as_ref().is_none_or(|p| p.len() <= 16)
             && (self.preservation == PreservationCapability::PreservesSessions)
                 == self.upgrade.is_some()
@@ -762,6 +763,19 @@ mod tests {
             serde_json::from_value::<BusyDaemonInfo>(missing).is_err(),
             "schema 3 always says how many sessions"
         );
+    }
+
+    #[test]
+    fn busy_info_never_counts_fewer_sessions_than_attached_clients() {
+        let mut live = info();
+        assert!(live.valid());
+        live.sessions = live.active_connections - 1;
+        assert!(!live.valid(), "attached clients' sessions are sessions");
+        let mut encoded = serde_json::to_value(info()).unwrap();
+        encoded["sessions"] = 1.into();
+        assert!(serde_json::from_value::<BusyDaemonInfo>(encoded).is_err());
+        live.sessions = live.active_connections + 1;
+        assert!(live.valid(), "retained sessions add to the attached ones");
     }
 
     #[test]
