@@ -622,8 +622,8 @@ pub struct PersonalSessions {
 /// The running image held for a host: see [`PersonalSessions::host_images`].
 #[cfg(target_os = "linux")]
 pub struct HostImages {
-    for_owners: crate::owner_process::SelfImage,
-    for_frontends: crate::owner_process::SelfImage,
+    /// What the host starts its frontends and owners from.
+    image: crate::owner_process::SelfImage,
     fleet: Arc<crate::owner_process::OwnerFleet>,
 }
 
@@ -665,20 +665,16 @@ impl PersonalSessions {
     }
 
     /// What this daemon needs to be the host of its sessions: the running
-    /// image, held once for the owners and once for the frontends. `None` if
+    /// image, held for its frontends and owners. `None` if
     /// it cannot be held: the router then runs in this process
     /// ([`PersonalSessions::backend`]). Asked before [`PersonalSessions::host`]
     /// so that a daemon knows whether it is a host before it builds what the
     /// host is then given.
     pub fn host_images(&self) -> Option<HostImages> {
         let (image, fleet) = self.owners.as_ref()?;
-        let images = image
-            .try_clone()
-            .and_then(|a| image.try_clone().map(|b| (a, b)));
-        match images {
-            Ok((for_owners, for_frontends)) => Some(HostImages {
-                for_owners,
-                for_frontends,
+        match image.try_clone() {
+            Ok(image) => Some(HostImages {
+                image,
                 fleet: fleet.clone(),
             }),
             Err(error) => {
@@ -704,11 +700,7 @@ impl PersonalSessions {
         active: Arc<std::sync::atomic::AtomicUsize>,
         start: crate::host::HostStart,
     ) -> Arc<crate::host::Host> {
-        let HostImages {
-            for_owners,
-            for_frontends,
-            fleet,
-        } = images;
+        let HostImages { image, fleet } = images;
         let catalog = crate::host::Catalog::new(active);
         let ended = {
             let catalog = catalog.clone();
@@ -722,14 +714,13 @@ impl PersonalSessions {
             })
         };
         let owners = crate::owner_process::OwnerHost::new(
-            for_owners,
             self.log_dir.clone(),
             daemon,
             fleet,
             self.services.clone(),
         )
         .on_ended(ended);
-        crate::host::Host::new(for_frontends, owners, catalog, self.frontend.clone(), start)
+        crate::host::Host::new(image, owners, catalog, self.frontend.clone(), start)
     }
 
     /// The backend a router in this process runs every session with, when

@@ -4,9 +4,10 @@
 //!
 //! The daemon -- the host ([`crate::host`]), whose network frontend is a
 //! process of its own -- starts one owner per cold-created session, from
-//! the image it holds since its own start ([`SelfImage`]), never from the
-//! path on disk: a package or update that replaces the file cannot give a
-//! session another build. It starts it by `posix_spawn` only -- no Rust code
+//! an image it holds by descriptor ([`SelfImage`]: its own since its start,
+//! unless a frontend upgrade made another current), never from the path on
+//! disk: a package or update that replaces the file cannot give a session
+//! another build. It starts it by `posix_spawn` only -- no Rust code
 //! runs between the fork and the exec -- with exactly three descriptors
 //! besides the standard ones:
 //!
@@ -1149,9 +1150,6 @@ impl crate::update::OwnerStop for OwnerFleet {
 /// ([`OwnerHost::start_raw`], when the frontend asks the host for one) and
 /// serves each one's host channel.
 pub struct OwnerHost {
-    /// What the next owner starts from: this daemon's image, until a
-    /// frontend replacement sets another ([`OwnerHost::set_image`]).
-    image: Mutex<SelfImage>,
     log_dir: Option<PathBuf>,
     daemon: Option<Arc<dyn DaemonUpdates>>,
     fleet: Arc<OwnerFleet>,
@@ -1177,14 +1175,12 @@ pub(crate) struct RawOwner {
 
 impl OwnerHost {
     pub(crate) fn new(
-        image: SelfImage,
         log_dir: Option<PathBuf>,
         daemon: Option<Arc<dyn DaemonUpdates>>,
         fleet: Arc<OwnerFleet>,
         services: Arc<HostServices>,
     ) -> OwnerHost {
         OwnerHost {
-            image: Mutex::new(image),
             log_dir,
             daemon,
             fleet,
@@ -1202,14 +1198,6 @@ impl OwnerHost {
 
     pub(crate) fn fleet(&self) -> &Arc<OwnerFleet> {
         &self.fleet
-    }
-
-    /// Start every owner from `image` from now on. An owner that runs keeps
-    /// its own image: it is the parent of its session's shells.
-    // Not called until the frontend upgrade (#529 M2) is in.
-    #[allow(dead_code)]
-    pub(crate) fn set_image(&self, image: SelfImage) {
-        *self.image.lock().unwrap_or_else(|e| e.into_inner()) = image;
     }
 
     /// Whether a new session of `uid` would get its envelope now.
@@ -1238,10 +1226,12 @@ impl OwnerHost {
 }
 
 impl OwnerHost {
-    /// Start one owner for `init`'s session and supervise it: its envelope
-    /// lease, its host channel, its reaping. The caller gets the ends a
-    /// frontend needs, and hands them on to its frontend process.
-    pub(crate) fn start_raw(&self, init: OwnerInit) -> io::Result<RawOwner> {
+    /// Start one owner for `init`'s session from `image` and supervise it:
+    /// its envelope lease, its host channel, its reaping. The caller gets
+    /// the ends a frontend needs, and hands them on to its frontend
+    /// process. The owner runs `image` for as long as it lives; it is the
+    /// parent of its session's shells.
+    pub(crate) fn start_raw(&self, init: OwnerInit, image: &SelfImage) -> io::Result<RawOwner> {
         let host_init = HostInit {
             principal: init.principal.clone(),
             login: init.login,
@@ -1261,11 +1251,6 @@ impl OwnerHost {
             io::Error::other(why)
         })?;
         let account = Arc::new(account);
-        let image = self
-            .image
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .try_clone()?;
         let (child, slot) = {
             // The permit first, then the fleet: a replacement holds the
             // spawn gate for writing while it stops the fleet, so the other
@@ -1275,7 +1260,7 @@ impl OwnerHost {
             // fleet either sees this owner or this start sees it closed.
             let mut state = self.fleet.lock();
             Self::may_start(&state).map_err(io::Error::other)?;
-            let child = spawn_owner(&image, &host_init, &permit)?;
+            let child = spawn_owner(image, &host_init, &permit)?;
             drop(permit);
             let pidfd = match child.pidfd.try_clone() {
                 Ok(pidfd) => pidfd,
@@ -2195,20 +2180,19 @@ mod tests {
             ..Default::default()
         });
         let fleet = OwnerFleet::new();
-        let host = OwnerHost::new(
-            SelfImage::hold().unwrap(),
-            None,
-            None,
-            fleet.clone(),
-            services.clone(),
-        );
+        let host = OwnerHost::new(None, None, fleet.clone(), services.clone());
         let principal = Principal {
             uid: 1000,
             name: "me".into(),
             identity: "fixture".into(),
             incarnation: 0,
         };
-        let refused = host.start_raw(OwnerInit::new(principal, [0; 16])).err();
+        let refused = host
+            .start_raw(
+                OwnerInit::new(principal, [0; 16]),
+                &SelfImage::hold().unwrap(),
+            )
+            .err();
         let refused = refused.expect("no envelope: no owner");
         assert!(refused.to_string().contains("envelope"), "{refused}");
         assert!(fleet.is_empty(), "nothing was spawned");
@@ -2225,13 +2209,7 @@ mod tests {
         for pid in 0..MAX_OWNERS as u32 {
             fleet.lock().owners.insert(1_000_000 + pid, slot());
         }
-        let host = OwnerHost::new(
-            SelfImage::hold().unwrap(),
-            None,
-            None,
-            fleet.clone(),
-            services.clone(),
-        );
+        let host = OwnerHost::new(None, None, fleet.clone(), services.clone());
         let principal = Principal {
             uid: 1000,
             name: "me".into(),
@@ -2239,7 +2217,12 @@ mod tests {
             incarnation: 0,
         };
         assert!(host.start_check().is_err());
-        let refused = host.start_raw(OwnerInit::new(principal, [0; 16])).err();
+        let refused = host
+            .start_raw(
+                OwnerInit::new(principal, [0; 16]),
+                &SelfImage::hold().unwrap(),
+            )
+            .err();
         let refused = refused.expect("too many unreaped owners: no owner");
         assert!(refused.to_string().contains("unreaped"), "{refused}");
         assert_eq!(fleet.len(), MAX_OWNERS, "nothing was spawned");

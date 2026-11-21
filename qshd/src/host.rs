@@ -17,7 +17,9 @@
 //!   from its current image ([`FrontendImage`]: its own, held since its
 //!   start, until a frontend upgrade makes another current), and starts
 //!   another when it dies.
-//! - one **owner** per session, the parent of that session's shells.
+//! - one **owner** per session, the parent of that session's shells,
+//!   started from the image current at the session's start, which it runs
+//!   for as long as it lives.
 //!
 //! **Frontend death.** Every owner sees its link close and parks its
 //! session, as at a client's death. The host reaps the frontend and starts
@@ -716,8 +718,9 @@ pub fn reset_secret_beside(
 
 /// The host side of a personal daemon: see the module documentation.
 pub struct Host {
-    /// The image the next frontend starts from, whose facts the catalog
-    /// records of the sessions created and handed over meanwhile.
+    /// The image the next frontend and the next owner start from, whose
+    /// facts the catalog records of the sessions created and handed over
+    /// meanwhile.
     current: Mutex<Arc<FrontendImage>>,
     owners: OwnerHost,
     catalog: Arc<Catalog>,
@@ -1426,12 +1429,13 @@ impl Host {
                 }
             }
         }
-        // Taken before the owner starts: the owners' image is switched
-        // together with the current one, so this is the image it runs.
+        // The owner starts from this very image, so what the catalog
+        // records of it is what the owner runs, whatever becomes current
+        // meanwhile.
         let image = self.current();
         let owner = self
             .owners
-            .start_raw(OwnerInit::new(principal, token))
+            .start_raw(OwnerInit::new(principal, token), &image.image)
             .map_err(|error| error.to_string())?;
         self.created(token, uid, owner, &image)
     }

@@ -1,4 +1,4 @@
-//! The images a host starts frontends from (#529 M2): each held by
+//! The images a host starts frontends and owners from (#529 M2): each held by
 //! descriptor, with what the host knows of it, and the word a frontend
 //! sends once it serves.
 
@@ -31,7 +31,7 @@ impl ImageIdentity {
     }
 }
 
-/// What the host knows of an image it starts frontends from.
+/// What the host knows of an image it starts frontends and owners from.
 pub(crate) struct ImageInfo {
     pub(crate) identity: ImageIdentity,
     /// Its [`crate::state::HOST_REVISION`].
@@ -66,8 +66,8 @@ impl ImageInfo {
     }
 }
 
-/// An image the host starts frontends from: held by descriptor since it
-/// was opened, never by path, with what the host knows of it.
+/// An image the host starts frontends and owners from: held by descriptor
+/// since it was opened, never by path, with what the host knows of it.
 pub(crate) struct FrontendImage {
     pub(crate) image: SelfImage,
     pub(crate) info: Arc<ImageInfo>,

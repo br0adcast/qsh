@@ -481,7 +481,6 @@ fn a_session_the_router_ended_leaves_the_catalog_at_once() {
 /// no owner running.
 fn host_serving(image: FrontendImage) -> Arc<Host> {
     let owners = OwnerHost::new(
-        SelfImage::hold().unwrap(),
         None,
         None,
         crate::owner_process::OwnerFleet::new(),
