@@ -1512,17 +1512,24 @@ mod tests {
     ///
     /// The owner installs the process's log relay and its `SIGTERM` and
     /// `SIGINT` handlers for good, so the body runs in a process of its own.
+    ///
+    /// The test runs itself again, as its own process, with [`HOST_GONE_CHILD`]
+    /// set; that run drives the owner.
     #[test]
     fn an_owner_whose_host_is_gone_closes_its_link_without_a_word() {
-        let name = "owner_process::owner::tests::an_owner_whose_host_is_gone_closes_its_link_without_a_word_body";
+        if std::env::var_os(HOST_GONE_CHILD).is_some() {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(an_owner_whose_host_is_gone_closes_its_link_without_a_word_body());
+            return;
+        }
+        let name = "owner_process::owner::tests::an_owner_whose_host_is_gone_closes_its_link_without_a_word";
         let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-            .args([
-                name,
-                "--exact",
-                "--ignored",
-                "--test-threads=1",
-                "--nocapture",
-            ])
+            .env(HOST_GONE_CHILD, "1")
+            .args([name, "--exact", "--test-threads=1", "--nocapture"])
             .output()
             .expect("run the isolated check");
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1537,11 +1544,13 @@ mod tests {
         );
     }
 
-    /// Runs only via [`an_owner_whose_host_is_gone_closes_its_link_without_a_word`],
-    /// in a process of its own.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "runs only via an_owner_whose_host_is_gone_closes_its_link_without_a_word, in a \
-                process of its own"]
+    /// Set in the process of its own that
+    /// [`an_owner_whose_host_is_gone_closes_its_link_without_a_word`] starts.
+    const HOST_GONE_CHILD: &str = "QSHD_TEST_OWNER_HOST_GONE_CHILD";
+
+    /// The owner's part of
+    /// [`an_owner_whose_host_is_gone_closes_its_link_without_a_word`], in its
+    /// process of its own.
     async fn an_owner_whose_host_is_gone_closes_its_link_without_a_word_body() {
         use std::io::Write;
         let uid = unsafe { libc::geteuid() };
