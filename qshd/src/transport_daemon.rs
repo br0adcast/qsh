@@ -196,6 +196,8 @@ async fn status_with(
     total_connections: u64,
     cleanup: Option<&CleanupSource>,
 ) -> Result<StatusResponse> {
+    // Only Linux hosts fill the owners' cleanup in below.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut response = transport_status_response(
         ports,
         total_connections,

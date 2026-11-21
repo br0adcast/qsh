@@ -12,11 +12,20 @@ pub(crate) struct DroppedRecords(AtomicU64);
 impl DroppedRecords {
     /// `n` more records had no room.
     pub(crate) fn add(&self, n: u64) {
-        let _ = self
-            .0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |owed| {
-                Some(owed.saturating_add(n))
-            });
+        // A compare-exchange loop rather than `fetch_update`, which newer
+        // toolchains deprecate in favor of a name the supported one lacks.
+        let mut owed = self.0.load(Ordering::SeqCst);
+        loop {
+            match self.0.compare_exchange_weak(
+                owed,
+                owed.saturating_add(n),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(now) => owed = now,
+            }
+        }
     }
 
     /// What is owed, taken: zero until more records are dropped.
