@@ -360,18 +360,79 @@ impl FrontendUpgrades for Answering {
     fn commit(
         &self,
         receipt: [u8; 16],
-    ) -> crate::frontend_upgrade::BoxFuture<'_, crate::frontend_upgrade::CommitResponse> {
+    ) -> crate::frontend_upgrade::BoxFuture<'_, Option<crate::frontend_upgrade::CommitResponse>>
+    {
         Box::pin(async move {
-            crate::frontend_upgrade::CommitResponse::RolledBack {
+            Some(crate::frontend_upgrade::CommitResponse::RolledBack {
                 reason: hex::encode(receipt),
-            }
+            })
         })
     }
     fn reload(
         &self,
-    ) -> crate::frontend_upgrade::BoxFuture<'_, crate::frontend_upgrade::ReloadResponse> {
-        Box::pin(async { crate::frontend_upgrade::ReloadResponse::UpToDate })
+    ) -> crate::frontend_upgrade::BoxFuture<'_, Option<crate::frontend_upgrade::ReloadResponse>>
+    {
+        Box::pin(async { Some(crate::frontend_upgrade::ReloadResponse::UpToDate) })
     }
+}
+
+/// Upgrades whose commit and reload end with no known outcome, as after a
+/// panic in the commit's task.
+struct Unknown;
+impl FrontendUpgrades for Unknown {
+    fn prepare(
+        &self,
+        _: crate::frontend_upgrade::PrepareRequest,
+    ) -> crate::frontend_upgrade::BoxFuture<'_, PrepareResponse> {
+        Box::pin(async { PrepareResponse::UpToDate })
+    }
+    fn commit(
+        &self,
+        _: [u8; 16],
+    ) -> crate::frontend_upgrade::BoxFuture<'_, Option<crate::frontend_upgrade::CommitResponse>>
+    {
+        Box::pin(async { None })
+    }
+    fn reload(
+        &self,
+    ) -> crate::frontend_upgrade::BoxFuture<'_, Option<crate::frontend_upgrade::ReloadResponse>>
+    {
+        Box::pin(async { None })
+    }
+}
+
+/// A commit whose outcome is not known is answered with no line, as one
+/// past its bound: the caller cannot be told what serves.
+#[tokio::test]
+async fn a_commit_with_an_unknown_outcome_answers_nothing() {
+    let [_, commit] = upgrade_requests();
+    let upgrades: Option<Arc<dyn FrontendUpgrades>> = Some(Arc::new(Unknown));
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    client
+        .write_all(control::format_request(&commit).as_bytes())
+        .await
+        .unwrap();
+    let (stop_tx, _stop_rx) = mpsc::channel(1);
+    let actions = actions();
+    let handled = handle_transport_control_connection_with_peer_check_and_info(
+        server,
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+        vec![60000],
+        stop_tx,
+        Arc::new(AtomicUsize::new(0)),
+        actions.control_gate.clone(),
+        None,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        None,
+        Some(actions),
+        upgrades,
+        |_| Ok(()),
+    )
+    .await;
+    assert!(handled.is_err(), "{handled:?}");
+    let mut answer = String::new();
+    client.read_to_string(&mut answer).await.unwrap();
+    assert_eq!(answer, "");
 }
 
 /// `RELOAD-FRONTEND` is a `serve` daemon's reload socket's: a control
@@ -422,6 +483,15 @@ async fn the_reload_socket_answers_only_a_reload_from_its_account() {
     for other in ["STATUS\n", "STOP\n", "RELOAD-FRONTEND now\n"] {
         assert_eq!(reload_answer(other, true).await, "", "{other}");
     }
+    // A reload whose outcome is not known is answered with nothing.
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    client.write_all(b"RELOAD-FRONTEND\n").await.unwrap();
+    assert!(handle_reload_connection(server, &Unknown, |_| Ok(()))
+        .await
+        .is_err());
+    let mut answer = String::new();
+    client.read_to_string(&mut answer).await.unwrap();
+    assert_eq!(answer, "");
 }
 
 /// A hosted daemon hands both requests to its upgrades and answers with

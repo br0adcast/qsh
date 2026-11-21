@@ -626,3 +626,63 @@ async fn a_frontends_ready_is_recorded_for_whoever_waits() {
         .await
         .expect("reported");
 }
+
+/// A replacement the serve loop cannot take is refused at once as busy, one
+/// the daemon's stop cuts short is answered as stopping, and only a
+/// candidate given up on is a rollback.
+#[tokio::test]
+async fn a_replacement_is_busy_stopping_or_rolled_back_as_the_loop_answers() {
+    use upgrade::NotReplaced;
+    let host = host_serving(image(1, vec![1], Vec::new()));
+    let candidate = || image(2, vec![1], Vec::new());
+    assert_eq!(
+        host.replace_frontend(candidate()).await,
+        Err(NotReplaced::Busy("no frontend is served yet")),
+        "no serve loop has taken its end"
+    );
+    // The serve loop's end, as `serve` takes it.
+    let mut replacements = host.replacements.lock().unwrap().take().unwrap();
+
+    let (asked, ()) = tokio::join!(host.replace_frontend(candidate()), async {
+        replacements
+            .recv()
+            .await
+            .unwrap()
+            .refuse(upgrade::REPLACING)
+    });
+    assert_eq!(asked, Err(NotReplaced::Busy(upgrade::REPLACING)));
+
+    let (asked, ()) = tokio::join!(host.replace_frontend(candidate()), async {
+        replacements
+            .recv()
+            .await
+            .unwrap()
+            .failed("it exited".into())
+            .answer()
+    });
+    assert_eq!(asked, Err(NotReplaced::RolledBack("it exited".into())));
+
+    // One replacement waits for its answer: another is refused at once.
+    let first = host.replace_frontend(candidate());
+    tokio::pin!(first);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), first.as_mut())
+            .await
+            .is_err(),
+        "the first waits"
+    );
+    assert_eq!(
+        host.replace_frontend(candidate()).await,
+        Err(NotReplaced::Busy("another frontend replacement is pending"))
+    );
+    // Dropped unanswered, as at the daemon's stop.
+    drop(replacements.recv().await.unwrap());
+    assert_eq!(first.await, Err(NotReplaced::Stopping));
+
+    // The serve loop is gone.
+    drop(replacements);
+    assert_eq!(
+        host.replace_frontend(candidate()).await,
+        Err(NotReplaced::Stopping)
+    );
+}

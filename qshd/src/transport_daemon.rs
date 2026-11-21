@@ -46,8 +46,11 @@ use std::time::Duration;
 
 use crate::destructive_restart::Actions;
 use crate::frontend_upgrade::{
-    FrontendUpgrades, PrepareResponse, Refusal, COMMIT_TIMEOUT, PREPARE_TIMEOUT, RELOAD_TIMEOUT,
+    FrontendUpgrades, PrepareResponse, Refusal, COMMIT_TIMEOUT, PREPARE_TIMEOUT,
 };
+// Only a hosted `serve` daemon's reload socket, a Linux one, waits for it.
+#[cfg(target_os = "linux")]
+use crate::frontend_upgrade::RELOAD_TIMEOUT;
 use crate::server_info::{FrontendIdentity, Serving};
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -689,11 +692,13 @@ async fn handle_reload_connection(
     if control::parse_request(line.trim_end_matches('\n')) != Some(ControlRequest::ReloadFrontend) {
         return Ok(());
     }
-    // Past its bound the outcome is not known here: no answer is better
-    // than a wrong one.
+    // Past its bound, or when its commit failed in a way that leaves it
+    // unknown, the outcome is not known here: no answer is better than a
+    // wrong one.
     let response = tokio::time::timeout(RELOAD_TIMEOUT, upgrades.reload())
         .await
-        .context("the reload exceeded its bound")?;
+        .context("the reload exceeded its bound")?
+        .context("the reload has no known outcome")?;
     write_answer(&mut write_half, &response).await
 }
 
@@ -1310,11 +1315,13 @@ async fn handle_transport_control_connection_with_peer_check_and_info(
             let Some(upgrades) = upgrades else {
                 return Ok(());
             };
-            // Past its bound the outcome is not known here: no answer is
-            // better than a wrong one.
+            // Past its bound, or when the commit failed in a way that leaves
+            // it unknown, the outcome is not known here: no answer is better
+            // than a wrong one.
             let response = tokio::time::timeout(COMMIT_TIMEOUT, upgrades.commit(receipt))
                 .await
-                .context("the frontend upgrade's commit exceeded its bound")?;
+                .context("the frontend upgrade's commit exceeded its bound")?
+                .context("the frontend upgrade's commit has no known outcome")?;
             return write_answer(&mut write_half, &response).await;
         }
         // A reload is asked on a `serve` daemon's reload socket, never here:

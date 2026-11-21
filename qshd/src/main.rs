@@ -249,16 +249,20 @@ fn main() -> Result<()> {
         }
         other => bail!(
             "expected command `transport-echo`, `transport-shell`, `transport-ensure`, \
-             `serve` or `self-check` (or the `--version`/`--help` flags), got: {:?}",
+             `serve`, `reload` or `self-check` (or the `--version`/`--help` flags), got: {:?}",
             other
         ),
     }
 }
 
 /// What `qshd reload` says when no daemon answers its reload request: an
-/// older daemon, one without a host, or none at all. Nothing was changed.
-const CANNOT_RELOAD: &str =
-    "the running qshd cannot reload; restart it with `systemctl --user restart qshd`";
+/// older daemon, one without a host, or none at all, which change nothing;
+/// but also a daemon whose reload did not finish within its bound, or whose
+/// outcome it does not know, and which may still replace its frontend. The
+/// line claims neither.
+const CANNOT_RELOAD: &str = "the running qshd did not answer the reload: it cannot reload, or it \
+     did not finish in time; check `qshd`'s log or `systemctl --user status qshd`; to restart \
+     deliberately, use `systemctl --user restart qshd`";
 
 /// The `reload` command, the personal unit's `ExecReload`: ask the running
 /// `serve` daemon on `--port` to replace its frontend with the installed
@@ -3275,6 +3279,13 @@ mod tests {
                 r#"{"status":"refused","reason":"it is older","outcome":{"case":"older"}}"#
             )),
             ("it is older".into(), false)
+        );
+        // A daemon that is stopping is not said to serve on.
+        assert_eq!(
+            reload_line(answered(
+                r#"{"status":"refused","reason":"the daemon is stopping","outcome":null}"#
+            )),
+            ("the daemon is stopping".into(), false)
         );
         assert_eq!(
             reload_line(answered(r#"{"status":"rolled_back","reason":"it exited"}"#)),

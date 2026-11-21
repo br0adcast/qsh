@@ -140,12 +140,28 @@ pub enum ImageFault {
 pub fn image_fault() -> Option<ImageFault> {
     #[cfg(any(debug_assertions, feature = "test-build-labels"))]
     {
-        let spec = std::env::var(TEST_IMAGE_FAULTS_ENV).ok()?;
-        let own = self_checksum().ok()?;
-        fault_for(&own, &parse_image_faults(&spec))
+        image_fault_in(std::env::var(TEST_IMAGE_FAULTS_ENV).ok(), || {
+            self_checksum().ok()
+        })
     }
     #[cfg(not(any(debug_assertions, feature = "test-build-labels")))]
     None
+}
+
+/// The fault `spec` names for this binary, whose checksum `own` works out.
+/// An unset or empty `spec` names none, and nothing is hashed for it: every
+/// test daemon is given the variable, mostly empty, and a frontend asks on
+/// its way to `Ready`.
+#[cfg_attr(
+    not(any(debug_assertions, feature = "test-build-labels")),
+    allow(dead_code)
+)]
+fn image_fault_in(
+    spec: Option<String>,
+    own: impl FnOnce() -> Option<String>,
+) -> Option<ImageFault> {
+    let spec = spec.filter(|spec| !spec.is_empty())?;
+    fault_for(&own()?, &parse_image_faults(&spec))
 }
 
 #[cfg_attr(
@@ -733,6 +749,23 @@ mod tests {
         assert!(super::parse_image_faults("").is_empty());
         assert_eq!(super::fault_for("bb", &parsed), Some(FrontendSilent));
         assert_eq!(super::fault_for("zz", &parsed), None);
+    }
+
+    #[test]
+    fn an_unset_or_empty_fault_spec_hashes_nothing() {
+        use super::ImageFault::*;
+        let unhashed = || -> Option<String> { panic!("hashed for no fault") };
+        assert_eq!(super::image_fault_in(None, unhashed), None);
+        assert_eq!(super::image_fault_in(Some(String::new()), unhashed), None);
+        let own = || Some("aa".to_string());
+        assert_eq!(
+            super::image_fault_in(Some("aa=frontend-exit".into()), own),
+            Some(FrontendExit)
+        );
+        assert_eq!(
+            super::image_fault_in(Some("bb=frontend-exit".into()), own),
+            None
+        );
     }
 
     #[test]

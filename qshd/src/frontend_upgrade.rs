@@ -87,22 +87,24 @@ pub enum PrepareResponse {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommitResponse {
     /// The candidate's frontend serves, as `identity`.
-    Replaced {
-        identity: BusyDaemonIdentity,
-    },
-    /// The candidate's frontend did not come up; the previous image serves
-    /// again, under the identity it had.
-    RolledBack {
-        reason: String,
-    },
-    Refused {
-        reason: Refusal,
-    },
+    Replaced { identity: BusyDaemonIdentity },
+    /// The candidate was started and did not come up, or could not be
+    /// started; the previous image was started again, under the identity it
+    /// had. Attached clients were disconnected briefly; every session is
+    /// kept.
+    RolledBack { reason: String },
+    /// Not carried out, and nothing was rolled back. Every refusal but two
+    /// comes before anything changed. [`Refusal::Busy`] also answers a
+    /// replacement the daemon could not take (no frontend served yet,
+    /// another pending, the whole daemon replacing itself), and
+    /// [`Refusal::Stopping`] one cut short by the daemon's stop.
+    Refused { reason: Refusal },
 }
 
 /// The answer to `RELOAD-FRONTEND` (`systemctl --user reload qshd`): the
 /// serving frontend replaced by the file the daemon was started from, or
-/// why not. In every case but `Replaced` the frontend serves on as it was.
+/// why not. In every case but `Replaced` and `RolledBack` the frontend
+/// serves on as it was, unless the daemon is stopping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ReloadResponse {
@@ -110,8 +112,9 @@ pub enum ReloadResponse {
     Replaced { build: u64 },
     /// That file is the serving frontend's image.
     UpToDate,
-    /// Nothing was replaced: `reason` says why, and `outcome` what the
-    /// replacement would have come to, when it came that far.
+    /// Nothing was replaced: `reason` says why (the daemon may be stopping),
+    /// and `outcome` what the replacement would have come to, when it came
+    /// that far.
     Refused {
         reason: String,
         outcome: Option<Outcome>,
@@ -121,7 +124,7 @@ pub enum ReloadResponse {
     RolledBack { reason: String },
 }
 
-/// Why a prepare or a commit was refused: nothing changed.
+/// Why a prepare or a commit was refused: see [`CommitResponse::Refused`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Refusal {
@@ -131,7 +134,8 @@ pub enum Refusal {
     Candidate { detail: String },
     /// The candidate is older than the serving frontend.
     Older,
-    /// Another upgrade, or a replacement of the whole daemon, is under way.
+    /// Another upgrade, or a replacement of the whole daemon, is under way,
+    /// or no frontend serves yet. Which frontend serves next is not known.
     Busy,
     /// The receipt's time ran out.
     Expired,
@@ -141,7 +145,8 @@ pub enum Refusal {
     /// The daemon's sessions changed since the prepare, and the receipt no
     /// longer covers what the upgrade would come to now.
     Changed { outcome: Outcome },
-    /// The daemon is stopping.
+    /// The daemon is stopping: no frontend serves on, whatever the upgrade
+    /// had come to.
     Stopping,
 }
 
@@ -153,10 +158,14 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// one answers none of them, as an older daemon.
 pub trait FrontendUpgrades: Send + Sync {
     fn prepare(&self, request: PrepareRequest) -> BoxFuture<'_, PrepareResponse>;
-    fn commit(&self, receipt: [u8; 16]) -> BoxFuture<'_, CommitResponse>;
+    /// `None` when what came of the commit is not known (it failed in a
+    /// way that tells nothing, a panic): the caller then answers nothing,
+    /// as past the commit's bound.
+    fn commit(&self, receipt: [u8; 16]) -> BoxFuture<'_, Option<CommitResponse>>;
     /// Replace the serving frontend with the file at the path the daemon
-    /// was started from, if [`reload_permits`] what that comes to.
-    fn reload(&self) -> BoxFuture<'_, ReloadResponse>;
+    /// was started from, if [`reload_permits`] what that comes to. `None`
+    /// as for [`FrontendUpgrades::commit`].
+    fn reload(&self) -> BoxFuture<'_, Option<ReloadResponse>>;
 }
 
 /// One session of the running daemon, as the host's catalog keeps it.

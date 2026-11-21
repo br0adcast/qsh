@@ -77,8 +77,15 @@ fn images() -> Images {
     assert!(status.success(), "strip failed on {}", path.display());
     let bytes = std::fs::read(&path).expect("read the copy");
     assert!((bytes.len() as u64) < qshd::update::MAX_UPDATE_SIZE);
+    // Isolated as the daemons are: a temporary home, and the TMPDIR the
+    // tests run with.
+    let home = private_temp_home();
     let out = Command::new(&path)
         .arg("self-check")
+        .env("XDG_CACHE_HOME", home.path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("TMUX_TMPDIR", home.path())
         .env("HISTFILE", "/dev/null")
         .env_remove(TEST_BUILD_LABELS_ENV)
         .env_remove(TEST_IMAGE_FAULTS_ENV)
@@ -446,6 +453,11 @@ fn a_silent_upgrade_keeps_the_shell_and_serves_the_new_build() {
         Some(info.generation),
         identity.generation,
         "SERVER-INFO says B"
+    );
+    assert_eq!(
+        back.client.server_generation().map(hex::encode),
+        identity.generation,
+        "the new frontend tells its clients B's generation in-band"
     );
     no_session_ended(&daemon, owner);
     back.client.close();
@@ -1445,6 +1457,7 @@ fn serve(images: &Images, labels: &str, faults: &str) -> Served {
         ])
         .env("XDG_CACHE_HOME", home.path())
         .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
         .env(MARK_ENV, &mark)
         .env("HISTFILE", "/dev/null")
         .env("SHELL", "/bin/sh")
@@ -1584,6 +1597,7 @@ fn reload_in(qshd: &Path, home: &Path, port: u16) -> Reloaded {
         .args(["reload", "--port", &port.to_string()])
         .env("XDG_CACHE_HOME", home)
         .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home)
         .env("HISTFILE", "/dev/null")
         .env_remove(TEST_BUILD_LABELS_ENV)
         .env_remove(TEST_IMAGE_FAULTS_ENV)
@@ -1822,7 +1836,8 @@ fn reload_refuses_an_unreachable_outcome() {
 
 /// A daemon that has no reload socket -- here a `transport-ensure` daemon,
 /// which never binds one; an older `serve` is the same -- is not touched:
-/// `reload` says it cannot reload and exits 1, and the daemon serves on.
+/// `reload` says that it got no answer and exits 1, and the daemon serves
+/// on.
 #[test]
 fn reload_against_a_daemon_without_the_socket_fails_and_leaves_it_running() {
     let _serial = serialised();
@@ -1836,7 +1851,9 @@ fn reload_against_a_daemon_without_the_socket_fails_and_leaves_it_running() {
     assert_eq!(reloaded.code, Some(1), "{}", reloaded.output);
     assert!(
         reloaded.output.contains(
-            "the running qshd cannot reload; restart it with `systemctl --user restart qshd`"
+            "the running qshd did not answer the reload: it cannot reload, or it did not \
+             finish in time; check `qshd`'s log or `systemctl --user status qshd`; to restart \
+             deliberately, use `systemctl --user restart qshd`"
         ),
         "{}",
         reloaded.output

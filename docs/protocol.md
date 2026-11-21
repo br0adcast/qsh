@@ -1277,6 +1277,21 @@ connections may need again.
 - **A frontend exits in order** (the host's `Stop`, `SIGTERM`, `SIGINT`):
   as at its death. Its router's last sweep ends no session.
 
+**What a hosted daemon says it is.** Its `STATUS` carries
+`host: {version, build, revision}`: the host process's own binary, and
+`revision` its `HOST_REVISION`, the contracts between the host and its
+frontend and owners. A daemon that is no host, or an older one, has no
+`host`. `STATUS` `version`, `build` and `checksum`, like `SERVER-INFO`,
+`REGISTRATION-INFO` and the generation a frontend tells its clients in-band,
+name the frontend that serves. That is the host's binary until a frontend
+replacement (§8.1.1) makes another image serve, under a new generation;
+`pid` stays the host's.
+
+A frontend starts from the host's `Init` (keys, generation, catalog) and its
+`Serve`, and then reports `Ready`, once, right before its router takes the
+first datagram. A replacement waits for that word; otherwise it is one more
+packet that says the frontend is alive.
+
 The process roles, the frontend's restart backoff, and what each failure
 costs a user are in `docs/qshd-service.md` ("Sessions outlive the network
 part"). macOS and `--system` keep one process.
@@ -2903,22 +2918,38 @@ same-account peers only, and each frame is at most 4096 bytes.
   - `replaced {identity}`: the new frontend's identity, under the host's pid
     and a new generation. `STATUS`, `REGISTRATION-INFO`, `ADD-CLIENT-IF`,
     `DESTRUCTIVE-RESTART-INFO` and `SERVER-INFO` describe it from then on.
-  - `rolled_back {reason}`: the candidate exited or stayed silent. It was
-    killed through its pidfd, and the previous image serves again under its
-    previous identity.
-  - `refused {reason}`.
+  - `rolled_back {reason}`: the candidate exited or stayed silent, and was
+    killed through its pidfd; or it could not be started at all (its spawn
+    failed, or an update's exec window was open). The previous image was
+    started again and serves under its previous identity. Attached clients
+    were disconnected briefly, as for a replacement; every session is kept.
+  - `refused {reason}`: nothing was rolled back. Most refusals come before
+    the old frontend is stopped. `busy` also answers a replacement the host
+    cannot take (no frontend serves yet, another replacement is pending, or
+    the whole daemon is replacing itself), and `stopping` one that the
+    daemon's stop cut short: no frontend serves on after it. Neither says
+    which frontend serves next, so a caller registers with nothing on
+    `stopping`, and rediscovers.
 
-  The commit runs to its end even if its caller goes away. No `Restarting` is
-  sent and no channel ends: clients come back through the session reset
-  (§1.1).
+  Past its 30 s bound, or when what came of the commit is not known (its task
+  failed), the daemon writes no line and closes the connection, and the
+  commit runs on to its end. A caller that gets no answer cannot tell what
+  serves: `transport-ensure` fails and asks for a rediscovery, never takes
+  the silence as a reason to start a second daemon. The commit runs to its
+  end even if its caller goes away. No `Restarting` is sent and no channel
+  ends: clients come back through the session reset (§1.1).
 
 A daemon without a host answers neither request, as an older daemon does. A
 host always answers, so `transport-ensure` never takes its silence as a
 reason to start a second daemon.
 
 **`TRANSPORT-BUSY` schema 3.** The record that asks the user now says
-`sessions`: every session of the daemon, attached or retained. It is never
-less than `active_connections`, and a record where both are 0 is invalid.
+`sessions`, which is never less than `active_connections`; a record where
+both are 0 is invalid. For a host's `unreachable` offer and its destructive
+record, `sessions` is every session of the daemon, attached or retained. A
+`soft` offer counts only the attached sessions, so its `sessions` equals
+`attached`. A daemon that is no host knows only its attached sessions, and
+says `sessions` equal to `active_connections`.
 `preservation: "preserves_sessions"` comes with an `upgrade` offer
 `{case, attached, sessions, stranded}`, and never without it. A `soft` offer
 has attached clients and no stranded session; an `unreachable` one has
@@ -2935,12 +2966,16 @@ connection. The daemon prepares the file at the path it was started from,
 recorded at its start: the caller describes nothing, and size, sha256 and
 build are what the host reads. The identity is the serving one, and the
 request is consent to `soft` and to nothing more. A `silent` or `soft`
-outcome is committed; every other is refused and logged. Within 50 s
-(`qshd reload` waits 60 s) the daemon answers one line, tagged by `status`:
-`replaced {build}`, `up_to_date`, `refused {reason, outcome}` (`outcome` is
-`null` when the request never got that far) or `rolled_back {reason}`.
-Anything else on that socket gets no answer, and so does `RELOAD-FRONTEND` on
-a control socket.
+outcome is committed, and an `up_to_date` one is answered as such; `older`,
+`unreachable`, `destructive` and `full_restart` are refused and logged.
+Within 50 s (`qshd reload` waits 60 s) the daemon answers one line, tagged by
+`status`: `replaced {build}`, `up_to_date`, `refused {reason, outcome}`
+(`outcome` is `null` when the request never got that far) or
+`rolled_back {reason}`, as for a commit. Past that bound, or when what came
+of its commit is not known, it writes no line, and a commit under way runs
+on; `qshd reload` then says that the daemon did not answer, without
+claiming an outcome, as for a daemon that has no reload socket. Anything else on that socket gets no answer, and
+so does `RELOAD-FRONTEND` on a control socket.
 
 ---
 

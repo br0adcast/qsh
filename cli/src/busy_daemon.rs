@@ -34,12 +34,25 @@ fn parse_choice(input: Option<&str>) -> BusyChoice {
 fn question(info: &BusyDaemonInfo) -> String {
     let version = crate::report::printable(&info.identity.version);
     if let Some(offer) = &info.upgrade {
-        return format!("Running qshd {version} can update to this client's qshd and keep every session. {} other connected client(s) will be disconnected briefly (up to a minute for older clients) and reconnect on their own.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Update and keep sessions\nChoose [1]:", offer.attached);
+        // An offer that strands sessions may disconnect nobody.
+        let disconnected = if offer.attached > 0 {
+            format!(" {} other connected client(s) will be disconnected briefly (up to a minute for older clients) and reconnect on their own.", offer.attached)
+        } else {
+            String::new()
+        };
+        return format!("Running qshd {version} can update to this client's qshd and keep every session.{disconnected}\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Update and keep sessions\nChoose [1]:");
     }
     if info.active_connections == 0 && info.sessions > 0 {
         return format!("Running qshd {version} has {} session(s), none with a connected client.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", info.sessions);
     }
-    format!("Running qshd {} has {} active connections. The new daemon cannot start while these connections are active.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", crate::report::printable(&info.identity.version), info.active_connections)
+    // A host also counts the sessions whose client is away.
+    let retained = info.sessions.saturating_sub(info.active_connections);
+    let others = if retained > 0 {
+        format!(" and {retained} other session(s) without a connected client")
+    } else {
+        String::new()
+    };
+    format!("Running qshd {version} has {} active connections{others}. The new daemon cannot start while these connections are active.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", info.active_connections)
 }
 /// The second warning for an upgrade that leaves sessions unreachable.
 fn unreachable_warning(info: &BusyDaemonInfo) -> Option<String> {
@@ -95,15 +108,18 @@ pub fn ask_for_target(
     let mut prompt = BusyPrompt::new(info.clone()).ok_or(ssh::SshError::Cancelled)?;
     let answer = tty.read_choice(&question(&info), cancel)?;
     let mut choice = parse_choice(answer.as_deref());
-    let consent = if choice == BusyChoice::ForceUpdate && info.upgrade.is_some() {
-        let offer = info.upgrade.as_ref().map(|offer| offer.case);
-        let confirmed = match offer {
-            Some(UpgradeCase::Unreachable) => {
+    let upgrade = info
+        .upgrade
+        .as_ref()
+        .filter(|_| choice == BusyChoice::ForceUpdate);
+    let consent = if let Some(offer) = upgrade {
+        let confirmed = match offer.case {
+            UpgradeCase::Unreachable => {
                 let warning = unreachable_warning(&info).unwrap_or_default();
                 let answer = tty.read_choice(&warning, cancel)?;
                 (answer.as_deref().map(str::trim) == Some("2")).then_some(())
             }
-            _ => Some(()),
+            UpgradeCase::Soft => Some(()),
         };
         let consent = confirmed
             .and_then(|()| info.confirm_frontend_upgrade())
@@ -221,6 +237,38 @@ mod tests {
         ] {
             assert!(text.contains(expected), "{text}");
         }
+    }
+    #[test]
+    fn an_offer_that_disconnects_nobody_says_nothing_of_clients() {
+        let mut live = offer_info(bringup::UpgradeCase::Unreachable);
+        live.active_connections = 0;
+        live.upgrade.as_mut().unwrap().attached = 0;
+        assert!(live.valid());
+        let text = question(&live);
+        assert!(text.contains("keep every session."), "{text}");
+        assert!(!text.contains("connected client"), "{text}");
+        assert!(!text.contains("disconnected"), "{text}");
+        assert!(question(&offer_info(bringup::UpgradeCase::Unreachable))
+            .contains("3 other connected client(s) will be disconnected briefly"));
+    }
+    #[test]
+    fn a_destructive_question_names_attached_and_retained_sessions() {
+        let mut live = info();
+        live.active_connections = 2;
+        live.sessions = 5;
+        let text = question(&live);
+        assert!(
+            text.contains(
+                "Running qshd 0.5.9 has 2 active connections and 3 other session(s) without a connected client."
+            ),
+            "{text}"
+        );
+        // Without retained sessions, as from a daemon that is no host.
+        let text = question(&info());
+        assert!(
+            text.contains("Running qshd 0.5.9 has 2 active connections. The new daemon"),
+            "{text}"
+        );
     }
     #[test]
     fn soft_choice_three_gives_an_upgrade_consent_without_a_second_question() {

@@ -278,9 +278,10 @@ The default answer is always to cancel. The new frontend must report that it
 serves within 10 s. If it exits or stays silent, the daemon kills it and
 starts the previous version again at once: sessions are kept, and the login
 warns that the previous version keeps serving. The daemon checks the new
-binary through a descriptor it holds from the first check on, so a change to
-the file afterwards has no effect. One upgrade runs at a time. An older or
-byte-identical binary never replaces the running one.
+binary through a descriptor it holds from the first check on, so renaming,
+replacing or deleting the file afterwards has no effect; a write into the
+same file in place is not guarded against. One upgrade runs at a time. An
+older or byte-identical binary never replaces the running one.
 
 After a replacement `STATUS`, `SERVER-INFO` and the rest describe the new
 version, and `STATUS.host` still names the host's own binary. A daemon that a
@@ -815,26 +816,34 @@ It runs `qshd reload --port 60022`, which asks the running daemon to serve
 from the upgraded binary at the path it was started from (`/usr/bin/qshd`),
 and keeps every session. The daemon replaces only its network part, as a
 login with a newer `qsh` does (see "A newer qshd replaces only the network
-part"). Clients that are attached are disconnected briefly and come back on
-their own: running the command is your consent to that. The package scripts
-never reload on their own.
+part"). Clients that are attached are disconnected briefly (up to a minute
+for older clients) and come back on their own: running the command is your
+consent to that. The package scripts never reload on their own.
 
 `qshd reload` prints one line and exits 0 when the new binary serves
 ("qshd frontend replaced by build N; sessions kept"), and also when the
 installed binary is the one that already serves ("qshd is up to date"). It
-exits 1, and nothing changes, when:
+exits 1 when the new binary does not serve:
 
-- the installed binary is older than the running one (a downgrade);
-- it is missing or unreadable, or fails its own check;
+- the installed binary is older than the running one (a downgrade). Nothing
+  changes;
+- it is missing or unreadable, or fails its own check. Nothing changes;
 - it would leave some sessions unreachable, or only a full restart can
-  install it, which ends every session. The daemon logs the case. Run
-  `systemctl --user restart qshd` if you want that;
-- the new frontend does not start: the previous version keeps serving, and
-  the line says so;
-- the running daemon cannot reload at all: one from before this version, or
-  one that runs every session in its own process. The line says
-  "the running qshd cannot reload; restart it with
-  `systemctl --user restart qshd`", and the daemon keeps running as it was.
+  install it, which ends every session. Nothing changes, and the daemon logs
+  the case. Run `systemctl --user restart qshd` if you want that;
+- another upgrade is under way, or the daemon is stopping. The line says
+  which;
+- the new frontend does not start: the daemon starts the previous version
+  again, which keeps serving, and the line says so. Every session is kept,
+  but attached clients were disconnected briefly, as for a replacement;
+- the running daemon does not answer. Either it cannot reload at all (one
+  from before this version, or one that runs every session in its own
+  process), and keeps running as it was; or its reload did not finish within
+  its 50 s bound, and its replacement may still finish. The line says "the
+  running qshd did not answer the reload: it cannot reload, or it did not
+  finish in time; check `qshd`'s log or `systemctl --user status qshd`; to
+  restart deliberately, use `systemctl --user restart qshd`". A second
+  `systemctl --user reload qshd` tells whether the installed binary serves.
 
 systemd then reports the reload as failed. A reload never stops or starts a
 daemon. The request goes over a private socket in the cache directory,

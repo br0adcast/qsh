@@ -60,16 +60,35 @@ pub(crate) const READY_BOUND: Duration = Duration::from_secs(10);
 /// by [`crate::transport_daemon::CONTROL_REQUEST_TIMEOUT`], to let go of the
 /// control gate.
 const GATE_WAIT: Duration = crate::transport_daemon::CONTROL_REQUEST_TIMEOUT;
-pub(super) const STOPPING: &str = "the daemon is stopping";
+const STOPPING: &str = "the daemon is stopping";
 pub(super) const REPLACING: &str = "the daemon is replacing itself";
 
 // ---- the serve loop's side ---------------------------------------------------
 
+/// Why [`Host::replace_frontend`] did not make its candidate serve. The
+/// commit answers each differently: only a rollback says that the previous
+/// image serves again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NotReplaced {
+    /// The candidate was never started, for the reason given: no frontend
+    /// is served yet, another replacement is pending, or the daemon is
+    /// replacing itself whole. Which frontend serves next is not this
+    /// upgrade's to say.
+    Busy(&'static str),
+    /// The daemon is stopping, before or while the candidate started: no
+    /// frontend serves on.
+    Stopping,
+    /// The candidate was started and did not come up, or could not be
+    /// started, for the reason given; the previous image was started again.
+    RolledBack(String),
+}
+
 /// A replacement of the running frontend by `candidate`, for the serve loop;
-/// `done` hears how it ended.
+/// `done` hears how it ended. Dropped unanswered, it says that the daemon
+/// is stopping.
 pub(crate) struct Replacement {
     pub(super) candidate: Arc<FrontendImage>,
-    done: oneshot::Sender<Result<(), String>>,
+    done: oneshot::Sender<Result<(), NotReplaced>>,
 }
 
 /// The serve loop's end of [`Host::replace_frontend`].
@@ -77,8 +96,8 @@ pub(crate) type Replacements = mpsc::Receiver<Replacement>;
 
 impl Replacement {
     /// Never started: `why`.
-    pub(super) fn refuse(self, why: &str) {
-        let _ = self.done.send(Err(why.into()));
+    pub(super) fn refuse(self, why: &'static str) {
+        let _ = self.done.send(Err(NotReplaced::Busy(why)));
     }
 
     /// Its candidate did not come up, for `reason`: answered once the
@@ -93,13 +112,13 @@ impl Replacement {
 
 /// A replacement whose candidate did not come up.
 pub(super) struct RolledBack {
-    done: oneshot::Sender<Result<(), String>>,
+    done: oneshot::Sender<Result<(), NotReplaced>>,
     reason: String,
 }
 
 impl RolledBack {
     pub(super) fn answer(self) {
-        let _ = self.done.send(Err(self.reason));
+        let _ = self.done.send(Err(NotReplaced::RolledBack(self.reason)));
     }
 }
 
@@ -113,10 +132,15 @@ pub(super) struct Ran {
 
 impl Host {
     /// Replace the running frontend with `candidate`: returns once the
-    /// candidate's frontend serves and is current (`Ok`), or once it was
-    /// given up on and the previous image started again (`Err`, why). A
-    /// shutdown meanwhile is an `Err` too.
-    pub(crate) async fn replace_frontend(&self, candidate: FrontendImage) -> Result<(), String> {
+    /// candidate's frontend serves and is current (`Ok`), once it was given
+    /// up on and the previous image started again
+    /// ([`NotReplaced::RolledBack`]), or at once if the serve loop cannot
+    /// take it ([`NotReplaced::Busy`]). A shutdown, before or meanwhile, is
+    /// [`NotReplaced::Stopping`].
+    pub(crate) async fn replace_frontend(
+        &self,
+        candidate: FrontendImage,
+    ) -> Result<(), NotReplaced> {
         let (done, answer) = oneshot::channel();
         let replacement = Replacement {
             candidate: Arc::new(candidate),
@@ -130,17 +154,17 @@ impl Host {
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
         {
-            return Err("no frontend is served yet".into());
+            return Err(NotReplaced::Busy("no frontend is served yet"));
         }
         self.replace
             .try_send(replacement)
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
-                    "another frontend replacement is pending".into()
+                    NotReplaced::Busy("another frontend replacement is pending")
                 }
-                mpsc::error::TrySendError::Closed(_) => STOPPING.to_string(),
+                mpsc::error::TrySendError::Closed(_) => NotReplaced::Stopping,
             })?;
-        answer.await.unwrap_or_else(|_| Err(STOPPING.into()))
+        answer.await.unwrap_or(Err(NotReplaced::Stopping))
     }
 
     /// Run the candidate of `replacing` as `child` until it exits: current
@@ -242,6 +266,10 @@ struct Held {
 /// mutex guard: no I/O, wait or await under it.
 #[derive(Default)]
 struct Book {
+    /// The newest prepare's candidate, open by descriptor. One that is never
+    /// committed stays held -- and with it its file's blocks, even once the
+    /// file is deleted -- until the next prepare or the daemon's end: its
+    /// receipt's expiry is checked only when the receipt is spent.
     held: Option<Held>,
     /// A commit runs: no prepare, no other commit.
     committing: bool,
@@ -343,26 +371,51 @@ impl FrontendUpgrades for Upgrader {
         Box::pin(self.0.clone().prepare(request))
     }
 
-    fn commit(&self, receipt: [u8; 16]) -> BoxFuture<'_, CommitResponse> {
+    fn commit(&self, receipt: [u8; 16]) -> BoxFuture<'_, Option<CommitResponse>> {
         Box::pin(commit_detached(self.0.clone(), receipt))
     }
 
-    fn reload(&self) -> BoxFuture<'_, ReloadResponse> {
+    fn reload(&self) -> BoxFuture<'_, Option<ReloadResponse>> {
         Box::pin(self.0.clone().reload())
     }
 }
 
 /// The commit of `receipt` on a task of its own: a caller that goes away,
 /// or a handler that gives up, never leaves the transaction half done.
-async fn commit_detached(inner: Arc<Inner>, receipt: [u8; 16]) -> CommitResponse {
-    tokio::spawn(inner.commit(receipt))
+/// `None` if the task failed (a panic): what came of the commit is not
+/// known, so nothing is said of it.
+async fn commit_detached(inner: Arc<Inner>, receipt: [u8; 16]) -> Option<CommitResponse> {
+    detached(inner.commit(receipt)).await
+}
+
+/// `work` on a task of its own, to its end: `None` if that task failed.
+async fn detached<T: Send + 'static>(
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T> {
+    tokio::spawn(work)
         .await
-        .unwrap_or_else(|error| {
-            crate::log::error("qshd", &format!("the frontend upgrade failed: {error}"));
-            CommitResponse::RolledBack {
-                reason: format!("the upgrade failed: {error}"),
-            }
+        .map_err(|error| {
+            crate::log::error(
+                "qshd",
+                &format!("the frontend upgrade failed, with an unknown outcome: {error}"),
+            )
         })
+        .ok()
+}
+
+/// The answer of a commit whose replacement `not` replaced the frontend:
+/// only a candidate given up on, with the previous image started again,
+/// is a rollback.
+fn not_replaced(not: NotReplaced) -> CommitResponse {
+    match not {
+        NotReplaced::Busy(_) => CommitResponse::Refused {
+            reason: Refusal::Busy,
+        },
+        NotReplaced::Stopping => CommitResponse::Refused {
+            reason: Refusal::Stopping,
+        },
+        NotReplaced::RolledBack(reason) => CommitResponse::RolledBack { reason },
+    }
 }
 
 /// What a caller of `PREPARE-FRONTEND-UPGRADE` says the candidate is: the
@@ -469,6 +522,24 @@ fn reload_refused(reason: String, outcome: Option<Outcome>) -> ReloadResponse {
         &format!("reload refused ({outcome:?}): {reason}; the frontend serves on"),
     );
     ReloadResponse::Refused { reason, outcome }
+}
+
+/// A reload a prepare or a commit refused for `reason`. Busy or stopping,
+/// the daemon may be about to serve another frontend, or none: nothing is
+/// said of what serves on.
+fn reload_refusal(reason: &Refusal) -> ReloadResponse {
+    let text = refusal_text(reason);
+    match reason {
+        Refusal::Busy | Refusal::Stopping => {
+            crate::log::warn("qshd", &format!("reload refused: {text}"));
+            ReloadResponse::Refused {
+                reason: text,
+                outcome: None,
+            }
+        }
+        Refusal::Changed { outcome } => reload_refused(text, Some(outcome.clone())),
+        _ => reload_refused(text, None),
+    }
 }
 
 /// Why a reload that came to `outcome` is refused, in the user's words:
@@ -622,25 +693,26 @@ impl Inner {
     }
 
     /// `RELOAD-FRONTEND`: a prepare of the start path, as it is now, and its
-    /// commit, if [`reload_permits`] what it comes to.
-    async fn reload(self: Arc<Self>) -> ReloadResponse {
+    /// commit, if [`reload_permits`] what it comes to. `None` if what came
+    /// of the commit is not known.
+    async fn reload(self: Arc<Self>) -> Option<ReloadResponse> {
         let Some(path) = self.start_path.clone() else {
-            return reload_refused(
+            return Some(reload_refused(
                 "the daemon does not know the file it was started from".into(),
                 None,
-            );
+            ));
         };
         let examined = match tokio::time::timeout(PREPARE_TIMEOUT, self.examine(path, None)).await {
             Ok(Ok(examined)) => examined,
-            Ok(Err(reason)) => return reload_refused(refusal_text(&reason), None),
+            Ok(Err(reason)) => return Some(reload_refusal(&reason)),
             Err(_) => {
-                return reload_refused(
+                return Some(reload_refused(
                     format!(
                         "the checks of the installed qshd did not finish within {} s",
                         PREPARE_TIMEOUT.as_secs()
                     ),
                     None,
-                )
+                ))
             }
         };
         let (serving, build) = (
@@ -649,10 +721,13 @@ impl Inner {
         );
         let outcome = examined.outcome.clone();
         match &outcome {
-            Outcome::UpToDate => return ReloadResponse::UpToDate,
+            Outcome::UpToDate => return Some(ReloadResponse::UpToDate),
             permitted if reload_permits(permitted) => {}
             refused => {
-                return reload_refused(outcome_text(refused, build, serving), Some(outcome));
+                return Some(reload_refused(
+                    outcome_text(refused, build, serving),
+                    Some(outcome),
+                ));
             }
         }
         // The user's command consents to disconnecting attached clients
@@ -660,25 +735,19 @@ impl Inner {
         // has come to more meanwhile.
         let receipt = match self.hold(examined, Some(UpgradeCase::Soft)) {
             Ok(receipt) => receipt,
-            Err(reason) => return reload_refused(refusal_text(&reason), None),
+            Err(reason) => return Some(reload_refusal(&reason)),
         };
         crate::log::info(
             "qshd",
             &format!("reload: replacing the network frontend with build {build} ({outcome:?})"),
         );
-        match commit_detached(self.clone(), receipt).await {
+        Some(match commit_detached(self.clone(), receipt).await? {
             CommitResponse::Replaced { identity } => ReloadResponse::Replaced {
                 build: identity.build,
             },
             CommitResponse::RolledBack { reason } => ReloadResponse::RolledBack { reason },
-            CommitResponse::Refused { reason } => {
-                let outcome = match &reason {
-                    Refusal::Changed { outcome } => Some(outcome.clone()),
-                    _ => None,
-                };
-                reload_refused(refusal_text(&reason), outcome)
-            }
-        }
+            CommitResponse::Refused { reason } => reload_refusal(&reason),
+        })
     }
 
     /// The checks of a prepare, blocking: the file at `path` -- held from
@@ -852,7 +921,7 @@ impl Inner {
                 }
                 CommitResponse::Replaced { identity: busy }
             }
-            Err(reason) => {
+            Err(not) => {
                 // Open already if the serve loop got as far as a start; not
                 // if it never took the replacement. A replacement of the
                 // whole daemon, which keeps admission closed itself, cannot
@@ -860,11 +929,16 @@ impl Inner {
                 if !self.host.control.is_closed() {
                     admission.open();
                 }
+                let why = match &not {
+                    NotReplaced::Busy(why) => *why,
+                    NotReplaced::Stopping => STOPPING,
+                    NotReplaced::RolledBack(reason) => reason.as_str(),
+                };
                 crate::log::warn(
                     "qshd",
-                    &format!("the network frontend was not replaced: {reason}"),
+                    &format!("the network frontend was not replaced: {why}"),
                 );
-                CommitResponse::RolledBack { reason }
+                not_replaced(not)
             }
         }
     }
@@ -937,6 +1011,62 @@ mod tests {
         book.hold(seq, held(3, now + RECEIPT_TTL)).unwrap();
         book.begin().unwrap();
         assert!(matches!(book.take([3; 16], now), Err(Refusal::Unknown)));
+    }
+
+    #[test]
+    fn only_a_rollback_says_the_previous_image_serves_again() {
+        for why in ["no frontend is served yet", REPLACING] {
+            assert_eq!(
+                not_replaced(NotReplaced::Busy(why)),
+                CommitResponse::Refused {
+                    reason: Refusal::Busy
+                }
+            );
+        }
+        assert_eq!(
+            not_replaced(NotReplaced::Stopping),
+            CommitResponse::Refused {
+                reason: Refusal::Stopping
+            }
+        );
+        assert_eq!(
+            not_replaced(NotReplaced::RolledBack("it exited".into())),
+            CommitResponse::RolledBack {
+                reason: "it exited".into()
+            }
+        );
+    }
+
+    /// A reload refused because the daemon is busy or stopping says why,
+    /// and nothing of what serves on.
+    #[test]
+    fn a_busy_or_stopping_reload_names_no_serving_frontend() {
+        for reason in [Refusal::Busy, Refusal::Stopping] {
+            let ReloadResponse::Refused { reason, outcome } = reload_refusal(&reason) else {
+                panic!("not refused");
+            };
+            assert!(!reason.contains("serv"), "{reason}");
+            assert_eq!(outcome, None);
+        }
+        let changed = Refusal::Changed {
+            outcome: Outcome::Unreachable {
+                attached: 0,
+                sessions: 1,
+                stranded: 1,
+            },
+        };
+        let ReloadResponse::Refused { outcome, .. } = reload_refusal(&changed) else {
+            panic!("not refused");
+        };
+        assert!(matches!(outcome, Some(Outcome::Unreachable { .. })));
+    }
+
+    /// A commit whose task fails has no known outcome: nothing is answered.
+    #[tokio::test]
+    async fn a_failed_commit_task_has_no_answer() {
+        assert_eq!(detached(async { 7 }).await, Some(7));
+        let failed: Option<CommitResponse> = detached(async { panic!("fixture panic") }).await;
+        assert_eq!(failed, None);
     }
 
     #[test]

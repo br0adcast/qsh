@@ -32,6 +32,14 @@ use crate::state;
 pub const UNANSWERED: &str =
     "the daemon's frontend upgrade did not answer; rediscover before choosing again";
 
+/// A prepare or commit refused because the daemon is stopping: it is no
+/// daemon to register with, nor one that serves on.
+pub const STOPPING: &str = "the daemon is stopping; rediscover before choosing again";
+
+/// The longest request line a daemon reads, its `\n` included: a longer one
+/// is not parsed, so it is never answered.
+const REQUEST_BOUND: usize = 4096;
+
 /// What `transport-ensure` goes on to do about the running daemon.
 // One value per login, returned once: its size does not matter, and the
 // STATUS it carries is used as it is.
@@ -43,7 +51,8 @@ pub enum EnsureUpgrade {
     Legacy,
     /// This image's frontend serves now, as the daemon's `STATUS` says.
     Replaced(StatusResponse),
-    /// The running frontend serves on, for the reason given.
+    /// No upgrade now, for the reason given: the login registers with the
+    /// frontend it saw, which fails if another serves by then.
     Keep { warning: String },
     /// The upgrade disconnects or strands somebody: ask the user.
     Ask(FrontendUpgradeOffer),
@@ -123,15 +132,26 @@ pub fn step_with(
     // A commit refused because the sessions changed since the prepare earns
     // one fresh prepare, which takes the census again; never a second.
     let mut fresh_prepare = true;
-    loop {
-        let request = ControlRequest::PrepareFrontendUpgrade(PrepareRequest {
-            path: candidate.path.clone(),
-            size: candidate.size,
-            checksum: candidate.checksum.clone(),
-            build: candidate.build,
-            identity: identity.clone(),
-            consent: consent.cloned(),
+    let request = ControlRequest::PrepareFrontendUpgrade(PrepareRequest {
+        path: candidate.path.clone(),
+        size: candidate.size,
+        checksum: candidate.checksum.clone(),
+        build: candidate.build,
+        identity: identity.clone(),
+        consent: consent.cloned(),
+    });
+    // A host never answers a line it cannot read, and its silence is no
+    // permission to go on: such a request is not sent at all.
+    let length = crate::control::format_request(&request).len();
+    if length > REQUEST_BOUND {
+        return Ok(EnsureUpgrade::Keep {
+            warning: kept(&format!(
+                "its upgrade request would be {length} bytes, more than the daemon's \
+                 {REQUEST_BOUND}-byte bound; the path of this qshd is too long"
+            )),
         });
+    }
+    loop {
         let response: PrepareResponse = match ask(&request, PREPARE_CLIENT_TIMEOUT)? {
             // A host answers every prepare (ruling R6): no line is no
             // permission to stop it and start another.
@@ -165,11 +185,7 @@ pub fn step_with(
                     },
                 })
             }
-            PrepareResponse::Refused { reason } => {
-                return Ok(EnsureUpgrade::Keep {
-                    warning: kept(&refusal(&reason)),
-                })
-            }
+            PrepareResponse::Refused { reason } => return refused(&reason),
         };
         let response: CommitResponse = match ask(
             &ControlRequest::CommitFrontendUpgrade(receipt),
@@ -196,9 +212,7 @@ pub fn step_with(
                 fresh_prepare = false;
                 continue;
             }
-            CommitResponse::Refused { reason } => Ok(EnsureUpgrade::Keep {
-                warning: kept(&refusal(&reason)),
-            }),
+            CommitResponse::Refused { reason } => refused(&reason),
         };
     }
 }
@@ -277,6 +291,24 @@ fn declined(offer: &FrontendUpgradeOffer) -> String {
     format!(
         "the daemon's version differs from the app's, but replacing its frontend {cost} -- not replacing"
     )
+}
+
+/// What a refused prepare or commit leaves to do. A stopping daemon is no
+/// daemon to register with. Of a busy one, nothing is said of what serves
+/// on: another upgrade or a restart may be replacing it.
+fn refused(reason: &Refusal) -> Result<EnsureUpgrade> {
+    match reason {
+        Refusal::Stopping => bail!(STOPPING),
+        Refusal::Busy => Ok(EnsureUpgrade::Keep {
+            warning: format!(
+                "the newer qshd frontend was not installed: {}",
+                refusal(reason)
+            ),
+        }),
+        other => Ok(EnsureUpgrade::Keep {
+            warning: kept(&refusal(other)),
+        }),
+    }
 }
 
 fn kept(why: &str) -> String {
@@ -633,5 +665,77 @@ mod tests {
             panic!("not kept");
         };
         assert!(warning.contains("expired"), "{warning}");
+    }
+
+    /// A stopping daemon is an error, never one to register with, and a
+    /// busy one is kept without a word on what serves on: at the prepare
+    /// and at the commit alike.
+    #[test]
+    fn a_busy_or_stopping_daemon_is_never_said_to_serve_on() {
+        let refused = |reason| json(&PrepareResponse::Refused { reason });
+        let commit_refused = |reason| json(&CommitResponse::Refused { reason });
+        for replies in [
+            vec![refused(Refusal::Stopping)],
+            vec![ready(), commit_refused(Refusal::Stopping)],
+        ] {
+            let (result, sent) = run(replies, None, true);
+            assert_eq!(result.unwrap_err().to_string(), STOPPING);
+            assert!(!sent.contains(&"status"), "{sent:?}");
+        }
+        for replies in [
+            vec![refused(Refusal::Busy)],
+            vec![ready(), commit_refused(Refusal::Busy)],
+        ] {
+            let (result, _) = run(replies, None, true);
+            let EnsureUpgrade::Keep { warning } = result.unwrap() else {
+                panic!("not kept");
+            };
+            assert!(warning.contains("under way"), "{warning}");
+            assert!(!warning.contains("serves on"), "{warning}");
+        }
+    }
+
+    /// A prepare the daemon could not read is never sent: the frontend
+    /// serves on, with a warning that says why. One that fits is sent.
+    #[test]
+    fn a_prepare_over_the_request_bound_is_not_sent() {
+        // What a candidate with a path of `n` bytes comes to, and the
+        // length of the line sent, if one was.
+        let with_path = |n: usize| {
+            let long = Candidate {
+                path: format!("/{}", "p".repeat(n)),
+                ..candidate()
+            };
+            let mut sent = None;
+            let result = step_with(
+                |request, _| {
+                    sent = Some(crate::control::format_request(request).len());
+                    Ok(json(&PrepareResponse::UpToDate))
+                },
+                &long,
+                &identity(),
+                None,
+                true,
+            )
+            .unwrap();
+            (result, sent)
+        };
+        let fits = (0..REQUEST_BOUND)
+            .rev()
+            .find(|n| with_path(*n).1.is_some())
+            .expect("a short path is sent");
+        let (result, sent) = with_path(fits);
+        assert_eq!(result, EnsureUpgrade::Legacy);
+        assert!(
+            sent.is_some_and(|length| length <= REQUEST_BOUND),
+            "{sent:?}"
+        );
+        let (result, sent) = with_path(fits + 1);
+        assert_eq!(sent, None, "nothing is sent");
+        let EnsureUpgrade::Keep { warning } = result else {
+            panic!("not kept");
+        };
+        assert!(warning.contains("4096-byte bound"), "{warning}");
+        assert!(warning.contains("serves on"), "{warning}");
     }
 }
