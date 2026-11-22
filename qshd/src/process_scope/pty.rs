@@ -1,5 +1,6 @@
 //! Portable-PTY custody over the Linux exact-instance scope.
 
+use super::leader_watch::LeaderWatch;
 use super::{scope, Failure, Native, QualifiedProc, Unavailable};
 use nix::libc;
 use portable_pty::Child;
@@ -7,7 +8,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use transport::channel_open::{CleanupAuthority, CleanupStatus};
-use transport::channel_server::{ChannelWait, ChildStatus, LeaderStatus};
+use transport::channel_server::{
+    ActiveObservation, ChannelWait, ChildStatus, LeaderStatus, ReapNotifier,
+};
 
 // A grace interval chooses signal escalation; elapsed time never proves exit.
 const HUP_GRACE: Duration = Duration::from_secs(1);
@@ -156,6 +159,8 @@ struct NativeWait {
     /// Who hears that the leader's session was proved empty and the leader
     /// reaped, and the leader's pid; told once.
     reported: Option<(Arc<dyn LeaderReports>, u32)>,
+    /// Wakes the owner when the leader exits, so it is not polled (#649).
+    watch: Option<LeaderWatch>,
 }
 pub(crate) fn own_child(
     child: Box<dyn Child + Send + Sync>,
@@ -192,6 +197,8 @@ pub(crate) fn own_reported_child(
         }
         (None, _) => None,
     };
+    // Opened while the leader is this process's unreaped child.
+    let watch = pid.map(LeaderWatch::open);
     let (scope, unproved_child) = match pid {
         Some(pid) => (Some(scope::Scope::new(PtyChild { child, pid }, view)), None),
         None => (None, Some(child)),
@@ -201,6 +208,7 @@ pub(crate) fn own_reported_child(
         _unproved_child: unproved_child,
         stop_started: None,
         reported,
+        watch,
     })
 }
 impl NativeWait {
@@ -232,6 +240,18 @@ impl NativeWait {
     }
 }
 impl ChannelWait for NativeWait {
+    fn active_observation(&self) -> ActiveObservation {
+        if self.watch.as_ref().is_some_and(LeaderWatch::notifies) {
+            ActiveObservation::Notification
+        } else {
+            ActiveObservation::Poll
+        }
+    }
+    fn set_reap_notifier(&mut self, notifier: ReapNotifier) {
+        if let Some(watch) = self.watch.as_mut().filter(|watch| watch.notifies()) {
+            watch.start(move || notifier.notify());
+        }
+    }
     fn poll_leader_status(&mut self) -> Option<LeaderStatus> {
         let status = match self.scope.as_mut() {
             Some(scope) => scope.poll_leader(),
@@ -357,6 +377,43 @@ mod tests {
         assert!(matches!(wait.poll_exit(), ChildStatus::Unknown(_)));
         assert_eq!(waits.load(Ordering::SeqCst), 0);
         assert_eq!(kills.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn leader_exit_is_notified_not_polled_where_a_pidfd_and_runtime_exist() {
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let view = || QualifiedProc {
+            root: std::fs::File::open("/dev/null").unwrap().into(),
+        };
+        let child = |pid| ControlledChild {
+            pid,
+            waits: Arc::default(),
+            kills: Arc::default(),
+        };
+        let watched = own_child(Box::new(child(Some(sleeper.id()))), view());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let _inside = runtime.enter();
+            assert_eq!(
+                watched.active_observation(),
+                ActiveObservation::Notification
+            );
+            let unidentified = own_child(Box::new(child(None)), view());
+            assert_eq!(unidentified.active_observation(), ActiveObservation::Poll);
+        }
+        assert_eq!(
+            watched.active_observation(),
+            ActiveObservation::Poll,
+            "without a runtime to watch on, the owner keeps polling"
+        );
+        drop(watched);
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
     }
     extern "C" fn notify_only(_: libc::c_int) {}
 

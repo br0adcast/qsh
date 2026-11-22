@@ -1235,6 +1235,7 @@ mod census_parser_tests {
 
 pub mod scope;
 
+mod leader_watch;
 mod pty;
 pub(crate) use pty::{
     own_child, own_reported_child, prepare, LeaderReports, LeaderStart, LeaderWindow,
