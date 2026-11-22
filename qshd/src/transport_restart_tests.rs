@@ -46,6 +46,7 @@ async fn dispatch(
         deadline,
         None,
         Some(actions),
+        None,
     )
     .await
 }
@@ -255,6 +256,7 @@ async fn assert_owner_teardown_revokes_exec(fatal: bool) {
         Arc::new(AtomicUsize::new(0)),
         actions.control_gate.clone(),
         None,
+        crate::server_info::Serving::own(false),
         stop,
         Some(actions.clone()),
     )
@@ -280,4 +282,233 @@ async fn stop_future_latches_shutdown_before_acceptor_drop_can_attempt_exec() {
 #[tokio::test]
 async fn fatal_accept_latches_shutdown_before_acceptor_drop_can_attempt_exec() {
     assert_owner_teardown_revokes_exec(true).await;
+}
+
+/// The two frontend-upgrade requests, as a client sends them.
+fn upgrade_requests() -> [ControlRequest; 2] {
+    [
+        ControlRequest::PrepareFrontendUpgrade(crate::frontend_upgrade::PrepareRequest {
+            path: "/nonexistent/qshd".into(),
+            size: 1,
+            checksum: "ef".repeat(32),
+            build: 2,
+            identity: binding().identity,
+            consent: None,
+        }),
+        ControlRequest::CommitFrontendUpgrade([5; 16]),
+    ]
+}
+
+/// One request through the control handler with `upgrades`: the line it
+/// answers with, if any.
+async fn upgrade_answer(
+    request: &ControlRequest,
+    upgrades: Option<Arc<dyn FrontendUpgrades>>,
+) -> String {
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    client
+        .write_all(control::format_request(request).as_bytes())
+        .await
+        .unwrap();
+    let (stop_tx, _stop_rx) = mpsc::channel(1);
+    let actions = actions();
+    handle_transport_control_connection_with_peer_check_and_info(
+        server,
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+        vec![60000],
+        stop_tx,
+        Arc::new(AtomicUsize::new(0)),
+        actions.control_gate.clone(),
+        None,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        None,
+        Some(actions),
+        upgrades,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    let mut answer = String::new();
+    client.read_to_string(&mut answer).await.unwrap();
+    answer
+}
+
+/// A daemon that is no host (no upgrades) answers neither frontend-upgrade
+/// request: it writes no line and closes, exactly as an older daemon that
+/// does not know the verbs.
+#[tokio::test]
+async fn a_daemon_without_upgrades_answers_neither_request() {
+    for request in upgrade_requests() {
+        assert_eq!(upgrade_answer(&request, None).await, "", "{request:?}");
+    }
+}
+
+struct Answering;
+impl FrontendUpgrades for Answering {
+    fn prepare(
+        &self,
+        request: crate::frontend_upgrade::PrepareRequest,
+    ) -> crate::frontend_upgrade::BoxFuture<'_, PrepareResponse> {
+        Box::pin(async move {
+            PrepareResponse::Refused {
+                reason: Refusal::Candidate {
+                    detail: request.path,
+                },
+            }
+        })
+    }
+    fn commit(
+        &self,
+        receipt: [u8; 16],
+    ) -> crate::frontend_upgrade::BoxFuture<'_, Option<crate::frontend_upgrade::CommitResponse>>
+    {
+        Box::pin(async move {
+            Some(crate::frontend_upgrade::CommitResponse::RolledBack {
+                reason: hex::encode(receipt),
+            })
+        })
+    }
+    fn reload(
+        &self,
+    ) -> crate::frontend_upgrade::BoxFuture<'_, Option<crate::frontend_upgrade::ReloadResponse>>
+    {
+        Box::pin(async { Some(crate::frontend_upgrade::ReloadResponse::UpToDate) })
+    }
+}
+
+/// Upgrades whose commit and reload end with no known outcome, as after a
+/// panic in the commit's task.
+struct Unknown;
+impl FrontendUpgrades for Unknown {
+    fn prepare(
+        &self,
+        _: crate::frontend_upgrade::PrepareRequest,
+    ) -> crate::frontend_upgrade::BoxFuture<'_, PrepareResponse> {
+        Box::pin(async { PrepareResponse::UpToDate })
+    }
+    fn commit(
+        &self,
+        _: [u8; 16],
+    ) -> crate::frontend_upgrade::BoxFuture<'_, Option<crate::frontend_upgrade::CommitResponse>>
+    {
+        Box::pin(async { None })
+    }
+    fn reload(
+        &self,
+    ) -> crate::frontend_upgrade::BoxFuture<'_, Option<crate::frontend_upgrade::ReloadResponse>>
+    {
+        Box::pin(async { None })
+    }
+}
+
+/// A commit whose outcome is not known is answered with no line, as one
+/// past its bound: the caller cannot be told what serves.
+#[tokio::test]
+async fn a_commit_with_an_unknown_outcome_answers_nothing() {
+    let [_, commit] = upgrade_requests();
+    let upgrades: Option<Arc<dyn FrontendUpgrades>> = Some(Arc::new(Unknown));
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    client
+        .write_all(control::format_request(&commit).as_bytes())
+        .await
+        .unwrap();
+    let (stop_tx, _stop_rx) = mpsc::channel(1);
+    let actions = actions();
+    let handled = handle_transport_control_connection_with_peer_check_and_info(
+        server,
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+        vec![60000],
+        stop_tx,
+        Arc::new(AtomicUsize::new(0)),
+        actions.control_gate.clone(),
+        None,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        None,
+        Some(actions),
+        upgrades,
+        |_| Ok(()),
+    )
+    .await;
+    assert!(handled.is_err(), "{handled:?}");
+    let mut answer = String::new();
+    client.read_to_string(&mut answer).await.unwrap();
+    assert_eq!(answer, "");
+}
+
+/// `RELOAD-FRONTEND` is a `serve` daemon's reload socket's: a control
+/// socket never answers it, not even a hosted daemon's.
+#[tokio::test]
+async fn a_control_socket_never_answers_a_reload() {
+    let upgrades: Option<Arc<dyn FrontendUpgrades>> = Some(Arc::new(Answering));
+    for upgrades in [None, upgrades] {
+        assert_eq!(
+            upgrade_answer(&ControlRequest::ReloadFrontend, upgrades).await,
+            ""
+        );
+    }
+}
+
+/// One line through the reload socket's handler, from a peer `accepted`
+/// or not: what it answers, if anything.
+#[cfg(target_os = "linux")]
+async fn reload_answer(line: &str, accepted: bool) -> String {
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    client.write_all(line.as_bytes()).await.unwrap();
+    let handled = handle_reload_connection(server, &Answering, |_| {
+        if accepted {
+            Ok(())
+        } else {
+            anyhow::bail!("control peer belongs to a different effective account")
+        }
+    })
+    .await;
+    assert_eq!(handled.is_ok(), accepted, "{handled:?}");
+    // A refused peer's request is never read: its close resets the
+    // connection, which is no answer too.
+    let mut answer = String::new();
+    let _ = client.read_to_string(&mut answer).await;
+    answer
+}
+
+/// The reload socket answers `RELOAD-FRONTEND` from its own account with
+/// one line, and nothing else: no other request, and no other account.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_reload_socket_answers_only_a_reload_from_its_account() {
+    assert_eq!(
+        reload_answer("RELOAD-FRONTEND\n", true).await,
+        "{\"status\":\"up_to_date\"}\n"
+    );
+    assert_eq!(reload_answer("RELOAD-FRONTEND\n", false).await, "");
+    for other in ["STATUS\n", "STOP\n", "RELOAD-FRONTEND now\n"] {
+        assert_eq!(reload_answer(other, true).await, "", "{other}");
+    }
+    // A reload whose outcome is not known is answered with nothing.
+    let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+    client.write_all(b"RELOAD-FRONTEND\n").await.unwrap();
+    assert!(handle_reload_connection(server, &Unknown, |_| Ok(()))
+        .await
+        .is_err());
+    let mut answer = String::new();
+    client.read_to_string(&mut answer).await.unwrap();
+    assert_eq!(answer, "");
+}
+
+/// A hosted daemon hands both requests to its upgrades and answers with
+/// one line each.
+#[tokio::test]
+async fn a_hosted_daemon_answers_both_requests_with_one_line() {
+    let [prepare, commit] = upgrade_requests();
+    let upgrades: Option<Arc<dyn FrontendUpgrades>> = Some(Arc::new(Answering));
+    assert_eq!(
+        upgrade_answer(&prepare, upgrades.clone()).await,
+        "{\"status\":\"refused\",\"reason\":{\"kind\":\"candidate\",\"detail\":\"/nonexistent/qshd\"}}\n"
+    );
+    assert_eq!(
+        upgrade_answer(&commit, upgrades).await,
+        format!(
+            "{{\"status\":\"rolled_back\",\"reason\":\"{}\"}}\n",
+            "05".repeat(16)
+        )
+    );
 }

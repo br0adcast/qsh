@@ -337,6 +337,13 @@ pub fn cache_dir(system: bool) -> Result<PathBuf> {
     personal_cache_dir(dirs::cache_dir())
 }
 
+/// The reload socket of the personal `serve` daemon on `port`, in the
+/// personal cache directory: `qshd reload --port <port>` (the personal
+/// unit's `ExecReload`) asks the daemon there to replace its frontend.
+pub fn reload_socket_path(port: u16) -> Result<PathBuf> {
+    Ok(cache_dir(false)?.join(format!("qshd-serve-{port}.sock")))
+}
+
 /// The personal cache directory under the platform's cache root, as
 /// `dirs::cache_dir()` found it.
 fn personal_cache_dir(root: Option<PathBuf>) -> Result<PathBuf> {
@@ -424,6 +431,12 @@ pub fn run_serve_command(args: &[String]) -> Result<()> {
 /// OS-aware entrypoint; parsing still precedes all startup side effects.
 pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
     let parsed = parse_serve_args_os(args)?;
+    // The file a personal host's reload installs (`systemctl --user reload
+    // qshd`, #529 M2), named now, before anything can rename over it: after
+    // a package upgrade `/proc/self/exe` names the deleted old file. A
+    // `readlink`, no descriptor; only a hosted personal daemon uses it.
+    #[cfg(target_os = "linux")]
+    let start_path = crate::state::own_binary_path();
     // Every channel needs the reviewed Darwin runtime; refuse before binding
     // the port rather than at the first channel open (#551).
     #[cfg(target_os = "macos")]
@@ -652,7 +665,8 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         authorized_keys: parsed.authorized_keys.clone(),
         account: name.clone(),
         allowlist,
-        // A `serve` daemon never replaces itself: the gate stays open.
+        // A `serve` daemon never replaces itself whole; only a frontend
+        // upgrade closes the gate, for its moment.
         admission: Arc::default(),
         runtime_threads: parsed.runtime_threads,
     };
@@ -703,17 +717,40 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
     let daemon = managed_daemon(&backend);
     let runtime = serve_runtime(parsed.runtime_threads)?;
     #[cfg(target_os = "linux")]
-    let host = sessions.host(
-        Some(daemon.clone()),
-        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        host_start,
-    );
+    let host = sessions.host_images().map(|images| {
+        sessions.host(
+            images,
+            Some(daemon.clone()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            host_start,
+        )
+    });
+    // A host's frontend can be replaced from the file it was started from.
+    #[cfg(target_os = "linux")]
+    let reloads = host.as_ref().and_then(|host| {
+        let start_path = start_path
+            .map_err(|error| {
+                crate::log::warn(
+                    "qshd",
+                    &format!("cannot tell where its own binary is ({error:#}); reload is off"),
+                )
+            })
+            .ok()?;
+        let upgrades = crate::host::upgrade::Upgrader::new(
+            host.clone(),
+            crate::server_info::Serving::own(true),
+            None,
+            Some(start_path),
+        );
+        bind_reload_socket(parsed.port, upgrades)
+    });
     runtime.block_on(async {
         let mut signals = transport_daemon::PersonalSignals::register()?;
         #[cfg(target_os = "linux")]
         if let Some(host) = host {
             let result =
-                transport_daemon::run_host_until_stop(host, socket, signals.requested()).await;
+                transport_daemon::run_host_until_stop(host, socket, reloads, signals.requested())
+                    .await;
             // No frontend is left; every session's owner now stops and is
             // reaped before the daemon exits, as below.
             let owners = sessions.stop_all().await;
@@ -737,6 +774,34 @@ pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
         let owners = sessions.stop_all().await;
         result.and(owners.map_err(|error| anyhow::anyhow!(error)))
     })
+}
+
+/// The reload socket of the hosted `serve` daemon on `port`, handing
+/// reloads to `upgrades`; `None`, logged, if it cannot be bound: the daemon
+/// serves on without it, and `qshd reload` finds nobody to ask.
+#[cfg(target_os = "linux")]
+fn bind_reload_socket(
+    port: u16,
+    upgrades: Arc<crate::host::upgrade::Upgrader>,
+) -> Option<transport_daemon::ReloadSocket> {
+    let bound = reload_socket_path(port).and_then(|path| {
+        crate::control::bind_private_owned(&path)
+            .with_context(|| format!("binding {}", path.display()))
+    });
+    match bound {
+        Ok((listener, cleanup)) => Some(transport_daemon::ReloadSocket {
+            listener,
+            cleanup,
+            upgrades,
+        }),
+        Err(error) => {
+            crate::log::warn(
+                "qshd",
+                &format!("cannot bind the reload socket ({error:#}); reload is off"),
+            );
+            None
+        }
+    }
 }
 
 /// A `serve` daemon describes itself but never replaces itself: a service

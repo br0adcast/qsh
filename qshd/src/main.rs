@@ -69,8 +69,8 @@ use base64::Engine as _;
 use serde::Serialize;
 
 use qshd::{
-    channel_backend, control, handover, load_or_create_transport_key, load_transport_key, log, pty,
-    serve, state, transport_daemon, update, version,
+    channel_backend, control, ensure_upgrade, handover, load_or_create_transport_key,
+    load_transport_key, log, pty, serve, state, transport_daemon, update, version,
 };
 
 fn candidate_identity() -> Result<CandidateImageIdentity> {
@@ -141,6 +141,10 @@ fn help_text() -> String {
             .to_string(),
         "                    Long-lived daemon for a service manager (systemd/launchd); \
          see docs/qshd-service.md."
+            .to_string(),
+        "  reload            [--port <P>]".to_string(),
+        "                    Replace the running personal `serve` daemon's network frontend \
+         with the installed binary; sessions are kept (Linux, `ExecReload`)."
             .to_string(),
         "  bootstrap-capabilities  Report executable bootstrap API support.".to_owned(),
         "  server-info       --challenge <hex> [--socket <PATH>]  Query running daemon metadata."
@@ -221,6 +225,7 @@ fn main() -> Result<()> {
         Some("transport-shell") => run_transport_shell_command(&args),
         Some("transport-ensure") => run_transport_ensure(&args, service_stage),
         Some("serve") => serve::run_serve_command_os(&args),
+        Some("reload") => run_reload_command(&args),
         Some("server-info") => qshd::server_info::run_command(&args),
         Some("helper-status") => qshd::helper_status::run_command(&args),
         Some("bootstrap-capabilities") => {
@@ -244,9 +249,85 @@ fn main() -> Result<()> {
         }
         other => bail!(
             "expected command `transport-echo`, `transport-shell`, `transport-ensure`, \
-             `serve` or `self-check` (or the `--version`/`--help` flags), got: {:?}",
+             `serve`, `reload` or `self-check` (or the `--version`/`--help` flags), got: {:?}",
             other
         ),
+    }
+}
+
+/// What `qshd reload` says when no daemon answers its reload request: an
+/// older daemon, one without a host, or none at all, which change nothing;
+/// but also a daemon whose reload did not finish within its bound, or whose
+/// outcome it does not know, and which may still replace its frontend. The
+/// line claims neither.
+const CANNOT_RELOAD: &str = "the running qshd did not answer the reload: it cannot reload, or it \
+     did not finish in time; check `qshd`'s log or `systemctl --user status qshd`; to restart \
+     deliberately, use `systemctl --user restart qshd`";
+
+/// The `reload` command, the personal unit's `ExecReload`: ask the running
+/// `serve` daemon on `--port` to replace its frontend with the installed
+/// binary, and say in one line what came of it. Exits 0 when the installed
+/// binary serves (replaced, or already), 1 otherwise. It never starts or
+/// stops a daemon: one that cannot reload is left as it is.
+fn run_reload_command(args: &[OsString]) -> Result<()> {
+    let port = parse_reload_args(args)?;
+    let (line, ok) = reload_line(serve::reload_socket_path(port).and_then(|sock| {
+        control::client_request_with_timeout(
+            &sock,
+            &control::ControlRequest::ReloadFrontend,
+            qshd::frontend_upgrade::RELOAD_CLIENT_TIMEOUT,
+        )
+    }));
+    if ok {
+        println!("{line}");
+        Ok(())
+    } else {
+        eprintln!("{line}");
+        std::process::exit(1)
+    }
+}
+
+/// `reload [--port <P>]`: the port of the `serve` daemon to ask.
+fn parse_reload_args(args: &[OsString]) -> Result<u16> {
+    let mut port = serve::DEFAULT_SERVE_PORT;
+    let mut rest = args.iter().enumerate().skip(1);
+    while let Some((at, arg)) = rest.next() {
+        // Numbered as `main` numbers them: the command is argument 1.
+        match argument_text(arg, at + 1)? {
+            "--port" => {
+                let (at, value) = rest.next().context("--port needs a value")?;
+                port = argument_text(value, at + 1)?
+                    .parse()
+                    .ok()
+                    .filter(|port| *port != 0)
+                    .context("port must be a number 1..65535")?;
+            }
+            other => bail!("reload: unexpected argument {other:?}"),
+        }
+    }
+    Ok(port)
+}
+
+/// The one line `qshd reload` prints for what its request came to, and
+/// whether that is success.
+fn reload_line(reply: Result<control::ControlReply>) -> (String, bool) {
+    use qshd::frontend_upgrade::ReloadResponse;
+    let answer = match reply {
+        Ok(control::ControlReply::Answered(line)) => serde_json::from_str(&line).ok(),
+        _ => None,
+    };
+    match answer {
+        Some(ReloadResponse::Replaced { build }) => (
+            format!("qshd frontend replaced by build {build}; sessions kept"),
+            true,
+        ),
+        Some(ReloadResponse::UpToDate) => ("qshd is up to date".into(), true),
+        Some(ReloadResponse::Refused { reason, .. }) => (reason, false),
+        Some(ReloadResponse::RolledBack { reason }) => (
+            format!("{reason}; the previous version keeps serving"),
+            false,
+        ),
+        None => (CANNOT_RELOAD.into(), false),
     }
 }
 
@@ -561,6 +642,9 @@ struct ParsedTransportEnsureArgs {
     busy_attempt: Option<BusyAttemptId>,
     busy_decision: Option<BusyDecision>,
     destructive_consent: Option<daemon_bootstrap_protocol::DestructiveRestartConsent>,
+    /// The user's agreement to replace a hosted daemon's frontend (#529 M2),
+    /// with the force decision it answers.
+    frontend_upgrade_consent: Option<daemon_bootstrap_protocol::FrontendUpgradeConsent>,
     service_restart_consent: Option<daemon_bootstrap_protocol::ServiceRestartConsent>,
     service_candidate_helper: Option<PathBuf>,
     service_installed_helper: Option<PathBuf>,
@@ -593,6 +677,8 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
     let mut busy_attempt = None;
     let mut busy_decision: Option<BusyDecision> = None;
     let mut destructive_consent: Option<daemon_bootstrap_protocol::DestructiveRestartConsent> =
+        None;
+    let mut frontend_upgrade_consent: Option<daemon_bootstrap_protocol::FrontendUpgradeConsent> =
         None;
     let mut service_restart_consent: Option<daemon_bootstrap_protocol::ServiceRestartConsent> =
         None;
@@ -646,6 +732,20 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
                 anyhow::ensure!(value.len() <= 4096, "destructive consent exceeds limit");
                 destructive_consent =
                     Some(serde_json::from_str(value).context("invalid destructive consent")?);
+                i += 2;
+            }
+            "--frontend-upgrade-consent" if frontend_upgrade_consent.is_none() => {
+                let value = argument_text(
+                    args.get(i + 1)
+                        .context("--frontend-upgrade-consent requires a value")?,
+                    i + 2,
+                )?;
+                anyhow::ensure!(
+                    value.len() <= 4096,
+                    "frontend upgrade consent exceeds limit"
+                );
+                frontend_upgrade_consent =
+                    Some(serde_json::from_str(value).context("invalid frontend upgrade consent")?);
                 i += 2;
             }
             "--service-restart-consent" if service_restart_consent.is_none() => {
@@ -743,6 +843,22 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
         destructive_consent.is_none() || service_restart_consent.is_none(),
         "conflicting restart consent scopes"
     );
+    if let Some(consent) = &frontend_upgrade_consent {
+        anyhow::ensure!(
+            destructive_consent.is_none() && service_restart_consent.is_none(),
+            "conflicting restart consent scopes"
+        );
+        anyhow::ensure!(
+            consent.action == daemon_bootstrap_protocol::FrontendUpgradeAction::ReplaceFrontend
+                && busy_decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.choice == BusyChoice::ForceUpdate
+                        && decision.attempt == consent.attempt
+                        && decision.identity == consent.identity
+                        && decision.candidate == consent.candidate),
+            "frontend upgrade consent does not match a force decision"
+        );
+    }
     if let Some(consent) = &service_restart_consent {
         anyhow::ensure!(
             !restart_only
@@ -779,6 +895,7 @@ fn parse_transport_ensure_args(args: &[OsString]) -> Result<ParsedTransportEnsur
         busy_attempt,
         busy_decision,
         destructive_consent,
+        frontend_upgrade_consent,
         service_restart_consent,
         service_candidate_helper,
         service_installed_helper,
@@ -1248,19 +1365,153 @@ fn run_transport_ensure(args: &[OsString], stage_context: Option<OsString>) -> R
             let (generation, profiles) = live_profiles(&transaction, &status, &keypair.public)?;
             let identity = status_identity(&status, generation.clone());
             let candidate = parsed.report_busy.then(candidate_identity).transpose()?;
+            // The user's decision, if it answers exactly this daemon and this
+            // candidate; any other is answered with a fresh record.
+            let decided = parsed.busy_decision.as_ref().filter(|decision| {
+                Some(&decision.attempt) == parsed.busy_attempt.as_ref()
+                    && decision.identity == identity
+                    && Some(&decision.candidate) == candidate.as_ref()
+                    && decision.valid()
+            });
+            // A hosted daemon may take this newer image by replacing only its
+            // frontend (#529 M2); the daemon says what that costs. A user who
+            // chose to cancel or keep the old daemon is not asked again.
+            if !parsed.restart_only
+                && status.host.is_some()
+                && matches!(
+                    action,
+                    version::ReconcileAction::Replace | version::ReconcileAction::KeepOldWarn(_)
+                )
+                && !decided.is_some_and(|decision| {
+                    matches!(
+                        decision.choice,
+                        BusyChoice::Cancel | BusyChoice::ContinueOld
+                    )
+                })
+            {
+                let forced =
+                    decided.is_some_and(|decision| decision.choice == BusyChoice::ForceUpdate);
+                let consent = parsed.frontend_upgrade_consent.as_ref().filter(|_| forced);
+                match ensure_upgrade::step(
+                    &transaction,
+                    &status,
+                    &identity,
+                    consent,
+                    parsed.report_busy,
+                )? {
+                    ensure_upgrade::EnsureUpgrade::Legacy => {}
+                    ensure_upgrade::EnsureUpgrade::Replaced(upgraded) => {
+                        let (generation, profiles) =
+                            live_profiles(&transaction, &upgraded, &keypair.public)?;
+                        return reuse_live_daemon(
+                            &transaction,
+                            &parsed,
+                            &keypair.public,
+                            &upgraded,
+                            generation,
+                            profiles,
+                            None,
+                        );
+                    }
+                    ensure_upgrade::EnsureUpgrade::Keep { warning }
+                    | ensure_upgrade::EnsureUpgrade::RolledBack { warning } => {
+                        return reuse_live_daemon(
+                            &transaction,
+                            &parsed,
+                            &keypair.public,
+                            &status,
+                            generation,
+                            profiles,
+                            Some(&warning),
+                        );
+                    }
+                    ensure_upgrade::EnsureUpgrade::Ask(offer) => {
+                        return write_transport_busy(BusyDaemonInfo {
+                            schema: 3,
+                            attempt: parsed
+                                .busy_attempt
+                                .clone()
+                                .context("missing busy attempt")?,
+                            identity,
+                            candidate: candidate.context("missing selected candidate")?,
+                            active_connections: offer.attached,
+                            sessions: offer.sessions,
+                            serving_profiles: profiles,
+                            preservation: PreservationCapability::PreservesSessions,
+                            service_restart: None,
+                            upgrade: Some(offer),
+                        });
+                    }
+                    // With the user's consent to exactly this, the destructive
+                    // restart below runs, whatever the attached count.
+                    ensure_upgrade::EnsureUpgrade::Destructive { .. }
+                        if forced && parsed.destructive_consent.is_some() => {}
+                    ensure_upgrade::EnsureUpgrade::Destructive { attached, sessions } => {
+                        if !parsed.report_busy {
+                            // Nobody can be asked: sessions, retained ones
+                            // included, are never ended unasked.
+                            let warning = format!(
+                                "the daemon's version differs from the app's, but only a full \
+                                 restart installs it, which would end its {sessions} session(s) \
+                                 -- not replacing"
+                            );
+                            return reuse_live_daemon(
+                                &transaction,
+                                &parsed,
+                                &keypair.public,
+                                &status,
+                                generation,
+                                profiles,
+                                Some(&warning),
+                            );
+                        }
+                        return write_transport_busy(BusyDaemonInfo {
+                            schema: 3,
+                            attempt: parsed
+                                .busy_attempt
+                                .clone()
+                                .context("missing busy attempt")?,
+                            identity: identity.clone(),
+                            candidate: candidate.context("missing selected candidate")?,
+                            active_connections: attached,
+                            sessions,
+                            serving_profiles: profiles,
+                            preservation: PreservationCapability::Unknown,
+                            service_restart: qshd::service_restart::offered_service(
+                                &transaction,
+                                parsed.port,
+                                &status.version,
+                                identity.generation.as_deref(),
+                            ),
+                            upgrade: None,
+                        });
+                    }
+                    ensure_upgrade::EnsureUpgrade::FullRestart => {
+                        // No session to lose: stop it and become the daemon,
+                        // once it has let go of its socket and port.
+                        transaction.request(&control::ControlRequest::Stop)?;
+                        wait_for_daemon_release(&transaction, parsed.port)?;
+                        let allowlist =
+                            transport_daemon::build_server_allowlist(parsed.client_pubkey);
+                        return become_transport_daemon(
+                            &parsed,
+                            &cache_dir,
+                            &sock_path,
+                            keypair,
+                            allowlist,
+                            transaction,
+                            None,
+                        );
+                    }
+                }
+            }
             let needs_choice = parsed.report_busy
                 && matches!(action, version::ReconcileAction::KeepOldWarn(_))
                 && status.total_connections > 0;
             // Current activity decides whether to report a new BUSY record, not
             // whether an identity-scoped Continue still selects this daemon.
             let mut forced_exit = false;
-            let accepted = if let Some(decision) =
-                parsed.busy_decision.as_ref().filter(|decision| {
-                    Some(&decision.attempt) == parsed.busy_attempt.as_ref()
-                        && decision.identity == identity
-                        && Some(&decision.candidate) == candidate.as_ref()
-                        && decision.valid()
-                }) {
+            let accepted = if let Some(decision) = decided {
                 match decision.choice {
                     BusyChoice::Cancel => bail!("busy daemon startup cancelled"),
                     BusyChoice::ContinueOld => true,
@@ -1315,8 +1566,8 @@ fn run_transport_ensure(args: &[OsString], stage_context: Option<OsString>) -> R
                 if status.total_connections == 0 {
                     bail!("selected daemon identity changed; rediscover before choosing again");
                 }
-                let info = BusyDaemonInfo {
-                    schema: 2,
+                return write_transport_busy(BusyDaemonInfo {
+                    schema: 3,
                     attempt: parsed
                         .busy_attempt
                         .clone()
@@ -1324,6 +1575,9 @@ fn run_transport_ensure(args: &[OsString], stage_context: Option<OsString>) -> R
                     identity: identity.clone(),
                     candidate: candidate.clone().context("missing selected candidate")?,
                     active_connections: status.total_connections,
+                    // A daemon without a host does not count its retained
+                    // sessions: the attached ones are those known.
+                    sessions: status.total_connections,
                     serving_profiles: profiles.clone(),
                     preservation: PreservationCapability::Unknown,
                     service_restart: qshd::service_restart::offered_service(
@@ -1332,17 +1586,8 @@ fn run_transport_ensure(args: &[OsString], stage_context: Option<OsString>) -> R
                         &status.version,
                         identity.generation.as_deref(),
                     ),
-                };
-                if !info.valid() {
-                    bail!("invalid running daemon identity");
-                }
-                writeln!(
-                    std::io::stdout(),
-                    "TRANSPORT-BUSY {}",
-                    serde_json::to_string(&info)?
-                )?;
-                std::io::stdout().flush()?;
-                return Ok(());
+                    upgrade: None,
+                });
             }
             if !forced_exit {
                 let warning = match &action {
@@ -1358,40 +1603,15 @@ fn run_transport_ensure(args: &[OsString], stage_context: Option<OsString>) -> R
                 };
                 match decision {
                     transport_daemon::EnsureDecision::Reuse => {
-                        if transport_daemon::reuse_compatibility(profiles.as_deref())
-                            == transport_daemon::ReuseCompatibility::Incompatible
-                        {
-                            bail!("running qshd {} serves incompatible session profiles {:?}; required profile [{}, {}, {}]. No daemon restart was requested. Use a client with a matching profile, or finish active qsh sessions before updating the daemon", status.version, profiles, transport::wire::VERSION, transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION);
-                        }
-                        let actual = if let Some(pubkey) = parsed.client_pubkey {
-                            let request = registration_request(
-                                &transaction,
-                                &status,
-                                generation.as_deref(),
-                                pubkey,
-                            )?;
-                            validate_add_client_reply(transaction.request(&request)?, &status)?
-                        } else {
-                            ready_ports(&status)?;
-                            status.clone()
-                        };
-                        let (after_generation, after_profiles) =
-                            live_profiles(&transaction, &actual, &keypair.public)?;
-                        if after_generation != generation || after_profiles != profiles {
-                            bail!(
-                                "daemon changed during registration; rediscover and choose again"
-                            );
-                        }
-                        transaction.validate_route()?;
-                        write_transport_ready_profiles(
-                            &mut std::io::stdout(),
-                            &actual.version,
+                        return reuse_live_daemon(
+                            &transaction,
+                            &parsed,
                             &keypair.public,
-                            &ready_ports(&actual)?,
-                            combined_warning(warning, actual.logging_warning.as_deref()).as_deref(),
+                            &status,
+                            generation,
                             profiles,
-                        )?;
-                        return Ok(());
+                            warning,
+                        );
                     }
                     transport_daemon::EnsureDecision::BecomeDaemon => {
                         // The daemon is stale (`Replace`): ask it to stop,
@@ -1443,6 +1663,61 @@ fn run_transport_ensure(args: &[OsString], stage_context: Option<OsString>) -> R
         transaction,
         None,
     )
+}
+
+/// Registers this login's client key with the live daemon `status`
+/// describes, serving `generation` with `profiles`, and reports it ready,
+/// with `warning` if the daemon was kept for a reason. Fails if the daemon
+/// changed under the registration.
+fn reuse_live_daemon(
+    transaction: &control::EnsureLock,
+    parsed: &ParsedTransportEnsureArgs,
+    public: &[u8; 32],
+    status: &control::StatusResponse,
+    generation: Option<String>,
+    profiles: Option<Vec<[u8; 3]>>,
+    warning: Option<&str>,
+) -> Result<()> {
+    if transport_daemon::reuse_compatibility(profiles.as_deref())
+        == transport_daemon::ReuseCompatibility::Incompatible
+    {
+        bail!("running qshd {} serves incompatible session profiles {:?}; required profile [{}, {}, {}]. No daemon restart was requested. Use a client with a matching profile, or finish active qsh sessions before updating the daemon", status.version, profiles, transport::wire::VERSION, transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION);
+    }
+    let actual = if let Some(pubkey) = parsed.client_pubkey {
+        let request = registration_request(transaction, status, generation.as_deref(), pubkey)?;
+        validate_add_client_reply(transaction.request(&request)?, status)?
+    } else {
+        ready_ports(status)?;
+        status.clone()
+    };
+    let (after_generation, after_profiles) = live_profiles(transaction, &actual, public)?;
+    if after_generation != generation || after_profiles != profiles {
+        bail!("daemon changed during registration; rediscover and choose again");
+    }
+    transaction.validate_route()?;
+    write_transport_ready_profiles(
+        &mut std::io::stdout(),
+        &actual.version,
+        public,
+        &ready_ports(&actual)?,
+        combined_warning(warning, actual.logging_warning.as_deref()).as_deref(),
+        profiles,
+    )
+}
+
+/// Prints `TRANSPORT-BUSY` with `info`, which must be a valid record: the
+/// caller asks the user and runs `transport-ensure` again with the answer.
+fn write_transport_busy(info: BusyDaemonInfo) -> Result<()> {
+    if !info.valid() {
+        bail!("invalid running daemon identity");
+    }
+    writeln!(
+        std::io::stdout(),
+        "TRANSPORT-BUSY {}",
+        serde_json::to_string(&info)?
+    )?;
+    std::io::stdout().flush()?;
+    Ok(())
 }
 
 /// How long `transport-ensure` waits before asking a second time when the
@@ -1693,27 +1968,32 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     let active_count = Arc::new(AtomicUsize::new(0));
     let control_gate = Arc::new(tokio::sync::RwLock::new(()));
     let admission = Arc::new(update::AdmissionGate::default());
-    let identity = update::OwnImage::current()
-        .ok()
-        .map(|own| BusyDaemonIdentity {
-            version: state::QSHD_VERSION.into(),
-            build: own.build,
-            checksum: own.checksum,
-            pid: std::process::id(),
-            generation: Some(hex::encode(qshd::server_info::current().generation)),
-        });
-    let actions = Arc::new(qshd::RestartActions::new(
-        identity,
-        control_gate.clone(),
-        admission.clone(),
-        cfg!(target_os = "linux"),
-    ));
 
     // The same session backend `serve` hands its router: the daemon has no
     // startup session of its own to decide, and no tmux to drive -- it hands
     // out channels, and what to put in them (attaching to an existing tmux
     // session or something else entirely) is the client's decision now.
     let sessions = channel_backend::PersonalSessions::hold(Some(start.cache_dir.clone()));
+    // Whether this daemon is a host is known before its coordinator is
+    // built: the coordinator's identity and every identity answer of the
+    // control server come from one description of the serving frontend.
+    #[cfg(target_os = "linux")]
+    let host_images = sessions.host_images();
+    #[cfg(target_os = "linux")]
+    let hosted = host_images.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let hosted = false;
+    let serving = qshd::server_info::Serving::own(hosted);
+    let identity = serving
+        .identity()
+        .ok()
+        .map(|identity| identity.busy_identity());
+    let actions = Arc::new(qshd::RestartActions::new(
+        identity,
+        control_gate.clone(),
+        admission.clone(),
+        cfg!(target_os = "linux"),
+    ));
     let backend = channel_backend::ChannelSessionBackend::new(Arc::new(
         qshd::screen_budget::ScreenBudget::new(qshd::screen_budget::BudgetLimits::default()),
     ));
@@ -1756,9 +2036,10 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     #[cfg(target_os = "linux")]
     let host_allowlist = qshd::host::HostAllowlist::new(Arc::clone(&shared_allowlist));
     #[cfg(target_os = "linux")]
-    let host = {
+    let host = host_images.map(|images| {
         let keys = signature_keys();
         sessions.host(
+            images,
             daemon.clone(),
             Arc::clone(&active_count),
             qshd::host::HostStart {
@@ -1774,7 +2055,22 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
                 runtime_threads: None,
             },
         )
-    };
+    });
+    // A host's frontend can be replaced by a newer image (#529 M2); the
+    // control server hands the two upgrade requests to this. Its reload
+    // would install the file this daemon runs from, but only `serve` has a
+    // reload socket: here `transport-ensure` brings the newer image.
+    #[cfg(target_os = "linux")]
+    let upgrades = host.as_ref().map(|host| {
+        let start_path =
+            (!start.binary_path.as_os_str().is_empty()).then(|| start.binary_path.clone());
+        qshd::host::upgrade::Upgrader::new(
+            host.clone(),
+            serving.clone(),
+            Some(actions.clone()),
+            start_path,
+        ) as Arc<dyn qshd::frontend_upgrade::FrontendUpgrades>
+    });
 
     let runtime =
         tokio::runtime::Runtime::new().context("creating the transport daemon's runtime")?;
@@ -1792,6 +2088,8 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
                 vec![start.port],
                 active_count,
                 actions,
+                serving,
+                upgrades,
                 signals.requested(),
             )
             .await;
@@ -1811,6 +2109,7 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
             active_count,
             actions,
             Some(opens),
+            serving,
             signals.requested(),
         )
         .await;
@@ -2028,13 +2327,14 @@ fn control_sock_path(cache_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ask_status_with, control, help_text, load_or_create_transport_key,
+        ask_status_with, control, help_text, load_or_create_transport_key, parse_reload_args,
         parse_transport_echo_args, parse_transport_ensure_args, parse_transport_shell_args,
-        personal_server_auth, ready_ports, state, update, validate_add_client_reply, version_text,
-        write_transport_ready,
+        personal_server_auth, ready_ports, reload_line, serve, state, update,
+        validate_add_client_reply, version_text, write_transport_ready, CANNOT_RELOAD,
     };
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
+    use std::ffi::OsString;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -2538,6 +2838,127 @@ mod tests {
         assert!(parse(&ordinary, &consent).is_err());
     }
 
+    /// A force decision and the frontend-upgrade consent that answers it.
+    fn force_and_upgrade_consent() -> (serde_json::Value, serde_json::Value) {
+        let decision = serde_json::json!({"attempt":"12".repeat(16),"identity":{"version":"0.6.0","build":1,"checksum":"ab".repeat(32),"pid":42,"generation":"cd".repeat(16)},"candidate":{"build":2,"checksum":"ef".repeat(32)},"choice":"force_update"});
+        let consent = serde_json::json!({"attempt":decision["attempt"],"identity":decision["identity"],"candidate":decision["candidate"],"case":"soft","action":"replace_frontend"});
+        (decision, consent)
+    }
+
+    fn parse_upgrade_consent(
+        decision: &serde_json::Value,
+        consent: &str,
+        extra: &[&str],
+    ) -> anyhow::Result<super::ParsedTransportEnsureArgs> {
+        let attempt = "12".repeat(16);
+        let decision = decision.to_string();
+        let mut input = vec![
+            "transport-ensure",
+            "--name",
+            "fixture",
+            "--port",
+            "60022",
+            "--report-busy",
+            "--busy-attempt",
+            &attempt,
+            "--busy-decision",
+            &decision,
+            "--frontend-upgrade-consent",
+            consent,
+        ];
+        input.extend(extra);
+        parse_transport_ensure_args(&args(&input))
+    }
+
+    #[test]
+    fn frontend_upgrade_consent_requires_a_matching_force_decision() {
+        let (decision, consent) = force_and_upgrade_consent();
+        let parsed = parse_upgrade_consent(&decision, &consent.to_string(), &[]).unwrap();
+        assert_eq!(
+            parsed.frontend_upgrade_consent.map(|c| c.case),
+            Some(daemon_bootstrap_protocol::UpgradeCase::Soft)
+        );
+        for field in ["attempt", "generation", "candidate", "case", "action"] {
+            let mut stale = consent.clone();
+            match field {
+                "attempt" => stale["attempt"] = "34".repeat(16).into(),
+                "generation" => stale["identity"]["generation"] = "aa".repeat(16).into(),
+                "candidate" => stale["candidate"]["build"] = 3.into(),
+                "case" => stale["case"] = "destructive".into(),
+                _ => stale["action"] = "stop_and_restart".into(),
+            }
+            assert!(
+                parse_upgrade_consent(&decision, &stale.to_string(), &[]).is_err(),
+                "{field}"
+            );
+        }
+        for choice in ["continue_old", "cancel"] {
+            let mut other = decision.clone();
+            other["choice"] = choice.into();
+            assert!(
+                parse_upgrade_consent(&other, &consent.to_string(), &[]).is_err(),
+                "{choice}"
+            );
+        }
+        // Without a decision at all.
+        let without = parse_transport_ensure_args(&args(&[
+            "transport-ensure",
+            "--name",
+            "fixture",
+            "--port",
+            "60022",
+            "--report-busy",
+            "--busy-attempt",
+            &"12".repeat(16),
+            "--frontend-upgrade-consent",
+            &consent.to_string(),
+        ]));
+        assert!(without.is_err());
+        let long = format!("{}{}", consent, " ".repeat(4096));
+        assert!(parse_upgrade_consent(&decision, &long, &[]).is_err());
+        assert!(
+            parse_upgrade_consent(
+                &decision,
+                &consent.to_string(),
+                &["--frontend-upgrade-consent", &consent.to_string()]
+            )
+            .is_err(),
+            "given once"
+        );
+    }
+
+    #[test]
+    fn frontend_upgrade_consent_conflicts_with_other_consents() {
+        let (decision, consent) = force_and_upgrade_consent();
+        let mut destructive = consent.clone();
+        destructive.as_object_mut().unwrap().remove("case");
+        destructive["action"] = "stop_and_restart".into();
+        assert!(parse_upgrade_consent(
+            &decision,
+            &consent.to_string(),
+            &["--destructive-consent", &destructive.to_string()]
+        )
+        .is_err());
+        let selector = serde_json::json!({"profile":"personal_transport_v1","uid":1000,"endpoint":"/fixture/qsh/control.sock","port":60022});
+        let mut offered = decision.clone();
+        offered["service_restart"] = selector.clone();
+        let service = serde_json::json!({"attempt":decision["attempt"],"service":selector,"candidate":decision["candidate"],"action":"restart_account_service"});
+        assert!(parse_upgrade_consent(
+            &offered,
+            &consent.to_string(),
+            &[
+                "--service-candidate-helper",
+                "/fixture/qshd",
+                "--service-restart-consent",
+                &service.to_string()
+            ]
+        )
+        .is_err());
+        assert!(
+            parse_upgrade_consent(&decision, &consent.to_string(), &["--restart-only"]).is_err()
+        );
+    }
+
     #[test]
     fn busy_flags_require_explicit_report_mode_and_valid_scoped_identity() {
         let decision = serde_json::json!({"attempt":"12".repeat(16),"identity":{"version":"0.5.0","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"choice":"continue_old"}).to_string();
@@ -2589,6 +3010,7 @@ mod tests {
             }],
             total_connections: 1,
             pid: 42,
+            host: None,
         }
     }
 
@@ -2813,6 +3235,91 @@ mod tests {
         assert!(text.contains("-V"));
         assert!(text.contains("--help"));
         assert!(text.contains("-h"));
+    }
+
+    #[test]
+    fn reload_takes_only_a_port() {
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(
+            parse_reload_args(&args(&["reload"])).unwrap(),
+            serve::DEFAULT_SERVE_PORT
+        );
+        assert_eq!(
+            parse_reload_args(&args(&["reload", "--port", "60023"])).unwrap(),
+            60023
+        );
+        for bad in [
+            &["reload", "--port"][..],
+            &["reload", "--port", "0"],
+            &["reload", "--port", "x"],
+            &["reload", "--system"],
+        ] {
+            assert!(parse_reload_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// One line for each answer, and success only when the installed
+    /// binary serves; no answer at all names the deliberate way.
+    #[test]
+    fn reload_says_one_line_per_answer() {
+        let answered = |json: &str| Ok(control::ControlReply::Answered(json.into()));
+        assert_eq!(
+            reload_line(answered(r#"{"status":"replaced","build":7}"#)),
+            (
+                "qshd frontend replaced by build 7; sessions kept".into(),
+                true
+            )
+        );
+        assert_eq!(
+            reload_line(answered(r#"{"status":"up_to_date"}"#)),
+            ("qshd is up to date".into(), true)
+        );
+        assert_eq!(
+            reload_line(answered(
+                r#"{"status":"refused","reason":"it is older","outcome":{"case":"older"}}"#
+            )),
+            ("it is older".into(), false)
+        );
+        // A daemon that is stopping is not said to serve on.
+        assert_eq!(
+            reload_line(answered(
+                r#"{"status":"refused","reason":"the daemon is stopping","outcome":null}"#
+            )),
+            ("the daemon is stopping".into(), false)
+        );
+        assert_eq!(
+            reload_line(answered(r#"{"status":"rolled_back","reason":"it exited"}"#)),
+            (
+                "it exited; the previous version keeps serving".into(),
+                false
+            )
+        );
+        for reply in [
+            Ok(control::ControlReply::NoDaemon),
+            Ok(control::ControlReply::TimedOut),
+            answered("not json"),
+            Err(anyhow::anyhow!("an unsafe endpoint")),
+        ] {
+            assert_eq!(reload_line(reply), (CANNOT_RELOAD.into(), false));
+        }
+    }
+
+    /// `ExecReload` of the personal unit runs `qshd reload`: the help says
+    /// what it does, and that it keeps sessions.
+    #[test]
+    fn the_help_text_names_reload() {
+        let text = help_text();
+        let line = text
+            .lines()
+            .position(|line| line.trim_start().starts_with("reload "))
+            .expect("a reload entry");
+        assert!(text.lines().nth(line).unwrap().contains("--port"));
+        assert!(
+            text.lines()
+                .nth(line + 1)
+                .is_some_and(|next| next.contains("frontend") && next.contains("sessions")),
+            "{text}"
+        );
     }
 
     /// Runs [`ask_status_with`] over a scripted sequence of replies and

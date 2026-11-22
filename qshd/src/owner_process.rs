@@ -4,9 +4,10 @@
 //!
 //! The daemon -- the host ([`crate::host`]), whose network frontend is a
 //! process of its own -- starts one owner per cold-created session, from
-//! the image it holds since its own start ([`SelfImage`]), never from the
-//! path on disk: a package or update that replaces the file cannot give a
-//! session another build. It starts it by `posix_spawn` only -- no Rust code
+//! an image it holds by descriptor ([`SelfImage`]: its own since its start,
+//! unless a frontend upgrade made another current), never from the path on
+//! disk: a package or update that replaces the file cannot give a session
+//! another build. It starts it by `posix_spawn` only -- no Rust code
 //! runs between the fork and the exec -- with exactly three descriptors
 //! besides the standard ones:
 //!
@@ -193,6 +194,76 @@ impl SelfImage {
         }
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         Ok(SelfImage { fd: dup_high(&fd)? })
+    }
+
+    /// Open the executable at `path` and hold it from now on: whatever
+    /// happens to the path afterwards -- a rename over it, a deletion --
+    /// the image is the file opened here. It must be a regular file.
+    /// (`O_NONBLOCK` only keeps a FIFO or device at `path` from blocking the
+    /// open; it means nothing for a regular file.)
+    pub fn open(path: &std::path::Path) -> io::Result<SelfImage> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let raw = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            )
+        };
+        if raw < 0 {
+            return Err(last_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let image = SelfImage { fd: dup_high(&fd)? };
+        if image.stat()?.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok(image)
+    }
+
+    fn stat(&self) -> io::Result<libc::stat> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(self.fd.as_raw_fd(), &mut stat) } < 0 {
+            return Err(last_error());
+        }
+        Ok(stat)
+    }
+
+    /// The held file's size now.
+    pub(crate) fn size(&self) -> io::Result<u64> {
+        Ok(self.stat()?.st_size as u64)
+    }
+
+    /// Up to `buf.len()` bytes of the held file at `offset`, read through
+    /// the held descriptor itself, never by its path.
+    pub(crate) fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        loop {
+            let read = unsafe {
+                libc::pread(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    offset as libc::off_t,
+                )
+            };
+            if read >= 0 {
+                return Ok(read as usize);
+            }
+            let error = last_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// The path that reaches the held file from this process
+    /// (`/proc/self/fd/N`), for as long as `self` lives.
+    pub(crate) fn proc_path(&self) -> std::path::PathBuf {
+        format!("/proc/self/fd/{}", self.fd.as_raw_fd()).into()
     }
 
     /// Another descriptor of the same image.
@@ -1149,7 +1220,6 @@ impl crate::update::OwnerStop for OwnerFleet {
 /// ([`OwnerHost::start_raw`], when the frontend asks the host for one) and
 /// serves each one's host channel.
 pub struct OwnerHost {
-    image: SelfImage,
     log_dir: Option<PathBuf>,
     daemon: Option<Arc<dyn DaemonUpdates>>,
     fleet: Arc<OwnerFleet>,
@@ -1175,14 +1245,12 @@ pub(crate) struct RawOwner {
 
 impl OwnerHost {
     pub(crate) fn new(
-        image: SelfImage,
         log_dir: Option<PathBuf>,
         daemon: Option<Arc<dyn DaemonUpdates>>,
         fleet: Arc<OwnerFleet>,
         services: Arc<HostServices>,
     ) -> OwnerHost {
         OwnerHost {
-            image,
             log_dir,
             daemon,
             fleet,
@@ -1228,10 +1296,12 @@ impl OwnerHost {
 }
 
 impl OwnerHost {
-    /// Start one owner for `init`'s session and supervise it: its envelope
-    /// lease, its host channel, its reaping. The caller gets the ends a
-    /// frontend needs, and hands them on to its frontend process.
-    pub(crate) fn start_raw(&self, init: OwnerInit) -> io::Result<RawOwner> {
+    /// Start one owner for `init`'s session from `image` and supervise it:
+    /// its envelope lease, its host channel, its reaping. The caller gets
+    /// the ends a frontend needs, and hands them on to its frontend
+    /// process. The owner runs `image` for as long as it lives; it is the
+    /// parent of its session's shells.
+    pub(crate) fn start_raw(&self, init: OwnerInit, image: &SelfImage) -> io::Result<RawOwner> {
         let host_init = HostInit {
             principal: init.principal.clone(),
             login: init.login,
@@ -1260,7 +1330,7 @@ impl OwnerHost {
             // fleet either sees this owner or this start sees it closed.
             let mut state = self.fleet.lock();
             Self::may_start(&state).map_err(io::Error::other)?;
-            let child = spawn_owner(&self.image, &host_init, &permit)?;
+            let child = spawn_owner(image, &host_init, &permit)?;
             drop(permit);
             let pidfd = match child.pidfd.try_clone() {
                 Ok(pidfd) => pidfd,
@@ -2180,20 +2250,19 @@ mod tests {
             ..Default::default()
         });
         let fleet = OwnerFleet::new();
-        let host = OwnerHost::new(
-            SelfImage::hold().unwrap(),
-            None,
-            None,
-            fleet.clone(),
-            services.clone(),
-        );
+        let host = OwnerHost::new(None, None, fleet.clone(), services.clone());
         let principal = Principal {
             uid: 1000,
             name: "me".into(),
             identity: "fixture".into(),
             incarnation: 0,
         };
-        let refused = host.start_raw(OwnerInit::new(principal, [0; 16])).err();
+        let refused = host
+            .start_raw(
+                OwnerInit::new(principal, [0; 16]),
+                &SelfImage::hold().unwrap(),
+            )
+            .err();
         let refused = refused.expect("no envelope: no owner");
         assert!(refused.to_string().contains("envelope"), "{refused}");
         assert!(fleet.is_empty(), "nothing was spawned");
@@ -2210,13 +2279,7 @@ mod tests {
         for pid in 0..MAX_OWNERS as u32 {
             fleet.lock().owners.insert(1_000_000 + pid, slot());
         }
-        let host = OwnerHost::new(
-            SelfImage::hold().unwrap(),
-            None,
-            None,
-            fleet.clone(),
-            services.clone(),
-        );
+        let host = OwnerHost::new(None, None, fleet.clone(), services.clone());
         let principal = Principal {
             uid: 1000,
             name: "me".into(),
@@ -2224,7 +2287,12 @@ mod tests {
             incarnation: 0,
         };
         assert!(host.start_check().is_err());
-        let refused = host.start_raw(OwnerInit::new(principal, [0; 16])).err();
+        let refused = host
+            .start_raw(
+                OwnerInit::new(principal, [0; 16]),
+                &SelfImage::hold().unwrap(),
+            )
+            .err();
         let refused = refused.expect("too many unreaped owners: no owner");
         assert!(refused.to_string().contains("unreaped"), "{refused}");
         assert_eq!(fleet.len(), MAX_OWNERS, "nothing was spawned");

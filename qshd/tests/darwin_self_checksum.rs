@@ -219,11 +219,13 @@ fn cold_checksum_actor() {
     assert!(same_inode && old_absent == renamed);
     assert_eq!(hash(&mut file, before.2, end), expected);
     bound(&file, selected, after);
-    // These are the first production checksum/STATUS calls in this process.
+    // These are the first production checksum/STATUS calls in this process:
+    // a `Serving` hashes nothing until it is asked.
+    let serving = qshd::server_info::Serving::own(false);
     let sum = qshd::state::self_checksum();
-    let status = qshd::transport_daemon::transport_status_response(&[], 0, None);
+    let status = qshd::transport_daemon::transport_status_response(&[], 0, None, &serving);
     let cached_sum = qshd::state::self_checksum();
-    let cached_status = qshd::transport_daemon::transport_status_response(&[], 0, None);
+    let cached_status = qshd::transport_daemon::transport_status_response(&[], 0, None, &serving);
     remaining(end);
     let facts = Facts {
         bytes: before.2,

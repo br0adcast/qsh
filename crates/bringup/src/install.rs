@@ -441,7 +441,16 @@ pub(crate) fn bring_up(
             "invalid busy-daemon decision options".into(),
         ));
     }
-    if req.destructive_consent.is_some() && req.service_restart_consent.is_some() {
+    if [
+        req.destructive_consent.is_some(),
+        req.service_restart_consent.is_some(),
+        req.frontend_upgrade_consent.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count()
+        > 1
+    {
         return Err(BringUpError::InvalidRequest(
             "conflicting restart consent scopes".into(),
         ));
@@ -456,6 +465,18 @@ pub(crate) fn bring_up(
         {
             return Err(BringUpError::InvalidRequest(
                 "service restart needs its observed SSH target and force decision".into(),
+            ));
+        }
+    }
+    if let Some(consent) = &req.frontend_upgrade_consent {
+        if !req.busy_decision.as_ref().is_some_and(|decision| {
+            decision.choice == crate::BusyChoice::ForceUpdate
+                && decision.attempt == consent.attempt
+                && decision.identity == consent.identity
+                && decision.candidate == consent.candidate
+        }) {
+            return Err(BringUpError::InvalidRequest(
+                "stale frontend upgrade consent".into(),
             ));
         }
     }
@@ -487,6 +508,7 @@ pub(crate) fn bring_up(
         }
         if decision.choice == crate::BusyChoice::ForceUpdate
             && req.service_restart_consent.is_none()
+            && req.frontend_upgrade_consent.is_none()
             && (req.destructive_consent.is_none() || decision.identity.generation.is_none())
         {
             return Err(BringUpError::DestructiveRestartUnavailable);
@@ -535,6 +557,7 @@ pub(crate) fn bring_up(
         req.busy_decision,
         req.destructive_consent,
         req.service_restart_consent,
+        req.frontend_upgrade_consent,
         req.pending_busy_target.as_ref(),
         host.clone(),
         username.clone(),
@@ -575,6 +598,7 @@ fn on_session(
     busy_decision: Option<crate::BusyDecision>,
     destructive_consent: Option<crate::DestructiveRestartConsent>,
     service_restart_consent: Option<crate::ServiceRestartConsent>,
+    frontend_upgrade_consent: Option<crate::FrontendUpgradeConsent>,
     pending_busy_target: Option<&crate::BusySshTarget>,
     host: String,
     username: String,
@@ -637,6 +661,36 @@ fn on_session(
         }
         check_cancel(cancel)?;
     }
+    // A foreground login whose found cached copy is older than this client's
+    // own qshd offers the bundled one, so that the running daemon can update
+    // from it. Background and recovery logins never ask, and a qshd on
+    // `PATH` has no version to compare. A busy retry runs the helper the
+    // first attempt chose, so it never asks again.
+    let replaces = match (&policy, &probe.located, &probe.found_version) {
+        (InstallPolicy::AskIfMissing { version }, locate::Located::Found(_), Some(found))
+            if pending_busy_target.is_none()
+                && crate::image::valid_version(version)
+                    .is_some_and(|bundled| locate::older_than_bundled(found, &bundled)) =>
+        {
+            Some(found.to_string())
+        }
+        _ => None,
+    };
+    // The found copy is checked before the offer, as an unsafe selected
+    // daemon never leads to an installation question; declining then runs
+    // it without a second check.
+    if let (Some(_), None, locate::Located::Found(found)) =
+        (&replaces, &trusted_found, &probe.located)
+    {
+        let trusted = session.trusted_path(
+            found,
+            probe.platform.os,
+            trust::Purpose::Execute,
+            &hooks,
+            cancel,
+        )?;
+        trusted_found = Some((found.clone(), trusted));
+    }
     let mut verified_candidate_digest = None;
     let path = match (&policy, probe.located) {
         (
@@ -644,11 +698,14 @@ fn on_session(
             | InstallPolicy::RestartOnly
             | InstallPolicy::AskIfMissing { .. },
             locate::Located::Found(path),
-        ) => path,
+        ) if replaces.is_none() => path,
         (InstallPolicy::ExistingOnly | InstallPolicy::RestartOnly, _) => {
             return Err(BringUpError::InstallRequired)
         }
-        (InstallPolicy::AskIfMissing { version } | InstallPolicy::EnsureBundled { version }, _) => {
+        (
+            InstallPolicy::AskIfMissing { version } | InstallPolicy::EnsureBundled { version },
+            located,
+        ) => 'install: {
             let request = ImageRequest::new(probe.platform, version.clone())?;
             request.validate()?;
             let path = probe
@@ -665,11 +722,17 @@ fn on_session(
                     ssh_port,
                     image: request.clone(),
                     remote_path: path.clone(),
+                    replaces: replaces.clone(),
                 };
                 let accepted = hooks.approval.approve(&offer, cancel)?;
                 check_cancel(cancel)?;
                 if !accepted {
-                    return Err(BringUpError::Declined);
+                    // Declining an upgrade keeps today's login: the found
+                    // copy runs, after the same trust check below.
+                    match located {
+                        locate::Located::Found(found) => break 'install found,
+                        _ => return Err(BringUpError::Declined),
+                    }
                 }
             }
             let source = hooks.source.as_ref().ok_or_else(|| {
@@ -682,7 +745,11 @@ fn on_session(
             check_cancel(cancel)?;
             validate_image(&request, &image, cancel)?;
             verified_candidate_digest = Some(hex(&image.sha256));
-            session.install(&path, image, &hooks, cancel)?
+            let installed = session.install(&path, image, &hooks, cancel)?;
+            // The installed file is new, even at the found copy's path: a
+            // trust result taken before it was written never applies to it.
+            trusted_found = None;
+            installed
         }
     };
     let path = match trusted_found {
@@ -729,6 +796,9 @@ fn on_session(
             .map(|d| d.attempt.clone())
             .unwrap_or_else(|| crate::BusyAttemptId::from_bytes(rand::random()))
     });
+    let consented = destructive_consent.is_some()
+        || service_restart_consent.is_some()
+        || frontend_upgrade_consent.is_some();
     let output = session
         .command(
             "qshd transport-ensure",
@@ -743,13 +813,14 @@ fn on_session(
                     decision: busy_decision.as_ref(),
                     destructive_consent: destructive_consent.as_ref(),
                     service_restart_consent: service_restart_consent.as_ref(),
+                    frontend_upgrade_consent: frontend_upgrade_consent.as_ref(),
                 },
             )?,
             hooks.timing.ensure,
             cancel,
         )
         .map_err(|error| {
-            if destructive_consent.is_some() || service_restart_consent.is_some() {
+            if consented {
                 BringUpError::DestructiveRestartUncertain {
                     cause: Some(Box::new(error)),
                 }
@@ -758,18 +829,16 @@ fn on_session(
             }
         })?;
     if output.code != 0 {
-        return Err(
-            if destructive_consent.is_some() || service_restart_consent.is_some() {
-                BringUpError::DestructiveRestartUncertain {
-                    cause: Some(Box::new(output.failure("qshd transport-ensure"))),
-                }
-            } else {
-                output.failure("qshd transport-ensure")
-            },
-        );
+        return Err(if consented {
+            BringUpError::DestructiveRestartUncertain {
+                cause: Some(Box::new(output.failure("qshd transport-ensure"))),
+            }
+        } else {
+            output.failure("qshd transport-ensure")
+        });
     }
     let stdout = output.complete_stdout().map_err(|error| {
-        if destructive_consent.is_some() || service_restart_consent.is_some() {
+        if consented {
             BringUpError::DestructiveRestartUncertain {
                 cause: Some(Box::new(BringUpError::BadReady(error))),
             }
@@ -787,9 +856,7 @@ fn on_session(
                 "reported candidate differs from verified provider bytes".into(),
             ));
         }
-        Err(error @ BringUpError::BadReady(_))
-            if (destructive_consent.is_some() || service_restart_consent.is_some()) =>
-        {
+        Err(error @ BringUpError::BadReady(_)) if consented => {
             return Err(BringUpError::DestructiveRestartUncertain {
                 cause: Some(Box::new(error)),
             })

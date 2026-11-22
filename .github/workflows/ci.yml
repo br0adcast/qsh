@@ -748,7 +748,7 @@ jobs:
           export XDG_CACHE_HOME="$runtime/cache"
           export HISTFILE=/dev/null
           mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME"
-          cargo test -p qsh --lib --locked sessions -- --nocapture --test-threads=1 \
+          cargo test -p qsh --lib --locked -- sessions:: sessions_store:: --nocapture --test-threads=1 \
             2>&1 | tee "$runtime/results.log"
           for name in \
             sessions::tests::slot139_planted_leaves_cannot_change_outside_objects \
@@ -1057,7 +1057,7 @@ jobs:
             self_checksum_is_64_hex self_checksum_second_call_does_not_recompute; do
             grep -Fx "test state::tests::$name ... ok" "$runtime/state-results.log"
           done
-          grep -F 'test result: ok. 11 passed; 0 failed; 0 ignored;' "$runtime/state-results.log"
+          grep -F 'test result: ok. 15 passed; 0 failed; 0 ignored;' "$runtime/state-results.log"
       - name: Native control peer-account tests
         shell: bash
         run: |

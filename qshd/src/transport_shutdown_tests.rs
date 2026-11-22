@@ -200,6 +200,7 @@ async fn stop_with_held_cleanup(replace: bool, signal: bool, fail: bool, pressur
                 Arc::new(AtomicUsize::new(0)),
                 gate,
                 None,
+                crate::server_info::Serving::own(false),
                 stop,
                 None,
             )
@@ -730,6 +731,7 @@ async fn personal39_join_retains_a_stop_ack_whose_writer_is_pending() {
         None,
         None,
         None,
+        None,
     );
     stop_rx
         .recv()
@@ -815,6 +817,7 @@ fn spawn_control_fixture(
             Arc::new(AtomicUsize::new(0)),
             gate,
             None,
+            crate::server_info::Serving::own(false),
             stop,
             Some(actions),
         )
@@ -944,6 +947,7 @@ fn spawn_accept_fixture(
             Arc::new(AtomicUsize::new(0)),
             gate,
             None,
+            crate::server_info::Serving::own(false),
             stop,
             None,
         )

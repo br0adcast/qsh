@@ -14,9 +14,12 @@
 //! - the **frontend** ([`crate::frontend`]) -- a child process that runs the
 //!   session router on the inherited UDP socket: handshakes, connections,
 //!   bridges. It holds nothing that must outlive it. The host starts it
-//!   from the image it holds since its own start, and starts another when
-//!   it dies.
-//! - one **owner** per session, the parent of that session's shells.
+//!   from its current image ([`FrontendImage`]: its own, held since its
+//!   start, until a frontend upgrade makes another current), and starts
+//!   another when it dies.
+//! - one **owner** per session, the parent of that session's shells,
+//!   started from the image current at the session's start, which it runs
+//!   for as long as it lives.
 //!
 //! **Frontend death.** Every owner sees its link close and parks its
 //! session, as at a client's death. The host reaps the frontend and starts
@@ -57,6 +60,13 @@
 //! frontend process that is stopped, or whose runtime runs nothing; one
 //! whose router alone is stuck still answers.
 //!
+//! **Frontend upgrade** ([`upgrade`], #529 M2). A newer image may replace
+//! the frontend while the host keeps its own binary and every owner keeps
+//! its own: the old frontend is stopped as at any frontend death, the new
+//! one starts on the same sockets from the image held since the prepare, and
+//! becomes current once it says it serves -- or is killed and the previous
+//! image started again.
+//!
 //! **Session caps.** A session counts against them from its `Create` until
 //! it ends -- its owner's `End`, its router's end of its login (`Ended`),
 //! or the host's own stop of its owner -- not until its owner is reaped: a
@@ -66,11 +76,18 @@
 
 #[path = "host/allow.rs"]
 mod allow;
+#[path = "host/images.rs"]
+mod images;
+#[path = "host/upgrade.rs"]
+pub mod upgrade;
 #[path = "host/wire.rs"]
 pub(crate) mod wire;
 
 pub use allow::HostAllowlist;
 pub(crate) use allow::ADD_CLIENT_WAIT;
+#[cfg(test)]
+use images::ImageIdentity;
+use images::{FrontendImage, ImageInfo, Readiness};
 
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
@@ -170,6 +187,12 @@ struct Entry {
     /// to the allowlist then: scrubbed when the host ends the session,
     /// unless added again since.
     client_key: Option<([u8; 32], u64)>,
+    /// The owner link versions the owner speaks: those of the image it was
+    /// started from, for as long as it runs.
+    links: Arc<[u16]>,
+    /// The session profiles of the frontend the session was last handed
+    /// to: its client speaks one of them.
+    profiles: Arc<[[u8; 3]]>,
 }
 
 impl Entry {
@@ -442,8 +465,9 @@ impl Catalog {
 
     /// A warm start by `uid` for `token`: the session's owner on a new
     /// link, which the asking frontend's router then holds -- once it says
-    /// so ([`TAKEOVER_CONFIRM`]).
-    fn lookup(&self, token: LoginId, uid: u32) -> Found {
+    /// so ([`TAKEOVER_CONFIRM`]). Its client reached the session through a
+    /// frontend serving `profiles`.
+    fn lookup(&self, token: LoginId, uid: u32, profiles: &[[u8; 3]]) -> Found {
         let mut entries = self.lock();
         let Some(entry) = entries.get_mut(&token) else {
             return Found::Unknown;
@@ -465,6 +489,7 @@ impl Catalog {
             return Found::Unknown;
         };
         // Its client is back, proven by the handshake that asks.
+        entry.profiles = profiles.into();
         entry.state = SessionState::Live;
         entry.last_client_recv = Instant::now();
         entry.confirm_by = Some(Instant::now() + TAKEOVER_CONFIRM);
@@ -517,6 +542,20 @@ impl Catalog {
         drop(entries);
         self.changed.notify_one();
         Some(entry.owner_pid)
+    }
+
+    /// What an upgrade of the frontend must know of every session, attached
+    /// or retained: whether its client is attached (counted in `STATUS`),
+    /// which profiles its client may speak, which links its owner speaks.
+    pub(crate) fn census(&self) -> Vec<crate::frontend_upgrade::SessionFacts> {
+        self.lock()
+            .values()
+            .map(|entry| crate::frontend_upgrade::SessionFacts {
+                attached: entry.active,
+                profiles: entry.profiles.to_vec(),
+                links: entry.links.to_vec(),
+            })
+            .collect()
     }
 
     /// The owner of `token`'s session and its account, if there is one.
@@ -686,17 +725,29 @@ pub fn reset_secret_beside(
 
 /// The host side of a personal daemon: see the module documentation.
 pub struct Host {
-    image: SelfImage,
+    /// The image the next frontend and the next owner start from, whose
+    /// facts the catalog records of the sessions created and handed over
+    /// meanwhile.
+    current: Mutex<Arc<FrontendImage>>,
     owners: OwnerHost,
     catalog: Arc<Catalog>,
     control: Arc<FrontendControl>,
     start: HostStart,
+    /// Where a frontend upgrade hands the serve loop its replacement
+    /// ([`Host::replace_frontend`]).
+    replace: tokio::sync::mpsc::Sender<upgrade::Replacement>,
+    /// The serve loop's end of `replace`, until it takes it.
+    replacements: Mutex<Option<upgrade::Replacements>>,
 }
 
 struct FrontendChild {
     pid: u32,
     pidfd: OwnedFd,
     channel: OwnedFd,
+    /// The image it runs.
+    image: Arc<FrontendImage>,
+    /// Whether it has said that it serves.
+    ready: Arc<Readiness>,
 }
 
 type SpawnJob = Box<dyn FnOnce() + Send>;
@@ -809,27 +860,45 @@ impl Host {
         control: Arc<FrontendControl>,
         start: HostStart,
     ) -> Arc<Host> {
+        // One replacement at a time: the upgrade that sends one waits for
+        // its end.
+        let (replace, replacements) = tokio::sync::mpsc::channel(1);
         Arc::new(Host {
-            image,
+            current: Mutex::new(Arc::new(FrontendImage {
+                image,
+                info: Arc::new(ImageInfo::own()),
+            })),
             owners,
             catalog,
             control,
             start,
+            replace,
+            replacements: Mutex::new(Some(replacements)),
         })
     }
 
-    /// Run frontends on `socket` until `shutdown`: start one, serve its
-    /// requests, reap it when it ends, start the next after the backoff.
-    /// Returns once no frontend is left. The owners are not stopped here:
-    /// the daemon stops them next (`PersonalSessions::stop_all`), frontend
-    /// or no frontend.
-    ///
-    /// `generation` is the daemon's: every frontend answers with it.
+    /// The image frontends start from now.
+    fn current(&self) -> Arc<FrontendImage> {
+        self.current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Make `image` current without starting anything.
+    fn set_current(&self, image: Arc<FrontendImage>) {
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = image;
+    }
+
+    /// Run frontends on `socket` until `shutdown`: start one from the
+    /// current image, serve its requests, reap it when it ends, start the
+    /// next after the backoff. Returns once no frontend is left. The owners
+    /// are not stopped here: the daemon stops them next
+    /// (`PersonalSessions::stop_all`), frontend or no frontend.
     pub async fn serve(
         self: Arc<Self>,
         socket: std::net::UdpSocket,
         shutdown: Shutdown,
-        generation: [u8; 16],
     ) -> anyhow::Result<()> {
         use anyhow::Context;
         // Sized once, where every socket the daemon serves passes.
@@ -837,6 +906,12 @@ impl Host {
         // The copy each frontend inherits; `socket` itself stays as it is
         // for the daemon's life (a replacement hands its number over).
         let inherited = dup_high(&socket).context("duplicating the UDP socket")?;
+        let mut replacements = self
+            .replacements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .context("the host serves only once")?;
         let expiry = {
             let host = self.clone();
             tokio::spawn(expire(
@@ -854,19 +929,65 @@ impl Host {
         };
         let mut backoff = BACKOFF_MIN;
         let mut number = 0u64;
-        while !shutdown.is_requested() && self.may_start(&shutdown).await {
+        // A replacement whose candidate starts next, and the waiter of one
+        // that was rolled back, answered once the previous image is started
+        // again.
+        let mut candidate: Option<upgrade::Replacement> = None;
+        let mut rolled_back: Option<upgrade::RolledBack> = None;
+        while !shutdown.is_requested() {
+            if self.control.is_closed() {
+                // The daemon is replacing itself: no image starts now.
+                if let Some(replacement) = candidate.take() {
+                    replacement.refuse(upgrade::REPLACING);
+                }
+                if let Some(back) = rolled_back.take() {
+                    back.answer();
+                }
+            }
+            if !self.may_start(&shutdown, &mut replacements).await {
+                break;
+            }
             number += 1;
             let started = Instant::now();
-            let attempt = match tokio::task::block_in_place(|| self.spawn_frontend(&inherited)) {
+            let replacing = candidate.take();
+            let image = replacing
+                .as_ref()
+                .map_or_else(|| self.current(), |r| r.candidate.clone());
+            let spawned = tokio::task::block_in_place(|| self.spawn_frontend(&image, &inherited));
+            // The previous image is started again (or could not be): the
+            // upgrade that failed is answered.
+            if let Some(back) = rolled_back.take() {
+                back.answer();
+            }
+            let attempt = match spawned {
                 Ok(Some(child)) => {
-                    self.run_frontend(child, number, generation, &shutdown)
-                        .await;
+                    let ran = match replacing {
+                        Some(replacing) => {
+                            self.run_candidate(
+                                child,
+                                number,
+                                &shutdown,
+                                &mut replacements,
+                                replacing,
+                            )
+                            .await
+                        }
+                        None => upgrade::Ran {
+                            replaced_by: self
+                                .run_frontend(child, number, &shutdown, &mut replacements)
+                                .await,
+                            rolled_back: None,
+                        },
+                    };
+                    candidate = ran.replaced_by;
+                    rolled_back = ran.rolled_back;
                     Attempt::Ran(started.elapsed())
                 }
                 // An exec window is open: no child is spawned into it, and
                 // nothing crashed.
                 Ok(None) => {
                     number -= 1;
+                    rolled_back = replacing.map(|r| r.failed("an exec window is open".into()));
                     Attempt::Skipped
                 }
                 Err(error) => {
@@ -874,13 +995,26 @@ impl Host {
                         "qshd",
                         &format!("cannot start the network frontend: {error}"),
                     );
+                    rolled_back = replacing
+                        .map(|r| r.failed(format!("the new frontend did not start: {error}")));
                     Attempt::Ran(started.elapsed())
                 }
             };
             self.catalog.detach_all();
             self.control.reaped();
             if shutdown.is_requested() {
+                // A replacement still waiting is answered as it drops: the
+                // daemon is stopping.
                 break;
+            }
+            if candidate.is_some() || rolled_back.is_some() {
+                // A replacement stopped this frontend, or its candidate did
+                // not come up: no crash, and no backoff. The next frontend
+                // starts at once, a candidate with admission open again.
+                if candidate.is_some() {
+                    self.start.admission.open();
+                }
+                continue;
             }
             let (wait, next) = next_backoff(backoff, attempt);
             backoff = next;
@@ -896,6 +1030,11 @@ impl Host {
             tokio::select! {
                 _ = shutdown.requested() => break,
                 _ = tokio::time::sleep(wait) => {}
+                // A frontend down in its backoff is not waited for.
+                Some(replacement) = replacements.recv() => {
+                    self.start.admission.open();
+                    candidate = Some(replacement);
+                }
             }
         }
         expiry.abort();
@@ -905,7 +1044,12 @@ impl Host {
 
     /// Leave to start a frontend, waited for while the daemon is replacing
     /// itself (until the exec turns out not to happen); `false` at shutdown.
-    async fn may_start(&self, shutdown: &Shutdown) -> bool {
+    /// A frontend upgrade meanwhile is refused.
+    async fn may_start(
+        &self,
+        shutdown: &Shutdown,
+        replacements: &mut upgrade::Replacements,
+    ) -> bool {
         loop {
             let changed = self.control.changed.notified();
             tokio::pin!(changed);
@@ -916,22 +1060,28 @@ impl Host {
             tokio::select! {
                 _ = shutdown.requested() => return false,
                 _ = changed => {}
+                Some(replacement) = replacements.recv() => replacement.refuse(upgrade::REPLACING),
             }
         }
     }
 
-    /// `None` while a replacement's exec window is open.
-    fn spawn_frontend(&self, socket: &OwnedFd) -> std::io::Result<Option<FrontendChild>> {
+    /// A frontend from `image`; `None` while a replacement's exec window
+    /// is open.
+    fn spawn_frontend(
+        &self,
+        image: &Arc<FrontendImage>,
+        socket: &OwnedFd,
+    ) -> std::io::Result<Option<FrontendChild>> {
         let (host_end, front_end) = socket_pair_of(nix::sys::socket::SockType::SeqPacket)?;
         let front_end = dup_high(&front_end)?;
-        let image = self.image.try_clone()?;
+        let exe = image.image.try_clone()?;
         let socket = dup_high(socket)?;
         let spawned = on_spawner_thread(move || {
             let Some(permit) = crate::update::try_spawn_permit() else {
                 return Ok(None);
             };
             spawn_role(
-                &image,
+                &exe,
                 FRONTEND_ROLE,
                 &[(&front_end, CHANNEL_FD), (&socket, UDP_FD)],
                 &permit,
@@ -942,6 +1092,8 @@ impl Host {
             pid,
             pidfd,
             channel: host_end,
+            image: image.clone(),
+            ready: Arc::default(),
         }))
     }
 
@@ -1017,18 +1169,22 @@ impl Host {
         true
     }
 
-    /// Serve one frontend process until it has exited, and reap it.
+    /// Serve one frontend process until it has exited, and reap it. A
+    /// frontend upgrade meanwhile stops it in order: the replacement that
+    /// did, whose candidate starts next.
     async fn run_frontend(
         &self,
         child: FrontendChild,
         number: u64,
-        generation: [u8; 16],
         shutdown: &Shutdown,
-    ) {
+        replacements: &mut upgrade::Replacements,
+    ) -> Option<upgrade::Replacement> {
         let FrontendChild {
             pid,
             pidfd,
             channel,
+            image,
+            ready,
         } = child;
         let kept = self.catalog.describe();
         crate::log::info(
@@ -1061,7 +1217,8 @@ impl Host {
                 let init = ToFrontend::Init(Box::new(FrontendInit {
                     server_priv: self.start.server_priv,
                     server_pub: self.start.server_pub,
-                    generation,
+                    // Its image's: what the frontend's clients are told.
+                    generation: image.info.identity.generation(),
                     reset_secret: self.start.reset_secret.as_ref().map(|s| *s.expose()),
                     authorized_keys: self.start.authorized_keys.clone(),
                     account: self.start.account.clone(),
@@ -1088,6 +1245,7 @@ impl Host {
         // When a frontend that was told to stop is killed.
         let mut stop_at: Option<tokio::time::Instant> = None;
         let mut told_to_stop = false;
+        let mut replaced_by = None;
         // When the frontend is next asked whether it is alive, and how many
         // such questions it left unanswered since it was last heard.
         let mut probe_at = tokio::time::Instant::now() + PROBE_AFTER;
@@ -1122,13 +1280,25 @@ impl Host {
                             told_to_stop = true;
                         }
                     }
+                    // Stopped in order, as at a shutdown: its owners park.
+                    Some(replacement) = replacements.recv(), if usable && !stopping => {
+                        crate::log::info(
+                            "qshd",
+                            &format!("network frontend {number} pid={pid}: stopping it for a new image"),
+                        );
+                        let _ = self.send(channel, &ToFrontend::Stop, &[]).await;
+                        stop_at = Some(tokio::time::Instant::now() + STOP_GRACE);
+                        told_to_stop = true;
+                        replaced_by = Some(replacement);
+                    }
                     packet = channel.receive(), if usable => {
                         let served = match packet {
                             Ok(Some((packet, descriptors))) => {
                                 unanswered = 0;
                                 probe_at = tokio::time::Instant::now() + PROBE_AFTER;
                                 drop(descriptors);
-                                self.serve_request(channel, pid, &packet, &mut sent).await
+                                self.serve_request(channel, pid, &packet, &mut sent, &ready, &image.info)
+                                    .await
                             }
                             // It closed its channel: it is exiting, and its
                             // exit shows in a moment -- or it is killed.
@@ -1190,16 +1360,19 @@ impl Host {
         } else {
             crate::log::warn("qshd", &text);
         }
+        replaced_by
     }
 
-    /// Serve one packet of the frontend `pid`; `false` if the frontend is
-    /// to be given up on.
+    /// Serve one packet of the frontend `pid`, which runs `image`; `false`
+    /// if the frontend is to be given up on.
     async fn serve_request(
         &self,
         channel: &Channel,
         pid: u32,
         packet: &[u8],
         sent: &mut HashMap<[u8; 32], u64>,
+        ready: &Readiness,
+        image: &ImageInfo,
     ) -> bool {
         let msg = match ToHost::decode(packet) {
             Ok(msg) => msg,
@@ -1209,7 +1382,7 @@ impl Host {
             }
         };
         match msg {
-            ToHost::Lookup { id, token, uid } => match self.catalog.lookup(token, uid) {
+            ToHost::Lookup { id, token, uid } => match self.lookup(token, uid, image) {
                 Found::Owner(link, owner) => {
                     let reply = ToFrontend::Reply {
                         id,
@@ -1233,7 +1406,7 @@ impl Host {
                 token,
                 principal,
             } => {
-                let created = tokio::task::block_in_place(|| self.create(token, principal));
+                let created = tokio::task::block_in_place(|| self.create(token, principal, image));
                 match created {
                     Ok((link, owner)) => {
                         let reply = ToFrontend::Reply {
@@ -1294,6 +1467,10 @@ impl Host {
             }
             // Any packet says the frontend is alive (see `run_frontend`).
             ToHost::Alive => true,
+            ToHost::Ready => {
+                ready.report();
+                true
+            }
             // Removed unless added again since: then the frontend is sent
             // that addition (it is newer than what `sent` holds).
             ToHost::ForgetKey { key, seq } => {
@@ -1324,13 +1501,15 @@ impl Host {
         }
     }
 
-    /// Start the owner of `token`'s new session: the frontend's end of its
-    /// link and a descriptor of its process. A session the login already
-    /// has is replaced (a cold start), unless it is another account's.
+    /// Start the owner of `token`'s new session, for a frontend running
+    /// `serving`: the frontend's end of its link and a descriptor of its
+    /// process. A session the login already has is replaced (a cold start),
+    /// unless it is another account's.
     fn create(
         &self,
         token: LoginId,
         principal: transport::Principal,
+        serving: &ImageInfo,
     ) -> Result<(OwnedFd, OwnedFd), String> {
         if let Some((uid, old)) = self.catalog.owner_of(token) {
             if uid != principal.uid {
@@ -1365,10 +1544,29 @@ impl Host {
                 }
             }
         }
+        // The owner starts from this very image, so what the catalog
+        // records of it is what the owner runs, whatever becomes current
+        // meanwhile.
+        let image = self.current();
         let owner = self
             .owners
-            .start_raw(OwnerInit::new(principal, token))
+            .start_raw(OwnerInit::new(principal, token), &image.image)
             .map_err(|error| error.to_string())?;
+        self.created(token, uid, owner, &image, &serving.profiles)
+    }
+
+    /// Enter `uid`'s session `token`, whose owner just started from
+    /// `image`, and whose client reached it through a frontend serving
+    /// `profiles`: the frontend's end of its link and a descriptor of its
+    /// process.
+    fn created(
+        &self,
+        token: LoginId,
+        uid: u32,
+        owner: crate::owner_process::RawOwner,
+        image: &FrontendImage,
+        profiles: &[[u8; 3]],
+    ) -> Result<(OwnedFd, OwnedFd), String> {
         let pidfd = match owner.pidfd.try_clone() {
             Ok(pidfd) => pidfd,
             Err(error) => {
@@ -1389,9 +1587,18 @@ impl Host {
                 confirm_by: None,
                 active: false,
                 client_key: None,
+                links: image.info.link_versions.as_slice().into(),
+                profiles: profiles.into(),
             },
         );
         Ok((owner.link, owner.pidfd))
+    }
+
+    /// A warm start by `uid` for `token`, by a frontend running `image`:
+    /// the client speaks one of its profiles. (While a replacement starts,
+    /// that need not be the current image.)
+    fn lookup(&self, token: LoginId, uid: u32, image: &ImageInfo) -> Found {
+        self.catalog.lookup(token, uid, &image.profiles)
     }
 }
 

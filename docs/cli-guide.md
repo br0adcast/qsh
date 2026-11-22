@@ -13,7 +13,8 @@ qsh -i ~/.ssh/id_ed25519 user@server.example.org,ssh=2222 10.8.0.1,ssh
 Each address has the form `host[:port]`, followed by optional comma-separated
 settings: `ssh[=port]`, `nossh`, `knock=STEPS`, or `noknock`. The first example
 needs an answering daemon. SSH-enabled addresses can start an installed daemon
-or, with interactive approval, install one that is missing.
+or, with interactive approval, install one that is missing or whose cached copy
+is older than the client.
 
 The `user@` prefix selects the account to claim. A personal daemon serves only
 the account running it; a system daemon checks the named account through its
@@ -408,7 +409,8 @@ An unsafe selected daemon stops startup with a verification error. qsh does not
 try a lower-priority candidate, request installation approval, or download a
 replacement. Correct the reported ownership/permissions or install qshd in a
 private directory owned by your account. Custom builds do not need a published
-release hash or a matching filename version: cache filenames only rank candidates,
+release hash or a matching filename version: cache filenames rank candidates and
+decide whether an interactive login offers to install the client's newer qshd,
 and the running command reports its actual version. Protocol and capability
 negotiation still determine compatibility.
 
@@ -424,9 +426,13 @@ Unix permissions are enforced, and ACLs do not grant additional access. Rechecks
 narrow races but do not atomically bind pathname execution or protect against
 concurrent changes by trusted writers.
 
-If no daemon is found during an interactive connection:
+If no daemon is found during an interactive connection, or the newest one
+cached in the remote `~/.cache/qsh` is older than the client (a `qshd` found on
+`PATH` is never compared):
 
 1. qsh asks permission to install a daemon for the remote OS and architecture.
+   For an older cached copy the question names both versions; declining runs
+   the cached copy, after the same safety checks.
 2. It fetches `SHA256SUMS` and `SHA256SUMS.sigstore.json` for the **exact client
    version** from GitHub Releases. It authenticates the original manifest under
    the compiled qsh repository/workflow policy before selecting an archive hash.

@@ -495,7 +495,7 @@ fn busy_user_decline_stops_all_routes_before_later_connection_activity() {
                         .next()
                         .unwrap()
                         .trim_matches('\'');
-                    return format!("TRANSPORT-BUSY {}\n",serde_json::json!({"schema":2,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"active_connections":2,"serving_profiles":null,"preservation":"unknown"})).into_bytes();
+                    return format!("TRANSPORT-BUSY {}\n",serde_json::json!({"schema":3,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"active_connections":2,"sessions":2,"serving_profiles":null,"preservation":"unknown"})).into_bytes();
                 }
                 if command.ends_with(" bootstrap-capabilities") {
                     return b"{\"schema\":1,\"busy_decisions\":true}\n".to_vec();
@@ -726,10 +726,10 @@ fn selected_fixture(
                         .unwrap()
                         .trim_matches('\'');
                     return format!("TRANSPORT-BUSY {}\n", serde_json::json!({
-                        "schema":2,"attempt":attempt,
+                        "schema":3,"attempt":attempt,
                         "identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42 + round,"generation":if reply==b"modern-uncertain\n" {Some("cd".repeat(16))}else{None}},
                         "candidate":{"build":2,"checksum":"ef".repeat(32)},
-                        "active_connections":2,"serving_profiles":null,"preservation":"unknown",
+                        "active_connections":2,"sessions":2,"serving_profiles":null,"preservation":"unknown",
                         "service_restart":if reply==b"service-uncertain\n" {Some(serde_json::json!({"profile":"personal_transport_v1","uid":1000,"endpoint":"/test/cache/qsh/control.sock","port":60022}))} else {None}
                     })).into_bytes();
                 }

@@ -202,6 +202,19 @@ impl Actions {
         Coordinator::new(identity.clone())?;
         Ok(Self::new(Some(identity), control_gate, admission, capable))
     }
+    /// The daemon now serves as `identity` (a frontend replacement, #529).
+    /// A receipt prepared for the previous identity binds a frontend that no
+    /// longer serves, so every outstanding receipt is dropped with it. The
+    /// same validity filter as [`Actions::new`] applies; capability stays as
+    /// it was decided at construction.
+    pub fn set_identity(&self, identity: BusyDaemonIdentity) {
+        let identity = Some(identity).filter(|id| id.valid() && id.generation.is_some());
+        // Poison is terminal for every receipt operation already.
+        if let Ok(mut state) = self.state.lock() {
+            state.identity = identity;
+            state.receipts.clear();
+        }
+    }
     pub(crate) fn receipt_identity(&self) -> Option<BusyDaemonIdentity> {
         if !self.capable {
             return None;
@@ -376,6 +389,39 @@ mod tests {
         assert!(!actions.state.lock().unwrap().finish_replacement(lease));
         actions.admission.open();
         assert!(actions.admission.is_closed());
+    }
+    #[tokio::test]
+    async fn a_destructive_receipt_prepared_before_set_identity_cannot_commit() {
+        let actions = Actions::with_identity(
+            binding().identity,
+            std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            std::sync::Arc::new(crate::update::AdmissionGate::default()),
+            true,
+        )
+        .unwrap();
+        let receipt = actions.prepare(binding()).unwrap();
+        let serving = BusyDaemonIdentity {
+            version: "0.6.1".into(),
+            build: 3,
+            checksum: "12".repeat(32),
+            generation: Some("34".repeat(16)),
+            ..binding().identity
+        };
+        actions.set_identity(serving.clone());
+        assert_eq!(actions.receipt_identity(), Some(serving.clone()));
+        assert_eq!(
+            actions.commit(receipt, &binding()).await,
+            Err(Rejected::Unknown)
+        );
+        assert!(!actions.shutdown.is_requested());
+        assert_eq!(actions.prepare(binding()), Err(Rejected::Mismatch));
+        // A receipt for the identity that now serves still works.
+        let current = DestructiveRestartConsent {
+            identity: serving,
+            ..binding()
+        };
+        let receipt = actions.prepare(current.clone()).unwrap();
+        assert_eq!(actions.commit(receipt, &current).await, Ok(Commit::New));
     }
 
     #[test]

@@ -106,6 +106,15 @@ qshd serve [--port N] [--authorized-keys PATH] [--host-key PATH] [--runtime-thre
 An unknown flag, or a port that isn't a number, makes the daemon exit with
 an error right away, without starting anything.
 
+```
+qshd reload [--port N]
+```
+
+Asks the running personal `serve` daemon on that port (default `60022`) to
+replace its network part with the installed binary, keeping every session
+(Linux). It is the personal unit's `ExecReload`: see "Upgrading without
+losing sessions" below.
+
 ## What it does
 
 - listens on `--port` (default `60022/udp`) on all IPv4 interfaces
@@ -249,6 +258,42 @@ when one of them goes:
   unproved until the daemon is restarted;
 - a stop (`STOP`, `SIGTERM`, the service stop) still ends every session and
   waits for every owner, also while no frontend runs.
+
+### A newer qshd replaces only the network part
+
+When `qsh` logs in over SSH and brings a newer `qshd` than the running
+daemon's, `transport-ensure` asks the daemon to replace only its frontend
+with the newer binary. An interactive login brings its own `qshd` when the
+newest copy cached in `~/.cache/qsh` is older than the client: it asks, as
+it does when `qshd` is missing, and installs and verifies the client's
+version the same way. Declining runs the cached copy, as before; a `qshd`
+found on `PATH` (a package's or an administrator's) is run without asking,
+and background or recovery logins never ask. A cached prerelease not spelled
+`alpha.N`, `beta.N` or `rc.N`, such as the withdrawn `0.6.0-rc1`, counts as
+older than this client's version, including its prereleases. The host keeps
+its own binary, each session's owner keeps the one it was started from, and
+sessions started afterwards run the new one. What happens depends on the daemon's sessions, attached or not:
+
+| The daemon's sessions | What happens |
+|---|---|
+| no other client is attached, and the new version serves every session's client | the frontend is replaced silently |
+| other clients are attached | `qsh` asks first. Those clients are disconnected briefly (up to a minute for older clients) and come back on their own; every session is kept |
+| some sessions' clients cannot speak the new version's protocol | `qsh` asks, with a stronger warning: those sessions and their commands keep running, but their clients cannot reach them until they expire |
+| the new version cannot work with this host or with a running session | only a full restart installs it. `qsh` asks first, as it ends every session; with no session at all it restarts silently, as before |
+
+The default answer is always to cancel. The new frontend must report that it
+serves within 10 s. If it exits or stays silent, the daemon kills it and
+starts the previous version again at once: sessions are kept, and the login
+warns that the previous version keeps serving. The daemon checks the new
+binary through a descriptor it holds from the first check on, so renaming,
+replacing or deleting the file afterwards has no effect; a write into the
+same file in place is not guarded against. One upgrade runs at a time. An
+older or byte-identical binary never replaces the running one.
+
+After a replacement `STATUS`, `SERVER-INFO` and the rest describe the new
+version, and `STATUS.host` still names the host's own binary. A daemon that a
+service manager started (`qshd serve`) is not upgraded by a login; see
+"Linux: systemd, per-user" for `systemctl --user reload qshd`.
 
 macOS and system mode run the router and every session in the daemon's own
 process, as before: there a crash of the daemon's network part ends every
@@ -745,6 +790,7 @@ Description=qshd — a resilient terminal daemon
 
 [Service]
 ExecStart=%h/.local/bin/qshd serve --port 60022
+ExecReload=%h/.local/bin/qshd reload --port 60022
 Restart=on-failure
 RestartSec=2
 
@@ -764,6 +810,51 @@ sudo loginctl enable-linger "$USER"
 By default, `systemd` sends the service's standard output and standard
 error to the journal — there's nothing extra to configure. Log:
 `journalctl --user -u qshd -f`.
+
+### Upgrading without losing sessions: `systemctl --user reload qshd`
+
+After a package upgrade, run:
+
+```bash
+systemctl --user reload qshd
+```
+
+It runs `qshd reload --port 60022`, which asks the running daemon to serve
+from the upgraded binary at the path it was started from (`/usr/bin/qshd`),
+and keeps every session. The daemon replaces only its network part, as a
+login with a newer `qsh` does (see "A newer qshd replaces only the network
+part"). Clients that are attached are disconnected briefly (up to a minute
+for older clients) and come back on their own: running the command is your
+consent to that. The package scripts never reload on their own.
+
+`qshd reload` prints one line and exits 0 when the new binary serves
+("qshd frontend replaced by build N; sessions kept"), and also when the
+installed binary is the one that already serves ("qshd is up to date"). It
+exits 1 when the new binary does not serve:
+
+- the installed binary is older than the running one (a downgrade). Nothing
+  changes;
+- it is missing or unreadable, or fails its own check. Nothing changes;
+- it would leave some sessions unreachable, or only a full restart can
+  install it, which ends every session. Nothing changes, and the daemon logs
+  the case. Run `systemctl --user restart qshd` if you want that;
+- another upgrade is under way, or the daemon is stopping. The line says
+  which;
+- the new frontend does not start: the daemon starts the previous version
+  again, which keeps serving, and the line says so. Every session is kept,
+  but attached clients were disconnected briefly, as for a replacement;
+- the running daemon does not answer. Either it cannot reload at all (one
+  from before this version, or one that runs every session in its own
+  process), and keeps running as it was; or its reload did not finish within
+  its 50 s bound, and its replacement may still finish. The line says "the
+  running qshd did not answer the reload: it cannot reload, or it did not
+  finish in time; check `qshd`'s log or `systemctl --user status qshd`; to
+  restart deliberately, use `systemctl --user restart qshd`". A second
+  `systemctl --user reload qshd` tells whether the installed binary serves.
+
+systemd then reports the reload as failed. A reload never stops or starts a
+daemon. The request goes over a private socket in the cache directory,
+`~/.cache/qsh/qshd-serve-60022.sock`, which only your account can use.
 
 This is the per-user unit, one person at a time. For a shared,
 multi-account machine instead, see "System mode" above — a different

@@ -16,6 +16,10 @@ fn check() -> state::SelfCheck {
         protocols: vec![1],
         handover_versions: vec![],
         transport_features: vec![],
+        version: None,
+        host_revision: None,
+        link_versions: vec![],
+        session_profiles: vec![],
     }
 }
 
@@ -111,7 +115,7 @@ fn main() {
     let mut source = File::open(&source_path).unwrap();
     let stage = PreparedStage::prepare(StageRoot::from_trusted(File::open(&root).unwrap(), root).unwrap(),
         &mut source, candidate, "fixture", 1, operation, |_| Ok(state::SelfCheck {
-            build:42, arch:"fixture".into(), protocol:1, protocols:vec![1], handover_versions:vec![], transport_features:vec![] })).unwrap();
+            build:42, arch:"fixture".into(), protocol:1, protocols:vec![1], handover_versions:vec![], transport_features:vec![], version:None, host_revision:None, link_versions:vec![], session_profiles:vec![] })).unwrap();
     fs::write(base.join("stage-path"), stage.executable().as_os_str().as_encoded_bytes()).unwrap();
     if std::env::var("STAGE_TEST_MODE").unwrap() == "reject-env" {
         std::env::set_var(LAUNCH_ENV, "forged");

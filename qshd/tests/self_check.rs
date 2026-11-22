@@ -64,3 +64,50 @@ fn a_debug_build_takes_its_label_from_the_override_keyed_by_its_checksum() {
     let labels = format!("{}=1,{sum}=4242", "0".repeat(64));
     assert_eq!(self_check(Some(labels)).build, 4242);
 }
+
+#[test]
+fn self_check_prints_the_compatibility_facts() {
+    let check = self_check(None);
+    assert_eq!(check.version.as_deref(), Some(qshd::state::QSHD_VERSION));
+    assert_eq!(check.host_revision, Some(qshd::state::HOST_REVISION));
+    assert_eq!(check.link_versions, vec![transport::OWNER_LINK_VERSION]);
+    let expected: Vec<[u8; 3]> = qshd::server_info::current()
+        .session_protocols
+        .iter()
+        .map(|p| [p.wire, p.handshake, p.channel])
+        .collect();
+    assert!(!check.session_profiles.is_empty());
+    assert_eq!(check.session_profiles, expected);
+}
+
+/// The test faults reach the real binary through the environment, keyed by
+/// its own checksum, and change only what they name.
+#[test]
+fn image_faults_change_the_reported_facts_of_the_named_binary() {
+    let bytes = std::fs::read(env!("CARGO_BIN_EXE_qshd")).expect("read qshd");
+    let sum = hex::encode(Sha256::digest(&bytes));
+    let run = |faults: String| {
+        let out = Command::new(env!("CARGO_BIN_EXE_qshd"))
+            .arg("self-check")
+            .env("HISTFILE", "/dev/null")
+            .env("QSHD_TEST_IMAGE_FAULTS", faults)
+            .output()
+            .expect("qshd self-check runs");
+        assert!(out.status.success());
+        SelfCheck::from_line(
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(run(format!("{sum}=host-revision=9")).host_revision, Some(9));
+    assert!(run(format!("{sum}=no-profiles"))
+        .session_profiles
+        .is_empty());
+    let other = run(format!("{}=no-profiles", "0".repeat(64)));
+    assert_eq!(other.host_revision, Some(qshd::state::HOST_REVISION));
+    assert!(!other.session_profiles.is_empty());
+}

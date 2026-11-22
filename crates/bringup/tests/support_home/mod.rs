@@ -175,6 +175,7 @@ impl Sandbox {
             busy_decision: None,
             destructive_consent: None,
             service_restart_consent: None,
+            frontend_upgrade_consent: None,
             pending_busy_target: None,
             name: "console".into(),
             ssh: self.params(),

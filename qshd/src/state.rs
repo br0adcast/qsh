@@ -105,6 +105,98 @@ fn parse_label_overrides(spec: &str) -> Vec<(String, u64)> {
         .collect()
 }
 
+/// Revision of the host-internal contracts a running host and a candidate
+/// image must share for the candidate to serve as the host's frontend: the
+/// host<->frontend and host<->owner wire (`host/wire.rs`,
+/// `owner_process/wire.rs`), the relink channel, the role names and
+/// descriptor numbers, and the frontend start sequence. It is raised by hand
+/// whenever one of those changes incompatibly. It is neither the qsh
+/// protocol (the session profiles) nor the owner link version.
+pub const HOST_REVISION: u32 = 1;
+
+/// The environment variable a DEBUG build -- or one built with the
+/// `test-build-labels` feature -- reads test image faults from, keyed by its
+/// own checksum like [`TEST_BUILD_LABELS_ENV`]: `<sha256 hex>=<fault>[,...]`
+/// with the faults `frontend-exit`, `frontend-silent`, `host-revision=<n>`
+/// and `no-profiles`. Every other build ignores it, without reading it.
+pub const TEST_IMAGE_FAULTS_ENV: &str = "QSHD_TEST_IMAGE_FAULTS";
+
+/// A deliberate defect a test gives a candidate image, so an upgrade's
+/// refusal and rollback paths run against a real binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageFault {
+    /// The frontend role exits before it reports ready.
+    FrontendExit,
+    /// The frontend role starts but never reports ready.
+    FrontendSilent,
+    /// `self-check` reports this host revision instead of [`HOST_REVISION`].
+    HostRevision(u32),
+    /// `self-check` reports no session profiles.
+    NoProfiles,
+}
+
+/// The fault this binary was given for its own checksum, if any. Always
+/// `None` in a build without `debug_assertions` or `test-build-labels`.
+pub fn image_fault() -> Option<ImageFault> {
+    #[cfg(any(debug_assertions, feature = "test-build-labels"))]
+    {
+        image_fault_in(std::env::var(TEST_IMAGE_FAULTS_ENV).ok(), || {
+            self_checksum().ok()
+        })
+    }
+    #[cfg(not(any(debug_assertions, feature = "test-build-labels")))]
+    None
+}
+
+/// The fault `spec` names for this binary, whose checksum `own` works out.
+/// An unset or empty `spec` names none, and nothing is hashed for it: every
+/// test daemon is given the variable, mostly empty, and a frontend asks on
+/// its way to `Ready`.
+#[cfg_attr(
+    not(any(debug_assertions, feature = "test-build-labels")),
+    allow(dead_code)
+)]
+fn image_fault_in(
+    spec: Option<String>,
+    own: impl FnOnce() -> Option<String>,
+) -> Option<ImageFault> {
+    let spec = spec.filter(|spec| !spec.is_empty())?;
+    fault_for(&own()?, &parse_image_faults(&spec))
+}
+
+#[cfg_attr(
+    not(any(debug_assertions, feature = "test-build-labels")),
+    allow(dead_code)
+)]
+fn fault_for(sum: &str, faults: &[(String, ImageFault)]) -> Option<ImageFault> {
+    faults.iter().find(|(s, _)| s == sum).map(|(_, f)| *f)
+}
+
+/// `sum=fault` entries, comma-separated; a malformed entry is skipped.
+#[cfg_attr(
+    not(any(debug_assertions, feature = "test-build-labels")),
+    allow(dead_code)
+)]
+fn parse_image_faults(spec: &str) -> Vec<(String, ImageFault)> {
+    spec.split(',')
+        .filter_map(|entry| {
+            let (sum, fault) = entry.trim().split_once('=')?;
+            if sum.is_empty() {
+                return None;
+            }
+            let fault = match fault {
+                "frontend-exit" => ImageFault::FrontendExit,
+                "frontend-silent" => ImageFault::FrontendSilent,
+                "no-profiles" => ImageFault::NoProfiles,
+                other => {
+                    ImageFault::HostRevision(other.strip_prefix("host-revision=")?.parse().ok()?)
+                }
+            };
+            Some((sum.to_string(), fault))
+        })
+        .collect()
+}
+
 /// The version of the handover description this binary writes when it
 /// replaces itself (`crate::handover::Handover`).
 pub const HANDOVER_VERSION: u32 = 1;
@@ -139,12 +231,44 @@ pub struct SelfCheck {
     /// fields.
     #[serde(default)]
     pub transport_features: Vec<String>,
+    /// `QSHD_VERSION` of the binary. Absent: unknown.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// [`HOST_REVISION`] of the binary. Absent: a binary that predates the
+    /// host, which a running host reads as incompatible.
+    #[serde(default)]
+    pub host_revision: Option<u32>,
+    /// The owner link versions the binary speaks. Absent: none.
+    #[serde(default)]
+    pub link_versions: Vec<u16>,
+    /// The qsh session profiles `[wire, handshake, channel]` the binary
+    /// serves clients with. Absent: none.
+    #[serde(default)]
+    pub session_profiles: Vec<[u8; 3]>,
 }
 
 impl SelfCheck {
     /// This binary's own answer.
     pub fn current() -> SelfCheck {
+        let fault = image_fault();
+        let session_profiles = if fault == Some(ImageFault::NoProfiles) {
+            Vec::new()
+        } else {
+            crate::server_info::current()
+                .session_protocols
+                .iter()
+                .map(|p| [p.wire, p.handshake, p.channel])
+                .collect()
+        };
+        let host_revision = match fault {
+            Some(ImageFault::HostRevision(n)) => n,
+            _ => HOST_REVISION,
+        };
         SelfCheck {
+            version: Some(QSHD_VERSION.to_string()),
+            host_revision: Some(host_revision),
+            link_versions: vec![transport::OWNER_LINK_VERSION],
+            session_profiles,
             build: build_label(),
             arch: std::env::consts::ARCH.to_string(),
             protocol: transport::channel::PROTOCOL_VERSION,
@@ -560,6 +684,10 @@ mod tests {
             protocols: vec![1],
             handover_versions: vec![1],
             transport_features: vec!["header-aad".to_string()],
+            version: Some("1.0.0".to_string()),
+            host_revision: Some(1),
+            link_versions: vec![1],
+            session_profiles: vec![[1, 2, 3]],
         };
         let line = check.to_line();
         assert!(line.ends_with('\n'));
@@ -575,6 +703,69 @@ mod tests {
         assert!(check.protocols.is_empty());
         assert!(check.handover_versions.is_empty());
         assert!(check.transport_features.is_empty());
+    }
+
+    #[test]
+    fn self_check_reports_host_revision_links_profiles_and_version() {
+        let check = super::SelfCheck::current();
+        assert_eq!(check.host_revision, Some(super::HOST_REVISION));
+        assert_eq!(check.link_versions, vec![transport::OWNER_LINK_VERSION]);
+        assert!(!check.session_profiles.is_empty());
+        let expected: Vec<[u8; 3]> = crate::server_info::current()
+            .session_protocols
+            .iter()
+            .map(|p| [p.wire, p.handshake, p.channel])
+            .collect();
+        assert_eq!(check.session_profiles, expected);
+        assert_eq!(check.version.as_deref(), Some(super::QSHD_VERSION));
+    }
+
+    #[test]
+    fn an_old_self_check_line_reads_as_no_compatibility_facts() {
+        let check =
+            super::SelfCheck::from_line(r#"{"build":1,"arch":"x86_64","protocol":2}"#).unwrap();
+        assert_eq!(check.version, None);
+        assert_eq!(check.host_revision, None);
+        assert!(check.link_versions.is_empty());
+        assert!(check.session_profiles.is_empty());
+    }
+
+    #[test]
+    fn image_faults_parse_and_apply_only_to_the_named_checksum() {
+        use super::ImageFault::*;
+        let parsed = super::parse_image_faults(
+            "aa=frontend-exit, bb=frontend-silent,cc=host-revision=7,dd=no-profiles,\
+             ee=host-revision=x,ff=unknown,broken,=no-profiles,gg=host-revision=",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                ("aa".to_string(), FrontendExit),
+                ("bb".to_string(), FrontendSilent),
+                ("cc".to_string(), HostRevision(7)),
+                ("dd".to_string(), NoProfiles),
+            ]
+        );
+        assert!(super::parse_image_faults("").is_empty());
+        assert_eq!(super::fault_for("bb", &parsed), Some(FrontendSilent));
+        assert_eq!(super::fault_for("zz", &parsed), None);
+    }
+
+    #[test]
+    fn an_unset_or_empty_fault_spec_hashes_nothing() {
+        use super::ImageFault::*;
+        let unhashed = || -> Option<String> { panic!("hashed for no fault") };
+        assert_eq!(super::image_fault_in(None, unhashed), None);
+        assert_eq!(super::image_fault_in(Some(String::new()), unhashed), None);
+        let own = || Some("aa".to_string());
+        assert_eq!(
+            super::image_fault_in(Some("aa=frontend-exit".into()), own),
+            Some(FrontendExit)
+        );
+        assert_eq!(
+            super::image_fault_in(Some("bb=frontend-exit".into()), own),
+            None
+        );
     }
 
     #[test]

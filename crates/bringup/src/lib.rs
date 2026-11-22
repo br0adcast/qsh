@@ -20,9 +20,10 @@ mod trust;
 
 pub use daemon_bootstrap_protocol::{
     BusyAttemptId, BusyChoice, BusyDaemonIdentity, BusyDaemonInfo, BusyDecision,
-    CandidateImageIdentity, DestructiveRestartAction, DestructiveRestartConsent, PendingBusy,
+    CandidateImageIdentity, DestructiveRestartAction, DestructiveRestartConsent,
+    FrontendUpgradeAction, FrontendUpgradeConsent, FrontendUpgradeOffer, PendingBusy,
     PersonalServiceProfile, PersonalServiceSelector, PreservationCapability, ServiceRestartAction,
-    ServiceRestartConsent,
+    ServiceRestartConsent, UpgradeCase,
 };
 
 pub use image::{
@@ -43,6 +44,9 @@ pub struct BringUpRequest {
     /// and exit authority are still required. ForceUpdate alone cannot imply it.
     pub destructive_consent: Option<DestructiveRestartConsent>,
     pub service_restart_consent: Option<ServiceRestartConsent>,
+    /// Agreement to replace only the network frontend, keeping sessions. Like
+    /// the other consents it needs the matching force-update decision.
+    pub frontend_upgrade_consent: Option<FrontendUpgradeConsent>,
     pub pending_busy_target: Option<BusySshTarget>,
     pub name: String,
     pub ssh: ssh::SshParams,

@@ -11,6 +11,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Run `qshd` on macOS 26 (Darwin 25, every xnu `12377` revision), after a
   source review of macOS 26.0–26.5 and native qualification on macOS 26.
+- On Linux, let a login with a newer `qsh` replace only the network part of a
+  running personal `qshd`, keeping every session. When the server's cached
+  `qshd` is older than the client's, an interactive login offers to install
+  the client's version, as for a missing `qshd`, and the running daemon then
+  updates its frontend: `qsh` asks first when other clients would be
+  disconnected briefly, or when some sessions' clients could no longer reach
+  them. Declining runs the cached one. If the new version does not start, the
+  running one serves again.
+- Add `qshd reload` and `ExecReload` to the personal systemd unit:
+  `systemctl --user reload qshd` makes the running daemon serve from the
+  upgraded `/usr/bin/qshd` and keeps every session. It refuses a downgrade, a
+  missing binary, and any change that would lose or strand a session, and it
+  leaves a daemon that cannot reload untouched.
 
 ### Changed
 
@@ -19,7 +32,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   channel later. Document the admitted macOS kernels.
 - Spell prerelease tags `alpha.N`, `beta.N` or `rc.N`, and refuse a release tag
   that does not outrank every other tag of its version, unless the run retries
-  that tag's published immutable release. The next candidate is `0.6.0-rc.2`.
+  that tag's published immutable release. The next release is
+  `0.6.0-alpha.1`.
+- Send the busy-daemon record (`TRANSPORT-BUSY`) as schema 3, which counts a
+  daemon's retained sessions and carries the frontend upgrade offer. A
+  schema 2 record is refused in both directions, so a login between this
+  version and an rc1 or main-snapshot build that would ask about a busy
+  daemon fails instead of asking.
 - Deliberately stop authenticating the withdrawn v0.6.0-rc1 release. Its signed
   `SHA256SUMS` names packages with `~`, and clients now accept one manifest
   layout per version, so rc1's archives are refused too, whether downloaded or

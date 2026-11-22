@@ -90,6 +90,8 @@ use binding_revision::{BindingRevision, BindingRevisions, RevisionChange};
 pub(crate) use lifecycle::CallbackFailure;
 use lifecycle::Lifecycle;
 pub(crate) use lifecycle::WorkerReceipt;
+/// The owner link version this build speaks between a frontend and its owners.
+pub use owner_link::codec::LINK_VERSION as OWNER_LINK_VERSION;
 pub use owner_link::{
     loopback, relink_unavailable, FrontendRelink, LinkEnd, LinkIo, Liveness, Lookup, OwnerExit,
     OwnerInit, OwnerLink, OwnerRelink, OwnerRun, OwnerStarter, RemoteBackend, SessionDirectory,

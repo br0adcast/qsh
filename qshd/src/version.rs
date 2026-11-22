@@ -98,6 +98,7 @@ mod tests {
             ports: vec![],
             total_connections: conns,
             pid: 0,
+            host: None,
         }
     }
 
