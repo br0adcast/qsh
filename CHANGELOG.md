@@ -27,6 +27,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Run each Linux session owner on one runtime worker instead of two: its
+  parts hand work to one another for every record, and a second worker only
+  added wake-ups. A flood of output took about 30 % less daemon CPU, and
+  typing about 15 % fewer context switches.
 - On Linux, learn that a session's shell has exited from a pidfd instead
   of checking it every 20 ms. An idle or detached session no longer wakes
   `qshd` 50 times a second: eight detached sessions went from about 880

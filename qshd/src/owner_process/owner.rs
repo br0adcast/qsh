@@ -96,7 +96,7 @@ fn run_entry() -> Result<()> {
         bail!("a session owner needs a non-auto-reaping SIGCHLD disposition");
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(OWNER_WORKERS)
         .enable_all()
         .build()
         .context("creating the session owner's runtime")?;
@@ -104,6 +104,15 @@ fn run_entry() -> Result<()> {
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
+
+/// One runtime worker per session owner (#650). An owner serves one session:
+/// its PTY reader, the channel runner and the link writer hand work to one
+/// another for every record, and a second worker only took turns with the
+/// first, woken through the kernel each time. A blocking wait still frees the
+/// worker (`block_in_place` hands it to another thread), and blocking work
+/// runs on the runtime's blocking pool as before. A multi-thread runtime is
+/// kept because `block_in_place` needs one.
+const OWNER_WORKERS: usize = 1;
 
 pub(crate) fn int_option(fd: i32, level: i32, name: i32) -> io::Result<i32> {
     let mut value: libc::c_int = 0;
