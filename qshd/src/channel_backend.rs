@@ -307,6 +307,8 @@ fn finish_personal_spawn(
     let reader = master
         .try_clone_reader()
         .map_err(|e| custody.failure(format!("reading from the channel is unavailable: {e:#}")))?;
+    // Each read takes what the master already holds (#651).
+    let reader = pty::DrainingReader::wrap(reader, master.as_raw_fd());
     let writer = master
         .take_writer()
         .map_err(|e| custody.failure(format!("writing to the channel is unavailable: {e:#}")))?;
