@@ -27,6 +27,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Run each Linux session owner on one runtime worker instead of two: its
+  parts hand work to one another for every record, and a second worker only
+  added wake-ups. A flood of output took about 30 % less daemon CPU, and
+  typing about 15 % fewer context switches.
 - Send a flood of terminal output in fuller datagrams: the daemon now takes
   the output its pseudo-terminal already holds in one read instead of one
   piece at a time, without waiting for more. `seq 1 2000000` finished about
