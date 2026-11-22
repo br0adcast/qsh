@@ -158,35 +158,8 @@ impl Drop for CancelOnDrop {
 /// with `round`: it travels apart from the answer, so the main loop needs the number
 /// to drop a message that arrives after its round is over.
 ///
-/// Dropping the task cancels its workers without blocking the terminal thread.
-pub fn spawn_round(
-    setup: Arc<Setup>,
-    addresses: Vec<Address>,
-    first: usize,
-    (cols, rows): (u16, u16),
-    round: u64,
-    progress: impl Into<UiSender>,
-) -> RoundTask {
-    let progress = progress.into();
-    let epoch = RecoveryEpoch {
-        connection: round,
-        network: 0,
-    };
-    let recovery = Arc::new(Recovery::new(epoch, addresses.len()));
-    launch(
-        setup,
-        addresses,
-        first,
-        (cols, rows),
-        round,
-        progress,
-        epoch,
-        recovery,
-        false,
-    )
-}
-
 /// Production recovery consumes the main loop's retained bounded DNS catalog.
+/// Dropping the task cancels its workers without blocking the terminal thread.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_catalog_round(
     setup: Arc<Setup>,

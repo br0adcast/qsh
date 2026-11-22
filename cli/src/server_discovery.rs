@@ -15,11 +15,6 @@ impl AuthenticatedServerInfo {
             Self::Ssh(proof) => proof.info(),
         }
     }
-
-    /// A proof about another process cannot describe this attached transport.
-    pub fn bound_to(&self, generation: Option<[u8; 16]>) -> Option<&ServerInfo> {
-        (generation == Some(self.info().generation)).then(|| self.info())
-    }
 }
 
 pub fn decision(info: Option<&ServerInfo>) -> UpgradeDecision {

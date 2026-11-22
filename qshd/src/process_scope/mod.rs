@@ -1237,6 +1237,20 @@ mod census_parser_tests {
 
 pub mod scope;
 
+/// A pidfd for `pid`: the one place this crate opens one. It names exactly
+/// that process only while the caller keeps it from being reaped (its own
+/// unreaped child, or a process it otherwise knows cannot be recycled).
+pub(crate) fn pidfd_open(pid: libc::pid_t) -> std::io::Result<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a non-negative result is a descriptor this call just opened.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw as libc::c_int) })
+}
+
 mod leader_watch;
 mod pty;
 pub(crate) use pty::{

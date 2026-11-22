@@ -487,7 +487,8 @@ fn serve_owned(
 /// with NO login admitted up front: a login, and the account behind it, get
 /// in only through `Request::Verify`. Tests call `serve` directly instead --
 /// see `serve`'s own docs.
-pub fn run_until_peer_closes(channels: UnixStream, auth: UnixStream, config: HelperConfig) {
+#[cfg(test)]
+pub(super) fn run_until_peer_closes(channels: UnixStream, auth: UnixStream, config: HelperConfig) {
     serve(
         channels,
         auth,

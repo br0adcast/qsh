@@ -331,10 +331,7 @@ async fn run_owner(
     let client = HostClient::new(out.clone());
     client.end_session_on_unreachable(shutdown.clone());
 
-    let OwnerBackend {
-        backend,
-        screens: _,
-    } = owner_backend(&client, updates);
+    let OwnerBackend { backend, .. } = owner_backend(&client, updates);
     let opens = OpensFence::new(backend.open_registry());
     let backend: Arc<dyn SessionBackend> = Arc::new(backend);
 
@@ -462,8 +459,8 @@ fn end_children() -> usize {
 pub(crate) struct OwnerBackend {
     pub(crate) backend: crate::channel_backend::ChannelSessionBackend,
     /// The screen budget its channels are charged to (given to the
-    /// backend's spawner; read here only by tests).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// backend's spawner; kept here only for tests).
+    #[cfg(test)]
     pub(crate) screens: Arc<crate::screen_budget::ScreenBudget>,
 }
 
@@ -484,7 +481,11 @@ pub(crate) fn owner_backend(client: &Arc<HostClient>, updates: bool) -> OwnerBac
     if updates {
         backend = backend.with_daemon(Arc::new(RemoteDaemonUpdates(client.clone())));
     }
-    OwnerBackend { backend, screens }
+    OwnerBackend {
+        backend,
+        #[cfg(test)]
+        screens,
+    }
 }
 
 /// The owner's log records on their way to the host: a bounded queue, and
