@@ -16,13 +16,6 @@ impl EndpointLock {
     /// Attempt immediately, even for a zero budget, then bound contention by
     /// `patience`. This does not bound filesystem operations or the transaction
     /// performed after acquisition. A timeout never removes or unlocks the file.
-    pub(crate) fn acquire(
-        authority: path::EndpointAuthority,
-        patience: Duration,
-    ) -> std::io::Result<Self> {
-        Self::acquire_prepared(authority, patience, || {})
-    }
-
     pub(crate) fn acquire_prepared(
         authority: path::EndpointAuthority,
         patience: Duration,
@@ -103,12 +96,6 @@ impl EndpointLock {
 
     pub(crate) fn validate_route(&self) -> std::io::Result<()> {
         self.authority.validate_route()
-    }
-
-    pub(crate) fn bind_private_absent_owned(
-        &self,
-    ) -> std::io::Result<(UnixListener, SocketCleanup)> {
-        bind_prepared_mode(&self.authority, |_| {}, false)
     }
 
     #[cfg(test)]
@@ -422,6 +409,3 @@ pub(crate) fn remove_if_stale_prepared(
     }
     unlinkat(parent, name, UnlinkatFlags::RemoveDir).is_ok()
 }
-
-#[cfg(test)]
-mod tests;

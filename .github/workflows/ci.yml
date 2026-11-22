@@ -393,228 +393,6 @@ jobs:
       # #548: a failed keeper fixture's last manager wait is bounded. A blocked
       # wait must end the harness with native stacks from `sample`. Reuses the
       # ordinary harness features built above.
-      - name: Qualify personal inherited launch with exact owned child custody
-        shell: bash
-        run: |
-          # launch529 BEGIN controlled ordinary
-          set -euo pipefail
-          umask 077 || exit 1
-          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" || exit 1
-          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" || exit 1
-          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-inherited-launch.XXXXXX") || exit 1
-          test -n "$runtime" || exit 1
-          trap 'rm -rf "$runtime"' EXIT || exit 1
-          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp" || exit 1
-          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache" || exit 1
-          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null || exit 1
-          unset SSH_AUTH_SOCK || exit 1
-          launch_artifacts() {
-            python3 - "$@" <<'PYLAUNCH'
-          import hashlib, json, os, pathlib, re, subprocess, sys
-          class Error(Exception):
-              pass
-          def require(value, code):
-              if not value:
-                  raise Error(code)
-          def main():
-              require(len(sys.argv) == 7, 'arguments')
-              stage, metadata_path, daemon_path, harness_path, prefix, features = sys.argv[1:]
-              require(stage in ('before', 'after'), 'stage')
-              root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
-              expected_features = [] if features == 'default' else ['system']
-              require(features in ('default', 'system'), 'features')
-              metadata = json.loads(pathlib.Path(metadata_path).read_text())
-              packages = [p for p in metadata['packages'] if p['name'] == 'qshd' and p['id'] in metadata['workspace_members']]
-              require(len(packages) == 1, 'package-count')
-              digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-              paths = []
-              artifacts = {}
-              for kind, source, data in [('bin', 'qshd/src/main.rs', daemon_path), ('lib', 'qshd/src/lib.rs', harness_path)]:
-                  records = [json.loads(line) for line in pathlib.Path(data).read_text().splitlines()]
-                  records = [r for r in records if r.get('reason') == 'compiler-artifact' and r.get('package_id') == packages[0]['id']
-                             and r.get('target', {}).get('name') == 'qshd' and r['target'].get('kind') == [kind]
-                             and r.get('profile', {}).get('test') is (kind == 'lib') and r.get('executable')]
-                  require(len(records) == 1, 'artifact-count')
-                  record = records[0]
-                  executable = pathlib.Path(record['executable'])
-                  require(executable.is_absolute() and executable.is_file() and os.access(executable, os.X_OK), 'executable')
-                  executable = executable.resolve(strict=True)
-                  require((root / 'target').resolve() in executable.parents, 'artifact-path')
-                  require(pathlib.Path(record['manifest_path']).resolve(strict=True) == root / 'qshd/Cargo.toml', 'manifest')
-                  require(pathlib.Path(record['target']['src_path']).resolve(strict=True) == root / source, 'source')
-                  require(sorted(record['features']) == expected_features, 'artifact-features')
-                  artifacts[kind] = dict(sha256=digest(executable), profile=record['profile'], source_sha256=digest(root / source), features=record['features'])
-                  paths.append(str(executable))
-              git = lambda *args: subprocess.check_output(['git', '-C', str(root), *args], stderr=subprocess.PIPE, text=True).strip()
-              commit, tree = git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD^{tree}')
-              require(re.fullmatch(r'[0-9a-f]{40}', commit) and re.fullmatch(r'[0-9a-f]{40}', tree), 'source-identity')
-              require(commit == os.environ['GITHUB_SHA'], 'source-head')
-              subprocess.run(['git', '-C', str(root), 'diff', 'HEAD', '--quiet'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-              names = sorted(name for name in git('ls-files', '-z').split('\0') if name)
-              sources = {name: digest(root / name) for name in names}
-              blobs = {}
-              for name in names:
-                  value = os.fsencode(os.readlink(root / name)) if (root / name).is_symlink() else (root / name).read_bytes()
-                  blobs[name] = hashlib.sha1(b'blob ' + str(len(value)).encode() + b'\0' + value).hexdigest()
-              canonical = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-              compiler = subprocess.check_output(['rustc', '-vV'], stderr=subprocess.PIPE, text=True).strip()
-              require('release: 1.98.1' in compiler.splitlines(), 'compiler')
-              receipt = dict(kind='launch529-Cargo-artifacts', source_commit=commit, source_tree=tree, compiler=compiler,
-                             source_manifest_sha256=canonical(sources), source_git_blob_digest=canonical(blobs),
-                             workflow_sha256=digest(root / '.github/workflows/ci.yml'), lock_sha256=digest(root / 'Cargo.lock'),
-                             features=expected_features, artifacts=artifacts)
-              prefix = pathlib.Path(prefix)
-              saved = prefix.with_suffix('.json')
-              if stage == 'before':
-                  require(not saved.exists(), 'existing-before')
-                  saved.write_text(json.dumps(receipt, sort_keys=True) + '\n')
-                  prefix.with_suffix('.paths').write_text('\n'.join(paths) + '\n')
-              else:
-                  require(json.loads(saved.read_text()) == receipt, 'changed-identity')
-              print('launch529_artifact_receipt ' + json.dumps(dict(stage=stage, **receipt), sort_keys=True))
-          try:
-              main()
-          except Error as error:
-              print('launch529_artifact_error ' + str(error), file=sys.stderr)
-              sys.exit(1)
-          except Exception:
-              print('launch529_artifact_error invalid-input', file=sys.stderr)
-              sys.exit(1)
-          PYLAUNCH
-          }
-          launch_execution_guard() {
-            python3 - "$@" <<'PYLAUNCHEXEC'
-          import importlib.util, json, os, pathlib, sys
-          class Error(Exception):
-              pass
-          def require(value, code):
-              if not value:
-                  raise Error(code)
-          def listing(path, name):
-              lines = [line for line in path.read_text().splitlines() if line]
-              require(lines == [name + ': test', '1 test, 0 benchmarks'], 'exact-list')
-          def main():
-              require(len(sys.argv) >= 2, 'arguments')
-              mode = sys.argv[1]
-              if mode == 'list':
-                  require(len(sys.argv) == 4, 'arguments')
-                  listing(pathlib.Path(sys.argv[2]), sys.argv[3])
-                  return
-              require(mode == 'audit' and len(sys.argv) >= 5, 'arguments')
-              runtime, names_path = map(pathlib.Path, sys.argv[2:4])
-              configurations = sys.argv[4:]
-              require(configurations in (['default'], ['default', 'system']), 'configurations')
-              names = names_path.read_text().splitlines()
-              require(len(names) == 21 and len(set(names)) == 21, 'case-names')
-              require((runtime / 'completed-configurations').read_text().splitlines() == configurations, 'configuration-completion')
-              root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
-              sys.path.insert(0, str(root / 'scripts'))
-              spec = importlib.util.spec_from_file_location('launch_exact_result_guard', root / 'scripts/run-nextest-ci.py')
-              checker = importlib.util.module_from_spec(spec)
-              spec.loader.exec_module(checker)
-              for configuration in configurations:
-                  require((runtime / (configuration + '-completed')).read_text().splitlines() == names, 'case-completion')
-                  pair = []
-                  for stage in ('before', 'after'):
-                      lines = (runtime / (configuration + '-' + stage + '-receipt.log')).read_text().splitlines()
-                      require(len(lines) == 1 and lines[0].startswith('launch529_artifact_receipt '), 'artifact-receipt')
-                      receipt = json.loads(lines[0].split(' ', 1)[1])
-                      require(receipt.pop('stage') == stage, 'artifact-stage')
-                      require(receipt['features'] == ([] if configuration == 'default' else ['system']), 'artifact-features')
-                      pair.append(receipt)
-                  require(pair[0] == pair[1], 'artifact-pair')
-                  for name in names:
-                      log = runtime / (configuration + '-' + name + '.log')
-                      require(log.is_file() and log.stat().st_size > 0, 'case-log')
-                      listing(runtime / (configuration + '-' + name + '.list'), name)
-                      checker.check_exact_libtest(log, name)
-              summary = dict(schema=1, configurations=len(configurations), portable_cases_per_configuration=17,
-                             native_cases_per_configuration=4, case_executions=21 * len(configurations))
-              text = 'launch529_execution_complete ' + json.dumps(summary, sort_keys=True)
-              require(len(text.encode()) <= 512, 'summary-size')
-              print(text)
-          try:
-              main()
-          except Error as error:
-              print('launch529_execution_error ' + str(error), file=sys.stderr)
-              sys.exit(1)
-          except Exception:
-              print('launch529_execution_error invalid-input', file=sys.stderr)
-              sys.exit(1)
-          PYLAUNCHEXEC
-          }
-          portable_names=(
-            session_owner::inherited_launch::tests::launch529_cancel_before_and_after_start_wins_late_admission
-            session_owner::inherited_launch::tests::launch529_deadline_is_absolute_across_partial_setup
-            session_owner::inherited_launch::tests::launch529_foreign_handle_cannot_cancel_or_settle
-            session_owner::inherited_launch::tests::launch529_frontend_transfer_cannot_restore_host_or_owner
-            session_owner::inherited_launch::tests::launch529_handle_drop_keeps_physical_custody
-            session_owner::inherited_launch::tests::launch529_known_extra_local_copy_is_pending_not_unknown
-            session_owner::inherited_launch::tests::launch529_known_prefix_deadline_does_not_refresh_final_bytes
-            session_owner::inherited_launch::tests::launch529_lost_wait_and_uncertain_close_never_refund
-            session_owner::inherited_launch::tests::launch529_poisoned_registry_keeps_exact_capsule_and_debt
-            session_owner::inherited_launch::tests::launch529_prefix_stall_and_dribble_retire_without_reply
-            session_owner::inherited_launch::tests::launch529_private_marker_routing_is_exact
-            session_owner::inherited_launch::tests::launch529_record_exact_shape_and_binding
-            session_owner::inherited_launch::tests::launch529_record_rejects_every_unsupported_field
-            session_owner::inherited_launch::tests::launch529_registry_drop_quarantines_unsettled_debt
-            session_owner::inherited_launch::tests::launch529_setup_sockets_refuse_stall_extra_cancel_and_invalid_types
-            session_owner::inherited_launch::tests::launch529_transferred_end_stays_charged
-            session_owner::inherited_launch::tests::launch529_wait_and_eof_are_independent_receipts
-          )
-          native_names=(
-            session_owner::inherited_launch::native_tests::launch529_eof_wait_and_extra_reference_order
-            session_owner::inherited_launch::native_tests::launch529_exec_admits_only_the_designated_frontend
-            session_owner::inherited_launch::native_tests::launch529_exec_failure_and_cancel_keep_exact_custody
-            session_owner::inherited_launch::native_tests::launch529_foreign_or_invalid_inheritance_refuses
-          )
-          test "${#portable_names[@]}" -eq 17 || exit 1
-          test "${#native_names[@]}" -eq 4 || exit 1
-          configurations=(default)
-          printf '%s\n' "${portable_names[@]}" "${native_names[@]}" > "$runtime/expected-names" || exit 1
-          # Only this supervised phase may build or execute. A bare zero exit is not proof.
-          (
-            cargo metadata --no-deps --format-version=1 --locked > "$runtime/workspace.json" || exit 1
-            for configuration in "${configurations[@]}"; do
-              build_command=(cargo build -p qshd --bin qshd --profile test --locked)
-              test_command=(cargo test -p qshd --lib --locked --no-run)
-              if [ "$configuration" = system ]; then
-                build_command+=(--features system)
-                test_command+=(--features system)
-              fi
-              build_command+=(--message-format=json-render-diagnostics)
-              test_command+=(--message-format=json-render-diagnostics)
-              "${build_command[@]}" > "$runtime/$configuration-daemon.jsonl" || exit 1
-              "${test_command[@]}" > "$runtime/$configuration-harness.jsonl" || exit 1
-              launch_artifacts before "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
-                "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration" \
-                > "$runtime/$configuration-before-receipt.log" || exit 1
-              cat "$runtime/$configuration-before-receipt.log" || exit 1
-              daemon=$(sed -n '1p' "$runtime/$configuration.paths") || exit 1
-              harness=$(sed -n '2p' "$runtime/$configuration.paths") || exit 1
-              test -n "$daemon" && test -x "$daemon" || exit 1
-              test -n "$harness" && test -x "$harness" || exit 1
-              export QSH_TEST_QSHD="$daemon" || exit 1
-              for name in "${portable_names[@]}" "${native_names[@]}"; do
-                list="$runtime/$configuration-$name.list"
-                "$harness" --include-ignored --exact "$name" --list --color=never > "$list" || exit 1
-                launch_execution_guard list "$list" "$name" || exit 1
-                log="$runtime/$configuration-$name.log"
-                "$harness" --include-ignored --exact "$name" --show-output --test-threads=1 --color=never \
-                  2>&1 | tee "$log" || exit 1
-                python3 scripts/run-nextest-ci.py --check-exact-libtest "$log" --require-exact-test "$name" || exit 1
-                printf '%s\n' "$name" >> "$runtime/$configuration-completed" || exit 1
-              done
-              launch_artifacts after "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
-                "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration" \
-                > "$runtime/$configuration-after-receipt.log" || exit 1
-              cat "$runtime/$configuration-after-receipt.log" || exit 1
-              printf '%s\n' "$configuration" >> "$runtime/completed-configurations" || exit 1
-            done
-          ) || exit 1
-          # Parent-side audit remains outside the phase even if its shell exits early with zero.
-          launch_execution_guard audit "$runtime" "$runtime/expected-names" "${configurations[@]}" || exit 1
-          # launch529 END controlled ordinary
       - name: Keeper failure settlement bound
         shell: bash
         run: |
@@ -963,71 +741,6 @@ jobs:
           grep -F 'validated 13 isolated detachment cases' "$runtime/detach-results.log"
           grep -F 'validated bounded parent wait and partial-ready cleanup' "$runtime/detach-results.log"
           grep -F 'validated 8 closed-stdio runtime preconditions' "$runtime/detach-results.log"
-      - name: Portable dormant host endpoint contracts
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
-          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-host-endpoint.XXXXXX")
-          trap 'rm -rf "$runtime"' EXIT
-          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
-          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
-          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
-          unset SSH_AUTH_SOCK SSH_AGENT_PID
-          # Actual foreign-UID ownership runs only in the disposable root library.
-          cargo test -p qshd --lib --locked endpoint::tests:: -- \
-            --skip endpoint::tests::private_parent_foreign_owner_refused --nocapture --test-threads=1 --color=never \
-            2>&1 | tee "$runtime/endpoint-results.log"
-          for name in \
-            endpoint::tests::private_parent_policy_is_opt_in_and_rechecked \
-            endpoint::tests::private_open_does_not_create_or_repair \
-            endpoint::tests::private_lock_substitution_preserves_replacement \
-            endpoint::tests::private_bind_policy_change_cannot_publish \
-            endpoint::tests::private_no_replace_failure_preserves_competitor; do
-            awk -v expected="test $name ... " '
-              index($0, expected) == 1 {
-                seen++; pending = 1
-                if ($0 == expected "ok") { passed++; pending = 0 }
-                next
-              }
-              pending && $0 == "ok" { passed++; pending = 0 }
-              END { exit !(seen == 1 && passed == 1) }
-            ' "$runtime/endpoint-results.log"
-          done
-          grep -Fx 'running 5 tests' "$runtime/endpoint-results.log"
-          grep -F 'test result: ok. 5 passed; 0 failed; 0 ignored;' "$runtime/endpoint-results.log"
-          cargo test -p qshd --lib --locked session_owner::host_endpoint_tests:: -- \
-            --nocapture --test-threads=1 --color=never \
-            2>&1 | tee "$runtime/host-endpoint-results.log"
-          for name in \
-            session_owner::host_endpoint_tests::host_endpoint_publication_is_private_and_distinct \
-            session_owner::host_endpoint_tests::host_endpoint_rejects_unsafe_or_missing_parent_before_lock \
-            session_owner::host_endpoint_tests::host_endpoint_never_replaces_an_existing_entry \
-            session_owner::host_endpoint_tests::host_endpoint_holds_lock_through_publication_lifetime \
-            session_owner::host_endpoint_tests::host_endpoint_cleanup_retains_original_parent \
-            session_owner::host_endpoint_tests::host_endpoint_cleanup_preserves_replaced_socket \
-            session_owner::host_endpoint_tests::host_endpoint_refuses_silent_unprovisioned_connection \
-            session_owner::host_endpoint_tests::host_endpoint_refuses_protocol_bytes_without_dispatch \
-            session_owner::host_endpoint_tests::host_endpoint_refusal_consumes_one_connection_per_call; do
-            awk -v expected="test $name ... " '
-              index($0, expected) == 1 {
-                seen++; pending = 1
-                if ($0 == expected "ok") { passed++; pending = 0 }
-                next
-              }
-              pending && $0 == "ok" { passed++; pending = 0 }
-              END { exit !(seen == 1 && passed == 1) }
-            ' "$runtime/host-endpoint-results.log"
-          done
-          grep -Fx 'running 9 tests' "$runtime/host-endpoint-results.log"
-          grep -F 'test result: ok. 9 passed; 0 failed; 0 ignored;' "$runtime/host-endpoint-results.log"
-          if grep -Fq SKIPPED "$runtime/endpoint-results.log" "$runtime/host-endpoint-results.log"; then
-            echo '::error::portable host endpoint contracts reported a runtime skip'
-            exit 1
-          fi
-
       - name: Native cold executable checksum regression
         shell: bash
         run: |
@@ -1682,71 +1395,6 @@ jobs:
           df -h / "$RUNNER_TEMP" /mnt 2>/dev/null || true
           du -sh target "$HOME/.cargo" "$HOME/.rustup" "$RUNNER_TEMP" 2>/dev/null || true
 
-      - name: Portable dormant host endpoint contracts
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
-          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-host-endpoint.XXXXXX")
-          trap 'rm -rf "$runtime"' EXIT
-          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp"
-          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache"
-          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null
-          unset SSH_AUTH_SOCK SSH_AGENT_PID
-          # Actual foreign-UID ownership runs only in the disposable root library.
-          cargo test -p qshd --lib --locked endpoint::tests:: -- \
-            --skip endpoint::tests::private_parent_foreign_owner_refused --nocapture --test-threads=1 --color=never \
-            2>&1 | tee "$runtime/endpoint-results.log"
-          for name in \
-            endpoint::tests::private_parent_policy_is_opt_in_and_rechecked \
-            endpoint::tests::private_open_does_not_create_or_repair \
-            endpoint::tests::private_lock_substitution_preserves_replacement \
-            endpoint::tests::private_bind_policy_change_cannot_publish \
-            endpoint::tests::private_no_replace_failure_preserves_competitor; do
-            awk -v expected="test $name ... " '
-              index($0, expected) == 1 {
-                seen++; pending = 1
-                if ($0 == expected "ok") { passed++; pending = 0 }
-                next
-              }
-              pending && $0 == "ok" { passed++; pending = 0 }
-              END { exit !(seen == 1 && passed == 1) }
-            ' "$runtime/endpoint-results.log"
-          done
-          grep -Fx 'running 5 tests' "$runtime/endpoint-results.log"
-          grep -F 'test result: ok. 5 passed; 0 failed; 0 ignored;' "$runtime/endpoint-results.log"
-          cargo test -p qshd --lib --locked session_owner::host_endpoint_tests:: -- \
-            --nocapture --test-threads=1 --color=never \
-            2>&1 | tee "$runtime/host-endpoint-results.log"
-          for name in \
-            session_owner::host_endpoint_tests::host_endpoint_publication_is_private_and_distinct \
-            session_owner::host_endpoint_tests::host_endpoint_rejects_unsafe_or_missing_parent_before_lock \
-            session_owner::host_endpoint_tests::host_endpoint_never_replaces_an_existing_entry \
-            session_owner::host_endpoint_tests::host_endpoint_holds_lock_through_publication_lifetime \
-            session_owner::host_endpoint_tests::host_endpoint_cleanup_retains_original_parent \
-            session_owner::host_endpoint_tests::host_endpoint_cleanup_preserves_replaced_socket \
-            session_owner::host_endpoint_tests::host_endpoint_refuses_silent_unprovisioned_connection \
-            session_owner::host_endpoint_tests::host_endpoint_refuses_protocol_bytes_without_dispatch \
-            session_owner::host_endpoint_tests::host_endpoint_refusal_consumes_one_connection_per_call; do
-            awk -v expected="test $name ... " '
-              index($0, expected) == 1 {
-                seen++; pending = 1
-                if ($0 == expected "ok") { passed++; pending = 0 }
-                next
-              }
-              pending && $0 == "ok" { passed++; pending = 0 }
-              END { exit !(seen == 1 && passed == 1) }
-            ' "$runtime/host-endpoint-results.log"
-          done
-          grep -Fx 'running 9 tests' "$runtime/host-endpoint-results.log"
-          grep -F 'test result: ok. 9 passed; 0 failed; 0 ignored;' "$runtime/host-endpoint-results.log"
-          if grep -Fq SKIPPED "$runtime/endpoint-results.log" "$runtime/host-endpoint-results.log"; then
-            echo '::error::portable host endpoint contracts reported a runtime skip'
-            exit 1
-          fi
-
       # nextest does not run doctests.
       - name: Doc tests
         run: cargo test --workspace --doc --locked
@@ -1895,87 +1543,6 @@ jobs:
               normalized = normalized.replace(policy_block, '', 1).replace(full_checkout, checkout, 1)
               return normalized, 'new'
 
-          def reverse_system_extension(source):
-              # Directional additive transition only; compare the entire residual afterward.
-              prior_names = (
-                  'helper::server::tests::host_policy::host529_policy_bad_bounds_wrong_nonce_and_shared_child_cap_refuse_before_fork',
-                  'helper::server::tests::host_policy::host529_policy_cancelled_consumer_and_deadline_retain_real_child_until_wait',
-                  'helper::server::tests::host_policy::host529_policy_current_account_and_root_restrictions_are_rechecked',
-                  'helper::server::tests::host_policy::host529_policy_forged_signature_and_wrong_key_refuse',
-                  'helper::server::tests::host_policy::host529_policy_key_revocation_between_issue_and_consume_is_current',
-                  'helper::server::tests::host_policy::host529_policy_late_real_verdict_after_cancel_or_revocation_cannot_grant',
-                  'helper::server::tests::host_policy::host529_policy_nonce_cannot_be_redirected_to_legacy_login',
-                  'helper::server::tests::host_policy::host529_policy_nonce_replay_expiry_shared_capacity_and_recovery',
-                  'helper::server::tests::host_policy::host529_policy_real_auth_and_two_policy_checks_do_not_create_logins',
-                  'helper::server::tests::host_policy::host529_policy_verdict_before_reap_lost_consumer_stays_charged',
-                  'process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session',
-                  'control::peer_tests::control_peer_root_client_rejects_foreign_server',
-                  'control::peer_tests::control_peer_foreign_client_rejects_root_server',
-                  'transport_daemon::peer_tests::control_peer_root_server_rejects_foreign_client',
-                  'transport_daemon::peer_tests::control_peer_foreign_server_rejects_root_client',
-                  'serve::tests::the_system_flag_is_accepted_and_moves_the_host_key',
-                  'helper::monitor::tests::pam_access_matches_ipv4_source_cidrs_with_explicit_fallbacks',
-                  'helper::monitor::tests::pam_access_matches_ipv6_source_cidrs_with_explicit_fallbacks',
-                  'log::tests::path_diagnostics_relative_preparation_rotates_after_detach_cwd_change',
-                  'log::tests::path_diagnostics_foreground_failure_warns_once_and_survives_in_status',
-                  'helper::server::tests::worker_parent::worker508_pre_stage_stop_is_retained_without_publication',
-                  'helper::server::tests::worker_parent::worker508_init_failure_before_stage_acceptance_settles',
-                  'helper::server::tests::worker_parent::worker508_post_stage_unread_stop_settles_failed',
-                  'helper::server::tests::worker_parent::worker508_terminal_before_pending_send_suppresses_stop',
-                  'endpoint::tests::private_parent_foreign_owner_refused',
-                  'session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup',
-              )
-              system_names = (
-                  'helper::server::tests::system_dispatch::authdispatch529_system_cancel_submitted_retains_real_child_until_wait',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_cancel_unsubmitted_cleans_only_exact_nonce',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_cap_before_spend_cleans_exact_remaining_nonce',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_close_loses_sink_without_releasing_real_child',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_coalesced_requests_keep_ordered_replies',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_current_policy_rejects_other_real_seam',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_deadline_and_partial_input_expire_inert',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_eof_retires_real_admitted_frontend',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_eof_submitted_drops_sink_not_physical_custody',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_forged_signature_and_unlisted_key_refuse',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_full_sink_stale_real_result_cannot_approve_twin',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_global_nonce_saturation_is_shared',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_host_pending_capacity_is_global',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_late_real_verdict_after_deadline_is_not_applied',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_real_signed_proof_and_current_revocation',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_replay_and_cross_seam_do_not_touch_other_ticket',
-                  'helper::server::tests::system_dispatch::authdispatch529_system_wrong_method_report_and_host_refuse',
-              )
-              allowances = (
-                  'drop_worker_privileges_refuses_without_root',
-                  'own_capability_sets_parses_and_reports_none_for_an_ordinary_process',
-                  'an_undeliverable_signal_is_reported_to_the_helper',
-                  'a_rotation_that_cannot_rename_is_reported_and_bounds_file_growth',
-              )
-
-              def root_contract(count, names):
-                  continuation = ' ' + chr(92) + '\n'
-                  lines = ['          run_suite lib qshd --ignored ' + str(count)]
-                  lines += ['            --require ' + name for name in names]
-                  lines += ['            ' + name for name in allowances]
-                  return continuation.join(lines) + '\n'
-
-              old_root = root_contract(102, prior_names)
-              new_root = root_contract(119, prior_names[:10] + system_names + prior_names[10:])
-              old_comment = '          # `--ignored 102` is the exact compiled system-library ignored count:\n'
-              new_comment = '          # `--ignored 119` is the exact compiled system-library ignored count:\n          # Plus seventeen isolated System bridge bodies, each required through its wrapper.\n'
-              old_prefix = "              require(policy[:2] == ['--ignored', '102'], 'library-policy')\n"
-              new_prefix = "              require(policy[:2] == ['--ignored', '119'], 'library-policy')\n"
-              bootstrap = "          python3 -B -m unittest discover -s scripts/tests -p 'test_client_install_bootstrap.py'\n"
-              system_control = '          python3 -I -B scripts/tests/test_no_silent_skips.py -v\n'
-              replacements = ((new_root, old_root), (new_comment, old_comment),
-                              (new_prefix, old_prefix), (bootstrap + system_control, bootstrap))
-              for current, previous in replacements:
-                  if source.count(current) != 1:
-                      raise UncertainScope()
-                  source = source.replace(current, previous, 1)
-              if source.count(system_control) != 0:
-                  raise UncertainScope()
-              return source
-
           def protected_policy(base, head):
               old, old_shape = workflow_contract(workflow_file(base, '.github/workflows/ci.yml'))
               new, new_shape = workflow_contract(workflow_file(head, '.github/workflows/ci.yml'))
@@ -1983,8 +1550,6 @@ jobs:
               if old_shape == 'new':
                   workflow_file(base, 'scripts/tests/test_ci_package_scope.py')
               matched = new_shape == 'new' and old == new
-              if not matched and new_shape == 'new':
-                  matched = old == reverse_system_extension(new)
               if matched:
                   evidence['contract'] = hashlib.sha256(old.encode('utf-8')).hexdigest()
               return matched
@@ -2191,228 +1756,6 @@ jobs:
       # the file names carry a metadata hash, and picking "the newest
       # `target/debug/deps/<name>-*`" would sooner or later pick a stale
       # one left by another build.
-      - name: Qualify personal inherited launch with exact owned child custody
-        shell: bash
-        run: |
-          # launch529 BEGIN controlled ordinary
-          set -euo pipefail
-          umask 077 || exit 1
-          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" || exit 1
-          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" || exit 1
-          runtime=$(mktemp -d "$RUNNER_TEMP/qsh-inherited-launch.XXXXXX") || exit 1
-          test -n "$runtime" || exit 1
-          trap 'rm -rf "$runtime"' EXIT || exit 1
-          mkdir -m 700 "$runtime/home" "$runtime/config" "$runtime/cache" "$runtime/tmp" || exit 1
-          export HOME="$runtime/home" XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache" || exit 1
-          export TMPDIR="$runtime/tmp" HISTFILE=/dev/null || exit 1
-          unset SSH_AUTH_SOCK || exit 1
-          launch_artifacts() {
-            python3 - "$@" <<'PYLAUNCH'
-          import hashlib, json, os, pathlib, re, subprocess, sys
-          class Error(Exception):
-              pass
-          def require(value, code):
-              if not value:
-                  raise Error(code)
-          def main():
-              require(len(sys.argv) == 7, 'arguments')
-              stage, metadata_path, daemon_path, harness_path, prefix, features = sys.argv[1:]
-              require(stage in ('before', 'after'), 'stage')
-              root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
-              expected_features = [] if features == 'default' else ['system']
-              require(features in ('default', 'system'), 'features')
-              metadata = json.loads(pathlib.Path(metadata_path).read_text())
-              packages = [p for p in metadata['packages'] if p['name'] == 'qshd' and p['id'] in metadata['workspace_members']]
-              require(len(packages) == 1, 'package-count')
-              digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-              paths = []
-              artifacts = {}
-              for kind, source, data in [('bin', 'qshd/src/main.rs', daemon_path), ('lib', 'qshd/src/lib.rs', harness_path)]:
-                  records = [json.loads(line) for line in pathlib.Path(data).read_text().splitlines()]
-                  records = [r for r in records if r.get('reason') == 'compiler-artifact' and r.get('package_id') == packages[0]['id']
-                             and r.get('target', {}).get('name') == 'qshd' and r['target'].get('kind') == [kind]
-                             and r.get('profile', {}).get('test') is (kind == 'lib') and r.get('executable')]
-                  require(len(records) == 1, 'artifact-count')
-                  record = records[0]
-                  executable = pathlib.Path(record['executable'])
-                  require(executable.is_absolute() and executable.is_file() and os.access(executable, os.X_OK), 'executable')
-                  executable = executable.resolve(strict=True)
-                  require((root / 'target').resolve() in executable.parents, 'artifact-path')
-                  require(pathlib.Path(record['manifest_path']).resolve(strict=True) == root / 'qshd/Cargo.toml', 'manifest')
-                  require(pathlib.Path(record['target']['src_path']).resolve(strict=True) == root / source, 'source')
-                  require(sorted(record['features']) == expected_features, 'artifact-features')
-                  artifacts[kind] = dict(sha256=digest(executable), profile=record['profile'], source_sha256=digest(root / source), features=record['features'])
-                  paths.append(str(executable))
-              git = lambda *args: subprocess.check_output(['git', '-C', str(root), *args], stderr=subprocess.PIPE, text=True).strip()
-              commit, tree = git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD^{tree}')
-              require(re.fullmatch(r'[0-9a-f]{40}', commit) and re.fullmatch(r'[0-9a-f]{40}', tree), 'source-identity')
-              require(commit == os.environ['GITHUB_SHA'], 'source-head')
-              subprocess.run(['git', '-C', str(root), 'diff', 'HEAD', '--quiet'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-              names = sorted(name for name in git('ls-files', '-z').split('\0') if name)
-              sources = {name: digest(root / name) for name in names}
-              blobs = {}
-              for name in names:
-                  value = os.fsencode(os.readlink(root / name)) if (root / name).is_symlink() else (root / name).read_bytes()
-                  blobs[name] = hashlib.sha1(b'blob ' + str(len(value)).encode() + b'\0' + value).hexdigest()
-              canonical = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-              compiler = subprocess.check_output(['rustc', '-vV'], stderr=subprocess.PIPE, text=True).strip()
-              require('release: 1.98.1' in compiler.splitlines(), 'compiler')
-              receipt = dict(kind='launch529-Cargo-artifacts', source_commit=commit, source_tree=tree, compiler=compiler,
-                             source_manifest_sha256=canonical(sources), source_git_blob_digest=canonical(blobs),
-                             workflow_sha256=digest(root / '.github/workflows/ci.yml'), lock_sha256=digest(root / 'Cargo.lock'),
-                             features=expected_features, artifacts=artifacts)
-              prefix = pathlib.Path(prefix)
-              saved = prefix.with_suffix('.json')
-              if stage == 'before':
-                  require(not saved.exists(), 'existing-before')
-                  saved.write_text(json.dumps(receipt, sort_keys=True) + '\n')
-                  prefix.with_suffix('.paths').write_text('\n'.join(paths) + '\n')
-              else:
-                  require(json.loads(saved.read_text()) == receipt, 'changed-identity')
-              print('launch529_artifact_receipt ' + json.dumps(dict(stage=stage, **receipt), sort_keys=True))
-          try:
-              main()
-          except Error as error:
-              print('launch529_artifact_error ' + str(error), file=sys.stderr)
-              sys.exit(1)
-          except Exception:
-              print('launch529_artifact_error invalid-input', file=sys.stderr)
-              sys.exit(1)
-          PYLAUNCH
-          }
-          launch_execution_guard() {
-            python3 - "$@" <<'PYLAUNCHEXEC'
-          import importlib.util, json, os, pathlib, sys
-          class Error(Exception):
-              pass
-          def require(value, code):
-              if not value:
-                  raise Error(code)
-          def listing(path, name):
-              lines = [line for line in path.read_text().splitlines() if line]
-              require(lines == [name + ': test', '1 test, 0 benchmarks'], 'exact-list')
-          def main():
-              require(len(sys.argv) >= 2, 'arguments')
-              mode = sys.argv[1]
-              if mode == 'list':
-                  require(len(sys.argv) == 4, 'arguments')
-                  listing(pathlib.Path(sys.argv[2]), sys.argv[3])
-                  return
-              require(mode == 'audit' and len(sys.argv) >= 5, 'arguments')
-              runtime, names_path = map(pathlib.Path, sys.argv[2:4])
-              configurations = sys.argv[4:]
-              require(configurations in (['default'], ['default', 'system']), 'configurations')
-              names = names_path.read_text().splitlines()
-              require(len(names) == 21 and len(set(names)) == 21, 'case-names')
-              require((runtime / 'completed-configurations').read_text().splitlines() == configurations, 'configuration-completion')
-              root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
-              sys.path.insert(0, str(root / 'scripts'))
-              spec = importlib.util.spec_from_file_location('launch_exact_result_guard', root / 'scripts/run-nextest-ci.py')
-              checker = importlib.util.module_from_spec(spec)
-              spec.loader.exec_module(checker)
-              for configuration in configurations:
-                  require((runtime / (configuration + '-completed')).read_text().splitlines() == names, 'case-completion')
-                  pair = []
-                  for stage in ('before', 'after'):
-                      lines = (runtime / (configuration + '-' + stage + '-receipt.log')).read_text().splitlines()
-                      require(len(lines) == 1 and lines[0].startswith('launch529_artifact_receipt '), 'artifact-receipt')
-                      receipt = json.loads(lines[0].split(' ', 1)[1])
-                      require(receipt.pop('stage') == stage, 'artifact-stage')
-                      require(receipt['features'] == ([] if configuration == 'default' else ['system']), 'artifact-features')
-                      pair.append(receipt)
-                  require(pair[0] == pair[1], 'artifact-pair')
-                  for name in names:
-                      log = runtime / (configuration + '-' + name + '.log')
-                      require(log.is_file() and log.stat().st_size > 0, 'case-log')
-                      listing(runtime / (configuration + '-' + name + '.list'), name)
-                      checker.check_exact_libtest(log, name)
-              summary = dict(schema=1, configurations=len(configurations), portable_cases_per_configuration=17,
-                             native_cases_per_configuration=4, case_executions=21 * len(configurations))
-              text = 'launch529_execution_complete ' + json.dumps(summary, sort_keys=True)
-              require(len(text.encode()) <= 512, 'summary-size')
-              print(text)
-          try:
-              main()
-          except Error as error:
-              print('launch529_execution_error ' + str(error), file=sys.stderr)
-              sys.exit(1)
-          except Exception:
-              print('launch529_execution_error invalid-input', file=sys.stderr)
-              sys.exit(1)
-          PYLAUNCHEXEC
-          }
-          portable_names=(
-            session_owner::inherited_launch::tests::launch529_cancel_before_and_after_start_wins_late_admission
-            session_owner::inherited_launch::tests::launch529_deadline_is_absolute_across_partial_setup
-            session_owner::inherited_launch::tests::launch529_foreign_handle_cannot_cancel_or_settle
-            session_owner::inherited_launch::tests::launch529_frontend_transfer_cannot_restore_host_or_owner
-            session_owner::inherited_launch::tests::launch529_handle_drop_keeps_physical_custody
-            session_owner::inherited_launch::tests::launch529_known_extra_local_copy_is_pending_not_unknown
-            session_owner::inherited_launch::tests::launch529_known_prefix_deadline_does_not_refresh_final_bytes
-            session_owner::inherited_launch::tests::launch529_lost_wait_and_uncertain_close_never_refund
-            session_owner::inherited_launch::tests::launch529_poisoned_registry_keeps_exact_capsule_and_debt
-            session_owner::inherited_launch::tests::launch529_prefix_stall_and_dribble_retire_without_reply
-            session_owner::inherited_launch::tests::launch529_private_marker_routing_is_exact
-            session_owner::inherited_launch::tests::launch529_record_exact_shape_and_binding
-            session_owner::inherited_launch::tests::launch529_record_rejects_every_unsupported_field
-            session_owner::inherited_launch::tests::launch529_registry_drop_quarantines_unsettled_debt
-            session_owner::inherited_launch::tests::launch529_setup_sockets_refuse_stall_extra_cancel_and_invalid_types
-            session_owner::inherited_launch::tests::launch529_transferred_end_stays_charged
-            session_owner::inherited_launch::tests::launch529_wait_and_eof_are_independent_receipts
-          )
-          native_names=(
-            session_owner::inherited_launch::native_tests::launch529_eof_wait_and_extra_reference_order
-            session_owner::inherited_launch::native_tests::launch529_exec_admits_only_the_designated_frontend
-            session_owner::inherited_launch::native_tests::launch529_exec_failure_and_cancel_keep_exact_custody
-            session_owner::inherited_launch::native_tests::launch529_foreign_or_invalid_inheritance_refuses
-          )
-          test "${#portable_names[@]}" -eq 17 || exit 1
-          test "${#native_names[@]}" -eq 4 || exit 1
-          configurations=(default system)
-          printf '%s\n' "${portable_names[@]}" "${native_names[@]}" > "$runtime/expected-names" || exit 1
-          # Only this supervised phase may build or execute. A bare zero exit is not proof.
-          (
-            cargo metadata --no-deps --format-version=1 --locked > "$runtime/workspace.json" || exit 1
-            for configuration in "${configurations[@]}"; do
-              build_command=(cargo build -p qshd --bin qshd --profile test --locked)
-              test_command=(cargo test -p qshd --lib --locked --no-run)
-              if [ "$configuration" = system ]; then
-                build_command+=(--features system)
-                test_command+=(--features system)
-              fi
-              build_command+=(--message-format=json-render-diagnostics)
-              test_command+=(--message-format=json-render-diagnostics)
-              "${build_command[@]}" > "$runtime/$configuration-daemon.jsonl" || exit 1
-              "${test_command[@]}" > "$runtime/$configuration-harness.jsonl" || exit 1
-              launch_artifacts before "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
-                "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration" \
-                > "$runtime/$configuration-before-receipt.log" || exit 1
-              cat "$runtime/$configuration-before-receipt.log" || exit 1
-              daemon=$(sed -n '1p' "$runtime/$configuration.paths") || exit 1
-              harness=$(sed -n '2p' "$runtime/$configuration.paths") || exit 1
-              test -n "$daemon" && test -x "$daemon" || exit 1
-              test -n "$harness" && test -x "$harness" || exit 1
-              export QSH_TEST_QSHD="$daemon" || exit 1
-              for name in "${portable_names[@]}" "${native_names[@]}"; do
-                list="$runtime/$configuration-$name.list"
-                "$harness" --include-ignored --exact "$name" --list --color=never > "$list" || exit 1
-                launch_execution_guard list "$list" "$name" || exit 1
-                log="$runtime/$configuration-$name.log"
-                "$harness" --include-ignored --exact "$name" --show-output --test-threads=1 --color=never \
-                  2>&1 | tee "$log" || exit 1
-                python3 scripts/run-nextest-ci.py --check-exact-libtest "$log" --require-exact-test "$name" || exit 1
-                printf '%s\n' "$name" >> "$runtime/$configuration-completed" || exit 1
-              done
-              launch_artifacts after "$runtime/workspace.json" "$runtime/$configuration-daemon.jsonl" \
-                "$runtime/$configuration-harness.jsonl" "$runtime/$configuration" "$configuration" \
-                > "$runtime/$configuration-after-receipt.log" || exit 1
-              cat "$runtime/$configuration-after-receipt.log" || exit 1
-              printf '%s\n' "$configuration" >> "$runtime/completed-configurations" || exit 1
-            done
-          ) || exit 1
-          # Parent-side audit remains outside the phase even if its shell exits early with zero.
-          launch_execution_guard audit "$runtime" "$runtime/expected-names" "${configurations[@]}" || exit 1
-          # launch529 END controlled ordinary
       - name: Build all workspace test targets at the supported Rust floor
         run: |
           cargo test --workspace --features qshd/system --locked --no-run \
@@ -2507,80 +1850,6 @@ jobs:
             if length == 1 then .[0].id else error("expected one qsh workspace package") end
           ' "$RUNNER_TEMP/workspace.json")
 
-          launch_artifacts() {
-            python3 - "$@" <<'PYLAUNCH'
-          import hashlib, json, os, pathlib, re, subprocess, sys
-          class Error(Exception):
-              pass
-          def require(value, code):
-              if not value:
-                  raise Error(code)
-          def main():
-              require(len(sys.argv) == 7, 'arguments')
-              stage, metadata_path, daemon_path, harness_path, prefix, features = sys.argv[1:]
-              require(stage in ('before', 'after'), 'stage')
-              root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
-              expected_features = [] if features == 'default' else ['system']
-              require(features in ('default', 'system'), 'features')
-              metadata = json.loads(pathlib.Path(metadata_path).read_text())
-              packages = [p for p in metadata['packages'] if p['name'] == 'qshd' and p['id'] in metadata['workspace_members']]
-              require(len(packages) == 1, 'package-count')
-              digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-              paths = []
-              artifacts = {}
-              for kind, source, data in [('bin', 'qshd/src/main.rs', daemon_path), ('lib', 'qshd/src/lib.rs', harness_path)]:
-                  records = [json.loads(line) for line in pathlib.Path(data).read_text().splitlines()]
-                  records = [r for r in records if r.get('reason') == 'compiler-artifact' and r.get('package_id') == packages[0]['id']
-                             and r.get('target', {}).get('name') == 'qshd' and r['target'].get('kind') == [kind]
-                             and r.get('profile', {}).get('test') is (kind == 'lib') and r.get('executable')]
-                  require(len(records) == 1, 'artifact-count')
-                  record = records[0]
-                  executable = pathlib.Path(record['executable'])
-                  require(executable.is_absolute() and executable.is_file() and os.access(executable, os.X_OK), 'executable')
-                  executable = executable.resolve(strict=True)
-                  require((root / 'target').resolve() in executable.parents, 'artifact-path')
-                  require(pathlib.Path(record['manifest_path']).resolve(strict=True) == root / 'qshd/Cargo.toml', 'manifest')
-                  require(pathlib.Path(record['target']['src_path']).resolve(strict=True) == root / source, 'source')
-                  require(sorted(record['features']) == expected_features, 'artifact-features')
-                  artifacts[kind] = dict(sha256=digest(executable), profile=record['profile'], source_sha256=digest(root / source), features=record['features'])
-                  paths.append(str(executable))
-              git = lambda *args: subprocess.check_output(['git', '-C', str(root), *args], stderr=subprocess.PIPE, text=True).strip()
-              commit, tree = git('rev-parse', 'HEAD'), git('rev-parse', 'HEAD^{tree}')
-              require(re.fullmatch(r'[0-9a-f]{40}', commit) and re.fullmatch(r'[0-9a-f]{40}', tree), 'source-identity')
-              require(commit == os.environ['GITHUB_SHA'], 'source-head')
-              subprocess.run(['git', '-C', str(root), 'diff', 'HEAD', '--quiet'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-              names = sorted(name for name in git('ls-files', '-z').split('\0') if name)
-              sources = {name: digest(root / name) for name in names}
-              blobs = {}
-              for name in names:
-                  value = os.fsencode(os.readlink(root / name)) if (root / name).is_symlink() else (root / name).read_bytes()
-                  blobs[name] = hashlib.sha1(b'blob ' + str(len(value)).encode() + b'\0' + value).hexdigest()
-              canonical = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-              compiler = subprocess.check_output(['rustc', '-vV'], stderr=subprocess.PIPE, text=True).strip()
-              require('release: 1.98.1' in compiler.splitlines(), 'compiler')
-              receipt = dict(kind='launch529-Cargo-artifacts', source_commit=commit, source_tree=tree, compiler=compiler,
-                             source_manifest_sha256=canonical(sources), source_git_blob_digest=canonical(blobs),
-                             workflow_sha256=digest(root / '.github/workflows/ci.yml'), lock_sha256=digest(root / 'Cargo.lock'),
-                             features=expected_features, artifacts=artifacts)
-              prefix = pathlib.Path(prefix)
-              saved = prefix.with_suffix('.json')
-              if stage == 'before':
-                  require(not saved.exists(), 'existing-before')
-                  saved.write_text(json.dumps(receipt, sort_keys=True) + '\n')
-                  prefix.with_suffix('.paths').write_text('\n'.join(paths) + '\n')
-              else:
-                  require(json.loads(saved.read_text()) == receipt, 'changed-identity')
-              print('launch529_artifact_receipt ' + json.dumps(dict(stage=stage, **receipt), sort_keys=True))
-          try:
-              main()
-          except Error as error:
-              print('launch529_artifact_error ' + str(error), file=sys.stderr)
-              sys.exit(1)
-          except Exception:
-              print('launch529_artifact_error invalid-input', file=sys.stderr)
-              sys.exit(1)
-          PYLAUNCH
-          }
           # The executable for one cargo target: `<kind>` tells the library
           # test binary (`lib`) apart from the `qshd` binary's own (`bin`),
           # which share a target name.
@@ -2643,7 +1912,7 @@ jobs:
               require(pathlib.Path(artifact['manifest_path']).resolve() == root / 'qshd/Cargo.toml', 'artifact-manifest')
               require(pathlib.Path(artifact['target']['src_path']).resolve() == root / 'qshd/src/lib.rs', 'artifact-source')
               require(sorted(artifact['features']) == ['system'], 'artifact-features')
-              require(policy[:2] == ['--ignored', '119'], 'library-policy')
+              require(policy[:2] == ['--ignored', '75'], 'library-policy')
               git = lambda *args: output(['git', '-C', str(root), *args])
               source_commit = sha(git('rev-parse', 'HEAD'), 'source-commit')
               require(source_commit == os.environ['GITHUB_SHA'], 'source-head')
@@ -2756,13 +2025,6 @@ jobs:
             if [ "$kind" = lib ]; then network_caps=(--cap-add=NET_ADMIN); fi
             echo "::group::$name"
             if [ "$kind/$name" = lib/qshd ]; then
-              if ! launch_artifacts before "$RUNNER_TEMP/workspace.json" "$RUNNER_TEMP/build.json" \
-                "$RUNNER_TEMP/build.json" "$logs/launch-root" system; then
-                failures=$((failures + 1))
-                echo "::endgroup::"
-                return
-              fi
-              fixture_env+=(-e "QSH_TEST_QSHD=$(sed -n '1p' "$logs/launch-root.paths")")
               if ! qshd_library_receipt before "$bin" "$@"; then
                 echo "::error::qshd library artifact receipt failed"
                 failures=$((failures + 1))
@@ -2784,8 +2046,6 @@ jobs:
             fi
             if [ "$kind/$name" = lib/qshd ]; then
               qshd_library_receipt after "$bin" "$@" || bad=1
-              launch_artifacts after "$RUNNER_TEMP/workspace.json" "$RUNNER_TEMP/build.json" \
-                "$RUNNER_TEMP/build.json" "$logs/launch-root" system || bad=1
             fi
             # Run even when the tests failed: "which tests did not run at
             # all" is a different answer from "which failed", and a broken
@@ -2918,14 +2178,12 @@ jobs:
           # skipped everywhere: the `check` job above runs this same binary
           # as an ordinary account, where all four do their work.
           #
-          # `--ignored 119` is the exact compiled system-library ignored count:
-          # Plus seventeen isolated System bridge bodies, each required through its wrapper.
-          # 85 prior isolated bodies plus12 ordinary nonroot owned-FD cases,
-          # four real-exec outers and one isolated launch body. The maintained
-          # ordinary/native steps explicitly execute every new positive. Each
-          # required host529_policy parent below reexecs exactly one body and
-          # requires that body's successful one-test result. These component
-          # checks do not substitute for privileged PAM/service qualification.
+          # `--ignored 75` is the exact compiled system-library ignored count:
+          # the isolated bodies that parent tests re-execute one at a time.
+          # The dormant System bridge, host-policy and inherited-launch bodies
+          # (44 of the former 119) went with their code (#658, #659). These
+          # component checks do not substitute for privileged PAM/service
+          # qualification.
           # native_observer_process remains an isolated exit-only observer role.
           # Its required native_observer_retains_unrelated_process parent below
           # drives marker/liveness, drop-without-kill and exact exit.
@@ -2971,34 +2229,7 @@ jobs:
           # child process by a parent test, so it never produces a `test
           # NAME ... ok` line in THIS binary's own log at all -- a --require
           # on one of them could never pass in this job.
-          run_suite lib qshd --ignored 119 \
-            --require helper::server::tests::host_policy::host529_policy_bad_bounds_wrong_nonce_and_shared_child_cap_refuse_before_fork \
-            --require helper::server::tests::host_policy::host529_policy_cancelled_consumer_and_deadline_retain_real_child_until_wait \
-            --require helper::server::tests::host_policy::host529_policy_current_account_and_root_restrictions_are_rechecked \
-            --require helper::server::tests::host_policy::host529_policy_forged_signature_and_wrong_key_refuse \
-            --require helper::server::tests::host_policy::host529_policy_key_revocation_between_issue_and_consume_is_current \
-            --require helper::server::tests::host_policy::host529_policy_late_real_verdict_after_cancel_or_revocation_cannot_grant \
-            --require helper::server::tests::host_policy::host529_policy_nonce_cannot_be_redirected_to_legacy_login \
-            --require helper::server::tests::host_policy::host529_policy_nonce_replay_expiry_shared_capacity_and_recovery \
-            --require helper::server::tests::host_policy::host529_policy_real_auth_and_two_policy_checks_do_not_create_logins \
-            --require helper::server::tests::host_policy::host529_policy_verdict_before_reap_lost_consumer_stays_charged \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_cancel_submitted_retains_real_child_until_wait \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_cancel_unsubmitted_cleans_only_exact_nonce \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_cap_before_spend_cleans_exact_remaining_nonce \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_close_loses_sink_without_releasing_real_child \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_coalesced_requests_keep_ordered_replies \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_current_policy_rejects_other_real_seam \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_deadline_and_partial_input_expire_inert \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_eof_retires_real_admitted_frontend \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_eof_submitted_drops_sink_not_physical_custody \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_forged_signature_and_unlisted_key_refuse \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_full_sink_stale_real_result_cannot_approve_twin \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_global_nonce_saturation_is_shared \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_host_pending_capacity_is_global \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_late_real_verdict_after_deadline_is_not_applied \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_real_signed_proof_and_current_revocation \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_replay_and_cross_seam_do_not_touch_other_ticket \
-            --require helper::server::tests::system_dispatch::authdispatch529_system_wrong_method_report_and_host_refuse \
+          run_suite lib qshd --ignored 75 \
             --require process_scope::observation::tests::native_observer_retains_unrelated_process_in_another_session \
             --require control::peer_tests::control_peer_root_client_rejects_foreign_server \
             --require control::peer_tests::control_peer_foreign_client_rejects_root_server \
@@ -3013,8 +2244,6 @@ jobs:
             --require helper::server::tests::worker_parent::worker508_init_failure_before_stage_acceptance_settles \
             --require helper::server::tests::worker_parent::worker508_post_stage_unread_stop_settles_failed \
             --require helper::server::tests::worker_parent::worker508_terminal_before_pending_send_suppresses_stop \
-            --require endpoint::tests::private_parent_foreign_owner_refused \
-            --require session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup \
             drop_worker_privileges_refuses_without_root \
             own_capability_sets_parses_and_reports_none_for_an_ordinary_process \
             an_undeliverable_signal_is_reported_to_the_helper \

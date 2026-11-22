@@ -14,22 +14,11 @@ import xml.etree.ElementTree as ET
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
-# Exact approved endpoint-plan names, independent of the workflow under test.
-ROOT_ENDPOINT_TEST = 'endpoint::tests::private_parent_foreign_owner_refused'
-ENDPOINT_PORTABLE = ('endpoint::tests::private_parent_policy_is_opt_in_and_rechecked',
- 'endpoint::tests::private_open_does_not_create_or_repair',
- 'endpoint::tests::private_lock_substitution_preserves_replacement',
- 'endpoint::tests::private_bind_policy_change_cannot_publish',
- 'endpoint::tests::private_no_replace_failure_preserves_competitor')
-HOST_ENDPOINT_PORTABLE = ('session_owner::host_endpoint_tests::host_endpoint_publication_is_private_and_distinct',
- 'session_owner::host_endpoint_tests::host_endpoint_rejects_unsafe_or_missing_parent_before_lock',
- 'session_owner::host_endpoint_tests::host_endpoint_never_replaces_an_existing_entry',
- 'session_owner::host_endpoint_tests::host_endpoint_holds_lock_through_publication_lifetime',
- 'session_owner::host_endpoint_tests::host_endpoint_cleanup_retains_original_parent',
- 'session_owner::host_endpoint_tests::host_endpoint_cleanup_preserves_replaced_socket',
- 'session_owner::host_endpoint_tests::host_endpoint_refuses_silent_unprovisioned_connection',
- 'session_owner::host_endpoint_tests::host_endpoint_refuses_protocol_bytes_without_dispatch',
- 'session_owner::host_endpoint_tests::host_endpoint_refusal_consumes_one_connection_per_call')
+# Two exact disposable-root cases of the qshd library, independent of the
+# workflow under test: the ordinary report must filter them, and the root
+# suite must require them.
+ROOT_CASE = 'control::peer_tests::control_peer_root_client_rejects_foreign_server'
+OTHER_ROOT_CASE = 'control::peer_tests::control_peer_foreign_client_rejects_root_server'
 
 
 def load_module():
@@ -66,47 +55,24 @@ class ReportTests(unittest.TestCase):
         self.write(cases)
         return self.module.check_report(self.report, self.expected if expected is None else expected)
 
-    def test_endpoint_foreign_owner_has_one_exact_disposable_owner(self):
+    def test_root_peer_case_has_one_exact_disposable_owner(self):
         expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
-        key = ("qshd", ROOT_ENDPOINT_TEST)
-        self.assertEqual([item for item in expected if item[1] == ROOT_ENDPOINT_TEST], [key])
+        key = ("qshd", ROOT_CASE)
+        self.assertEqual([item for item in expected if item[1] == ROOT_CASE], [key])
         self.assertEqual(expected[key]["owner"], "CI container job: run_suite lib qshd")
         self.assertEqual(self.module.exclusion_filter({key: expected[key]}),
-                         f"not ((binary_id(=qshd) & test(={ROOT_ENDPOINT_TEST})))")
+                         f"not ((binary_id(=qshd) & test(={ROOT_CASE})))")
         workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
-        self.assertIn("--require " + ROOT_ENDPOINT_TEST, workflow)
+        self.assertIn("--require " + ROOT_CASE, workflow)
         selected = {key: expected[key]}
-        self.assertEqual(self.check([(ROOT_ENDPOINT_TEST, "skipped", self.module.FILTER_REASON),
+        self.assertEqual(self.check([(ROOT_CASE, "skipped", self.module.FILTER_REASON),
                                      ("ordinary", "pass", "")], selected), (1, [key], []))
         for cases in ([("ordinary", "pass", "")],
-                      [(ROOT_ENDPOINT_TEST, "pass", "")],
-                      [(ROOT_ENDPOINT_TEST, "skipped", self.module.IGNORE_REASON)],
-                      [(ROOT_ENDPOINT_TEST, "stdout", "SKIPPED " + ROOT_ENDPOINT_TEST)]):
+                      [(ROOT_CASE, "pass", "")],
+                      [(ROOT_CASE, "skipped", self.module.IGNORE_REASON)],
+                      [(ROOT_CASE, "stdout", "SKIPPED " + ROOT_CASE)]):
             with self.subTest(cases=cases), self.assertRaises(ValueError):
                 self.check(cases, selected)
-
-    def test_endpoint_portable_lanes_freeze_exact_names_counts_and_root_exclusion(self):
-        workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
-        blocks = workflow.split("      - name: Portable dormant host endpoint contracts\n")[1:]
-        self.assertEqual(len(blocks), 2)
-        self.assertEqual(len(ENDPOINT_PORTABLE), 5)
-        self.assertEqual(len(HOST_ENDPOINT_PORTABLE), 9)
-        for block in blocks:
-            block = block.split("\n      - name:", 1)[0]
-            groups = re.findall(r"for name in \\\n(.*?); do", block, re.DOTALL)
-            self.assertEqual(len(groups), 2)
-            names = [tuple(shlex.split(group.replace("\\\n", " "))) for group in groups]
-            self.assertEqual(names, [ENDPOINT_PORTABLE, HOST_ENDPOINT_PORTABLE])
-            self.assertIn("--skip " + ROOT_ENDPOINT_TEST, block)
-            self.assertNotIn(ROOT_ENDPOINT_TEST, ENDPOINT_PORTABLE + HOST_ENDPOINT_PORTABLE)
-            self.assertIn("--locked endpoint::tests::", block)
-            self.assertIn("--locked session_owner::host_endpoint_tests::", block)
-            for count in (5, 9):
-                self.assertIn(f"running {count} tests", block)
-                self.assertIn(f"test result: ok. {count} passed; 0 failed; 0 ignored;", block)
-            self.assertIn('grep -Fq SKIPPED "$runtime/endpoint-results.log" "$runtime/host-endpoint-results.log"', block)
-            self.assertIn('--test-threads=1 --color=never', block)
-            self.assertIn('seen == 1 && passed == 1', block)
 
     def test_authorization_template_cases_have_exact_disposable_owner(self):
         names = {
@@ -263,25 +229,13 @@ class ReportTests(unittest.TestCase):
         workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
         self.assertIn("--require " + name, workflow)
 
-    def test_inherited_launch_root_case_has_one_exact_disposable_owner(self):
-        name = 'session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup'
-        expected = self.module.load_exclusions(SCRIPTS / "nextest-exclusions.json")
-        key = ("qshd", name)
-        self.assertEqual(len(expected), 76)
-        self.assertEqual([entry for entry in expected if entry[1] == name], [key])
-        self.assertEqual(expected[key]["owner"], "CI container job: run_suite lib qshd")
-        self.assertIn("binary_id(=qshd)", self.module.exclusion_filter({key: expected[key]}))
-        self.assertIn(f"test(={name})", self.module.exclusion_filter({key: expected[key]}))
-        workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
-        self.assertEqual(workflow.count("--require " + name), 1)
-
     def test_composed_manifest_preserves_exact_main_union_and_rejects_aliases(self):
         manifest = SCRIPTS / 'nextest-exclusions.json'
         expected = self.module.load_exclusions(manifest)
         encoded = json.dumps(sorted(expected), separators=(',', ':')).encode()
-        self.assertEqual(hashlib.sha256(encoded).hexdigest(), 'd59bff07e64e3b6eff2a0f1dcb1b7c734be7b323aa5cdcbc8bf18d517c96988d')
-        self.assertEqual(len(expected), 76)
-        launch = 'session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup'
+        self.assertEqual(hashlib.sha256(encoded).hexdigest(), '7af3fdc4e8484e74fe9cd818361934575539dbd3fe9cf578a2a9ee637bc7dd41')
+        self.assertEqual(len(expected), 74)
+        launch = OTHER_ROOT_CASE
         raw = json.loads(manifest.read_text())
         group = next(group for group in raw['exclusions'] if launch in group['tests'])
         duplicate = json.loads(json.dumps(raw))
@@ -293,23 +247,23 @@ class ReportTests(unittest.TestCase):
         next(group for group in alias['exclusions'] if launch in group['tests'])['binary'] = 'qshd::wrong_owner_alias'
         fixture.write_text(json.dumps(alias))
         aliased = self.module.load_exclusions(fixture)
-        self.assertEqual(len(aliased), 76, 'same-cardinality alias must not pass identity checks')
-        selected = {key: value for key, value in aliased.items() if key[1] in (launch, ROOT_ENDPOINT_TEST)}
+        self.assertEqual(len(aliased), 74, 'same-cardinality alias must not pass identity checks')
+        selected = {key: value for key, value in aliased.items() if key[1] in (launch, ROOT_CASE)}
         with self.assertRaises(ValueError):
             self.check([(launch, 'skipped', self.module.FILTER_REASON),
-                        (ROOT_ENDPOINT_TEST, 'skipped', self.module.FILTER_REASON), ('ordinary', 'pass', '')], selected)
+                        (ROOT_CASE, 'skipped', self.module.FILTER_REASON), ('ordinary', 'pass', '')], selected)
 
     def test_composed_root_requirements_are_filtered_once_in_ordinary_reports(self):
-        launch = 'session_owner::inherited_launch::native_tests::launch529_root_and_foreign_entry_refuse_before_setup'
+        launch = OTHER_ROOT_CASE
         expected = self.module.load_exclusions(SCRIPTS / 'nextest-exclusions.json')
-        selected = {('qshd', name): expected[('qshd', name)] for name in (launch, ROOT_ENDPOINT_TEST)}
-        valid = [(name, 'skipped', self.module.FILTER_REASON) for name in (launch, ROOT_ENDPOINT_TEST)] + [('ordinary', 'pass', '')]
+        selected = {('qshd', name): expected[('qshd', name)] for name in (launch, ROOT_CASE)}
+        valid = [(name, 'skipped', self.module.FILTER_REASON) for name in (launch, ROOT_CASE)] + [('ordinary', 'pass', '')]
         result = self.check(valid, selected)
         self.assertEqual(result[0], 1)
         self.assertEqual(set(result[1]), set(selected))
         self.assertEqual(result[2], [])
-        for name in (launch, ROOT_ENDPOINT_TEST):
-            other = ROOT_ENDPOINT_TEST if name == launch else launch
+        for name in (launch, ROOT_CASE):
+            other = ROOT_CASE if name == launch else launch
             for state in ('missing', 'pass', 'ignored', 'runtime-skip'):
                 cases = [(other, 'skipped', self.module.FILTER_REASON), ('ordinary', 'pass', '')]
                 if state == 'pass': cases.append((name, 'pass', ''))

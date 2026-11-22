@@ -65,17 +65,9 @@ pub(crate) struct EndpointAuthority {
     pub syscall_path: PathBuf,
     cwd: Option<File>,
     pub lock: OsString,
-    private_parent: bool,
 }
 
 impl EndpointAuthority {
-    pub(crate) fn open_private(path: &Path) -> io::Result<Self> {
-        let mut authority = Self::open(path, false)?;
-        authority.private_parent = true;
-        authority.validate_route()?;
-        Ok(authority)
-    }
-
     pub fn open(path: &Path, create: bool) -> io::Result<Self> {
         let current_dir = if path.is_absolute() {
             None
@@ -104,7 +96,6 @@ impl EndpointAuthority {
             syscall_path: path.to_owned(),
             cwd,
             lock,
-            private_parent: false,
         };
         authority.validate_route()?;
         Ok(authority)
@@ -125,13 +116,6 @@ impl EndpointAuthority {
         let new = current.metadata()?;
         if old.dev() != new.dev() || old.ino() != new.ino() {
             return Err(refused("the control endpoint parent changed"));
-        }
-        if self.private_parent
-            && (old.uid() != nix::unistd::geteuid().as_raw() || old.mode() & 0o7777 != 0o700)
-        {
-            return Err(refused(
-                "the host endpoint requires an existing private directory owned by this account",
-            ));
         }
         Ok(())
     }

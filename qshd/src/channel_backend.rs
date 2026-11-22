@@ -48,7 +48,6 @@ pub(crate) mod fixture_leader_observation;
 pub struct PtyChannelSpawner {
     opens: Arc<ChannelOpenRegistry>,
     budget: Arc<ScreenBudget>,
-    retained_screens: Option<Arc<crate::session_owner::screen_owner::RetainedScreenFactory>>,
     /// Who hears of every session leader this spawner starts: a session
     /// owner's host (#529).
     #[cfg(target_os = "linux")]
@@ -63,7 +62,6 @@ impl PtyChannelSpawner {
     pub fn new(budget: Arc<ScreenBudget>) -> Self {
         Self {
             budget,
-            retained_screens: None,
             #[cfg(target_os = "linux")]
             leaders: None,
             #[cfg(all(test, target_os = "linux"))]
@@ -95,22 +93,6 @@ impl PtyChannelSpawner {
         self.leaders = Some(leaders);
         self
     }
-    /// Explicit retained-owner configuration; ordinary constructors keep their pool.
-    pub fn with_retained_screens(
-        mut self,
-        factory: Arc<crate::session_owner::screen_owner::RetainedScreenFactory>,
-    ) -> Self {
-        self.retained_screens = Some(factory);
-        self
-    }
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn with_fixture_leader_observer(
-        mut self,
-        observer: fixture_leader_observation::FixtureLeaderObserver,
-    ) -> Self {
-        self.fixture_leader_observer = Some(observer);
-        self
-    }
     #[cfg(all(test, target_os = "macos", feature = "test-darwin-keeper"))]
     pub(crate) fn with_keeper_fixture(
         mut self,
@@ -135,7 +117,7 @@ impl ChannelSpawner for PtyChannelSpawner {
     fn spawn(
         &self,
         owner: &Principal,
-        login: LoginId,
+        _login: LoginId,
         req: &OpenRequest,
         term: Option<&str>,
         custody: &OpenCustody,
@@ -165,11 +147,8 @@ impl ChannelSpawner for PtyChannelSpawner {
         #[cfg(target_os = "macos")]
         let prepared = crate::darwin_process_scope::prepare_personal()
             .map_err(|error| custody.refuse_before_creation(error.to_string()))?;
-        let screen = match &self.retained_screens {
-            Some(factory) if req.screen => factory.take(owner, login, req, custody),
-            _ => make_screen(req, owner, Arc::clone(&self.budget)),
-        }
-        .map_err(|e| custody.refuse_before_creation(e))?;
+        let screen = make_screen(req, owner, Arc::clone(&self.budget))
+            .map_err(|e| custody.refuse_before_creation(e))?;
         let size = PtySize {
             rows: req.rows,
             cols: req.cols,
