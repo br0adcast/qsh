@@ -51,6 +51,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Security
 
+- Update `url` to 2.5.9 for RUSTSEC-2026-0592, a stack overflow in
+  `Url::origin()` on nested `blob:` URLs. qsh uses `url` through the release
+  HTTPS client.
 - Release publication waits for approval in the `release` environment and
   refuses to sign without a tag ruleset protecting `v*` tags. Releases are
   created as drafts and published after their last asset, and must be
