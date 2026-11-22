@@ -71,6 +71,23 @@ Per measured process, over the workload's window:
 | `threads_*` | Thread counts at both ends, plus threads that exited or were created between them. When either churn count is nonzero, the live-thread counters are partial. A thread that starts and exits between the two samples appears in neither count, so zero churn does not prove that the live-thread counters are complete. `cpu_s` includes such threads. |
 | `peak_rss_kib`, `rss_kib` | `VmHWM` and `VmRSS` at the end of the window. |
 
+The `qshd` row is one process: the one that runs the async runtime. That
+is the whole daemon on macOS, in system mode (its worker) and in builds
+before #529. A Linux personal daemon since #529 is a host process with
+children: a frontend that runs the router, and one owner per session that
+runs its backend. The host does almost no work, so for such a daemon
+`qshd` reports almost none. Use `qshd_tree` instead, which covers the
+whole process tree of the process `serve` started:
+
+| Metric | Meaning and limits |
+|---|---|
+| `qshd_tree.roles.<role>` | Per role: `daemon` (the process `serve` started), `frontend` and `owner` (by their hidden role argument, whatever image they run), `qshd` (any other process of the build's image, such as the system mode's worker) and `session` (shells and everything else). For each role: `cpu_s`, `cpu_percent`, `voluntary_switches_per_s` and `involuntary_switches_per_s` summed over the role's processes, `pss_kib` at the end of the window, `processes_start`, `processes_end`, and the processes that `started` or `exited` during the window. Switches count only the threads alive when each sample was taken. |
+| `qshd_tree.daemon_total` | The same sums over every role but `session`. `complete` is false when one of those processes exited during the window: its last stretch of CPU is lost. A process that started during the window counts all of its CPU. |
+
+`pss_kib` is the proportional set size from `smaps_rollup`: the image every
+owner maps is shared among them rather than counted in full per process, as
+`VmRSS` would count it.
+
 For the session as a whole:
 
 | Metric | Meaning and limits |
@@ -165,7 +182,7 @@ No runtime measurement is part of ordinary CI.
 | `redraw` | A remote script redraws the full screen with distinct content at 20 frames per second for the window. |
 | `saturation` | `seq 1 2000000` on the remote side, followed by a completion marker. The window is the whole fixed amount of work. |
 | `reconnect` | The relay drops all traffic for the window; the outage CPU and traffic are measured, and then recovery time. |
-| `retained` | Eight clients each start their own session (separate client homes) and leave with `Ctrl-] .`. The run checks that eight session processes remain under qshd, then measures qshd with no client attached. |
+| `retained` | Eight clients each start their own session (separate client homes) and leave with `Ctrl-] .`. The run checks that eight sessions remain under qshd -- eight session processes, or a hosted daemon's eight owners -- then measures qshd with no client attached. |
 | `busy` | One typing session as in `typing`, beside four other sessions (`--busy-sessions`) that each redraw their full screen at 20 frames per second, all through the same qshd. The window covers the keys. Only the echo is measured: with several clients behind the relay, the next client datagram need not be the typing client's. A run in which any key lacks its echo fails. With many sessions the harness itself, one Python process relaying every datagram, can delay echoes; compare `harness_cpu_s` with the run's length before attributing a latency tail to qshd. |
 
 Each run settles for 2 seconds after connecting before its window starts.
@@ -182,6 +199,8 @@ Retained runs also record `qshd_rss_without_sessions_kib` before the first
 client and `qshd_rss_samples_kib` after detach and settling, including when
 N is zero. These are `/proc` `VmRSS` readings for the async runtime process:
 the personal daemon or system worker, not the helper or whole process tree.
+For a hosted Linux daemon that is its host, which holds no session: read
+the window's `qshd_tree` PSS for its sessions' memory.
 The samples follow a nominal one-second schedule; delayed reads can catch up,
 and the array has no individual timestamps. Missing readings remain null.
 Neither the sampled maximum nor `VmRSS` is an exact live-memory peak. Compare
