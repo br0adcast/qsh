@@ -1758,7 +1758,7 @@ fn ask_status_with(
 /// does not survive `fork`, so everything async only happens after
 /// `detach::detach()`), prints `TRANSPORT-READY` in the parent, and
 /// daemonizes. From here on only the detached daemon runs --
-/// [`transport_daemon::run_transport_daemon`].
+/// [`transport_daemon::run_transport_daemon_until_stop`].
 ///
 /// The transport listens on EXACTLY ONE port (`parsed.port`): the new
 /// transport roams natively by changing the source address on a single

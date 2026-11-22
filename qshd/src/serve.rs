@@ -89,7 +89,8 @@ fn home() -> Result<PathBuf> {
 }
 
 /// Parse `serve`'s arguments (the first element is the subcommand itself).
-pub fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
+#[cfg(test)]
+fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
     parse_serve_args_os(&args.iter().map(OsString::from).collect::<Vec<_>>())
 }
 
@@ -424,10 +425,7 @@ fn refuse_without_pam_service(pam_d: &Path, service: &str) -> anyhow::Result<()>
 /// there is nothing to daemonize here (`transport-ensure` forks because an
 /// SSH login must return; `serve` is started by systemd or launchd, which
 /// expect to keep the process).
-pub fn run_serve_command(args: &[String]) -> Result<()> {
-    run_serve_command_os(&args.iter().map(OsString::from).collect::<Vec<_>>())
-}
-
+///
 /// OS-aware entrypoint; parsing still precedes all startup side effects.
 pub fn run_serve_command_os(args: &[OsString]) -> Result<()> {
     let parsed = parse_serve_args_os(args)?;

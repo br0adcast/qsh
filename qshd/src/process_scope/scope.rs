@@ -26,6 +26,7 @@ pub enum Progress {
     Unknown,
     Complete(i32),
 }
+#[cfg(any(feature = "system", test))]
 /// Read-only reservation fact; observing this never performs a native lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReservedRoot {
@@ -63,6 +64,7 @@ pub struct Scope<C> {
     custody_lost: bool,
 }
 impl<C: ChildCustody> Scope<C> {
+    #[cfg(any(feature = "system", test))]
     pub(crate) fn reserved_root(&self) -> ReservedRoot {
         if self.completed.is_some() {
             ReservedRoot::Released
@@ -86,6 +88,7 @@ impl<C: ChildCustody> Scope<C> {
             custody_lost: false,
         }
     }
+    #[cfg(feature = "system")]
     /// Transfer the same reserved child and retained exact handles after its
     /// private startup pipe has authenticated successful setsid.
     pub(super) fn from_reserved(
@@ -141,6 +144,7 @@ impl<C: ChildCustody> Scope<C> {
     pub fn escalate(&mut self) {
         self.phase = Phase::Kill;
     }
+    #[cfg(any(feature = "system", test))]
     /// Advance exact discovery/signals while reserving the leader for an
     /// external private-receipt drain. Already-latched completion is unchanged;
     /// this method never performs a new consuming wait.

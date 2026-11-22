@@ -126,7 +126,8 @@ struct VersionProbe {
 }
 
 /// Read a handover back from its unnamed file, closing it.
-pub fn read_handover(fd: OwnedFd) -> Result<Handover> {
+#[cfg(test)]
+pub(crate) fn read_handover(fd: OwnedFd) -> Result<Handover> {
     read_description(&mut File::from(fd))
 }
 
@@ -321,7 +322,8 @@ pub(crate) fn mark_close_on_exec(
 /// [`HANDOVER_FD_ENV`]. Returns only on failure. The caller clears
 /// close-on-exec on the handed-over descriptors right before this and puts
 /// it back if this returns.
-pub fn exec_staged(staged: &Path, handover_fd: RawFd) -> Errno {
+#[cfg(test)]
+fn exec_staged(staged: &Path, handover_fd: RawFd) -> Errno {
     let (path, argv, env) = match exec_arguments(staged, handover_fd) {
         Ok(args) => args,
         Err(e) => return e,
@@ -395,6 +397,7 @@ pub(crate) fn exec_guarded_with_retries(
 /// Call `exec` (which returns only its error) up to `attempts` times,
 /// `pause` apart, for as long as it answers `ETXTBSY`; return the first
 /// other answer, or `ETXTBSY` after the last attempt.
+#[cfg(test)]
 pub(crate) fn exec_with_retries(
     mut exec: impl FnMut() -> Errno,
     attempts: u32,

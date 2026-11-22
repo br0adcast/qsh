@@ -89,10 +89,7 @@ fn test_label_override() -> Option<u64> {
 }
 
 /// `sum=label` entries, comma-separated; a malformed entry is skipped.
-#[cfg_attr(
-    not(any(debug_assertions, feature = "test-build-labels")),
-    allow(dead_code)
-)]
+#[cfg(any(debug_assertions, feature = "test-build-labels"))]
 fn parse_label_overrides(spec: &str) -> Vec<(String, u64)> {
     spec.split(',')
         .filter_map(|entry| {
@@ -152,10 +149,7 @@ pub fn image_fault() -> Option<ImageFault> {
 /// An unset or empty `spec` names none, and nothing is hashed for it: every
 /// test daemon is given the variable, mostly empty, and a frontend asks on
 /// its way to `Ready`.
-#[cfg_attr(
-    not(any(debug_assertions, feature = "test-build-labels")),
-    allow(dead_code)
-)]
+#[cfg(any(debug_assertions, feature = "test-build-labels"))]
 fn image_fault_in(
     spec: Option<String>,
     own: impl FnOnce() -> Option<String>,
@@ -164,19 +158,13 @@ fn image_fault_in(
     fault_for(&own()?, &parse_image_faults(&spec))
 }
 
-#[cfg_attr(
-    not(any(debug_assertions, feature = "test-build-labels")),
-    allow(dead_code)
-)]
+#[cfg(any(debug_assertions, feature = "test-build-labels"))]
 fn fault_for(sum: &str, faults: &[(String, ImageFault)]) -> Option<ImageFault> {
     faults.iter().find(|(s, _)| s == sum).map(|(_, f)| *f)
 }
 
 /// `sum=fault` entries, comma-separated; a malformed entry is skipped.
-#[cfg_attr(
-    not(any(debug_assertions, feature = "test-build-labels")),
-    allow(dead_code)
-)]
+#[cfg(any(debug_assertions, feature = "test-build-labels"))]
 fn parse_image_faults(spec: &str) -> Vec<(String, ImageFault)> {
     spec.split(',')
         .filter_map(|entry| {
@@ -666,6 +654,7 @@ mod tests {
         assert_eq!((own.dev(), own.ino()), (launched.dev(), launched.ino()));
     }
 
+    #[cfg(any(debug_assertions, feature = "test-build-labels"))]
     #[test]
     fn label_overrides_are_read_entry_by_entry() {
         assert_eq!(
@@ -730,6 +719,7 @@ mod tests {
         assert!(check.session_profiles.is_empty());
     }
 
+    #[cfg(any(debug_assertions, feature = "test-build-labels"))]
     #[test]
     fn image_faults_parse_and_apply_only_to_the_named_checksum() {
         use super::ImageFault::*;
@@ -751,6 +741,7 @@ mod tests {
         assert_eq!(super::fault_for("zz", &parsed), None);
     }
 
+    #[cfg(any(debug_assertions, feature = "test-build-labels"))]
     #[test]
     fn an_unset_or_empty_fault_spec_hashes_nothing() {
         use super::ImageFault::*;

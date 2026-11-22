@@ -37,16 +37,16 @@ pub enum WaitRegistration {
 pub struct TimelineBudget {
     inner: BudgetRef,
 }
-#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
 #[derive(Clone)]
 enum BudgetRef {
     Local(Arc<BudgetInner>),
+    #[cfg(feature = "tokio-driver")]
     /// A frontend's view of a budget its session owner holds: it admits
     /// nothing, and the owner applies the coalescing latch.
     Remote(Arc<dyn RemoteTimeline>),
 }
 
-#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+#[cfg(feature = "tokio-driver")]
 /// What a retained bridge item became (see [`TimelinePermit::retained`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Retention {
@@ -56,9 +56,9 @@ pub(crate) enum Retention {
     Gap,
 }
 
+#[cfg(feature = "tokio-driver")]
 /// The frontend end of one stream instance's timeline budget, owned by the
 /// session owner process. Reports go to the owner in order.
-#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
 pub(crate) trait RemoteTimeline: Send + Sync {
     /// Bridge progress for `instance` under `generation` (the owner's latch
     /// decides whether the producer hears `OutputReady`).
@@ -69,9 +69,9 @@ pub(crate) trait RemoteTimeline: Send + Sync {
     fn unconfirmed(&self, instance: ChannelInstance, unconfirmed: bool);
 }
 
+#[cfg(feature = "tokio-driver")]
 /// One permit the session owner holds for a frontend: dropping this releases
 /// the owner's real permit.
-#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
 pub(crate) trait RemotePermit: Send + Sync {
     fn retained(&self, retention: Retention);
 }
@@ -119,17 +119,17 @@ impl BudgetState {
 pub struct TimelinePermit {
     inner: PermitRef,
 }
-#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
 enum PermitRef {
     Local {
         inner: Arc<BudgetInner>,
         class: EntryClass,
         bytes: usize,
     },
+    #[cfg(feature = "tokio-driver")]
     /// Boxed: queued records carry permits, and their wrappers stay small.
     Remote(Box<RemoteParts>),
 }
-#[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+#[cfg(feature = "tokio-driver")]
 struct RemoteParts {
     token: Box<dyn RemotePermit>,
     budget: Arc<dyn RemoteTimeline>,
@@ -164,11 +164,12 @@ impl TimelineBudget {
     fn local(&self) -> Option<&Arc<BudgetInner>> {
         match &self.inner {
             BudgetRef::Local(inner) => Some(inner),
+            #[cfg(feature = "tokio-driver")]
             BudgetRef::Remote(_) => None,
         }
     }
 
-    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    #[cfg(feature = "tokio-driver")]
     /// Report the stream's admitted geometry frontier to a remote owner.
     pub(crate) fn report_frontier(&self, geometry: crate::channel_geometry::GeometryRecord) {
         if let BudgetRef::Remote(remote) = &self.inner {
@@ -176,7 +177,7 @@ impl TimelineBudget {
         }
     }
 
-    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    #[cfg(feature = "tokio-driver")]
     /// Report whether admitted output is unacknowledged to a remote owner.
     pub(crate) fn report_unconfirmed(&self, instance: ChannelInstance, unconfirmed: bool) {
         if let BudgetRef::Remote(remote) = &self.inner {
@@ -245,6 +246,7 @@ impl TimelineBudget {
     }
 
     /// Coalesce bridge progress with the same latch as permit availability.
+    #[cfg(feature = "tokio-driver")]
     /// The bridge delivers the scoped OutputReady event; no second event queue.
     pub(crate) fn mark_output_ready(&self, instance: ChannelInstance, generation: u64) -> bool {
         let inner = match &self.inner {
@@ -326,12 +328,13 @@ impl TimelinePermit {
         TimelineBudget {
             inner: match &self.inner {
                 PermitRef::Local { inner, .. } => BudgetRef::Local(inner.clone()),
+                #[cfg(feature = "tokio-driver")]
                 PermitRef::Remote(parts) => BudgetRef::Remote(parts.budget.clone()),
             },
         }
     }
 
-    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    #[cfg(feature = "tokio-driver")]
     /// A permit a session owner holds; dropping this releases it there.
     pub(crate) fn remote(token: Box<dyn RemotePermit>, budget: Arc<dyn RemoteTimeline>) -> Self {
         Self {
@@ -339,7 +342,7 @@ impl TimelinePermit {
         }
     }
 
-    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    #[cfg(feature = "tokio-driver")]
     /// The bridge keeps this permit's item past its admission (a delivered
     /// marker or a terminal gap). Only a remote owner needs to hear it.
     pub(crate) fn retained(&self, retention: Retention) {
@@ -352,15 +355,15 @@ impl TimelinePermit {
 impl Drop for TimelinePermit {
     fn drop(&mut self) {
         // A remote permit's token releases the owner's permit on its own drop.
-        let PermitRef::Local {
-            inner,
-            class,
-            bytes,
-        } = &self.inner
-        else {
-            return;
+        let (inner, class, bytes) = match &self.inner {
+            PermitRef::Local {
+                inner,
+                class,
+                bytes,
+            } => (inner, *class, *bytes),
+            #[cfg(feature = "tokio-driver")]
+            PermitRef::Remote(_) => return,
         };
-        let (inner, class, bytes) = (inner, *class, *bytes);
         let notify = {
             let mut state = inner.state.lock().expect("timeline budget");
             let usage = state.usage_mut(class);

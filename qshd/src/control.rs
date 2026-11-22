@@ -3,8 +3,8 @@
 //! client ([`client_request`]). The async server for this protocol is
 //! separate per daemon path (there used to be a `serve_control` for the
 //! qsh path, removed along with `quic.rs`/`ports.rs` when the daemon moved
-//! to the new transport; the new transport has
-//! [`crate::transport_daemon::serve_transport_control`]), so only the
+//! to the new transport; the new transport serves it in
+//! `transport_daemon`), so only the
 //! shared types/codec/client remain here.
 //!
 //! **Incident notes ([`ControlReply`]):** the `STATUS` handler used to

@@ -10,8 +10,8 @@
 //!   become), synchronous socket binding, and printing `TRANSPORT-READY`,
 //!   then `daemonize::start()`;
 //! - this module (daemon, AFTER the fork) -- the daemon body
-//!   [`run_transport_daemon`]: hands the already-bound sockets over to
-//!   tokio, brings up the control server ([`serve_transport_control`]) and
+//!   [`run_transport_daemon_until_stop`]: hands the already-bound sockets over to
+//!   tokio, brings up the control server (its accept loop in `run_daemon`) and
 //!   the multi-session router (`transport::SessionManager::serve`, driving a
 //!   per-session [`crate::channel_backend::ChannelSessionBackend`]) in a
 //!   single runtime, and lives until the router exits or a `STOP` arrives.
@@ -35,8 +35,8 @@
 //! scrubbed off the shared set when it ends (a self-cleaning allowlist)
 //! -- no snapshot-at-startup limitation remains.
 //!
-//! [`run_serve_loop`] is the OTHER entry point into this module, used by the
-//! `serve` command (`serve.rs`) instead of [`run_transport_daemon`]: just the
+//! [`run_serve_loop_until_stop`] is the OTHER entry point into this module, used by the
+//! `serve` command (`serve.rs`) instead of [`run_transport_daemon_until_stop`]: just the
 //! router on one socket, no control socket, no `daemonize`, no version
 //! negotiation -- `serve` is not self-installing, so none of that applies.
 
@@ -323,35 +323,7 @@ fn status_of(
 /// -- the tokio runtime does not survive `fork`, so both the socket and the
 /// listener are bound with the std API before the fork, and "adopted" into
 /// tokio here.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_transport_daemon(
-    socket: std::net::UdpSocket,
-    server_priv: [u8; 32],
-    auth: ServerAuth,
-    backend: Arc<dyn SessionBackend>,
-    listener: std::os::unix::net::UnixListener,
-    _cleanup: control::SocketCleanup,
-    ports: Vec<u16>,
-    active_count: Arc<AtomicUsize>,
-    control_gate: Arc<tokio::sync::RwLock<()>>,
-    cleanup_registry: Option<Arc<ChannelOpenRegistry>>,
-) -> Result<()> {
-    run_transport_daemon_until_stop(
-        socket,
-        server_priv,
-        auth,
-        backend,
-        listener,
-        _cleanup,
-        ports,
-        active_count,
-        control_gate,
-        cleanup_registry,
-        std::future::pending(),
-    )
-    .await
-}
-
+///
 /// The executable owns its signal streams until this joined boundary returns.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_transport_daemon_until_stop(
@@ -909,24 +881,6 @@ async fn run_daemon(
 /// it has forgotten, and the router ends that login's session (see
 /// `transport::LoginEndedReporter`). The personal mode has no helper to hear
 /// it from and passes [`LoginEndedReports::none()`].
-pub async fn run_serve_loop(
-    socket: std::net::UdpSocket,
-    server_priv: [u8; 32],
-    auth: ServerAuth,
-    backend: Arc<dyn SessionBackend>,
-    login_ends: LoginEndedReports,
-) -> Result<()> {
-    run_serve_loop_until_stop(
-        socket,
-        server_priv,
-        auth,
-        backend,
-        login_ends,
-        std::future::pending(),
-    )
-    .await
-}
-
 pub(crate) async fn run_serve_loop_until_stop(
     socket: std::net::UdpSocket,
     server_priv: [u8; 32],
@@ -1040,7 +994,8 @@ pub(crate) async fn run_serve_loop_until_shutdown(
 /// (`STATUS`/`ADD-CLIENT`/`STOP`). A given connection's error is not
 /// propagated outward -- it is logged and the loop continues, so one bad
 /// connection doesn't take down the whole control socket.
-pub async fn serve_transport_control(
+#[cfg(test)]
+async fn serve_transport_control(
     listener: tokio::net::UnixListener,
     shared_allowlist: impl Into<ControlAllowlist>,
     ports: Vec<u16>,

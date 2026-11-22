@@ -102,6 +102,7 @@ impl WorkerOwner {
     ) -> Result<worker_control::Sent, Fault> {
         pending.send(&self.seam)
     }
+    #[cfg(test)]
     pub(super) fn leader(&mut self) -> LeaderStatus {
         self.child.leader()
     }

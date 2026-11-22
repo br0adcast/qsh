@@ -335,6 +335,7 @@ pub enum SendBlocked {
 // One current owner/frontier and one coalesced loss flag per u8 stream.
 // Reuse replaces the owner; repeated discards cannot erase an earlier loss.
 struct TrackedChannelOutput {
+    #[cfg(any(feature = "tokio-driver", test))]
     instance: crate::channel_geometry::ChannelInstance,
     continuity_end: u64,
     lost: bool,
@@ -1512,6 +1513,7 @@ impl Connection {
         Vec::new()
     }
 
+    #[cfg(any(feature = "tokio-driver", test))]
     /// Register the current typed owner without carrying a predecessor's loss.
     pub(crate) fn declare_channel_output(
         &mut self,
@@ -1534,6 +1536,7 @@ impl Connection {
         }
     }
 
+    #[cfg(any(feature = "tokio-driver", test))]
     /// Called after successful DATA admission or a warning disclosing prior DATA loss.
     pub(crate) fn track_channel_continuity_end(
         &mut self,
@@ -1545,6 +1548,7 @@ impl Connection {
         self.channel_output.get_mut(&stream).unwrap().continuity_end = continuity_end;
     }
 
+    #[cfg(any(feature = "tokio-driver", test))]
     /// Coalesced DATA loss or an unconfirmed warning about earlier DATA loss,
     /// classified against ACK state at discard time.
     /// Taking observations clears flags, never the current continuity frontier.
@@ -1559,6 +1563,7 @@ impl Connection {
             .collect()
     }
 
+    #[cfg(any(feature = "tokio-driver", test))]
     /// The model has ended: this stream can no longer regenerate a snapshot.
     /// If a discard already happened, arm its existing Reset exactly once.
     pub(crate) fn retain_stream_output(&mut self, stream: u8) -> bool {
@@ -1803,6 +1808,7 @@ impl Connection {
         self.flush_senders(now, out);
     }
 
+    #[cfg(any(feature = "tokio-driver", test))]
     /// Consume a whole source Vec after copying into the reliable sender. A
     /// blocked record is returned unchanged. Callers account source scratch and
     /// reliable bytes independently while both exist; this is not zero-copy.
@@ -3583,7 +3589,7 @@ impl Connection {
         self.flush_calls_for_test
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tokio-driver"))]
     pub(crate) fn last_flush_state_for_test(&self) -> Option<LinkState> {
         self.last_flush_state_for_test
     }
@@ -3910,7 +3916,7 @@ impl Connection {
     }
 
     /// Select the ordered profile explicitly in generic transport fixtures.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tokio-driver"))]
     pub(crate) fn enable_geometry_for_test(&mut self) {
         self.apply_features(self.features | Features::CHANNEL_GEOMETRY);
     }
