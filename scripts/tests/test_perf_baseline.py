@@ -82,6 +82,81 @@ class ProcAccountingTests(unittest.TestCase):
         self.assertGreater(state['peak_rss_kib'], 0)
 
 
+def tree_entry(role, start, ticks, voluntary=0, involuntary=0, pss=None):
+    return {'role': role, 'start_ticks': start, 'cpu_ticks': ticks, 'voluntary': voluntary,
+            'involuntary': involuntary, 'pss_kib': pss}
+
+
+class ProcessTreeTests(unittest.TestCase):
+    """A hosted Linux daemon works in its children: account the whole tree."""
+
+    def test_roles_come_from_the_hidden_role_argument(self):
+        role = perf.process_role
+        self.assertEqual(role(10, 10, ['qshd', 'serve', '--port', '1'], True), 'daemon')
+        self.assertEqual(role(11, 10, ['qshd', '__qshd-frontend-v1'], True), 'frontend')
+        self.assertEqual(role(12, 10, ['qshd', '__qshd-session-owner-v1'], True), 'owner')
+        # A replaced frontend runs another image; its role still names it.
+        self.assertEqual(role(13, 10, ['qshd', '__qshd-frontend-v1'], False), 'frontend')
+        self.assertEqual(role(14, 10, ['qshd', 'worker'], True), 'qshd')
+        self.assertEqual(role(15, 10, ['/bin/sh'], False), 'session')
+        # A shell cannot claim a role by naming it later in its arguments.
+        self.assertEqual(role(16, 10, ['/bin/sh', '-c', '__qshd-session-owner-v1'], False), 'session')
+
+    def test_tree_delta_sums_roles_and_records_processes_that_came_and_went(self):
+        ticks = perf.CLOCK_TICKS
+        before = {1: tree_entry('daemon', 1, 100, 10, 1, 900), 2: tree_entry('frontend', 2, 50, 20),
+                  3: tree_entry('owner', 3, 10, 5), 4: tree_entry('session', 4, 0)}
+        after = {1: tree_entry('daemon', 1, 100 + ticks, 30, 2, 1000),
+                 2: tree_entry('frontend', 2, 50 + 2 * ticks, 60, 0, 3000),
+                 # Owner 3 exited; owner 5 started within the window.
+                 5: tree_entry('owner', 9, ticks // 2, 7, 1, 2000),
+                 4: tree_entry('session', 4, 5 * ticks)}
+        delta = perf.tree_delta(before, after, 10)
+        roles = delta['roles']
+        self.assertEqual(roles['daemon']['cpu_s'], 1)
+        self.assertEqual(roles['daemon']['voluntary_switches_per_s'], 2)
+        self.assertEqual(roles['frontend']['cpu_s'], 2)
+        self.assertEqual(roles['frontend']['pss_kib'], 3000)
+        owner = roles['owner']
+        self.assertEqual((owner['processes_start'], owner['processes_end']), (1, 1))
+        self.assertEqual((owner['started'], owner['exited']), (1, 1))
+        # A process that started in the window counts all its CPU; one
+        # that exited takes its last window's CPU with it.
+        self.assertEqual(owner['cpu_s'], 0.5)
+        self.assertEqual(roles['session']['cpu_s'], 5)
+        total = delta['daemon_total']
+        self.assertEqual(total['cpu_s'], 3.5)
+        self.assertEqual(total['cpu_percent'], 35)
+        self.assertEqual(total['pss_kib'], 6000)
+        self.assertFalse(total['complete'])
+        self.assertTrue(perf.tree_delta(before, before, 10)['daemon_total']['complete'])
+
+    def test_a_reused_pid_is_a_process_that_exited_and_one_that_started(self):
+        before = {7: tree_entry('owner', 3, 100)}
+        after = {7: tree_entry('owner', 8, 20)}
+        owner = perf.tree_delta(before, after, 1)['roles']['owner']
+        self.assertEqual((owner['started'], owner['exited']), (1, 1))
+        self.assertEqual(owner['cpu_s'], round(20 / perf.CLOCK_TICKS, 3))
+
+    def test_live_tree_names_this_process_and_its_child(self):
+        child = subprocess.Popen(['sleep', '30'])
+        try:
+            tree = perf.sample_tree(os.getpid(), Path('/nonexistent/qshd'))
+            self.assertEqual(tree[os.getpid()]['role'], 'daemon')
+            self.assertEqual(tree[child.pid]['role'], 'session')
+            self.assertGreater(tree[os.getpid()]['start_ticks'], 0)
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_a_hosted_daemon_counts_its_sessions_by_owner(self):
+        children = [(11, 1), (12, 2), (13, 3)]
+        hosted = {11: 'frontend', 12: 'owner', 13: 'owner'}
+        self.assertEqual(perf.sessions_among(children, hosted), [(12, 2), (13, 3)])
+        single = {11: 'session', 12: 'session', 13: 'session'}
+        self.assertEqual(perf.sessions_among(children, single), children)
+
+
 class OrderingAndStatisticsTests(unittest.TestCase):
     def test_interleaved_order_alternates_which_build_runs_first(self):
         order = perf.schedule(['a', 'b'], ['idle', 'typing'], 3, 'interleaved', 1)

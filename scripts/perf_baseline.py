@@ -186,6 +186,137 @@ def process_delta(before, after, seconds):
     }
 
 
+# A hosted Linux personal daemon (#529) runs its router in a frontend and
+# each session's backend in an owner, both children of the process `serve`
+# started. Their hidden role is argv[1], whatever image they run.
+HIDDEN_ROLES = {"__qshd-frontend-v1": "frontend", "__qshd-session-owner-v1": "owner"}
+TREE_DAEMON_ROLES = ("daemon", "frontend", "owner", "qshd")
+
+
+def process_role(pid, root, argv, runs_qshd):
+    """`daemon` for the process `serve` started, `frontend`/`owner` by
+    their hidden role argument, `qshd` for any other process of the build's
+    image (the system mode's worker), `session` for everything else."""
+    if pid == root:
+        return "daemon"
+    if len(argv) > 1 and argv[1] in HIDDEN_ROLES:
+        return HIDDEN_ROLES[argv[1]]
+    return "qshd" if runs_qshd else "session"
+
+
+def descendants(root):
+    """`root` and every process below it, from one scan of /proc."""
+    children = collections.defaultdict(list)
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                children[parse_stat(read(f"/proc/{entry}/stat"))["ppid"]].append(int(entry))
+            except (OSError, ValueError, IndexError):
+                continue
+    found, pending = [], [root]
+    while pending:
+        pid = pending.pop()
+        found.append(pid)
+        pending.extend(children.get(pid, ()))
+    return found
+
+
+def runs_image(pid, image):
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return False
+    return os.path.realpath(exe.removesuffix(" (deleted)")) == os.path.realpath(image)
+
+
+def proportional_set_kib(pid):
+    """Pss from smaps_rollup: a process's share of pages it shares with others,
+    such as the image every owner maps. None when it cannot be read."""
+    try:
+        for line in read(f"/proc/{pid}/smaps_rollup").splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def sample_tree(root, qshd):
+    """Per process of root's tree: role, start, CPU and context switches over
+    its live threads, and PSS."""
+    tree = {}
+    for pid in descendants(root):
+        try:
+            stat = parse_stat(read(f"/proc/{pid}/stat"))
+            argv = read(f"/proc/{pid}/cmdline").split("\0")
+            voluntary = involuntary = 0
+            for tid in os.listdir(f"/proc/{pid}/task"):
+                try:
+                    switches = parse_switches(read(f"/proc/{pid}/task/{tid}/status"))
+                except OSError:
+                    continue
+                voluntary += switches[0]
+                involuntary += switches[1]
+        except (OSError, ValueError, IndexError):
+            continue  # gone between the scan and the read
+        tree[pid] = {"role": process_role(pid, root, argv, runs_image(pid, qshd)),
+                     "start_ticks": stat["start_ticks"], "cpu_ticks": stat["cpu_ticks"],
+                     "voluntary": voluntary, "involuntary": involuntary,
+                     "pss_kib": proportional_set_kib(pid)}
+    return tree
+
+
+def tree_delta(before, after, seconds):
+    """Window counters per role and for the daemon's own processes together.
+
+    A process that started in the window counts all its CPU; one that exited
+    is counted as exited and takes its last stretch of CPU with it, so a
+    total with any exit is marked incomplete. A reused pid is both."""
+    roles = {}
+
+    def role(name):
+        return roles.setdefault(name, {"processes_start": 0, "processes_end": 0, "started": 0, "exited": 0,
+                                       "cpu_ticks": 0, "voluntary": 0, "involuntary": 0, "pss_kib": 0})
+
+    for pid, entry in before.items():
+        role(entry["role"])["processes_start"] += 1
+        later = after.get(pid)
+        if later is None or later["start_ticks"] != entry["start_ticks"]:
+            role(entry["role"])["exited"] += 1
+    for pid, entry in after.items():
+        counts = role(entry["role"])
+        counts["processes_end"] += 1
+        counts["pss_kib"] += entry["pss_kib"] or 0
+        earlier = before.get(pid)
+        if earlier is None or earlier["start_ticks"] != entry["start_ticks"]:
+            counts["started"] += 1
+            earlier = {"cpu_ticks": 0, "voluntary": 0, "involuntary": 0}
+        for key in ("cpu_ticks", "voluntary", "involuntary"):
+            counts[key] += entry[key] - earlier[key]
+
+    def finish(counts):
+        cpu_s = counts.pop("cpu_ticks") / CLOCK_TICKS
+        counts["cpu_s"] = round(cpu_s, 3)
+        counts["cpu_percent"] = round(100 * cpu_s / seconds, 3)
+        counts["voluntary_switches_per_s"] = round(counts.pop("voluntary") / seconds, 2)
+        counts["involuntary_switches_per_s"] = round(counts.pop("involuntary") / seconds, 2)
+        return counts
+
+    daemon = [roles[name] for name in TREE_DAEMON_ROLES if name in roles]
+    total = {key: sum(counts[key] for counts in daemon)
+             for key in ("cpu_ticks", "voluntary", "involuntary", "pss_kib", "processes_end", "exited")}
+    total["complete"] = total.pop("exited") == 0
+    return {"daemon_total": finish(total), "roles": {name: finish(counts) for name, counts in roles.items()}}
+
+
+def sessions_among(children, roles):
+    """A hosted daemon's sessions are its owners; a single-process daemon's
+    are its children."""
+    if any(roles.get(pid) in ("frontend", "owner") for pid, _ in children):
+        return [child for child in children if roles.get(child[0]) == "owner"]
+    return children
+
+
 # --- Builds and host identity ----------------------------------------------
 
 def elf_identity(path):
@@ -981,7 +1112,9 @@ class Rig:
         return found[0] if found else None
 
     def session_processes(self):
-        return [child for child in children_of(self.daemon.pid) if child[0] != self.worker]
+        children = [child for child in children_of(self.daemon.pid) if child[0] != self.worker]
+        tree = sample_tree(self.daemon.pid, self.build / "qshd")
+        return sessions_among(children, {pid: entry["role"] for pid, entry in tree.items()})
 
     def daemon_identity(self, deadline):
         """The CPUs the running qshd may use and the runtime workers its log
@@ -1048,6 +1181,7 @@ class Rig:
 
     def snapshot(self, client=None):
         state = {"t": time.monotonic(), "qshd": sample_process(self.runtime_pid()), "relay": self.relay.snapshot()}
+        state["qshd_tree"] = sample_tree(self.daemon.pid, self.build / "qshd")
         if self.system:
             # The privileged helper: sessions, PAM and verdicts.
             state["qshd_helper"] = sample_process(self.daemon.pid)
@@ -1084,6 +1218,8 @@ def window(before, after):
     result = {"seconds": round(seconds, 3), "qshd": process_delta(before["qshd"], after["qshd"], seconds)}
     if "qshd_helper" in before:
         result["qshd_helper"] = process_delta(before["qshd_helper"], after["qshd_helper"], seconds)
+    if "qshd_tree" in before:
+        result["qshd_tree"] = tree_delta(before["qshd_tree"], after["qshd_tree"], seconds)
     relay = {key: after["relay"][key] - before["relay"][key] for key in before["relay"]}
     relay.update({f"{key}_per_s": round(value / seconds, 2) for key, value in list(relay.items())})
     result["relay"] = relay
