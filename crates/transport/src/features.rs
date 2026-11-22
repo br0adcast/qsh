@@ -36,9 +36,8 @@ impl Features {
     pub const CHANNEL_GEOMETRY: Features = Features(1 << 4);
     /// Bit 5: authenticated resource-limit aborts and explicit control failures.
     pub const RESOURCE_LIMITS: Features = Features(1 << 5);
-    /// Bit 6 is reserved for retained-session contracts. Runtime support is not
-    /// implemented yet, so this bit is deliberately excluded from SUPPORTED.
-    pub const SESSION_RESUME: Features = Features(1 << 6);
+    // Bit 6 was reserved for a retained-session design that was never
+    // implemented (#658). It is retired: never assign it to anything else.
     /// Bit 7: msg2 gives the client a token, and a daemon that no longer
     /// routes the connection says so with a `SessionReset` datagram carrying
     /// it (`crate::session_reset`). A server enables it only when it holds a
@@ -57,14 +56,13 @@ impl Features {
     );
 
     /// The names the logs and `qshd self-check` use, bit by bit.
-    const NAMES: [(Features, &'static str); 8] = [
+    const NAMES: [(Features, &'static str); 7] = [
         (Features::HEADER_AAD, "header-aad"),
         (Features::STREAM_CREDIT, "stream-credit"),
         (Features::OFFSET_WRAP, "offset-wrap"),
         (Features::AUTH_ACCEPTED, "auth-accepted"),
         (Features::CHANNEL_GEOMETRY, "channel-geometry"),
         (Features::RESOURCE_LIMITS, "resource-limits"),
-        (Features::SESSION_RESUME, "session-resume"),
         (Features::SESSION_RESET, "session-reset"),
     ];
 
@@ -151,9 +149,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_resume_reservation_is_named_but_never_advertised_or_negotiated() {
+    fn the_retired_bit_6_is_never_advertised_or_negotiated() {
         let reserved = Features::from_bits(0x40);
-        assert_eq!(reserved.names(), vec!["session-resume"]);
+        assert!(reserved.names().is_empty(), "{:?}", reserved.names());
         assert_eq!(Features::SUPPORTED.bits(), 0xbf);
         assert!(!Features::SUPPORTED.contains(reserved));
         assert_eq!(Features::negotiate(reserved, reserved), Features::NONE);

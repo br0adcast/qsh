@@ -70,10 +70,6 @@
 //! `monitor::fork_shell`'s docs. None of the calls is `std::env::set_var`, which this module
 //! deliberately avoids there -- see [`child_env`]'s docs.
 
-#[cfg(target_os = "linux")]
-#[allow(dead_code)] // No production durable monitor binding exists yet.
-pub(crate) mod durable_owner;
-
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -103,25 +99,12 @@ use super::protocol::{
     MonitorEvent, MonitorRequest, Nonce, Request, Response,
 };
 
-// Dormant internal adapter: fork entrypoints stay private to this existing
-// single-threaded server context. This exports sealed result types, not a new
-// runtime endpoint or a callable fork API for arbitrary worker threads.
-#[path = "policy_check.rs"]
-#[allow(dead_code)]
-pub(crate) mod policy_check;
-
-#[path = "local_auth_dispatch.rs"]
-#[allow(dead_code)] // Dormant proof driver; no runtime route is activated.
-mod local_auth_dispatch;
-
 pub(super) enum VerificationDestination {
     LegacyLogin {
         id: super::protocol::AuthRequestId,
         login_id: LoginId,
         rhost: String,
     },
-    #[cfg_attr(not(test), allow(dead_code))]
-    HostPolicy(Option<Box<policy_check::HostPolicyDestination>>),
 }
 
 enum VerificationWork<'a> {
@@ -132,8 +115,6 @@ enum VerificationWork<'a> {
         handshake_hash: &'a [u8; 32],
         nonce: &'a Nonce,
     },
-    #[cfg_attr(not(test), allow(dead_code))]
-    CurrentPolicy(&'a policy_check::SystemCredential),
 }
 
 /// How long the loop waits on the socket before looking for dead children.
@@ -639,10 +620,6 @@ struct LoopState {
     /// away never gets that far); or found already gone, because one of
     /// those three already claimed it.
     nonces: HashMap<Nonce, Instant>,
-    /// HostPolicy nonces are not spendable/releasable by the legacy worker seam.
-    /// Both destinations share MAX_OUTSTANDING_NONCES and the same expiry rule.
-    host_nonces: HashMap<Nonce, Instant>,
-    host_auth_tickets: Vec<local_auth_dispatch::HostTicket>,
     /// Accounts a `Request::Verify` has admitted, keyed by uid -- the
     /// account exactly as the verifying child resolved and approved it
     /// ([`verify_proof_after_nonce`]), carried back whole on its report
@@ -1226,8 +1203,6 @@ fn serve_inner(
         orphans: Vec::new(),
         closing: HashMap::new(),
         nonces: HashMap::new(),
-        host_nonces: HashMap::new(),
-        host_auth_tickets: Vec::new(),
         verified: admitted
             .values()
             .map(|account| (account.uid, account.clone()))
@@ -2265,7 +2240,7 @@ fn serve_auth_seam(
     match body {
         Request::Nonce => {
             let answer = match (!state.stopping && state.required_publication.is_none())
-                .then(|| issue_scoped_nonce(state, NonceDestination::LegacyLogin))
+                .then(|| issue_nonce(&mut state.nonces))
                 .flatten()
             {
                 Some(nonce) => Response::Nonce { nonce },
@@ -3506,7 +3481,6 @@ fn reap(sock: &UnixStream, state: &mut LoopState) {
     // this ever needs to -- this is what bounds the table for a nonce
     // nobody follows up on.
     sweep_expired_nonces(&mut state.nonces, now);
-    sweep_expired_nonces(&mut state.host_nonces, now);
 
     // And, on the same pass and the same timescale, logins that verified
     // and never became real: a `Request::LoginEnded` (see
@@ -3572,41 +3546,6 @@ fn log_failed_kill(result: nix::Result<()>, pid: Pid, what: &str) {
             ),
         ),
     }
-}
-
-// Independent nonce destinations share one bounded issuance budget.
-#[derive(Clone, Copy)]
-enum NonceDestination {
-    LegacyLogin,
-    #[cfg_attr(not(test), allow(dead_code))]
-    HostPolicy,
-}
-fn issue_scoped_nonce(state: &mut LoopState, destination: NonceDestination) -> Option<Nonce> {
-    if state.nonces.len().checked_add(state.host_nonces.len())? >= MAX_OUTSTANDING_NONCES {
-        return None;
-    }
-    for _ in 0..8 {
-        let nonce = match destination {
-            NonceDestination::LegacyLogin => issue_nonce(&mut state.nonces)?,
-            NonceDestination::HostPolicy => issue_nonce(&mut state.host_nonces)?,
-        };
-        let collision = match destination {
-            NonceDestination::LegacyLogin => state.host_nonces.contains_key(&nonce),
-            NonceDestination::HostPolicy => state.nonces.contains_key(&nonce),
-        };
-        if !collision {
-            return Some(nonce);
-        }
-        match destination {
-            NonceDestination::LegacyLogin => {
-                state.nonces.remove(&nonce);
-            }
-            NonceDestination::HostPolicy => {
-                state.host_nonces.remove(&nonce);
-            }
-        }
-    }
-    None
 }
 
 /// Mint a fresh, single-use nonce and remember when it was issued, or
@@ -4370,9 +4309,6 @@ fn fork_verification_work(
                         switches,
                         verifier_parent,
                     ),
-                    VerificationWork::CurrentPolicy(credential) => {
-                        credential.check_current(config, switches, verifier_parent)
-                    }
                 };
                 let verdict = match checked {
                     Ok((account, identity, algorithm)) => Verdict::Admitted {
@@ -5260,16 +5196,6 @@ fn publish_verification_destination(
             verdict,
             why,
         ),
-        VerificationDestination::HostPolicy(destination) => {
-            if let Some(destination) = destination.take() {
-                let verdict = if state.stopping || state.required_publication.is_some() {
-                    None
-                } else {
-                    verdict
-                };
-                destination.publish(verdict);
-            }
-        }
     }
 }
 
@@ -8425,8 +8351,6 @@ pub(crate) mod tests {
             orphans: Vec::new(),
             closing: HashMap::new(),
             nonces: HashMap::new(),
-            host_nonces: HashMap::new(),
-            host_auth_tickets: Vec::new(),
             verified: HashMap::from([(account.uid, account.clone())]),
             logins,
             monitors: HashMap::new(),
@@ -8496,8 +8420,6 @@ pub(crate) mod tests {
             orphans: Vec::new(),
             closing: HashMap::new(),
             nonces: HashMap::new(),
-            host_nonces: HashMap::new(),
-            host_auth_tickets: Vec::new(),
             verified: HashMap::new(),
             logins: HashMap::new(),
             monitors: HashMap::new(),
@@ -18009,8 +17931,6 @@ pub(crate) mod tests {
             "a startup verdict must not release the slot before a cleanup receipt"
         );
     }
-    include!("server_policy_tests.rs");
-    include!("local_auth_dispatch_tests.rs");
     include!("server_open_tests.rs");
     include!("server_account_binding_tests.rs");
     include!("monitor_native_integration_tests.rs");

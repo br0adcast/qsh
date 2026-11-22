@@ -76,6 +76,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Removed
 
+- Remove the dormant retained-session design that #529 set aside: the
+  `session_owner` engine, host catalog, inherited frontend launch and local
+  owner channel, `transport::session_resume`, and the system helper's unused
+  host-policy and authentication-dispatch drivers, about 21,000 lines of code
+  and 25,000 of tests. Nothing that runs changes. Feature bit 6, once reserved
+  for `session-resume`, is retired and never offered.
 - Withdraw `0.6.0-rc1` and delete its release and tag: SemVer orders it above
   every `0.6.0-rc.N`. Remove any cached `~/.cache/qsh/qshd-0.6.0-rc1-*` daemon
   from servers, or later candidates keep selecting it.
