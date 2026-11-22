@@ -663,3 +663,159 @@ mod locale_tests {
         assert_eq!(fresh_locale(None, None, None, None), None);
     }
 }
+
+/// A PTY master reader that, after each read, takes whatever more the
+/// master already holds, up to the caller's buffer (#651). Output reaches
+/// the master a few kilobytes at a time; read one piece at a time, every
+/// piece became a record of its own, sent at once with a short last
+/// segment. Taking what is already there waits for nothing: it only asks
+/// the master with a zero timeout whether more is readable.
+#[cfg(unix)]
+pub(crate) struct DrainingReader {
+    inner: Box<dyn std::io::Read + Send>,
+    master: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl DrainingReader {
+    /// Wrap `inner`, a reader of `master`'s descriptor. Without a
+    /// descriptor to ask, `inner` is returned as it is.
+    pub(crate) fn wrap(
+        inner: Box<dyn std::io::Read + Send>,
+        master: Option<std::os::fd::RawFd>,
+    ) -> Box<dyn std::io::Read + Send> {
+        let Some(fd) = master else { return inner };
+        // A copy of our own: the master's lifetime is the resize handle's.
+        match unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned() {
+            Ok(master) => Box::new(Self { inner, master }),
+            Err(_) => inner,
+        }
+    }
+
+    fn more_is_readable(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut entry = nix::libc::pollfd {
+            fd: self.master.as_raw_fd(),
+            events: nix::libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { nix::libc::poll(&mut entry, 1, 0) };
+        ready > 0 && entry.revents & nix::libc::POLLIN != 0
+    }
+}
+
+#[cfg(unix)]
+impl std::io::Read for DrainingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut last = self.inner.read(buf)?;
+        let mut filled = last;
+        // Only a large piece suggests more behind it: a keystroke's echo
+        // (a few bytes) costs no extra system call.
+        while last >= DRAIN_AFTER && filled < buf.len() && self.more_is_readable() {
+            match self.inner.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    last = n;
+                    filled += n;
+                }
+                // What was read is returned; the next read meets the error.
+                Err(_) => break,
+            }
+        }
+        Ok(filled)
+    }
+}
+
+/// The smallest piece after which a [`DrainingReader`] asks for more: one
+/// transport segment.
+#[cfg(unix)]
+const DRAIN_AFTER: usize = 1024;
+
+#[cfg(all(test, unix))]
+mod draining_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn pair() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { nix::libc::pipe(fds.as_mut_ptr()) }, 0);
+        use std::os::fd::FromRawFd;
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    /// A reader that returns at most `piece` bytes a call, as a PTY master
+    /// hands its output over a few kilobytes at a time.
+    struct Pieces(std::fs::File, usize);
+    impl Read for Pieces {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.1);
+            self.0.read(&mut buf[..n])
+        }
+    }
+
+    #[test]
+    fn what_is_already_readable_is_taken_in_one_read() {
+        use std::os::fd::AsRawFd;
+        let (r, mut w) = pair();
+        w.write_all(&[7u8; 4500]).unwrap();
+        let fd = r.as_raw_fd();
+        let mut reader = DrainingReader::wrap(Box::new(Pieces(r, 1500)), Some(fd));
+        let mut buf = [0u8; 8192];
+        assert_eq!(
+            reader.read(&mut buf).unwrap(),
+            4500,
+            "three pieces, one read"
+        );
+    }
+
+    #[test]
+    fn a_read_never_waits_for_bytes_not_yet_written() {
+        use std::os::fd::AsRawFd;
+        let (r, mut w) = pair();
+        w.write_all(&[1u8; 10]).unwrap();
+        let fd = r.as_raw_fd();
+        let mut reader = DrainingReader::wrap(Box::new(Pieces(r, 2000)), Some(fd));
+        let mut buf = [0u8; 8192];
+        // Nothing more is written: the read returns what was there and does
+        // not block (the writer stays open, so a blocking read would hang).
+        assert_eq!(reader.read(&mut buf).unwrap(), 10);
+        drop(w);
+        assert_eq!(
+            reader.read(&mut buf).unwrap(),
+            0,
+            "end of input passes through"
+        );
+    }
+
+    #[test]
+    fn a_small_piece_is_returned_without_asking_for_more() {
+        use std::os::fd::AsRawFd;
+        let (r, mut w) = pair();
+        w.write_all(&[5u8; 300]).unwrap();
+        let fd = r.as_raw_fd();
+        let mut reader = DrainingReader::wrap(Box::new(Pieces(r, 100)), Some(fd));
+        let mut buf = [0u8; 8192];
+        assert_eq!(
+            reader.read(&mut buf).unwrap(),
+            100,
+            "an echo-sized piece goes as it is"
+        );
+    }
+
+    #[test]
+    fn the_callers_buffer_bounds_a_read() {
+        use std::os::fd::AsRawFd;
+        let (r, mut w) = pair();
+        w.write_all(&[2u8; 5000]).unwrap();
+        let fd = r.as_raw_fd();
+        let mut reader = DrainingReader::wrap(Box::new(Pieces(r, 1500)), Some(fd));
+        let mut buf = [0u8; 4096];
+        assert_eq!(reader.read(&mut buf).unwrap(), 4096);
+        assert_eq!(reader.read(&mut buf).unwrap(), 904);
+    }
+}
