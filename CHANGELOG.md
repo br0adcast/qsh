@@ -27,6 +27,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- On Linux, learn that a session's shell has exited from a pidfd instead
+  of checking it every 20 ms. An idle or detached session no longer wakes
+  `qshd` 50 times a second: eight detached sessions went from about 880
+  context switches a second to about 3.
 - Refuse to start `qshd` on a macOS kernel without a qualified process
   ownership contract, naming the observed kernel, instead of refusing every
   channel later. Document the admitted macOS kernels.
