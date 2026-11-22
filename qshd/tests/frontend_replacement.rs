@@ -519,11 +519,14 @@ fn reap_adopted(pid: u32) -> Option<i32> {
 }
 
 /// The host itself dies (`SIGKILL`): its sessions are lost, as when a
-/// single-process daemon dies. Its frontend dies with it -- the kernel
-/// kills it (`PR_SET_PDEATHSIG`) instead of leaving it to notice and shut
-/// down -- so it neither serves on as an orphan nor holds the daemon's UDP
-/// port, which the daemon started next binds. This test adopts what the
-/// host leaves (subreaper), so it sees how the frontend ended.
+/// single-process daemon dies. Its frontend dies with it, so it neither
+/// serves on as an orphan nor holds the daemon's UDP port, which the daemon
+/// started next binds. The kernel kills it (`PR_SET_PDEATHSIG`), or, since
+/// a dying host closes its descriptors before the kernel signals its
+/// children, the frontend first sees its host channel end and exits on its
+/// own (`HOST_GONE_EXIT`, 3); either is an end with its host, and no other
+/// is. This test adopts what the host leaves (subreaper), so it sees how
+/// the frontend ended.
 #[test]
 fn a_dead_host_takes_its_frontend_and_frees_the_port() {
     let _serial = serialised();
@@ -537,9 +540,12 @@ fn a_dead_host_takes_its_frontend_and_frees_the_port() {
     daemon.child.kill().expect("SIGKILL to the host");
     daemon.child.wait().expect("the host is reaped");
     let status = reap_adopted(frontend).expect("the frontend ends with its host");
+    let killed_by_kernel = libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL;
+    let saw_host_gone = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 3;
     assert!(
-        libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
-        "the kernel killed the frontend with its host (status {status:#x})"
+        killed_by_kernel || saw_host_gone,
+        "the frontend ended with its host: killed by the kernel or exited on \
+         its host channel's end (status {status:#x})"
     );
     assert!(
         wait_until(Duration::from_secs(5), || UdpSocket::bind((
