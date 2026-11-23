@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- Sign with local RSA keys on the pure-Rust `rsa` 0.10 instead of a statically
+  linked OpenSSL 3.5.9 (#668). OpenSSL was adopted while `rsa` was affected by
+  RUSTSEC-2023-0071 with no fixed release; 0.10.0 fixes it. Each key is still
+  validated and prepared once per owner, and every signature is blinded.
+  Building qsh and qshd no longer needs an OpenSSL prefix or `OPENSSL_DIR`.
+  As with the crate's own decoders, an RSA key whose two primes are not of
+  balanced size is refused; ordinary generated keys are balanced.
+
 ## [0.6.0-alpha.1] — 2026-11-23
 
 ### Added

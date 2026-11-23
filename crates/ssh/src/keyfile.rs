@@ -85,7 +85,7 @@ impl russh::Signer for LazyKeySigner<'_> {
                     .map_err(|_| sshauth::keyfile::KeyFileError::DecryptionFailed)?;
                 let key = PreparedKey::from_key(key)?;
                 sign_with_hash_alg(&key, hash_alg, &data)
-                    .map_err(|_| sshauth::keyfile::KeyFileError::NativeOperation)
+                    .map_err(|_| sshauth::keyfile::KeyFileError::KeyOperation)
             })
             .await
             .map_err(SignError::from)?;

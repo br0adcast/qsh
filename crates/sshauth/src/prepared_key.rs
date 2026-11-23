@@ -1,6 +1,5 @@
-//! A validated, owned local signing key. RSA never returns to an upstream
-//! private-key representation after native preparation.
-use crate::{keyfile::KeyFileError, native_rsa::NativeRsa};
+//! A validated, owned local signing key, prepared once per owner.
+use crate::{keyfile::KeyFileError, rsa_key::OwnedRsa};
 use ssh_key::{PrivateKey, PublicKey, Signature};
 
 /// SSH may negotiate legacy SHA-1. QSH callers explicitly choose SHA-512.
@@ -15,7 +14,7 @@ pub struct PreparedKey {
     inner: Inner,
 }
 enum Inner {
-    Rsa(NativeRsa),
+    Rsa(Box<OwnedRsa>),
     Other(Box<PrivateKey>),
 }
 impl std::fmt::Debug for PreparedKey {
@@ -31,7 +30,10 @@ impl PreparedKey {
             return Err(KeyFileError::PassphraseRequired);
         }
         let inner = if let Some(pair) = key.key_data().rsa() {
-            Inner::Rsa(NativeRsa::from_components(pair, key.public_key().clone())?)
+            Inner::Rsa(Box::new(OwnedRsa::from_components(
+                pair,
+                key.public_key().clone(),
+            )?))
         } else {
             Inner::Other(Box::new(key))
         };
@@ -39,16 +41,16 @@ impl PreparedKey {
     }
     pub(crate) fn from_pkcs1(bytes: &[u8]) -> Result<Self, KeyFileError> {
         Ok(Self {
-            inner: Inner::Rsa(NativeRsa::from_pkcs1(bytes)?),
+            inner: Inner::Rsa(Box::new(OwnedRsa::from_pkcs1(bytes)?)),
         })
     }
     pub(crate) fn from_pkcs8(bytes: &[u8], inner: &[u8]) -> Result<Self, KeyFileError> {
         Ok(Self {
-            inner: Inner::Rsa(NativeRsa::from_pkcs8(bytes, inner)?),
+            inner: Inner::Rsa(Box::new(OwnedRsa::from_pkcs8(bytes, inner)?)),
         })
     }
     #[cfg(test)]
-    pub(crate) fn native_probe(&self) -> Option<&std::sync::Arc<crate::sign_file::NativeProbe>> {
+    pub(crate) fn rsa_probe(&self) -> Option<&std::sync::Arc<crate::sign_file::RsaProbe>> {
         match &self.inner {
             Inner::Rsa(key) => Some(&key.probe),
             Inner::Other(_) => None,
@@ -72,7 +74,7 @@ impl PreparedKey {
         &self,
         message: &[u8],
         digest: RsaDigest,
-        #[cfg(test)] probe: Option<&crate::sign_file::NativeProbe>,
+        #[cfg(test)] probe: Option<&crate::sign_file::RsaProbe>,
     ) -> Result<Signature, KeyFileError> {
         match &self.inner {
             Inner::Rsa(key) => key.sign(

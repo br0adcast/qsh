@@ -473,7 +473,7 @@ elif name == 'python3':
                                  deny_warnings=(target == 'x86_64-apple-darwin'))
                 tests = [c['args'] for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'test']
                 self.assertEqual(tests, [['test', '--locked', '-p', 'sshauth', '--target', target,
-                                         '--test', 'rsa_file_signing', '--test', 'native_rsa_backend', '--', '--include-ignored']])
+                                         '--test', 'rsa_file_signing', '--test', 'rsa_backend', '--', '--include-ignored']])
                 test_call = next(c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'test')
                 build_call = next(c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'build')
                 cargo_home = env.get('CARGO_HOME', env['HOME'] + '/.cargo')

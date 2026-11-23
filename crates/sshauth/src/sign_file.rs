@@ -13,7 +13,7 @@ pub struct FileSigner {
     key: crate::prepared_key::PreparedKey,
     login: Option<String>,
     #[cfg(test)]
-    native_probe: Option<std::sync::Arc<NativeProbe>>,
+    rsa_probe: Option<std::sync::Arc<RsaProbe>>,
 }
 
 impl FileSigner {
@@ -50,7 +50,7 @@ impl FileSigner {
             key,
             login: None,
             #[cfg(test)]
-            native_probe: None,
+            rsa_probe: None,
         }
     }
 
@@ -87,7 +87,7 @@ impl AuthSigner for FileSigner {
                 &record_challenge(handshake_hash, &record),
                 crate::prepared_key::RsaDigest::Sha512,
                 #[cfg(test)]
-                self.native_probe.as_deref(),
+                self.rsa_probe.as_deref(),
             )
             .map_err(|e| AuthError::Backend(format!("signing: {e}")))?;
         if !crate::verify::signature_algorithm_allowed(&signature.algorithm()) {
@@ -102,7 +102,7 @@ impl AuthSigner for FileSigner {
 
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct NativeProbe {
+pub(crate) struct RsaProbe {
     pub(crate) calls: std::sync::atomic::AtomicUsize,
     pub(crate) checks: std::sync::atomic::AtomicUsize,
     pub(crate) fail: std::sync::atomic::AtomicBool,
@@ -117,7 +117,7 @@ mod tests {
 
     use crate::record::decode_signature;
 
-    fn rsa_native_fixture() -> FileSigner {
+    fn rsa_fixture() -> FileSigner {
         let pair = ssh_key::private::RsaKeypair::random(
             &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
             2048,
@@ -130,10 +130,10 @@ mod tests {
     }
 
     #[test]
-    fn native_rsa_prepares_once_per_owner_and_supports_concurrent_proofs() {
+    fn rsa_prepares_once_per_owner_and_supports_concurrent_proofs() {
         use std::sync::{atomic::Ordering, Arc};
-        let signer = Arc::new(rsa_native_fixture().with_login("generated".into()));
-        let probe = signer.key.native_probe().unwrap().clone();
+        let signer = Arc::new(rsa_fixture().with_login("generated".into()));
+        let probe = signer.key.rsa_probe().unwrap().clone();
         assert_eq!(probe.checks.load(Ordering::SeqCst), 1);
         let workers: Vec<_> = (0..4)
             .map(|id| {
@@ -169,11 +169,11 @@ mod tests {
     }
 
     #[test]
-    fn native_rsa_route_is_observed_on_the_real_file_signer() {
+    fn rsa_route_is_observed_on_the_real_file_signer() {
         use std::sync::{atomic::Ordering, Arc};
-        let mut signer = rsa_native_fixture();
-        let probe = Arc::new(NativeProbe::default());
-        signer.native_probe = Some(probe.clone());
+        let mut signer = rsa_fixture();
+        let probe = Arc::new(RsaProbe::default());
+        signer.rsa_probe = Some(probe.clone());
         let record = signer.sign(&[17; 32], None).expect("sign generated RSA");
         let signature = decode_signature(&record.signature).unwrap();
         signature::Verifier::verify(signer.public_key(), &auth_challenge(&[17; 32]), &signature)
@@ -181,20 +181,20 @@ mod tests {
         assert_eq!(
             probe.calls.load(Ordering::SeqCst),
             1,
-            "native private signing must run"
+            "the private RSA operation must run"
         );
     }
 
     #[test]
-    fn native_rsa_failure_cannot_fall_back_to_a_successful_file_proof() {
+    fn rsa_failure_cannot_fall_back_to_a_successful_file_proof() {
         use std::sync::{atomic::Ordering, Arc};
-        let mut signer = rsa_native_fixture();
-        let probe = Arc::new(NativeProbe::default());
+        let mut signer = rsa_fixture();
+        let probe = Arc::new(RsaProbe::default());
         probe.fail.store(true, Ordering::SeqCst);
-        signer.native_probe = Some(probe.clone());
+        signer.rsa_probe = Some(probe.clone());
         assert!(
             signer.sign(&[19; 32], None).is_err(),
-            "a native failure must prevent any proof"
+            "a failed private operation must prevent any proof"
         );
         assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     }

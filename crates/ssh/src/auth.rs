@@ -928,13 +928,13 @@ impl russh::Signer for AgentSigner<'_> {
 }
 
 #[cfg(test)]
-mod native_worker_tests {
+mod rsa_worker_tests {
     use super::*;
     use russh::Signer;
     use std::sync::{mpsc, Condvar, Mutex};
 
     #[test]
-    fn native_rsa_cancel_drops_connection_runtime_while_owned_signing_is_held() {
+    fn rsa_cancel_drops_connection_runtime_while_owned_signing_is_held() {
         let pair = ssh_key::private::RsaKeypair::random(
             &mut ssh_key::rand_core::UnwrapErr(ssh_key::getrandom::SysRng),
             2048,
@@ -997,7 +997,7 @@ mod native_worker_tests {
         );
         assert!(
             matches!(cancelled_before_release, Ok(true)),
-            "cancellation and runtime drop must complete while native work remains held"
+            "cancellation and runtime drop must complete while owned signing work remains held"
         );
     }
 }
