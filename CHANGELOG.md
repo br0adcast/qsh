@@ -7,6 +7,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0-alpha.1] — 2026-11-23
+
 ### Added
 
 - Run `qshd` on macOS 26 (Darwin 25, every xnu `12377` revision), after a
@@ -44,8 +46,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   channel later. Document the admitted macOS kernels.
 - Spell prerelease tags `alpha.N`, `beta.N` or `rc.N`, and refuse a release tag
   that does not outrank every other tag of its version, unless the run retries
-  that tag's published immutable release. The next release is
-  `0.6.0-alpha.1`.
+  that tag's published immutable release. This release is the first spelled
+  so.
 - Send the busy-daemon record (`TRANSPORT-BUSY`) as schema 3, which counts a
   daemon's retained sessions and carries the frontend upgrade offer. A
   schema 2 record is refused in both directions, so a login between this
@@ -60,7 +62,6 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - Keep only the active and the replaced managed client generation after an
   update, and document how to remove a managed installation.
-
 - Stop querying package databases, hashing the client and verifying its receipt
   on the session thread for every server observation. qsh now checks update
   eligibility only when an offer or incompatibility can be shown, and queries
