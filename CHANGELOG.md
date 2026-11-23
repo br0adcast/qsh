@@ -7,6 +7,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0-alpha.2] — 2026-11-23
+
 ### Changed
 
 - Sign with local RSA keys on the pure-Rust `rsa` 0.10 instead of a statically

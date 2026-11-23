@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "bringup"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "base64 0.23.1",
  "client",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "client"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "prediction",
  "terminal",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "connect"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "knock",
  "semver",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "daemon-bootstrap-protocol"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "knock"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "socket2",
  "sshauth",
@@ -1757,7 +1757,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "logging"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "libc",
  "log",
@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "prediction"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "terminal",
  "unicode-width",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "qsh"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "base64 0.23.1",
  "bringup",
@@ -2342,7 +2342,7 @@ dependencies = [
 
 [[package]]
 name = "qshd"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -2447,7 +2447,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "release-auth"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "base64 0.23.1",
  "hex",
@@ -2466,7 +2466,7 @@ dependencies = [
 
 [[package]]
 name = "render"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "alacritty_terminal",
  "terminal",
@@ -3286,7 +3286,7 @@ checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
 name = "ssh"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3370,7 +3370,7 @@ dependencies = [
 
 [[package]]
 name = "sshauth"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -3476,7 +3476,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "alacritty_terminal",
  "memchr",
@@ -3486,7 +3486,7 @@ dependencies = [
 
 [[package]]
 name = "terminal-size"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 
 [[package]]
 name = "thiserror"
@@ -3689,7 +3689,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.6.0-alpha.1"
+version = "0.6.0-alpha.2"
 dependencies = [
  "blake2 0.11.0",
  "chacha20poly1305 0.11.0",
