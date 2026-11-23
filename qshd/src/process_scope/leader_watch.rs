@@ -10,7 +10,7 @@
 
 use nix::libc;
 use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 pub(super) struct LeaderWatch {
     pidfd: Option<OwnedFd>,
@@ -22,8 +22,7 @@ impl LeaderWatch {
     /// A watch on `pid`, the caller's unreaped child. Without a pidfd (a
     /// kernel before 5.3, or a refused open) the owner keeps polling.
     pub(super) fn open(pid: NonZeroU32) -> Self {
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.get() as libc::pid_t, 0) };
-        let pidfd = (raw >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw as libc::c_int) });
+        let pidfd = super::pidfd_open(pid.get() as libc::pid_t).ok();
         Self {
             pidfd,
             started: false,

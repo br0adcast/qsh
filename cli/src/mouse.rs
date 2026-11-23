@@ -212,13 +212,6 @@ impl MouseShift {
         (out.finish(), InputBytes::default())
     }
 
-    /// Takes back an unfinished tail `strip` returned that its caller will
-    /// not read (a window closed): it goes in front of the next bytes,
-    /// whichever of `apply` and `strip` gets them.
-    pub fn hand_back(&mut self, tail: Vec<u8>) {
-        self.hand_back_owned(InputBytes::unleased(tail));
-    }
-
     pub(crate) fn hand_back_owned(&mut self, mut tail: InputBytes) {
         tail.append(std::mem::take(&mut self.held));
         self.held = tail;

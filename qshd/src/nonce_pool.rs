@@ -210,7 +210,8 @@ impl PooledNonces {
     /// if that thread cannot start; whatever the warm-up fetched is given
     /// back first. If the thread ever stops by a panic, it ends the worker
     /// ([`POOL_THREAD_GONE_REASON`]).
-    pub fn start(helper: Arc<HelperAuth>) -> io::Result<Arc<PooledNonces>> {
+    #[cfg(test)]
+    pub(crate) fn start(helper: Arc<HelperAuth>) -> io::Result<Arc<PooledNonces>> {
         PooledNonces::start_with(
             helper,
             POOL_MAX_AGE,

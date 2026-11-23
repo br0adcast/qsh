@@ -600,13 +600,6 @@ impl<S: ChannelSubstrate> ChannelSession<S> {
         self.admission_started = false;
     }
 
-    /// Access for substrate-specific operations. Attachment transitions must
-    /// use reset_attachment or transfer AttachmentIntent into a new session;
-    /// clearing framing alone would leave stale resize correlation alive.
-    pub fn substrate_mut(&mut self) -> &mut S {
-        &mut self.substrate
-    }
-
     /// Marks a channel `Gone` and reports `event`, but only if the channel
     /// is currently `Opening` or `Ready`. A channel already `Gone`, or a
     /// stream this session never opened, means `event` is a duplicate or a

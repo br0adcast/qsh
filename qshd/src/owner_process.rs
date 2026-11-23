@@ -309,14 +309,6 @@ fn check(rc: libc::c_int) -> io::Result<()> {
     }
 }
 
-fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
-    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if raw < 0 {
-        return Err(last_error());
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
-}
-
 pub(crate) fn socket_pair_of(kind: nix::sys::socket::SockType) -> io::Result<(OwnedFd, OwnedFd)> {
     use nix::sys::socket::{socketpair, AddressFamily, SockFlag};
     socketpair(AddressFamily::Unix, kind, None, SockFlag::SOCK_CLOEXEC).map_err(io::Error::from)
@@ -489,7 +481,7 @@ pub(crate) fn spawn_role(
     };
     check(rc)?;
     // Our unreaped child: the number cannot name anything else yet.
-    let pidfd = match pidfd_open(pid) {
+    let pidfd = match crate::process_scope::pidfd_open(pid) {
         Ok(fd) => fd,
         Err(error) => {
             unsafe {

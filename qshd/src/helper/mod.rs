@@ -467,7 +467,8 @@ fn arm_and_verify_pdeathsig(helper_pid: nix::unistd::Pid) -> anyhow::Result<()> 
 /// the worker is not, an unprivileged process outliving the privileged one
 /// it depends on while still holding the listening port and every other
 /// session's pty is not merely an inconvenience.
-pub fn split_and_run(
+#[cfg(test)]
+fn split_and_run(
     config: HelperConfig,
     run_worker: impl FnOnce(
         spawner::HelperChannelSpawner,
@@ -794,6 +795,7 @@ fn split_with_clients<T>(
 /// cannot admit anyone without has stopped (the release thread, the nonce
 /// pool's). See `split_and_run`'s docs for why a worker in any of those
 /// states must not run on.
+#[cfg(test)]
 pub(crate) fn end_the_worker(why: &str) {
     // `loud`: on stderr as well, whether or not this process mirrors every
     // line there -- written without `eprintln!`, which panics on a write

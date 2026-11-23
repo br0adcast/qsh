@@ -78,7 +78,8 @@ pub const AUTH_POOL_THREAD: &str = "qshd-auth-pool";
 /// beside the seam those threads serve. Each must fit in
 /// [`MAX_THREAD_NAME_LEN`]. The worker's tokio runtime names its own
 /// threads, with tokio's default.
-pub const THREAD_NAMES: [&str; 4] = [
+#[cfg(test)]
+const THREAD_NAMES: [&str; 4] = [
     CHANNEL_READER_THREAD,
     AUTH_READER_THREAD,
     AUTH_RELEASE_THREAD,
@@ -299,6 +300,7 @@ const CHANNEL_SEND_TIMEOUT: Duration = OPEN_REPLY_TIMEOUT;
 /// by the caller because the spawner's reader must hold the other half from
 /// the moment it starts -- there is no point in the worker's life where the
 /// helper may report a login ended and nothing is listening.
+#[cfg(test)]
 pub(super) fn worker_clients(
     worker_channels: UnixStream,
     worker_auth: UnixStream,
