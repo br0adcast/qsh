@@ -59,8 +59,8 @@ dependencies and local path packages. It accepts crates.io and denies unknown
 registries/Git sources. Duplicate versions and path-only wildcard requirements
 remain visible warnings; their presence is not by itself a dependency bug.
 `vendor/vte` remains included, with its existing upstream/patch provenance.
-Native OpenSSL source/version/artifact review and platform qualification remain
-required separately; Cargo policy checks do not cover that native source.
+The AWS-LC C sources that `aws-lc-sys` builds are covered by its crate's
+provenance; there is no other native source outside Cargo.
 
 ## Existing license baseline
 
@@ -96,21 +96,22 @@ The refresh to stable `rsa 0.10.0` removes the previous exact prerelease
 exception for [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html).
 RustSec marks `>=0.10.0` as patched; the
 resolved product and fuzz graphs must contain no affected older RSA copy.
-This removes an advisory exception, while the native RSA private-operation
-boundary and its qualification requirements remain in force.
+Local RSA private operations run on this `rsa` (#668), which replaced the
+native OpenSSL backend adopted while the advisory had no fix (#59): one
+validated, precomputed key per owner, PKCS#1 v1.5 signatures with blinding.
 
-Review active entries on any related pin, callsite, startup-thread, native
+Review active entries on any related pin, callsite, startup-thread, RSA
 backend or advisory change, even before the date. Do not remove RSA support,
 disable verification or suppress another advisory in the same dependency
 family to satisfy a scanner. Other patchable findings require their own fixes
 and review; they do not inherit this disposition.
 
-Ordinary CI's existing native boundary tests remain required, including
-`native_rsa_route_is_observed_on_the_real_file_signer`,
-`native_rsa_failure_cannot_fall_back_to_a_successful_file_proof`, and
-`native_rsa_cancel_drops_connection_runtime_while_owned_signing_is_held`.
-Keep native parsing, ownership/cancellation and release-platform qualification
-alongside these tests. Passing signatures or a scanner alone do not establish
+Ordinary CI's existing RSA boundary tests remain required, including
+`rsa_route_is_observed_on_the_real_file_signer`,
+`rsa_failure_cannot_fall_back_to_a_successful_file_proof`, and
+`rsa_cancel_drops_connection_runtime_while_owned_signing_is_held`.
+Keep parsing, ownership/cancellation and release-platform checks alongside
+these tests. Passing signatures or a scanner alone do not establish
 constant-time execution or safety of a whole dependency.
 
 ## Fixture provenance

@@ -24,7 +24,7 @@ pub enum KeyFileError {
     UnsupportedEncryptedPpk,
     PassphraseRequired,
     DecryptionFailed,
-    NativeOperation,
+    KeyOperation,
 }
 
 impl fmt::Display for KeyFileError {
@@ -43,7 +43,7 @@ impl fmt::Display for KeyFileError {
                 f.write_str("encrypted PPK files are not supported; convert to OpenSSH format")
             }
             Self::PassphraseRequired => f.write_str("key is encrypted and needs a passphrase"),
-            Self::NativeOperation => f.write_str("native private-key operation failed"),
+            Self::KeyOperation => f.write_str("private-key operation failed"),
             Self::DecryptionFailed => {
                 f.write_str("could not decrypt private key with this passphrase")
             }
@@ -54,7 +54,7 @@ impl fmt::Display for KeyFileError {
 impl std::error::Error for KeyFileError {}
 
 /// A file retains either its locked OpenSSH representation or its prepared
-/// signing owner. Native RSA is never projected back into secret SSH components.
+/// signing owner. An owned RSA key is never projected back into secret SSH components.
 #[derive(Debug)]
 pub enum DecodedKey {
     Locked(Box<PrivateKey>),
@@ -284,7 +284,7 @@ pub fn decode(text: &str) -> Result<DecodedKey, KeyFileError> {
             pkcs8::PrivateKeyInfoRef::from_der(&bytes).map_err(|_| KeyFileError::InvalidFormat)?;
         if info.algorithm.oid == pkcs8::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1") {
             // Preserve the previous rsaEncryption AlgorithmIdentifier policy:
-            // explicit NULL is required, even if the native decoder is lenient.
+            // explicit NULL is required, even if the key decoder is lenient.
             if info.algorithm.parameters != Some(pkcs8::der::asn1::AnyRef::NULL) {
                 return Err(KeyFileError::InvalidFormat);
             }

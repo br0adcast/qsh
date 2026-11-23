@@ -252,7 +252,7 @@ class NativeProductWorkflowTests(unittest.TestCase):
         ('macos-15-intel', 'x86_64-apple-darwin'),
     )
     NATIVE = 'Qualify the linked products and generated RSA operations'
-    LINUX = 'Build the pinned native backend and products'
+    LINUX = 'Build the products'
     DARWIN = ('aarch64-apple-darwin', 'x86_64-apple-darwin')
 
     @staticmethod
@@ -298,7 +298,6 @@ class NativeProductWorkflowTests(unittest.TestCase):
             # The actual scanner, unchanged, handles every byte decision.
             scanner = ROOT / 'scripts/check-native-verifier-paths.py'
             (scripts / scanner.name).write_bytes(scanner.read_bytes())
-            (scripts / 'build-openssl.sh').write_text('printf "%s\\n" "$FIXTURE_NATIVE_PREFIX"\n')
             tools = Path(directory) / 'tools'
             tools.mkdir()
             shim = tools / 'shim'
@@ -357,13 +356,9 @@ elif name == 'python3':
                        GITHUB_WORKSPACE=str(work), RUNNER_TEMP=str(temp), NATIVE_TARGET=target,
                        RUNNER_OS='macOS' if 'darwin' in target else 'Linux',
                        FIXTURE_LOG=str(Path(directory) / 'calls.jsonl'),
-                       FIXTURE_BEFORE=before, FIXTURE_AFTER=after, FIXTURE_FAULT_TARGET=target,
-                       FIXTURE_NATIVE_PREFIX=str(Path(directory) / 'native'),
-                       OPENSSL_DIR=str(Path(directory) / 'native'), OPENSSL_STATIC='1')
-            for arch in self.DARWIN:
-                scoped = arch.upper().replace('-', '_')
-                env[scoped + '_OPENSSL_DIR'] = str(Path(directory) / arch)
-                env[scoped + '_OPENSSL_STATIC'] = '1'
+                       FIXTURE_BEFORE=before, FIXTURE_AFTER=after, FIXTURE_FAULT_TARGET=target)
+            for key in [k for k in env if k.endswith('OPENSSL_DIR') or k.endswith('OPENSSL_STATIC')]:
+                env.pop(key)
             if explicit_cargo:
                 env['CARGO_HOME'] = str(Path(directory) / 'cargo')
             yield work, env
@@ -426,14 +421,10 @@ elif name == 'python3':
             self.assertEqual(build['env']['AWS_LC_SYS_CFLAGS'], cflags)
             self.assertEqual(build['env']['AWS_LC_SYS_USE_SYSTEM'], '0')
             self.assertEqual(build['env']['CC'], 'musl-gcc' if linux else None)
-            if linux:
-                self.assertEqual(build['env']['OPENSSL_DIR'], env['FIXTURE_NATIVE_PREFIX'])
-                self.assertEqual(build['env']['OPENSSL_STATIC'], '1')
-            else:
-                for arch in self.DARWIN:
-                    for suffix in ('_OPENSSL_DIR', '_OPENSSL_STATIC'):
-                        key = arch.upper().replace('-', '_') + suffix
-                        self.assertEqual(build['env'][key], env[key])
+            # The products link no OpenSSL; nothing may hand them a prefix.
+            for key, value in build['env'].items():
+                if 'OPENSSL' in key:
+                    self.assertIsNone(value, key)
 
     def products(self, calls, records, work, env, targets, kind, *, linkage=False):
         paths = [f'target/{target}/release/{role}' for target in targets for role in ('qsh', 'qshd')]
@@ -473,7 +464,7 @@ elif name == 'python3':
                                  deny_warnings=(target == 'x86_64-apple-darwin'))
                 tests = [c['args'] for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'test']
                 self.assertEqual(tests, [['test', '--locked', '-p', 'sshauth', '--target', target,
-                                         '--test', 'rsa_file_signing', '--test', 'native_rsa_backend', '--', '--include-ignored']])
+                                         '--test', 'rsa_file_signing', '--test', 'rsa_backend', '--', '--include-ignored']])
                 test_call = next(c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'test')
                 build_call = next(c for c in calls if c['tool'] == 'cargo' and c['args'][0] == 'build')
                 cargo_home = env.get('CARGO_HOME', env['HOME'] + '/.cargo')
@@ -683,25 +674,18 @@ pwd() { printf called > "$GITHUB_WORKSPACE/pwd-called"; printf "%s" "$FIXTURE_PR
             ('macos-15', 'macOS portable tests', "''"),
             ('macos-26', 'macOS 26 portable tests', '-macos-26')])
         for required in ('    name: ${{ matrix.name }}\n', '    runs-on: ${{ matrix.runner }}\n',
-                         '          key: ${{ matrix.cache_suffix }}\n',
-                         'key: native-${{ runner.os }}-${{ runner.arch }}${{ matrix.cache_suffix }}-'):
+                         '          key: ${{ matrix.cache_suffix }}\n'):
             self.assertIn(required, arm)
         for forbidden in ('needs:', 'continue-on-error:', 'if: success()', 'download-artifact',
                           'Qualify offline release authentication', self.NATIVE,
                           'cargo test --locked -p sshauth'):
             self.assertNotIn(forbidden, job)
         ordered = ['Bind the Intel owner checkout', 'Observe the Intel Darwin runtime',
-                   'Install native owner prerequisites', 'Build and execute the pinned owner backend',
                    'Install qualified Rust for owner checks', 'Swatinem/rust-cache@',
                    'Qualify the production Intel Darwin process owner']
         self.assertEqual(sorted(ordered, key=job.index), ordered)
-        backend = self.body('native-crypto.yml', 'darwin-owner-intel', 'Build and execute the pinned owner backend')
-        for required in ('scripts/qualify-openssl.sh --target "$NATIVE_TARGET"',
-                         'scripts/build-openssl.sh --target "$NATIVE_TARGET"',
-                         '--cache "$RUNNER_TEMP/native-crypto"', '--toolchain-id "$ImageOS/$ImageVersion"',
-                         'echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"',
-                         "echo 'OPENSSL_STATIC=1' >> \"$GITHUB_ENV\""):
-            self.assertIn(required, backend)
+        # The products link no OpenSSL; the owner lane builds none.
+        self.assertNotIn('openssl', job.lower())
         rust = self.body('native-crypto.yml', 'darwin-owner-intel', 'Install qualified Rust for owner checks')
         self.assertIn('rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal', rust)
         self.assertIn('rustup target add "$NATIVE_TARGET"', rust)
@@ -732,20 +716,18 @@ pwd() { printf called > "$GITHUB_WORKSPACE/pwd-called"; printf "%s" "$FIXTURE_PR
         setup = [
             ('Bind the Intel owner checkout', 'Bind the Intel legacy service checkout'),
             ('Observe the Intel Darwin runtime', 'Observe the Intel Darwin runtime'),
-            ('Build and execute the pinned owner backend', 'Build and execute the pinned legacy service backend'),
             ('Install qualified Rust for owner checks', 'Install qualified Rust for legacy service checks'),
         ]
         for owner_name, legacy_name in setup:
             self.assertEqual(self.body('native-crypto.yml', 'darwin-owner-intel', owner_name),
                              self.body('native-crypto.yml', 'darwin-legacy-service-intel', legacy_name))
-        ordered = ['actions/checkout@', setup[0][1], setup[1][1],
-                   'Install native legacy service prerequisites', setup[2][1], setup[3][1],
+        ordered = ['actions/checkout@', setup[0][1], setup[1][1], setup[2][1],
                    'Swatinem/rust-cache@',
                    'Prepare native Intel Darwin legacy account-service restart artifacts',
                    'Native Intel Darwin legacy account-service restart acceptance',
                    'Report native Intel Darwin legacy-service bundle lifecycle']
         self.assertEqual(sorted(ordered, key=legacy.index), ordered)
-        self.assertIn('Install native legacy service prerequisites\n        run: brew install gnupg', legacy)
+        self.assertNotIn('openssl', legacy.lower())
         for forbidden in ('needs:', 'continue-on-error:', 'if: success()', 'upload-artifact',
                           'download-artifact', 'Qualify the production Intel Darwin process owner',
                           self.NATIVE, 'native-owner-x86_64-apple-darwin'):

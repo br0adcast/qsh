@@ -1,4 +1,4 @@
-//! Real authenticated connections using the shared native private-key route.
+//! Real authenticated connections using the shared owned private-key route.
 mod support;
 use std::sync::Arc;
 use support::{
@@ -75,7 +75,7 @@ fn local_rsa_files_and_pem_connect_with_each_advertised_ssh_digest() {
 }
 
 #[test]
-fn a_refused_native_rsa_identity_does_not_prompt_for_its_passphrase() {
+fn a_refused_rsa_identity_does_not_prompt_for_its_passphrase() {
     let dir = tempfile::tempdir().unwrap();
     let (locked, _) = support::keygen_with_passphrase("rsa", dir.path(), "generated passphrase");
     let server = FakeServer::start(FakeAuth {
@@ -170,7 +170,7 @@ fn malformed_attempt(locked: bool) -> (Result<(), ssh::SshError>, usize, String)
 }
 
 #[test]
-fn native_rsa_failure_before_offer_preserves_configured_discovery() {
+fn rsa_failure_before_offer_preserves_configured_discovery() {
     let Some(()) = support::sshd_or_skip() else {
         return;
     };
@@ -181,15 +181,15 @@ fn native_rsa_failure_before_offer_preserves_configured_discovery() {
 }
 
 #[test]
-fn native_rsa_failure_after_publickey_acceptance_never_changes_identity() {
+fn rsa_failure_after_publickey_acceptance_never_changes_identity() {
     let Some(()) = support::sshd_or_skip() else {
         return;
     };
     let (result, prompts, log) = malformed_attempt(true);
-    assert_eq!(prompts, 1, "PK_OK must precede decrypt/native validation");
+    assert_eq!(prompts, 1, "PK_OK must precede decrypt and key validation");
     assert!(
-        matches!(result, Err(ssh::SshError::AuthFailed(ref why)) if why.contains("native private-key operation failed")),
-        "accepted identity's native failure must end authentication, got {result:?}"
+        matches!(result, Err(ssh::SshError::AuthFailed(ref why)) if why.contains("private-key")),
+        "accepted identity's key failure must end authentication, got {result:?}"
     );
     assert_eq!(
         log.matches("Accepted publickey").count(),

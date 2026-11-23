@@ -19,26 +19,14 @@ Linux container job cover the floor.
    rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
    ```
 
-2. Install a C compiler and binutils, Perl, make, GnuPG, Python 3, Bash, and curl.
+2. Install a C compiler and binutils, Perl, make, Python 3, Bash, and curl.
    macOS needs the Xcode command-line tools/SDK (`xcrun` and `otool`). Linux
    `qshd/system` builds also require PAM development libraries. Integration tests
    need the OpenSSH server and client tools described below.
 
-3. Prepare the verified static native RSA backend **before** any Rust product
-   build, then export its prefix:
-
-   ```sh
-   target=$(rustc -vV | sed -n 's/^host: //p')
-   native_prefix=$(bash scripts/build-openssl.sh --target "$target" \
-     --cache "$PWD/target/native-crypto" --jobs 2)
-   export OPENSSL_DIR="$native_prefix" OPENSSL_STATIC=1
-   ```
-
-   Follow [native crypto](docs/native-crypto.md) for source verification, target
-   selection, cross builds, and qualification. Cross builds use the documented
-   target-prefixed variables. A system OpenSSL installation is not a substitute
-   for the qualified source/version/target manifest. CI and package builds use
-   the same helper.
+3. No native crypto prefix is needed: local RSA private operations use the
+   pure-Rust `rsa` crate (#668), and the client's TLS uses AWS-LC, which Cargo
+   builds from source with the C compiler above.
 
 4. Check the effective floor declarations and compile the supported feature
    boundaries with the existing lockfile:
@@ -145,8 +133,6 @@ this section.**
   RUSTUP_TOOLCHAIN=1.99.1 cargo clippy --workspace --all-targets --locked \
     --features qshd/system -- -D warnings
   ```
-- Changes to the native crypto build prerequisite follow
-  [its source verification and qualification procedure](docs/native-crypto.md).
 - Changes to GitHub Actions follow
   [the revision review and validation procedure](docs/actions-maintenance.md).
 - Pull request CI runs the lanes your change can reach; `CI gate` is the result.

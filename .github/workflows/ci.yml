@@ -97,19 +97,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: ${{ matrix.cache_suffix }}
-      - name: Install native build prerequisites
-        run: brew install gnupg
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/native-crypto
-          key: native-${{ runner.os }}-${{ runner.arch }}${{ matrix.cache_suffix }}-${{ hashFiles('scripts/*openssl*', 'scripts/openssl/*') }}
-      - name: Prepare the pinned native backend
-        shell: bash
-        run: |
-          target=$(rustc -vV | sed -n 's/^host: //p')
-          prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
-          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
-          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Test managed client installation on macOS
         shell: bash
         run: |
@@ -1267,7 +1254,6 @@ jobs:
           sh -n scripts/install.sh
           python3 -B -m unittest discover -s scripts/tests -p 'test_client_install_bootstrap.py'
           python3 -I -B scripts/tests/test_no_silent_skips.py -v
-          python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'
           python3 -m unittest discover -s scripts/tests -p 'test_release_version.py'
           python3 -m unittest discover -s scripts/tests -p 'test_rust_version.py'
           python3 -B -m unittest discover -s scripts/tests -p 'test_git_build_metadata.py'
@@ -1345,17 +1331,6 @@ jobs:
 
       - name: Install native build prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/native-crypto
-          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*openssl*', 'scripts/openssl/*') }}
-      - name: Prepare the pinned native backend
-        shell: bash
-        run: |
-          target=$(rustc -vV | sed -n 's/^host: //p')
-          prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
-          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
-          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Disk usage after setup and cache restoration
         run: |
           df -h / "$RUNNER_TEMP" /mnt 2>/dev/null || true
@@ -1608,7 +1583,7 @@ jobs:
                               'requirements.txt', 'pyproject.toml', 'uv.lock', 'poetry.lock'}
               if any(path.rsplit('/', 1)[-1] in dependencies for path in paths):
                   return True, 'DEPENDENCY_INPUT'
-              unrelated = {'.github/workflows/native-crypto.yml', 'scripts/tests/test_build_openssl.py',
+              unrelated = {'.github/workflows/native-crypto.yml',
                            'scripts/tests/test_native_verifier_paths.py',
                            'scripts/tests/test_released_peer_acceptance.py',
                            'scripts/tests/test_no_silent_skips.py',
@@ -1725,17 +1700,6 @@ jobs:
 
       - name: Install native build prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/native-crypto
-          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*openssl*', 'scripts/openssl/*') }}
-      - name: Prepare the pinned native backend
-        shell: bash
-        run: |
-          target=$(rustc -vV | sed -n 's/^host: //p')
-          prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
-          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
-          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Disk usage after setup and cache restoration
         run: |
           df -h / "$RUNNER_TEMP" /mnt 2>/dev/null || true

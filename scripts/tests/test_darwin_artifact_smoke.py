@@ -26,14 +26,11 @@ def metadata(programs):
     version=dict(kind='LC_BUILD_VERSION',platform='macos',minos='14.0',sdk='15.0')
     records=[dict(role=role,program=program,sha256=digest(data),arch='arm64',version_command=version)
              for program,data in programs.items() for role in ('staged','extracted')]
-    records.append(dict(role='native-probe',program='version-probe',sha256='c'*64,arch='arm64',version_command=version))
-    return dict(schema=1,target=TARGET,source=dict(sha='a'*40,run_id='1',run_attempt='1'),
+    return dict(schema=2,target=TARGET,source=dict(sha='a'*40,run_id='1',run_attempt='1'),
                 host=dict(arch='arm64',macos_version='15.0',macos_build='24A1',image_version=None),
                 sdk=dict(version='15.0',xcode_version='16.0',xcode_build='16A1'),
                 rust={'release':'1.93.0','commit-hash':'b'*40,'host':TARGET,
                       'reported_deployment_target':'14.0','explicit_deployment_target':None},
-                native=dict(version='3.6.0',manifest_sha256='d'*64,compiler_sha256='e'*64,
-                            compiler_version='17.0.0',flags=['-arch','arm64','-isysroot','<SDK>'],macros={'__APPLE__':'1'}),
                 binaries=records)
 
 
@@ -354,7 +351,7 @@ class PrepareTests(unittest.TestCase):
 
     def test_metadata_limit_duplicate_and_during_read_mutation_refuse(self):
         adapter=self.adapter();self.archive.write_bytes(self.archive_bytes());original=self.meta.read_bytes()
-        for raw in (b'x'*65537,original.replace(b'"schema":1',b'"schema":1,"schema":1')):
+        for raw in (b'x'*65537,original.replace(b'"schema":2',b'"schema":2,"schema":2')):
             self.meta.write_bytes(raw)
             with self.assertRaises(ValueError):
                 adapter.prepare(self.archive,self.meta,VERSION,TARGET,self.destination,source_commit='a'*40)
@@ -394,7 +391,7 @@ class PrepareTests(unittest.TestCase):
         refusal=json.loads(errors.getvalue().removeprefix('DARWIN_SMOKE_REFUSED '))
         self.assertEqual((refusal['phase'],refusal['category']),('CLI','CLI'))
 
-    def test_existing_producer_metadata_schema_and_all_five_records(self):
+    def test_existing_producer_metadata_schema_and_all_four_records(self):
         adapter=self.adapter()
         source,hashes=adapter._metadata(self.meta.read_bytes(),TARGET)
         self.assertEqual(source,'a'*40)
@@ -402,12 +399,13 @@ class PrepareTests(unittest.TestCase):
         original=json.loads(self.meta.read_bytes())
         import copy
         variants=[]
-        for change in ('projection','duplicate','wrong-target','wrong-hash','unknown'):
+        for change in ('projection','duplicate','wrong-target','wrong-hash','unknown','old-schema'):
             value=copy.deepcopy(original)
             if change=='projection':value['binaries']=value['binaries'][:2]
             elif change=='duplicate':value['binaries'][1]=value['binaries'][0]
             elif change=='wrong-target':value['target']='x86_64-apple-darwin'
             elif change=='wrong-hash':value['binaries'][0]['sha256']='f'*64
+            elif change=='old-schema':value['schema']=1
             else:value['source']['private_path']='/private/synthetic'
             variants.append(value)
         for value in variants:

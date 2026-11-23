@@ -212,20 +212,8 @@ Build the binaries to compare into separate directories. For the release
 configurations, from the repository root:
 
 ```sh
-gnu=$(bash scripts/build-openssl.sh --target x86_64-unknown-linux-gnu \
-  --cache "$PWD/target/native-crypto" --jobs 2)
-OPENSSL_DIR=$gnu OPENSSL_STATIC=1 \
-  cargo build --release --locked -p qsh -p qshd --target x86_64-unknown-linux-gnu
-
-uapi="$PWD/target/kernel-uapi"   # as in .github/workflows/release.yml
-mkdir -p "$uapi"
-ln -sfn /usr/include/linux "$uapi/linux"
-ln -sfn /usr/include/asm-generic "$uapi/asm-generic"
-ln -sfn "/usr/include/$(gcc -dumpmachine)/asm" "$uapi/asm"
-musl=$(bash scripts/build-openssl.sh --target x86_64-unknown-linux-musl \
-  --cache "$PWD/target/native-crypto" --cflag=-idirafter --cflag="$uapi" --jobs 2)
-CC=musl-gcc OPENSSL_DIR=$musl OPENSSL_STATIC=1 \
-  cargo build --release --locked -p qsh -p qshd --target x86_64-unknown-linux-musl
+cargo build --release --locked -p qsh -p qshd --target x86_64-unknown-linux-gnu
+CC=musl-gcc cargo build --release --locked -p qsh -p qshd --target x86_64-unknown-linux-musl
 ```
 
 Copy each pair of `qsh` and `qshd` into its own directory, because another

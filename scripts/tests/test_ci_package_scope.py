@@ -28,7 +28,6 @@ ORIGINAL_CONTROLS = (
     'sh -n scripts/install.sh',
     "python3 -B -m unittest discover -s scripts/tests -p 'test_client_install_bootstrap.py'",
     "python3 -I -B scripts/tests/test_no_silent_skips.py -v",
-    "python3 -m unittest discover -s scripts/tests -p 'test_build_openssl.py'",
     "python3 -m unittest discover -s scripts/tests -p 'test_release_version.py'",
     "python3 -m unittest discover -s scripts/tests -p 'test_rust_version.py'",
     "python3 -B -m unittest discover -s scripts/tests -p 'test_git_build_metadata.py'",
@@ -307,7 +306,7 @@ class PackageScopeTests(unittest.TestCase):
 
     def test_protected_policy_and_core_compositions_keep_native_optional(self):
         paths = ('qshd/src/helper/server.rs', 'crates/transport/src/lib.rs',
-                 '.github/workflows/native-crypto.yml', 'scripts/tests/test_build_openssl.py',
+                 '.github/workflows/native-crypto.yml',
                  'scripts/tests/test_native_verifier_paths.py',
                  'scripts/tests/test_released_peer_acceptance.py')
         for old in (True, False):
@@ -381,7 +380,7 @@ class PackageScopeTests(unittest.TestCase):
         self.assertEqual(step(self.source, 'Install integration test dependencies').split('        run: ', 1)[1].strip(),
             'sudo apt-get update && sudo apt-get install -y libpam0g-dev libselinux1-dev binutils patch zsh rpm rpm2cpio')
         names = ('Build and release script controls', 'Release attestation controls',
-                 'Prepare the pinned native backend', 'Formatting', 'Clippy',
+                 'Formatting', 'Clippy',
                  'Build the exact test daemon artifact', 'Unit and integration tests',
                  'Doc tests', DECISION, NATIVE_STEP)
         positions = [job.index('      - name: ' + name + '\n') for name in names]
@@ -634,7 +633,7 @@ class PackageScopeTests(unittest.TestCase):
 
     def test_positive_nonpackage_paths_and_push(self):
         for name in ('crates/transport/src/lib.rs', 'qshd/src/channel_backend.rs',
-                     '.github/workflows/native-crypto.yml', 'scripts/tests/test_build_openssl.py',
+                     '.github/workflows/native-crypto.yml',
                      'scripts/tests/test_native_verifier_paths.py',
                      'scripts/tests/test_released_peer_acceptance.py'):
             with self.subTest(path=name):

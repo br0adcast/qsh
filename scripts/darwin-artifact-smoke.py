@@ -20,11 +20,9 @@ DOCUMENT_LIMIT=4*1024**2
 PROGRAMS=('qsh','qshd')
 # Archives carry both products, including the client's additional native code.
 # This does not add notices or dependencies to server-only packages.
-NOTICES={'LICENSE-OPENSSL.txt':'openssl.txt',
-         'LICENSE-AWS-LC-RS.txt':'aws-lc-rs.txt','LICENSE-AWS-LC.txt':'aws-lc.txt'}
+NOTICES={'LICENSE-AWS-LC-RS.txt':'aws-lc-rs.txt','LICENSE-AWS-LC.txt':'aws-lc.txt'}
 # Pinned to the maintained notice bytes; isolated tools need no source-tree data.
 NOTICE_SHA256 = {
-    'LICENSE-OPENSSL.txt': '7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a',
     'LICENSE-AWS-LC-RS.txt': 'b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7',
     'LICENSE-AWS-LC.txt': '728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e',
 }
@@ -183,8 +181,8 @@ def _numeric_version(value):return _token(value,r'[0-9]{1,5}(?:\.[0-9]{1,3}){0,2
 
 def _metadata(raw,target):
     value=_json(raw,METADATA_LIMIT)
-    _keys(value,('schema','source','target','host','sdk','rust','native','binaries'))
-    if type(value['schema']) is not int or value['schema']!=1 or value['target']!=target:fail('METADATA')
+    _keys(value,('schema','source','target','host','sdk','rust','binaries'))
+    if type(value['schema']) is not int or value['schema']!=2 or value['target']!=target:fail('METADATA')
     source=value['source'];_keys(source,('sha','run_id','run_attempt'))
     _token(source['sha'],r'[0-9a-f]{40}',40)
     _token(source['run_id'],r'[0-9]{1,30}',30);_token(source['run_attempt'],r'[0-9]{1,10}',10)
@@ -198,27 +196,10 @@ def _metadata(raw,target):
     for name in ('release','commit-hash','host'):_token(rust[name],r'[A-Za-z0-9_.+-]+',256)
     _numeric_version(rust['reported_deployment_target'])
     if rust['explicit_deployment_target'] is not None:_numeric_version(rust['explicit_deployment_target'])
-    native=value['native'];_keys(native,('version','manifest_sha256','compiler_sha256','compiler_version','flags','macros'))
-    _token(native['version'],r'[0-9]+(?:\.[0-9]+){1,2}');_sha(native['manifest_sha256']);_sha(native['compiler_sha256']);_numeric_version(native['compiler_version'])
-    flags=native['flags']
-    if type(flags) is not list or len(flags)>32:fail('METADATA')
-    seen=set();index=0
-    while index<len(flags):
-        flag=flags[index]
-        if flag in ('-arch','-isysroot'):
-            if flag in seen or index+1>=len(flags):fail('METADATA')
-            if flags[index+1]!=(DARWIN_TARGETS[target] if flag=='-arch' else '<SDK>'):fail('METADATA')
-            seen.add(flag);index+=2
-        else:
-            _token(flag,r'-(?:O[0-3s]|fPIC|g0|mmacosx-version-min=[0-9]+(?:\.[0-9]+){0,2})');index+=1
-    if seen!={'-arch','-isysroot'}:fail('METADATA')
-    macros=native['macros'];allowed={'__APPLE__','__aarch64__','__arm64__','__x86_64__','__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__','__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__'}
-    if type(macros) is not dict or not set(macros)<=allowed:fail('METADATA')
-    for item in macros.values():_token(item,r'[0-9]+',20)
     records=value['binaries']
-    if type(records) is not list or len(records)!=5:fail('METADATA')
+    if type(records) is not list or len(records)!=4:fail('METADATA')
     found={}
-    expected={(role,program) for role in ('staged','extracted') for program in PROGRAMS}|{('native-probe','version-probe')}
+    expected={(role,program) for role in ('staged','extracted') for program in PROGRAMS}
     for record in records:
         _keys(record,('role','program','sha256','arch','version_command'))
         if type(record['role']) is not str or type(record['program']) is not str:fail('METADATA')

@@ -50,10 +50,9 @@ patches are not inherited from a dependency's workspace root. Relative to the
 product lock, the fuzz graph adds only
 `arbitrary 1.5.0`, `libfuzzer-sys 0.4.13` and the local
 `qsh-channel-fuzz` package. `libfuzzer-sys` builds bundled C++17 through
-`cc`/`ar`. The graph now links `sshauth` and `terminal`, so the pinned native
-OpenSSL prefix from `scripts/build-openssl.sh` is required for the
-`authorized_keys` target; the target calls only the in-memory listing parser
-with a fixed public key and never performs a private RSA operation.
+`cc`/`ar`. The graph links `sshauth` and `terminal`; the `authorized_keys`
+target calls only the in-memory listing parser with a fixed public key and
+never performs a private RSA operation.
 
 Historical qualification, before the 2026-11-17 dependency refresh: ordinary
 library tests compiled the C++ dependency using GCC 13.3 and GNU ar 2.42. The
