@@ -675,6 +675,7 @@ jobs:
             service_stage::tests::selected_source_adapter_refuses_symlink_and_stage_rejects_directory \
             service_stage::tests::substituted_fifo_is_rejected_without_blocking_validation \
             service_stage::tests::adoption_rechecks_context_even_when_deserialized_without_parse \
+            service_stage::tests::access_mode_predicates_distinguish_directories_files_and_writable_flags \
             selected_open_file_is_copied_verified_and_removed_on_drop \
             single_threaded_helper_reexec_adopts_and_transfers_cleanup_across_fork \
             actual_selected_qshd_self_check_runs_from_closed_writable_stage; do
@@ -684,7 +685,7 @@ jobs:
               END { exit !(seen == 1 && passed == 1) }
             ' "$runtime/service-stage-results.log"
           done
-          grep -F 'test result: ok. 25 passed; 0 failed; 0 ignored;' "$runtime/service-stage-results.log"
+          grep -F 'test result: ok. 26 passed; 0 failed; 0 ignored;' "$runtime/service-stage-results.log"
           if grep -Fq 'SKIPPED' "$runtime/service-stage-results.log"; then exit 1; fi
           cargo test -p qshd --lib --locked log280_ -- --nocapture --test-threads=1 --color=never \
             2>&1 | tee "$runtime/log-permission-results.log"
