@@ -1541,13 +1541,21 @@ fn accepted_busy_reuse_checks_explicit_protocol_and_reports_actual_ready() {
             Some(&identity),
             Some(&ack),
         );
-        if protocol == Some(1) {
+        if protocol != Some(2) {
             assert!(!success, "{out}");
-            assert!(
-                err.contains("incompatible session profiles")
-                    && err.contains("required profile [2,"),
-                "{err}"
-            );
+            if protocol == Some(1) {
+                assert!(
+                    err.contains("incompatible session profiles")
+                        && err.contains("required profile [2,"),
+                    "{err}"
+                );
+            } else {
+                assert!(
+                    err.contains("did not report compatible session profiles")
+                        && err.contains("required profile [2,"),
+                    "{err}"
+                );
+            }
             assert!(!out.contains("TRANSPORT-READY"));
             assert_eq!(requests, ["STATUS"]);
         } else {
@@ -1562,13 +1570,11 @@ fn accepted_busy_reuse_checks_explicit_protocol_and_reports_actual_ready() {
             assert_eq!(ready["ports"], serde_json::json!([60124]));
             assert_eq!(
                 ready["serving_profiles"],
-                protocol
-                    .map(|wire| serde_json::json!([[
-                        wire,
-                        transport::handshake_payload::HS_VERSION,
-                        transport::channel::PROTOCOL_VERSION
-                    ]]))
-                    .unwrap_or(serde_json::Value::Null)
+                serde_json::json!([[
+                    2,
+                    transport::handshake_payload::HS_VERSION,
+                    transport::channel::PROTOCOL_VERSION
+                ]])
             );
             assert!(ready["warning"].is_null());
             assert_eq!(requests.len(), 2);
@@ -1598,16 +1604,17 @@ fn changed_busy_identity_requires_a_fresh_choice() {
 }
 
 #[test]
-fn default_reuse_preserves_unknown_compatibility_and_never_reports_a_dialog() {
+fn default_reuse_rejects_unknown_and_incompatible_profiles_without_a_dialog() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     for protocol in [None, Some(1), Some(2)] {
         let ack = scripted_ack(protocol);
         let ((success, out, err), requests) =
             reuse_transaction(protocol, 2, false, false, true, false, None, Some(&ack));
         assert!(!out.contains("TRANSPORT-BUSY"));
-        if protocol == Some(1) {
+        if protocol != Some(2) {
             assert!(!success, "{out}");
             assert!(err.contains("required profile [2,"), "{err}");
+            assert!(!out.contains("TRANSPORT-READY"));
             assert_eq!(requests, ["STATUS"]);
         } else {
             assert!(success, "{err}");
@@ -1622,12 +1629,14 @@ fn default_reuse_preserves_unknown_compatibility_and_never_reports_a_dialog() {
 #[test]
 fn newer_incompatible_and_restart_only_peers_are_not_stopped() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-    for (active, newer, restart) in [(0, true, false), (2, false, true)] {
-        let ((success, out, err), requests) =
-            reuse_transaction(Some(1), active, newer, restart, true, false, None, None);
-        assert!(!success, "{out}");
-        assert!(err.contains("required profile [2,"), "{err}");
-        assert_eq!(requests, ["STATUS"]);
+    for protocol in [None, Some(1)] {
+        for (active, newer, restart) in [(0, true, false), (2, false, true)] {
+            let ((success, out, err), requests) =
+                reuse_transaction(protocol, active, newer, restart, true, false, None, None);
+            assert!(!success, "{out}");
+            assert!(err.contains("required profile [2,"), "{err}");
+            assert_eq!(requests, ["STATUS"]);
+        }
     }
 }
 

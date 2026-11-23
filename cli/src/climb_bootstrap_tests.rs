@@ -495,7 +495,7 @@ fn busy_user_decline_stops_all_routes_before_later_connection_activity() {
                         .next()
                         .unwrap()
                         .trim_matches('\'');
-                    return format!("TRANSPORT-BUSY {}\n",serde_json::json!({"schema":3,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"active_connections":2,"sessions":2,"serving_profiles":null,"preservation":"unknown"})).into_bytes();
+                    return format!("TRANSPORT-BUSY {}\n",serde_json::json!({"schema":3,"attempt":attempt,"identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42},"candidate":{"build":2,"checksum":"ef".repeat(32)},"active_connections":2,"sessions":2,"serving_profiles":[crate::busy_daemon::required_profile()],"preservation":"unknown"})).into_bytes();
                 }
                 if command.ends_with(" bootstrap-capabilities") {
                     return b"{\"schema\":1,\"busy_decisions\":true}\n".to_vec();
@@ -673,6 +673,21 @@ fn selected_fixture(
     busy: bool,
     missing_status: bool,
 ) -> SelectedFixture {
+    selected_fixture_with_profiles(
+        input,
+        reply,
+        busy,
+        missing_status,
+        Some(vec![crate::busy_daemon::required_profile()]),
+    )
+}
+fn selected_fixture_with_profiles(
+    input: &[u8],
+    reply: Vec<u8>,
+    busy: bool,
+    missing_status: bool,
+    serving_profiles: Option<Vec<[u8; 3]>>,
+) -> SelectedFixture {
     use base64::Engine as _;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -729,7 +744,7 @@ fn selected_fixture(
                         "schema":3,"attempt":attempt,
                         "identity":{"version":"0.5.9","build":1,"checksum":"ab".repeat(32),"pid":42 + round,"generation":if reply==b"modern-uncertain\n" {Some("cd".repeat(16))}else{None}},
                         "candidate":{"build":2,"checksum":"ef".repeat(32)},
-                        "active_connections":2,"sessions":2,"serving_profiles":null,"preservation":"unknown",
+                        "active_connections":2,"sessions":2,"serving_profiles":serving_profiles,"preservation":"unknown",
                         "service_restart":if reply==b"service-uncertain\n" {Some(serde_json::json!({"profile":"personal_transport_v1","uid":1000,"endpoint":"/test/cache/qsh/control.sock","port":60022}))} else {None}
                     })).into_bytes();
                 }
@@ -1355,4 +1370,42 @@ fn selected_continue_fresh_busy_replaces_consent_and_cancel_stops_all_routes() {
         2,
         1,
     );
+}
+
+#[test]
+fn incompatible_busy_daemon_never_continues_old_and_supports_two_choice_force() {
+    let _serial = crate::tty::SIGNAL_TESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for profiles in [None, Some(vec![[1, 1, 1]])] {
+        // Without "Continue with old daemon", choice 3 is unrecognized and
+        // choice 2 followed by Enter declines the destructive confirmation.
+        for input in [&b"3\n"[..], &b"2\n\n"[..]] {
+            assert_selected_failure(
+                selected_fixture_with_profiles(
+                    input,
+                    b"unexpected later ensure\n".to_vec(),
+                    true,
+                    false,
+                    profiles.clone(),
+                ),
+                1,
+                1,
+                0,
+            );
+        }
+        // Choice 2 followed by 2 confirms Force update (here hitting service-uncertain).
+        assert_selected_failure(
+            selected_fixture_with_profiles(
+                b"2\n2\n",
+                b"service-uncertain\n".to_vec(),
+                true,
+                false,
+                profiles,
+            ),
+            2,
+            2,
+            1,
+        );
+    }
 }
