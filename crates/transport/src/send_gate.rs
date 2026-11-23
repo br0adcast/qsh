@@ -102,8 +102,8 @@ pub(crate) enum GateOp {
 /// gate applies them there, and only there are its waiters woken.
 pub(crate) trait GateMirror: Send + Sync + std::fmt::Debug {
     fn apply(&self, op: GateOp);
+    #[cfg(feature = "tokio-driver")]
     /// A charge transfer the owner applies moved the real gate's tail.
-    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
     fn tail_moved(&self, tail: u64);
 }
 
@@ -136,7 +136,7 @@ impl SendGate {
         }
     }
 
-    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    #[cfg(feature = "tokio-driver")]
     /// A stand-in for a gate another process owns: admit, withdraw, transfer
     /// and update go to `mirror` and never report an opening themselves.
     pub(crate) fn mirror(kind: GateKind, mirror: std::sync::Arc<dyn GateMirror>) -> SendGate {
@@ -146,7 +146,7 @@ impl SendGate {
         }
     }
 
-    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    #[cfg(feature = "tokio-driver")]
     /// A remote charge moved the owner gate's tail behind this mirror.
     pub(crate) fn mirror_tail_moved(&self, tail: u64) {
         if let Some(mirror) = &self.mirror {
@@ -154,12 +154,12 @@ impl SendGate {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tokio-driver"))]
     pub(crate) fn is_mirror(&self) -> bool {
         self.mirror.is_some()
     }
 
-    #[cfg_attr(not(feature = "tokio-driver"), allow(dead_code))] // owner link only
+    #[cfg(feature = "tokio-driver")]
     /// Like [`SendGate::update`], naming the channel scope (`instance`,
     /// `generation`) a bridge would wake if the refresh opened the gate. A
     /// local gate ignores the scope; a mirror carries it to the owner, which
@@ -183,7 +183,7 @@ impl SendGate {
         self.notify_opened(&st, was_open)
     }
 
-    #[cfg(any(test, feature = "testnet"))]
+    #[cfg(all(feature = "tokio-driver", any(test, feature = "testnet")))]
     pub(crate) fn qualification_state(&self) -> (bool, bool, bool, u64) {
         let state = self.state.lock().expect("send gate");
         (
@@ -194,7 +194,7 @@ impl SendGate {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tokio-driver"))]
     pub(crate) fn pending_for_test(&self) -> u64 {
         self.state.lock().unwrap().pending
     }

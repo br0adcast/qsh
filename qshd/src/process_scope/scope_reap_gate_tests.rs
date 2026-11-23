@@ -23,6 +23,7 @@ fn worker40_deferred_final_reap_requires_a_fresh_later_census() {
     );
 }
 
+#[cfg(feature = "system")]
 #[test]
 fn worker40_native_deferred_final_reap_preserves_the_real_waitable_leader() {
     use crate::process_scope::{fork_child::ForkChild, Native};

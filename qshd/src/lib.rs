@@ -15,7 +15,7 @@
 //! -- used by `transport-ensure` in `main.rs` to first ask a live daemon
 //! instead of blindly starting a second one; the async server for this
 //! protocol is separate per path (qsh had `serve_control`, the new
-//! transport now has `transport_daemon::serve_transport_control`).
+//! transport serves it in `transport_daemon`).
 //! [`version`] -- the pure `reconcile` version-negotiation decision for
 //! `ensure`/`transport-ensure` when a daemon is already alive.
 //! [`transport_daemon`] -- daemonization of the `transport-ensure`

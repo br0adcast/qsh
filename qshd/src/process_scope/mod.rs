@@ -61,6 +61,7 @@ impl RetainedProcess {
             },
         }
     }
+    #[cfg(feature = "system")]
     fn acquire_reserved_child(
         fd: OwnedFd,
         expected_pid: u32,
@@ -342,6 +343,7 @@ pub enum CaptureFailure {
     Unproved(Acquisition),
 }
 impl QualifiedProc {
+    #[cfg(feature = "system")]
     /// Caller exclusively owns this exact unreaped direct child. This proves
     /// its identity, never membership in a session or authority over siblings.
     fn capture_reserved_child(
@@ -1241,12 +1243,13 @@ pub(crate) use pty::{
     own_child, own_reported_child, prepare, LeaderReports, LeaderStart, LeaderWindow,
 };
 
+#[cfg(feature = "system")]
 pub(crate) mod fork;
 
+#[cfg(feature = "system")]
 pub(crate) mod fork_child;
 
 #[cfg(feature = "system")]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod adoption;
 
 mod observation;

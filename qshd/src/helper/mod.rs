@@ -58,18 +58,14 @@ mod verification;
 pub(crate) mod worker_threads;
 // Staged private coordination foundation; not a worker/global drain receipt.
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(dead_code))]
 mod worker_bootstrap;
 #[cfg(target_os = "linux")]
 mod worker_child;
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(dead_code))]
 mod worker_control;
 pub(crate) mod worker_drain;
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(dead_code))]
 mod worker_owner;
-#[cfg_attr(not(test), allow(dead_code))]
 mod worker_protocol;
 pub(crate) mod worker_stop;
 
@@ -857,7 +853,7 @@ mod tests {
     }
 
     /// Reachable without root: an unknown worker account must be an error,
-    /// not a silent pass. Exercises the same path `run_serve_command` takes
+    /// not a silent pass. Exercises the same path `run_serve_command_os` takes
     /// for a mistyped `--worker-user`.
     #[test]
     fn drop_worker_privileges_refuses_an_unknown_account() {

@@ -512,7 +512,7 @@ fn the_helper_holds_no_network_descriptor_after_the_split() {
 
             // The startup banner already confirmed the pre-fork work
             // (binding the port, building `auth`) finished; the fork
-            // itself is the very next thing `run_serve_command` does.
+            // itself is the very next thing `run_serve_command_os` does.
             // Generous rather than tight, per this codebase's own rule
             // for timing-sensitive checks: a slow machine must make this
             // test slower, never flaky.

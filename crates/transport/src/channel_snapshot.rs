@@ -140,6 +140,7 @@ impl ChannelSnapshot {
             payload.push(u8::from(entry.open.screen));
         }
     }
+    #[cfg(feature = "tokio-driver")]
     pub(crate) fn decode_payload(payload: &[u8]) -> Result<Self, ChannelCodecError> {
         Self::decode(payload)
     }

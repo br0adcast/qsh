@@ -102,7 +102,7 @@ impl DgramTx {
     }
 
     /// Whether the reader is gone.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }

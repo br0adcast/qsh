@@ -322,39 +322,6 @@ pub fn spawn_command_no_echo(
     Ok((pair.master, child))
 }
 
-/// Launches an arbitrary command in a new pseudo-terminal with the DEFAULT
-/// echo setting LEFT ON -- needed for channel A of the tmux hybrid (`tmux
-/// new-session -A -s <name>`): unlike [`spawn_command_no_echo`], here the
-/// line discipline's echo is NOT touched -- `tmux` puts its own PTY into
-/// raw mode (the way full-screen programs like `vim` do), so kernel echo
-/// neither gets in its way nor is needed.
-///
-/// Otherwise built like [`spawn_shell`], but the command is supplied by the
-/// caller rather than taken from `$SHELL`, and opens at `size` (see
-/// `spawn_shell`'s docs for why).
-pub fn spawn_command(
-    size: PtySize,
-    mut cmd: CommandBuilder,
-    term: Option<&str>,
-) -> Result<(Box<dyn MasterPty + Send>, Box<dyn Child + Send + Sync>)> {
-    apply_base_env(&mut cmd, term);
-
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(size)
-        .context("opening the pseudo-terminal")?;
-
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .context("starting the command in the PTY")?;
-
-    // `slave` is only needed for the duration of spawn_command -- see spawn_shell.
-    drop(pair.slave);
-
-    Ok((pair.master, child))
-}
-
 /// Clears the `ECHO`/`ECHONL` flags in the PTY master side's termios. The
 /// line discipline is shared kernel state for both sides of a single PTY,
 /// so changing it via the master side also disables echo for the slave
