@@ -18,7 +18,7 @@ workflow remains within the trust boundary.
 This crate alone does not change downloader behavior or sign a qsh release.
 A public upstream positive fixture proves interoperability with this dependency;
 it does not prove any qsh release was signed. The four shipping-target fixture
-runs and static linkage checks are in the existing native crypto workflow.
+runs and static linkage checks are in the existing native-crypto workflow.
 
 The verifier dependencies are pinned together to Sigstore 0.16.0 with only
 the offline AWS-LC provider enabled. The embedded roots and interoperability

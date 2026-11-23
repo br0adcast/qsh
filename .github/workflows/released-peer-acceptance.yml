@@ -38,17 +38,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - name: Install focused fixture prerequisites
         run: sudo apt-get update && sudo apt-get install -y perl make gcc gnupg tmux
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/native-crypto
-          key: native-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*openssl*', 'scripts/openssl/*') }}
-      - name: Prepare the pinned native backend
-        shell: bash
-        run: |
-          target=$(rustc -vV | sed -n 's/^host: //p')
-          prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
-          echo "OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
-          echo 'OPENSSL_STATIC=1' >> "$GITHUB_ENV"
       - name: Qualify the acceptance controls
         run: python3 -m unittest discover -s scripts/tests -p 'test_released_peer_acceptance.py'
       - name: Run eight exact released-peer and current-peer scenarios

@@ -49,15 +49,6 @@ jobs:
             --root "$RUNNER_TEMP/fuzz-tools"
           echo "$RUNNER_TEMP/fuzz-tools/bin" >> "$GITHUB_PATH"
 
-      - name: Build the pinned native crypto prefix
-        run: |
-          set -euo pipefail
-          prefix=$(bash scripts/build-openssl.sh \
-            --target x86_64-unknown-linux-gnu \
-            --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
-          echo "X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
-          echo "X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1" >> "$GITHUB_ENV"
-
       - name: Verify every corpus inventory
         run: |
           set -euo pipefail

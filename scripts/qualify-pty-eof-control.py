@@ -766,11 +766,6 @@ def main():
             provenance[name + "_sha256"] = hashlib.sha256(os.environ.get(name, "").encode()).hexdigest()
         provenance["source_files"] = {p: digest(root / p) for p in (
             "qshd/src/darwin_process_scope/keeper_pty_eof_tests.rs", "qshd/src/darwin_process_scope/keeper_pty.rs", "qshd/src/darwin_process_scope/mod.rs", "qshd/tests/fixtures/pty_eof/helper.rs", "qshd/tests/fixtures/pty_eof/wire.rs", "qshd/tests/fixtures/pty_eof/ipc.rs", "scripts/qualify-pty-eof-control.py")}
-        crypto_manifest = Path(env["OPENSSL_DIR"]) / "manifest.json"
-        crypto = json.loads(bounded(crypto_manifest, 1024 * 1024))
-        if crypto["identity"]["target"] != target:
-            raise ValueError("qualified crypto target")
-        provenance["openssl_manifest_sha256"] = digest(crypto_manifest)
         allowed_sources = public_source_manifest(root)
         provenance["diagnostic_sources_sha256"] = hashlib.sha256(json.dumps(allowed_sources, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         provenance["diagnostic_source_count"] = len(allowed_sources)

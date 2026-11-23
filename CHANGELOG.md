@@ -13,7 +13,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   linked OpenSSL 3.5.9 (#668). OpenSSL was adopted while `rsa` was affected by
   RUSTSEC-2023-0071 with no fixed release; 0.10.0 fixes it. Each key is still
   validated and prepared once per owner, and every signature is blinded.
-  Building qsh and qshd no longer needs an OpenSSL prefix or `OPENSSL_DIR`.
+  Building qsh and qshd no longer needs an OpenSSL prefix or `OPENSSL_DIR`:
+  the OpenSSL build and qualification helper is removed, and release archives
+  and client packages no longer carry `LICENSE-OPENSSL.txt`.
   As with the crate's own decoders, an RSA key whose two primes are not of
   balanced size is refused; ordinary generated keys are balanced.
 

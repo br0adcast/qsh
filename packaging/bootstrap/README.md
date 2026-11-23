@@ -29,8 +29,7 @@ then disables automatic self-update, installs the existing qualified Rust
 The installed manager remains the verified executable. Compiler components
 retain rustup's official distribution checks; this change does not introduce a
 separate detached-signature policy for every Rust component. The existing
-base-image digests, compiler allowlist, and OpenSSL digest/signature
-verification remain prerequisites.
+base-image digests and compiler allowlist remain prerequisites.
 
 ## Rocky cross sysroot
 
@@ -94,7 +93,7 @@ Do not silently disable checks when a package, key, or repository changes.
 4. Run the local controls, both floor-image builds, native/cross GNU package
    qualification, and the existing installed-package acceptance jobs before
    accepting an update. Do not change compiler versions, libc/PAM floors,
-   packaging-tool pins, or qualified OpenSSL inputs as incidental cleanup.
+   or packaging-tool pins as incidental cleanup.
 
 Local bootstrap tests use executable fixtures without network access:
 
@@ -123,4 +122,4 @@ Lua scriptlets and all configured trigger kinds emit execution sentinels;
 the production transaction must emit none, while an enabled control observes
 every kind through the same private output capture. The
 native-crypto workflow runs these same controls in its newly built RPM image,
-then qualifies both GNU architectures and actual server packages.
+then builds the actual server packages for both GNU architectures.

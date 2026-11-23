@@ -59,8 +59,8 @@ dependencies and local path packages. It accepts crates.io and denies unknown
 registries/Git sources. Duplicate versions and path-only wildcard requirements
 remain visible warnings; their presence is not by itself a dependency bug.
 `vendor/vte` remains included, with its existing upstream/patch provenance.
-Native OpenSSL source/version/artifact review and platform qualification remain
-required separately; Cargo policy checks do not cover that native source.
+The AWS-LC C sources that `aws-lc-sys` builds are covered by its crate's
+provenance; there is no other native source outside Cargo.
 
 ## Existing license baseline
 

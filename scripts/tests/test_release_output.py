@@ -523,7 +523,7 @@ class DarwinMetadataTests(unittest.TestCase):
                 if argv[0] in (str(resolver),str(compiler)):return original(argv,**kwargs)
                 return self.command(argv,**kwargs)
             with mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=command):
-                value,tools,probe=output._darwin_context(self.root/'native','aarch64-apple-darwin')
+                value,tools=output._darwin_context('aarch64-apple-darwin')
         self.assertEqual(resolver_record.read_text(),'resolved\n')
         calls=[json.loads(line) for line in record.read_text().splitlines()]
         self.assertEqual([row[0] for row in calls],[str(compiler)]*2)
@@ -552,7 +552,7 @@ class DarwinMetadataTests(unittest.TestCase):
                     return raw
                 return self.command(argv,**kwargs)
             destination=self.root/'evidence.json'
-            with mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=command),self.assertRaisesRegex(ValueError,'^Darwin metadata rust-toolchain: invalid output$'):output.check_archive(self.root/'qsh-0.5.0-aarch64-apple-darwin.tar.gz',self.root/'inputs','0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=self.root/'native')
+            with mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=command),self.assertRaisesRegex(ValueError,'^Darwin metadata rust-toolchain: invalid output$'):output.check_archive(self.root/'qsh-0.5.0-aarch64-apple-darwin.tar.gz',self.root/'inputs','0.5.0','aarch64-apple-darwin',darwin_metadata=destination)
             self.assertFalse(destination.exists())
             compiler.unlink()
             with self.assertRaises(ValueError):output._metadata_rustc()
@@ -633,14 +633,10 @@ class DarwinMetadataTests(unittest.TestCase):
             for member in old:
                 member.name=member.name.replace('fixture-target',target)
                 new.addfile(member,old.extractfile(member) if member.isfile() else None)
-        prefix=self.root/'native';prefix.mkdir()
-        (prefix/'version-probe').write_bytes(b'PUBLIC SYNTHETIC NATIVE PROBE')
         self.sdk=self.root/'SDK';self.sdk.mkdir()
         self.rustup=self.helper.executable('rustup','raise SystemExit(9)\n')
         self.rustc=self.helper.executable('rustc','raise SystemExit(9)\n')
-        self.native=dict(identity=dict(source=dict(version='3.5.9'),target=target,compiler=dict(sha256='b'*64,version='Apple clang version 17.0.0\nInstalledDir: /Users/PRIVATE/clang',flags=['-arch','arm64' if target.startswith('aarch64') else 'x86_64','-isysroot',str(self.sdk)],macros='#define __APPLE__ 1\n#define __arm64__ 1\n#define __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ 150400\n#define PRIVATE "/Users/PRIVATE/secret"\n',path='/Users/PRIVATE/clang')),artifacts={'version-probe':hashlib.sha256((prefix/'version-probe').read_bytes()).hexdigest()})
-        (prefix/'manifest.json').write_text(json.dumps(self.native))
-        return renamed,inputs,prefix
+        return renamed,inputs
 
     def command(self,argv,**kwargs):
         self.categories.append(kwargs.get('category'))
@@ -654,14 +650,15 @@ class DarwinMetadataTests(unittest.TestCase):
     def context(self):
         return mock.patch.dict(os.environ,dict(GITHUB_SHA='a'*40,GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',ImageVersion='20261025.1',HOME=str(self.root),PATH=str(self.root),RUSTUP_TOOLCHAIN='1.99.1'),clear=True)
 
-    def test_archive_metadata_has_exact_five_bound_records_and_no_private_paths(self):
-        archive,inputs,prefix=self.fixture();destination=self.root/'evidence.json'
+    def test_archive_metadata_has_exact_four_bound_records_and_no_private_paths(self):
+        archive,inputs=self.fixture();destination=self.root/'evidence.json'
         with self.context(),mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=self.command):
-            output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=prefix)
+            output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination)
         raw=destination.read_text();value=json.loads(raw)
-        self.assertEqual(len(value['binaries']),5)
+        self.assertEqual(len(value['binaries']),4)
+        self.assertEqual(value['schema'],2)
+        self.assertNotIn('native',value)
         self.assertEqual(set(self.categories),output.METADATA_CATEGORIES-{'static-tool'})
-        self.assertEqual(value['native']['flags'],['-arch','arm64','-isysroot','<SDK>'])
         self.assertEqual(value['rust']['reported_deployment_target'],'11.0')
         self.assertLess(len(raw.encode()),32768)
         for forbidden in ('PRIVATE','/Users/',str(self.root),'InstalledDir'):self.assertNotIn(forbidden,raw)
@@ -669,7 +666,7 @@ class DarwinMetadataTests(unittest.TestCase):
         self.assertEqual(value['binaries'][2]['sha256'],value['binaries'][3]['sha256'])
 
     def test_metadata_cannot_rebind_the_already_version_probed_identity(self):
-        archive,inputs,prefix=self.fixture();destination=self.root/'evidence.json'
+        archive,inputs=self.fixture();destination=self.root/'evidence.json'
         native_binary=output._darwin_binary;native_digest=output.digest;changed=False
         def binary(*args,**kwargs):
             nonlocal changed
@@ -683,25 +680,18 @@ class DarwinMetadataTests(unittest.TestCase):
             if changed and isinstance(stream,tarfile.ExFileObject):return bytes.fromhex('f'*64)
             return native_digest(stream)
         with self.context(),mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=self.command),mock.patch.object(output,'_darwin_binary',side_effect=binary),mock.patch.object(output,'digest',side_effect=digest),self.assertRaises(ValueError):
-            output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=prefix)
+            output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination)
         self.assertFalse(destination.exists())
 
     def test_metadata_failure_never_creates_completed_evidence(self):
-        archive,inputs,prefix=self.fixture();destination=self.root/'evidence.json'
-        for failure in ('probe','arch','sdk','flag','command'):
-            (prefix/'manifest.json').write_text(json.dumps(self.native))
+        archive,inputs=self.fixture();destination=self.root/'evidence.json'
+        for failure in ('arch','command'):
             def command(argv,**kwargs):
                 if failure=='command':raise ValueError('fixed tool refusal')
                 if failure=='arch' and argv[:2]==['/usr/bin/lipo','-archs']:return b'x86_64\n'
                 return self.command(argv)
-            if failure=='probe':
-                changed=json.loads(json.dumps(self.native));changed['artifacts']['version-probe']='0'*64;(prefix/'manifest.json').write_text(json.dumps(changed))
-            if failure=='sdk':
-                changed=json.loads(json.dumps(self.native));changed['identity']['compiler']['flags'][-1]=str(self.root/'other');(prefix/'manifest.json').write_text(json.dumps(changed))
-            if failure=='flag':
-                changed=json.loads(json.dumps(self.native));changed['identity']['compiler']['flags'].append('-I/Users/PRIVATE/include');(prefix/'manifest.json').write_text(json.dumps(changed))
             with self.subTest(failure=failure),self.context(),mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=command),self.assertRaises(ValueError):
-                output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=prefix)
+                output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination)
             self.assertFalse(destination.exists())
 
     def test_metadata_tool_timeout_overflow_and_exact_direct_child_reap(self):
@@ -731,11 +721,12 @@ class DarwinMetadataTests(unittest.TestCase):
         with self.assertRaises(ChildProcessError):os.waitpid(int(record.read_text()),os.WNOHANG)
 
     def test_metadata_argument_pair_existing_output_and_changed_binary_refuse(self):
-        archive,inputs,prefix=self.fixture();destination=self.root/'evidence.json'
-        for args in (dict(darwin_metadata=destination),dict(native_prefix=prefix)):
-            with self.subTest(args=sorted(args)),self.assertRaises(ValueError):output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',**args)
+        archive,inputs=self.fixture();destination=self.root/'evidence.json'
+        # Darwin evidence exists only for a selected Darwin pair.
+        with self.assertRaisesRegex(ValueError,'selected Darwin pair'):
+            output.check_archive(archive,inputs,'0.5.0','x86_64-unknown-linux-musl',darwin_metadata=destination)
         destination.write_text('PUBLIC EXISTING EVIDENCE')
-        with self.assertRaises(ValueError):output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=prefix)
+        with self.assertRaises(ValueError):output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination)
         self.assertEqual(destination.read_text(),'PUBLIC EXISTING EVIDENCE');destination.unlink()
         def changed(argv,**kwargs):
             result=self.command(argv)
@@ -743,7 +734,7 @@ class DarwinMetadataTests(unittest.TestCase):
                 path=Path(argv[-1]);path.write_bytes(path.read_bytes()+b'\n# public mutation\n')
             return result
         with self.context(),mock.patch.object(output.sys,'platform','darwin'),mock.patch.object(output,'metadata_command',side_effect=changed),self.assertRaises(ValueError):
-            output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination,native_prefix=prefix)
+            output.check_archive(archive,inputs,'0.5.0','aarch64-apple-darwin',darwin_metadata=destination)
         self.assertFalse(destination.exists())
 
     def test_collector_preserves_exact_release_set_and_excludes_ci_only_evidence(self):
@@ -871,7 +862,7 @@ class ReleaseNoticeTests(unittest.TestCase):
         inputs = root / 'inputs'; inputs.mkdir()
         entries = {'qsh': b'inert client', 'qshd': b'inert server',
                    'README.md': b'inert readme', 'LICENSE': b'inert license', 'CHANGELOG.md': b'inert changes'}
-        for filename, source in dict({'LICENSE-OPENSSL.txt': 'openssl.txt'}, **CLIENT_NOTICES).items():
+        for filename, source in CLIENT_NOTICES.items():
             entries[filename] = (ROOT / 'docs/licenses' / source).read_bytes()
         if alter is not None: entries[alter] += b'altered notice'
         if extra is not None: entries[extra] = b'unexpected bytes'

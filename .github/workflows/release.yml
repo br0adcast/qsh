@@ -145,7 +145,7 @@ jobs:
           cargo install 'cargo-deb@=3.8.0' --locked
           bash packaging/rpm-tool/install.sh
 
-      - name: Build the pinned native backend and products
+      - name: Build the products
         run: |
           cargo_home="${CARGO_HOME:-$HOME/.cargo}"
           export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/qsh --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
@@ -154,14 +154,6 @@ jobs:
           fi
           export AWS_LC_SYS_USE_SYSTEM=0
           export AWS_LC_SYS_CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/qsh -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
-          uapi="$RUNNER_TEMP/kernel-uapi"
-          mkdir -p "$uapi"
-          ln -s /usr/include/linux "$uapi/linux"
-          ln -s /usr/include/asm-generic "$uapi/asm-generic"
-          ln -s "/usr/include/$(gcc -dumpmachine)/asm" "$uapi/asm"
-          native_prefix=$(bash scripts/build-openssl.sh --target "$NATIVE_TARGET" \
-            --cache "$RUNNER_TEMP/native-crypto" --cflag=-idirafter --cflag="$uapi" --jobs 2)
-          export OPENSSL_DIR="$native_prefix" OPENSSL_STATIC=1
           export CC=musl-gcc
           cargo build --release --locked -p qsh -p qshd --target "$NATIVE_TARGET"
           dynamic=$(readelf -d "target/$NATIVE_TARGET/release/qsh" "target/$NATIVE_TARGET/release/qshd")
@@ -211,7 +203,6 @@ jobs:
             mkdir -p "$stage"
             cp "target/$target/release/qsh" "target/$target/release/qshd" "$stage/"
             cp README.md LICENSE CHANGELOG.md "$stage/"
-            cp docs/licenses/openssl.txt "$stage/LICENSE-OPENSSL.txt"
             cp docs/licenses/aws-lc-rs.txt "$stage/LICENSE-AWS-LC-RS.txt"
             cp docs/licenses/aws-lc.txt "$stage/LICENSE-AWS-LC.txt"
             tar czf "dist/$stage.tar.gz" "$stage"
@@ -315,16 +306,6 @@ jobs:
       # release run does.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
-      - name: Prepare the pinned native architecture
-        run: |
-          brew install gnupg
-          for target in "$NATIVE_TARGET"; do
-            prefix=$(bash scripts/build-openssl.sh --target "$target" --cache "$RUNNER_TEMP/native-crypto" --jobs 2)
-            scoped=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
-            echo "${scoped}_OPENSSL_DIR=$prefix" >> "$GITHUB_ENV"
-            echo "${scoped}_OPENSSL_STATIC=1" >> "$GITHUB_ENV"
-          done
-
       - name: Test daemon handover on macOS
         run: |
           test_home=$(mktemp -d)
@@ -394,16 +375,13 @@ jobs:
             mkdir -p "$stage"
             cp "target/$target/release/qsh" "target/$target/release/qshd" "$stage/"
             cp README.md LICENSE CHANGELOG.md "$stage/"
-            cp docs/licenses/openssl.txt "$stage/LICENSE-OPENSSL.txt"
             cp docs/licenses/aws-lc-rs.txt "$stage/LICENSE-AWS-LC-RS.txt"
             cp docs/licenses/aws-lc.txt "$stage/LICENSE-AWS-LC.txt"
             tar czf "dist/$stage.tar.gz" "$stage"
             # Probes both actual stripped inputs, then checks archived bytes.
-            scoped=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
-            native_prefix="${scoped}_OPENSSL_DIR"
             python3 scripts/check-release-output.py archive --version "$VERSION" \
               --target "$target" --inputs "$stage" \
-              --darwin-metadata "$evidence/$target.json" --native-prefix "${!native_prefix}" \
+              --darwin-metadata "$evidence/$target.json" \
               "dist/$stage.tar.gz"
           done
 

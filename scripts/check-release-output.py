@@ -26,11 +26,9 @@ LIMIT = 8192
 DOCUMENT_LIMIT = 4 * 1024**2
 # These combined client/daemon archives redistribute the client's AWS-LC edge.
 # The server-only DEB/RPM payload remains a separate package role.
-NOTICES = {'LICENSE-OPENSSL.txt': 'openssl.txt',
-           'LICENSE-AWS-LC-RS.txt': 'aws-lc-rs.txt', 'LICENSE-AWS-LC.txt': 'aws-lc.txt'}
+NOTICES = {'LICENSE-AWS-LC-RS.txt': 'aws-lc-rs.txt', 'LICENSE-AWS-LC.txt': 'aws-lc.txt'}
 # Pinned to the maintained notice bytes; isolated tools need no source-tree data.
 NOTICE_SHA256 = {
-    'LICENSE-OPENSSL.txt': '7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a',
     'LICENSE-AWS-LC-RS.txt': 'b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7',
     'LICENSE-AWS-LC.txt': '728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e',
 }
@@ -334,56 +332,10 @@ def _metadata_compiler_identity(path):
         raise _metadata_failure('rust-toolchain','invalid output') from None
 
 
-def _metadata_compiler_version(text):
-    if type(text) is not str: raise ValueError('invalid compiler metadata')
-    match=re.match(r'(?:Apple clang|Apple LLVM|clang) version ([0-9]+(?:\.[0-9]+){1,2})(?: |$)',text.splitlines()[0])
-    if match is None: raise ValueError('invalid compiler metadata')
-    return _metadata_version(match.group(1))
-
-
-def _metadata_native(prefix,target,sdk):
-    with (Path(prefix)/'manifest.json').open('rb') as stream: raw=stream.read(262145)
-    if len(raw)>262144: raise ValueError('native metadata exceeds limit')
-    try:
-        value=json.loads(raw);identity=value['identity'];compiler=identity['compiler']
-        if identity['target']!=target: raise ValueError('native metadata target mismatch')
-        flags=compiler['flags'];normalized=[];index=0;seen=set()
-        if type(flags) is not list or len(flags)>32: raise ValueError('invalid native metadata flags')
-        while index<len(flags):
-            flag=flags[index]
-            if flag in ('-arch','-isysroot'):
-                if flag in seen or index+1>=len(flags): raise ValueError('invalid native metadata flags')
-                seen.add(flag);operand=flags[index+1]
-                if flag=='-arch' and operand!=DARWIN_TARGETS[target]: raise ValueError('native metadata architecture mismatch')
-                if flag=='-isysroot' and Path(operand).resolve()!=Path(sdk).resolve(): raise ValueError('native metadata SDK mismatch')
-                normalized.extend([flag,'<SDK>' if flag=='-isysroot' else operand]);index+=2
-            else:
-                _metadata_token(flag,r'-(?:O[0-3s]|fPIC|g0|mmacosx-version-min=[0-9]+(?:\.[0-9]+){0,2})')
-                normalized.append(flag);index+=1
-        if seen!={'-arch','-isysroot'}: raise ValueError('missing native metadata flags')
-        macros={}
-        allowed={'__APPLE__','__aarch64__','__arm64__','__x86_64__','__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__','__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__'}
-        for line in compiler['macros'].splitlines():
-            match=re.fullmatch(r'#define (\S+) (\S+)',line)
-            if match and match.group(1) in allowed:
-                if match.group(1) in macros: raise ValueError('ambiguous native metadata macro')
-                macros[match.group(1)]=_metadata_token(match.group(2),r'[0-9]+',20)
-        result=dict(version=_metadata_token(identity['source']['version'],r'[0-9]+(?:\.[0-9]+){1,2}'),
-                    manifest_sha256=hashlib.sha256(raw).hexdigest(),
-                    compiler_sha256=_metadata_token(compiler['sha256'],r'[0-9a-f]{64}',64),
-                    compiler_version=_metadata_compiler_version(compiler['version']),
-                    flags=normalized,macros=macros)
-        probe=_metadata_token(value['artifacts']['version-probe'],r'[0-9a-f]{64}',64)
-        return result,probe
-    except (KeyError,TypeError,AttributeError,IndexError,RecursionError):
-        raise ValueError('invalid native metadata manifest') from None
-
-
-def _darwin_context(prefix,target):
+def _darwin_context(target):
     if sys.platform!='darwin': raise ValueError('Darwin metadata requires the Darwin producer')
     sdk=_metadata_text(['/usr/bin/xcrun','--show-sdk-path'],category='sdk-path')
     if not Path(sdk).is_absolute(): raise ValueError('invalid selected SDK metadata')
-    native,probe=_metadata_native(prefix,target,sdk)
     xcode=_metadata_text(['/usr/bin/xcodebuild','-version'],category='xcode-version').splitlines()
     if len(xcode)!=2 or not xcode[0].startswith('Xcode ') or not xcode[1].startswith('Build version '):
         raise ValueError('invalid Xcode metadata')
@@ -402,7 +354,7 @@ def _darwin_context(prefix,target):
         raise _metadata_failure('rust-toolchain','invalid output')
     explicit=os.environ.get('MACOSX_DEPLOYMENT_TARGET')
     rust['explicit_deployment_target']=None if explicit is None else _metadata_version(explicit)
-    result=dict(schema=1,target=target,
+    result=dict(schema=2,target=target,
         source=dict(sha=_metadata_token(os.environ.get('GITHUB_SHA'),r'[0-9a-f]{40}',40),
                     run_id=_metadata_token(os.environ.get('GITHUB_RUN_ID'),r'[0-9]+',30),
                     run_attempt=_metadata_token(os.environ.get('GITHUB_RUN_ATTEMPT'),r'[0-9]+',10)),
@@ -412,10 +364,10 @@ def _darwin_context(prefix,target):
                   image_version=None if 'ImageVersion' not in os.environ else _metadata_token(os.environ['ImageVersion'],r'[A-Za-z0-9_.-]+',80)),
         sdk=dict(version=_metadata_version(_metadata_text(['/usr/bin/xcrun','--show-sdk-version'],category='sdk-version')),
                  xcode_version=_metadata_version(xcode[0][6:]),xcode_build=_metadata_token(xcode[1][14:],r'[A-Za-z0-9.-]+',64)),
-        rust=rust,native=native,binaries=[])
+        rust=rust,binaries=[])
     tools={name:_metadata_text(['/usr/bin/xcrun','--find',name],category='otool-path' if name=='otool' else 'lipo-path') for name in ('otool','lipo')}
     if any(not Path(path).is_absolute() for path in tools.values()): raise ValueError('invalid Darwin tool metadata')
-    return result,tools,probe
+    return result,tools
 
 
 def _darwin_binary(path,role,program,target,tools):
@@ -440,12 +392,12 @@ def _write_darwin_metadata(path,value):
     finally: os.unlink(temporary)
 
 
-def check_archive(path, inputs, version, target, *, darwin_metadata=None, native_prefix=None):
+def check_archive(path, inputs, version, target, *, darwin_metadata=None):
     enabled=darwin_metadata is not None
-    if enabled!=(native_prefix is not None) or (enabled and target not in DARWIN_TARGETS):
+    if enabled and target not in DARWIN_TARGETS:
         raise ValueError('Darwin metadata arguments require a selected Darwin pair')
     if enabled and os.path.lexists(darwin_metadata): raise ValueError('Darwin evidence already exists')
-    evidence,tools,probe=_darwin_context(native_prefix,target) if enabled else (None,None,None)
+    evidence,tools=_darwin_context(target) if enabled else (None,None)
     root = 'qsh-' + version + '-' + target
     if Path(path).name != root + '.tar.gz':
         raise ValueError('archive filename differs from selected version/target')
@@ -510,9 +462,6 @@ def check_archive(path, inputs, version, target, *, darwin_metadata=None, native
                     if staged['sha256']!=copied['sha256'] or copied['sha256']!=archived or archived!=verified[program]:
                         raise ValueError('Darwin metadata archive identity changed')
                     evidence['binaries'].extend([staged,copied])
-            native=_darwin_binary(Path(native_prefix)/'version-probe','native-probe','version-probe',target,tools)
-            if native['sha256']!=probe: raise ValueError('native metadata probe identity mismatch')
-            evidence['binaries'].append(native)
             _write_darwin_metadata(darwin_metadata,evidence)
 
 
@@ -620,7 +569,6 @@ def main():
             command.add_argument('--inputs', required=True)
             command.add_argument('--target', required=True)
             command.add_argument('--darwin-metadata')
-            command.add_argument('--native-prefix')
             command.add_argument('path')
         if name == 'package':
             command.add_argument('--probe', action='store_true')
@@ -632,7 +580,7 @@ def main():
             raise ValueError('invalid selected version')
         if args.command == 'archive':
             check_archive(args.path, args.inputs, args.version, args.target,
-                          darwin_metadata=args.darwin_metadata,native_prefix=args.native_prefix)
+                          darwin_metadata=args.darwin_metadata)
         elif args.command == 'package':
             check_package(args.path, args.format, args.program, args.version, args.arch, args.probe)
         elif args.command == 'package-name':

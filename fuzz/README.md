@@ -148,9 +148,8 @@ the normal limit.
 ## Reproducing locally
 
 Prerequisites are the pinned `nightly-2026-10-24`, `cargo-fuzz 0.13.2`
-installed from the verified official source and reviewed tool lock, and the
-repository's pinned native OpenSSL prefix. See `DEPENDENCIES.md` for provenance
-and security-check commands. Use owned directories:
+installed from the verified official source and reviewed tool lock. See
+`DEPENDENCIES.md` for provenance and security-check commands. Use owned directories:
 
 ```sh
 export HOME="$OWNED/home"
@@ -162,9 +161,6 @@ export CARGO_TARGET_DIR="$OWNED/target"
 export RUSTUP_TOOLCHAIN=nightly-2026-10-24
 export HISTFILE=/dev/null
 export CARGO_NET_OFFLINE=true
-
-export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_DIR="$OWNED/native-openssl"
-export X86_64_UNKNOWN_LINUX_GNU_OPENSSL_STATIC=1
 ```
 
 ### Dependency source and lock preflight

@@ -60,7 +60,6 @@
     "Cargo.toml", "**/Cargo.toml", "Cargo.lock", "**/Cargo.lock",
     "rust-toolchain", "rust-toolchain.toml", "**/rust-toolchain", "**/rust-toolchain.toml",
     ".config/**", "deny.toml", "build-support/**", "**/build.rs",
-    "scripts/*openssl*", "scripts/openssl/**", "scripts/tests/test_build_openssl.py",
     "scripts/check-dependencies.py", "scripts/install-dependency-tools.py",
     "scripts/dependency-exceptions.json", "scripts/dependency-tools.json",
     "scripts/tests/test_dependency_policy.py",
@@ -87,7 +86,7 @@
       ".github/pull_request_template.md",
       "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md",
       "docs/actions-maintenance.md", "docs/cli-guide.md", "docs/dependency-policy.md",
-      "docs/native-crypto.md", "docs/performance-baseline.md", "docs/private-data-check.md",
+      "docs/performance-baseline.md", "docs/private-data-check.md",
       "docs/protocol.md", "docs/qshd-service.md", "docs/terminal-resources.md",
       "docs/three-channel-functional.md", "docs/assets/qsh-banner.svg"
     ],

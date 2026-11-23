@@ -285,9 +285,7 @@ Linux quality/runtime checks use 1.99.1. Follow the ordered
 floor does not widen the exact compiler qualification for
 [terminal resource bounds](docs/terminal-resources.md).
 
-Prepare the verified static OpenSSL prefix described in the
-[native build prerequisites](docs/native-crypto.md), then build both binaries
-from source with Rust:
+Then build both binaries from source with Rust:
 
 ```sh
 cargo build --release --locked -p qsh -p qshd

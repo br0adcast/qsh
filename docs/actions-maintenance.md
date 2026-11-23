@@ -75,7 +75,7 @@ How a path selects lanes:
 
 - **Full matrix:** workflows, the selection policy and its controls, every
   Cargo manifest and lock file, toolchain files, `.config/`, `deny.toml`,
-  `build-support/`, every `build.rs`, the OpenSSL, dependency-policy and
+  `build-support/`, every `build.rs`, the dependency-policy and
   nextest runner inputs, an unknown path, and any uncertainty about the change
   set (an unreadable manifest, a malformed diff, an empty change).
 - **Rust crates:** every lane whose jobs build the crate. The dependency
