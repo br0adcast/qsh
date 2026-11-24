@@ -66,7 +66,7 @@ provenance; there is no other native source outside Cargo.
 
 `deny.toml` records the current declarations. The common set is MIT, Apache-2.0,
 BSD-3-Clause, ISC, Unicode-3.0 and Zlib. Additional rules apply only to the
-sixteen named workspace packages at 0.6.0-alpha.3 (AGPL-3.0-only), option-ext 0.2.0
+sixteen named workspace packages at 0.6.0-alpha.4 (AGPL-3.0-only), option-ext 0.2.0
 (MPL-2.0), and webpki-roots/webpki-root-certs 1.0.12
 (CDLA-Permissive-2.0). Workspace/private/path
 packages are not skipped, and no content-free license clarification is used.
