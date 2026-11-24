@@ -7,6 +7,17 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0-alpha.4] — 2026-11-24
+
+### Fixed
+
+- Enable terminal focus reporting (`DECSET 1004`, `ESC [ ? 1004 h`) in the
+  console client and redraw every row in place (without `ESC [ 2 J` flash) on
+  `FocusIn`, restoring screens left mostly blank/gray after a tab sits in the
+  background in macOS `Terminal.app` (#629, #676). Forward `ESC [ I` / `ESC [ O`
+  only to remote applications that enabled mode `1004`, and reset `?1004l` on
+  exit, suspend, and panic cleanup.
+
 ## [0.6.0-alpha.3] — 2026-11-24
 
 ### Fixed
