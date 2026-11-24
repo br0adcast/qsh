@@ -395,6 +395,8 @@ fn offer(client: &StdClient, image: &[u8], build: u64) {
                 checksum: sha256(image),
                 arch: std::env::consts::ARCH.to_string(),
                 size: image.len() as u64,
+                prefer_frontend_upgrade: false,
+                allow_frontend_disrupt: false,
             })),
         )
         .expect("fixture input admitted");
@@ -1352,4 +1354,169 @@ fn restart_only_reuses_a_live_different_build_without_stopping_it() {
         std::fs::read(home.path().join("qsh/transport_server_key.bin")).unwrap(),
         identity
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hosted_personal_daemon_updates_frontend_over_qsh_preserving_sessions() {
+    let _serial = serialised();
+    let bins = stripped_qshd();
+    let home = private_temp_home().expect("home");
+    let sock = home.path().join("qsh").join("control.sock");
+
+    let old_build = self_check(&bins.bin).build;
+    let mut new_image = bins.old.clone();
+    new_image.extend_from_slice(b"\0qshd-frontend-over-qsh-test\0");
+    let new_sum = sha256(&new_image);
+    let new_build = old_build + 1;
+    let labels = format!("{}={new_build}", hex::encode(new_sum));
+
+    let first = generate_keypair();
+    let second = generate_keypair();
+    let port = free_udp_port();
+    let _guard = DaemonGuard::new(sock.clone());
+    let server_pub = start_daemon(&bins.bin, home.path(), port, first.public, &labels);
+    assert!(wait_for(Duration::from_secs(15), || status(&sock).is_some()));
+    client_request(&sock, &ControlRequest::AddClient(second.public)).expect("ADD-CLIENT");
+    let before = status(&sock).expect("STATUS");
+    assert_eq!(before.build, old_build);
+    let old_frontends = frontends_of(before.pid);
+    assert_eq!(old_frontends.len(), 1);
+
+    // Second client stays actively attached with a running shell.
+    let (other, other_events) = connect(home.path(), port, server_pub, second.private, [9; 16]);
+    other
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::Open(OpenRequest {
+                stream: FIRST_CHANNEL_STREAM,
+                kind: ChannelKind::Shell,
+                cols: 80,
+                rows: 24,
+                screen: false,
+                command: Vec::new(),
+            })),
+        )
+        .expect("open shell");
+    assert!(wait_for(Duration::from_secs(15), || other_events.has(
+        |r| *r
+            == ServerRecord::Opened {
+                stream: FIRST_CHANNEL_STREAM
+            }
+    )));
+    let mut other_owners = Vec::new();
+    let mut other_shells = Vec::new();
+    assert!(wait_for(Duration::from_secs(15), || {
+        other_owners = owners_of(before.pid);
+        other_shells = other_owners
+            .iter()
+            .filter_map(|owner| owner.parse::<u32>().ok())
+            .flat_map(children_of)
+            .collect();
+        other_owners.len() == 1 && !other_shells.is_empty()
+    }));
+
+    // Offering client connects and checks `About` reports `os = Some("linux")`.
+    let (client, events) = connect(home.path(), port, server_pub, first.private, [1; 16]);
+    let about_before = ask_about(home.path(), &client, &events);
+    assert_eq!(about_before.build, old_build);
+    assert_eq!(about_before.os.as_deref(), Some("linux"));
+
+    // Without explicit disruption consent, busy daemon refuses with Busy { others: 1 }.
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::UpdateOffer(UpdateOffer {
+                build: new_build,
+                checksum: new_sum,
+                arch: std::env::consts::ARCH.to_string(),
+                size: new_image.len() as u64,
+                prefer_frontend_upgrade: true,
+                allow_frontend_disrupt: false,
+            })),
+        )
+        .expect("send busy offer");
+    assert!(
+        wait_for(Duration::from_secs(15), || events.has(
+            |r| *r == ServerRecord::UpdateAnswer(UpdateAnswer::Busy { others: 1 })
+        )),
+        "expected Busy {{ others: 1 }}, got {:?}; log:\n{}",
+        events.control(),
+        daemon_log(home.path())
+    );
+
+    // With explicit frontend disruption consent, daemon accepts and swaps only the frontend.
+    client
+        .send_bytes(
+            CONTROL_STREAM,
+            encode_client(&ClientRecord::UpdateOffer(UpdateOffer {
+                build: new_build,
+                checksum: new_sum,
+                arch: std::env::consts::ARCH.to_string(),
+                size: new_image.len() as u64,
+                prefer_frontend_upgrade: true,
+                allow_frontend_disrupt: true,
+            })),
+        )
+        .expect("send consented offer");
+    assert!(
+        wait_for(Duration::from_secs(15), || events
+            .has(|r| *r == ServerRecord::UpdateAnswer(UpdateAnswer::Accept))),
+        "{:?}; log:\n{}",
+        events.control(),
+        daemon_log(home.path())
+    );
+    send_image(&client, &new_image);
+    assert!(
+        wait_for(Duration::from_secs(180), || events.has(
+            |r| *r == ServerRecord::UpdateResult(UpdateResult::Restarting)
+        )),
+        "{:?}; log:\n{}",
+        events.control(),
+        daemon_log(home.path())
+    );
+    client.detach();
+    other.detach();
+
+    // Wait for STATUS to show the new serving frontend build.
+    assert!(
+        wait_for(Duration::from_secs(15), || status(&sock)
+            .is_some_and(|s| s.build == new_build)),
+        "STATUS did not advance to new build; log:\n{}",
+        daemon_log(home.path())
+    );
+    let after = status(&sock).expect("STATUS after");
+    assert_eq!(after.pid, before.pid, "host keeps its PID");
+    assert_eq!(after.checksum, hex::encode(new_sum));
+    assert_eq!(
+        std::fs::read(&bins.bin).expect("read persisted binary"),
+        new_image,
+        "verified binary persisted on disk"
+    );
+    assert!(leftovers(bins.dir.path()).is_empty());
+
+    // Frontend was replaced, while the other session's owner and shell survived!
+    let mut new_frontends = Vec::new();
+    assert!(wait_for(Duration::from_secs(15), || {
+        new_frontends = frontends_of(after.pid);
+        new_frontends.len() == 1 && new_frontends != old_frontends
+    }));
+    assert!(
+        std::path::Path::new(&format!("/proc/{}", other_owners[0])).exists(),
+        "the other session's owner process must survive frontend replacement"
+    );
+    for shell in &other_shells {
+        assert!(
+            std::path::Path::new(&format!("/proc/{shell}")).exists(),
+            "the other session's shell {shell} must survive frontend replacement"
+        );
+    }
+
+    // Fresh connection observes updated About (build, checksum, os).
+    let (again, again_events) = connect(home.path(), port, server_pub, first.private, [2; 16]);
+    let about_after = ask_about(home.path(), &again, &again_events);
+    assert_eq!(about_after.build, new_build);
+    assert_eq!(about_after.checksum, new_sum);
+    assert_eq!(about_after.os.as_deref(), Some("linux"));
+    again.close();
 }

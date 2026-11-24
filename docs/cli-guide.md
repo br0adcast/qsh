@@ -450,6 +450,30 @@ color. When the total size is known and there is enough room, the bar fills the
 available line width and adapts when the window is resized. Redirected output
 uses plain text without animation.
 
+### Updating an older personal daemon on direct login
+
+When an interactive foreground `qsh` login succeeds directly over UDP and
+authenticated server discovery reports a `qshd` version older than the client,
+`qsh` queries `qshd` over the open session (`ABOUT_REQUEST`) before opening a
+shell:
+
+- **Managed daemons** (`qshd serve` / `qshd serve --system`) are left alone and
+  the session opens normally.
+- **Personal daemons that report their OS** are offered an update directly over
+  `qsh` (without SSH). With approval, `qsh` fetches and authenticates the exact
+  matching release for the daemon's OS and architecture from GitHub Releases,
+  uploads the binary over `UPDATE_STREAM`, and reconnects directly after the
+  daemon swaps in the new version. On Linux hosted personal daemons, active and
+  parked sessions are preserved across the frontend replacement; if other
+  clients are currently attached, `qsh` asks for explicit confirmation (`[y/N]`)
+  before briefly disconnecting them. Declining or any non-fatal failure
+  continues straight into the compatible direct session.
+- **Older personal daemons that predate reporting their OS in `About`**: if an
+  SSH route is configured, `qsh` offers an explicit compatibility fallback to
+  update `qshd` over SSH. If you decline, if SSH is disabled (`,nossh`), or if
+  SSH is unavailable, `qsh` continues directly into the compatible session.
+- Background reconnects and recovery probes never prompt or update `qshd`.
+
 Linux and Darwin targets support x86_64 and aarch64. Automatic downloads require
 signed metadata; unsigned releases, including the existing v0.5.0, are refused.
 Old unsigned cache generations are misses, without trusting or migrating their

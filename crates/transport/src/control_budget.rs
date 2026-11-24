@@ -27,11 +27,11 @@ const GLOBAL_BYTES: usize = MAX_SESSIONS_TOTAL * SESSION_BYTES;
 // the byte envelope alone cannot bound their object/Arc/container overhead.
 pub(crate) const GLOBAL_RESPONSE_ENTRIES: usize =
     MAX_SESSIONS_TOTAL * (ORDINARY_ENTRIES + MAX_CHANNELS + 1 + 3 + 1 + CHANNEL_IDENTITIES);
-// Each About job additionally owns <=160 logical bytes of validated retained
+// Each About job additionally owns <=226 logical bytes of validated retained
 // metadata + per-waiter clone (not arbitrary allocations inside the provider).
 // This job cap includes retired sessions and remains held through result drop:
-// <=40,960 additional bytes globally, or <=160 for one current session.
-// Combined response/copy + About metadata: 182,111,616 globally, 1,422,587 for
+// <=57,856 additional bytes globally, or <=226 for one current session.
+// Combined response/copy + About metadata: 182,128,512 globally, 1,422,653 for
 // one current session. Struct/container and allocator overhead remain separate.
 const GLOBAL_JOBS: usize = 2 * MAX_SESSIONS_TOTAL;
 const PRINCIPAL_JOBS: usize = 2 * MAX_SESSIONS_PER_OWNER;

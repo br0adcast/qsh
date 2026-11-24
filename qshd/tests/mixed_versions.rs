@@ -278,6 +278,8 @@ fn offer(client: &StdClient, image: &[u8], build: u64) {
                 checksum: sha256(image),
                 arch: std::env::consts::ARCH.to_string(),
                 size: image.len() as u64,
+                prefer_frontend_upgrade: false,
+                allow_frontend_disrupt: false,
             })),
         )
         .expect("fixture input admitted");

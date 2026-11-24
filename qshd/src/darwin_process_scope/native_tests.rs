@@ -6377,6 +6377,8 @@ fn run_actual_daemon_replacement(role: ReplacementActorRole) {
                 checksum: new_hash,
                 arch: std::env::consts::ARCH.into(),
                 size: image.len() as u64,
+                prefer_frontend_upgrade: false,
+                allow_frontend_disrupt: false,
             })),
         )
         .unwrap();

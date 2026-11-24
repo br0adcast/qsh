@@ -454,6 +454,9 @@ pub struct OfferContext<'a> {
     pub in_progress: bool,
     /// Every active session, the offering one included.
     pub active_sessions: u64,
+    /// Explicit consent to briefly disconnect other attached clients during a
+    /// session-preserving frontend replacement.
+    pub allow_disrupt: bool,
 }
 
 /// The table of spec §3.2, row by row. `Ok` is `Accept`.
@@ -483,6 +486,7 @@ pub fn decide_offer(offer: &UpdateOffer, ctx: &OfferContext<'_>) -> Result<(), U
         Replacement::UpToDate => Err(UpdateAnswer::UpToDate),
         Replacement::DaemonNewer => Err(UpdateAnswer::DaemonNewer),
         _ if ctx.in_progress => Err(UpdateAnswer::InProgress),
+        Replacement::Busy { .. } if ctx.allow_disrupt => Ok(()),
         Replacement::Busy { others } => Err(UpdateAnswer::Busy {
             others: busy_count(others),
         }),
@@ -783,6 +787,11 @@ pub struct DaemonSelf {
     /// Worked out on the first question, once -- a binary that cannot be
     /// read is remembered as `None` too, not hashed again per request.
     own: OnceLock<Option<OwnImage>>,
+    /// The serving frontend identity on hosted daemons (#529), so `About` and
+    /// `decide_offer` stay current after a frontend upgrade.
+    serving: Option<Arc<crate::server_info::Serving>>,
+    #[cfg(target_os = "linux")]
+    frontend_upgrader: OnceLock<Arc<crate::host::upgrade::Upgrader>>,
     managed: bool,
     binary_path: PathBuf,
     own_uid: u32,
@@ -815,6 +824,9 @@ impl DaemonSelf {
         remove_stale_staged(&binary_path, running_from.as_deref());
         DaemonSelf {
             own: own_cell(own),
+            serving: None,
+            #[cfg(target_os = "linux")]
+            frontend_upgrader: OnceLock::new(),
             managed: false,
             binary_path,
             own_uid,
@@ -833,6 +845,9 @@ impl DaemonSelf {
     pub fn managed(opens: Arc<ChannelOpenRegistry>, own: Option<OwnImage>) -> DaemonSelf {
         DaemonSelf {
             own: own_cell(own),
+            serving: None,
+            #[cfg(target_os = "linux")]
+            frontend_upgrader: OnceLock::new(),
             managed: true,
             binary_path: PathBuf::new(),
             own_uid: u32::MAX,
@@ -852,10 +867,49 @@ impl DaemonSelf {
         self
     }
 
+    /// The serving frontend description, so `About` and offers stay current
+    /// across hosted frontend replacements (#529).
+    pub fn with_serving(mut self, serving: Arc<crate::server_info::Serving>) -> DaemonSelf {
+        self.serving = Some(serving);
+        self
+    }
+
+    /// Attach the hosted frontend upgrader once `Host` and `Upgrader` exist.
+    #[cfg(target_os = "linux")]
+    pub fn set_frontend_upgrader(&self, upgrader: Arc<crate::host::upgrade::Upgrader>) {
+        let _ = self.frontend_upgrader.set(upgrader);
+    }
+
+    fn has_frontend_upgrader(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.frontend_upgrader.get().is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn with_exec(mut self, exec: ExecFn) -> DaemonSelf {
         self.exec = Some(exec);
         self
+    }
+
+    /// This daemon's currently serving image, preferring `Serving` on hosted
+    /// daemons so frontend replacements update `About` and `offer` immediately.
+    fn current_own(&self) -> Option<OwnImage> {
+        if let Some(serving) = &self.serving {
+            if let Ok(identity) = serving.identity() {
+                return Some(OwnImage {
+                    build: identity.build,
+                    checksum: identity.checksum,
+                    arch: std::env::consts::ARCH.to_string(),
+                });
+            }
+        }
+        self.own().cloned()
     }
 
     /// This daemon's image, worked out once. `None` if the binary cannot be
@@ -911,7 +965,7 @@ fn own_cell(own: Option<OwnImage>) -> OnceLock<Option<OwnImage>> {
 
 impl DaemonUpdates for DaemonSelf {
     fn about(&self) -> Option<About> {
-        let own = self.own()?;
+        let own = self.current_own()?;
         let mut checksum = [0u8; 32];
         let bytes = hex::decode(&own.checksum).ok()?;
         if bytes.len() != 32 {
@@ -921,13 +975,14 @@ impl DaemonUpdates for DaemonSelf {
         Some(About {
             build: own.build,
             checksum,
-            arch: own.arch.clone(),
+            arch: own.arch,
             protocol: PROTOCOL_VERSION,
             mode: if self.managed {
                 DaemonMode::Managed
             } else {
                 DaemonMode::Personal
             },
+            os: Some(std::env::consts::OS.to_string()),
         })
     }
 
@@ -951,7 +1006,7 @@ impl DaemonUpdates for DaemonSelf {
         }
         // A daemon that cannot describe itself never answered `About`, so no
         // client has a reason to offer; one that does anyway is not taken.
-        let Some(own) = self.own() else {
+        let Some(own) = self.current_own() else {
             return Err(UpdateAnswer::NotAllowed);
         };
         decide_offer(
@@ -960,9 +1015,12 @@ impl DaemonUpdates for DaemonSelf {
                 managed: self.managed,
                 from_uid: from.uid,
                 own_uid: self.own_uid,
-                own,
+                own: &own,
                 in_progress: self.in_progress.load(Ordering::SeqCst),
                 active_sessions: self.active.load(Ordering::SeqCst) as u64,
+                allow_disrupt: offer.prefer_frontend_upgrade
+                    && offer.allow_frontend_disrupt
+                    && self.has_frontend_upgrader(),
             },
         )?;
         // Claim the one slot. A second offer that raced past the check above
@@ -993,6 +1051,10 @@ impl DaemonUpdates for DaemonSelf {
             handover: self.handover.clone(),
             exec: self.exec.clone(),
             owners: self.owners.clone(),
+            #[cfg(target_os = "linux")]
+            frontend_upgrader: self.frontend_upgrader.get().cloned(),
+            #[cfg(target_os = "linux")]
+            prepared_frontend: None,
             lease: None,
         }))
     }
@@ -1033,6 +1095,10 @@ struct StagedImage {
     handover: Option<Arc<HandoverBase>>,
     exec: Option<ExecFn>,
     owners: Option<Arc<dyn OwnerStop>>,
+    #[cfg(target_os = "linux")]
+    frontend_upgrader: Option<Arc<crate::host::upgrade::Upgrader>>,
+    #[cfg(target_os = "linux")]
+    prepared_frontend: Option<crate::host::upgrade::StagedFrontendUpgrade>,
 }
 
 impl StagedImage {
@@ -1141,6 +1207,42 @@ impl UpdateTransfer for StagedImage {
                 "the image does not match its checksum".to_string(),
             ));
         }
+        #[cfg(target_os = "linux")]
+        if self.offer.prefer_frontend_upgrade {
+            if let Some(upgrader) = self.frontend_upgrader.clone() {
+                if let Some(base) = &self.handover {
+                    let state = base.actions.state.lock().map_err(|_| revoked_update())?;
+                    if !self
+                        .lease
+                        .is_some_and(|lease| state.owns_replacement(lease))
+                    {
+                        return Err(revoked_update());
+                    }
+                    base.admission.close();
+                    self.closed_admission = true;
+                }
+                match upgrader.prepare_staged(
+                    &self.path,
+                    self.offer.size,
+                    &hex::encode(self.offer.checksum),
+                    self.offer.build,
+                    self.offer.allow_frontend_disrupt,
+                ) {
+                    Ok(crate::host::upgrade::StagedFrontendPlan::Frontend(upgrade)) => {
+                        self.prepared_frontend = Some(upgrade);
+                        return Ok(());
+                    }
+                    Ok(crate::host::upgrade::StagedFrontendPlan::FullExecFallback) => {
+                        // Fall through to full-exec checks below.
+                        self.reopen_admission();
+                    }
+                    Err(error) => {
+                        self.reopen_admission();
+                        return Err(error);
+                    }
+                }
+            }
+        }
         let check = run_self_check(&self.path, SELF_CHECK_TIMEOUT)
             .map_err(|detail| rejected(RejectCode::SelfCheckFailed, detail))?;
         if check.build != self.offer.build || check.arch != self.offer.arch {
@@ -1226,6 +1328,36 @@ impl UpdateTransfer for StagedImage {
             }
             base.admission.close();
             self.closed_admission = true;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(upgrade) = self.prepared_frontend.take() {
+            if let Some(upgrader) = self.frontend_upgrader.clone() {
+                // Give `UpdateResult::Restarting` time to reach the offering
+                // client before the old frontend stops.
+                std::thread::sleep(RESTART_GRACE);
+                let Some(_control) = write_within(&base.control_gate, CONTROL_GATE_TIMEOUT) else {
+                    return restart_stopped(
+                        RestartStop::ControlBusy,
+                        UpdateResult::Rejected {
+                            code: RejectCode::ControlBusy,
+                            detail: format!(
+                                "the control socket stayed busy for {} s",
+                                CONTROL_GATE_TIMEOUT.as_secs()
+                            ),
+                        },
+                    );
+                };
+                return match upgrader.commit_staged(upgrade, lease, &self.path, &self.binary_path) {
+                    Ok(renamed) => {
+                        self.closed_admission = false;
+                        if renamed {
+                            self.created = false;
+                        }
+                        UpdateResult::Restarting
+                    }
+                    Err(result) => restart_stopped(RestartStop::ExecFailed, result),
+                };
+            }
         }
         if let Err(error) = self.cleanup_preflight() {
             return restart_stopped(RestartStop::CleanupPending, error);
@@ -1777,6 +1909,8 @@ mod tests {
             checksum,
             arch: ARCH.to_string(),
             size: image.len() as u64,
+            prefer_frontend_upgrade: false,
+            allow_frontend_disrupt: false,
         }
     }
 
@@ -2128,12 +2262,15 @@ mod tests {
             own: &own,
             in_progress: false,
             active_sessions: 1,
+            allow_disrupt: false,
         };
         let newer = UpdateOffer {
             build: 101,
             checksum: [2; 32],
             arch: ARCH.to_string(),
             size: 1024,
+            prefer_frontend_upgrade: false,
+            allow_frontend_disrupt: false,
         };
         assert_eq!(
             decide_offer(&newer, &base),
@@ -2252,6 +2389,18 @@ mod tests {
             decide_offer(
                 &newer,
                 &OfferContext {
+                    active_sessions: 3,
+                    allow_disrupt: true,
+                    ..base
+                }
+            ),
+            Ok(()),
+            "explicit disruption consent allows a busy hosted daemon to accept"
+        );
+        assert_eq!(
+            decide_offer(
+                &newer,
+                &OfferContext {
                     active_sessions: 0,
                     ..base
                 }
@@ -2273,6 +2422,7 @@ mod tests {
                 arch: ARCH.to_string(),
                 protocol: PROTOCOL_VERSION,
                 mode: DaemonMode::Personal,
+                os: Some(std::env::consts::OS.to_string()),
             })
         );
         assert_eq!(

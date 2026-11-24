@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 use daemon_bootstrap_protocol::CandidateImageIdentity;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
+use transport::channel::{RejectCode, UpdateResult, PROTOCOL_VERSION};
 use transport::session_manager::Shutdown;
 
 use super::images::{FrontendImage, ImageIdentity, ImageInfo};
@@ -364,6 +365,267 @@ impl Upgrader {
             book: Mutex::default(),
         })))
     }
+
+    /// Inspect a verified image staged over `UPDATE_STREAM` and decide whether
+    /// it can replace only the network frontend while preserving sessions.
+    /// Caller must hold the replacement lease and have closed admission.
+    pub(crate) fn prepare_staged(
+        &self,
+        path: &Path,
+        expected_size: u64,
+        expected_checksum: &str,
+        expected_build: u64,
+        allow_disrupt: bool,
+    ) -> Result<StagedFrontendPlan, UpdateResult> {
+        let checked =
+            self.0
+                .check_staged(path, expected_size, expected_checksum, expected_build)?;
+        let outcome = self.0.outcome(&checked.serving, &checked.facts);
+        match outcome {
+            Outcome::UpToDate => Err(UpdateResult::Rejected {
+                code: RejectCode::Other,
+                detail: "the offered image is already serving".into(),
+            }),
+            Outcome::Older => Err(UpdateResult::Rejected {
+                code: RejectCode::VersionNotAccepted,
+                detail: "the offered image is older than the serving frontend".into(),
+            }),
+            Outcome::Silent => Ok(StagedFrontendPlan::Frontend(StagedFrontendUpgrade {
+                image: checked.image,
+                identity: checked.identity,
+                allow_disrupt,
+            })),
+            Outcome::Soft { attached } => {
+                // The offering client itself is counted among `attached`.
+                if attached <= 1 || allow_disrupt {
+                    Ok(StagedFrontendPlan::Frontend(StagedFrontendUpgrade {
+                        image: checked.image,
+                        identity: checked.identity,
+                        allow_disrupt,
+                    }))
+                } else {
+                    Err(UpdateResult::Busy {
+                        others: (attached - 1).min(u64::from(u32::MAX)) as u32,
+                    })
+                }
+            }
+            Outcome::Unreachable {
+                stranded, sessions, ..
+            } => Err(UpdateResult::Rejected {
+                code: RejectCode::VersionNotAccepted,
+                detail: format!(
+                    "the new qshd cannot serve {stranded} of {sessions} active session(s)"
+                ),
+            }),
+            Outcome::Destructive { sessions, .. } => {
+                if sessions <= 1 {
+                    Ok(StagedFrontendPlan::FullExecFallback)
+                } else {
+                    Err(UpdateResult::Rejected {
+                        code: RejectCode::VersionNotAccepted,
+                        detail: format!(
+                            "the new qshd requires a full daemon restart and cannot preserve \
+                             {sessions} active session(s)"
+                        ),
+                    })
+                }
+            }
+            Outcome::FullRestart => Ok(StagedFrontendPlan::FullExecFallback),
+        }
+    }
+
+    /// Commit a frontend replacement staged over `UPDATE_STREAM`.
+    /// Caller holds the control gate write guard, the replacement `lease`, and
+    /// closed admission, and runs on a Tokio blocking worker.
+    /// Returns `Ok(true)` if `staged_path` was moved into its persisted path.
+    pub(crate) fn commit_staged(
+        &self,
+        upgrade: StagedFrontendUpgrade,
+        lease: ReplacementLease,
+        staged_path: &Path,
+        binary_path: &Path,
+    ) -> Result<bool, UpdateResult> {
+        if let Some(actions) = &self.0.actions {
+            let Ok(state) = actions.state.lock() else {
+                return Err(UpdateResult::Rejected {
+                    code: RejectCode::ExecFailed,
+                    detail: "replacement authority unavailable".into(),
+                });
+            };
+            if !state.owns_replacement(lease) {
+                return Err(UpdateResult::Rejected {
+                    code: RejectCode::ExecFailed,
+                    detail: "replacement authority was revoked".into(),
+                });
+            }
+        }
+        {
+            let mut book = self.0.book();
+            if book.committing {
+                return Err(UpdateResult::Rejected {
+                    code: RejectCode::ControlBusy,
+                    detail: "another frontend upgrade is already committing".into(),
+                });
+            }
+            book.held = None;
+            book.committing = true;
+        }
+        let _committing = Committing(&self.0);
+        let serving = self
+            .0
+            .serving
+            .identity()
+            .map_err(|_| UpdateResult::Rejected {
+                code: RejectCode::ExecFailed,
+                detail: "cannot read serving frontend identity".into(),
+            })?;
+        let outcome = self.0.outcome(
+            &serving,
+            &candidate_facts(&upgrade.image.info, &upgrade.identity),
+        );
+        match outcome {
+            Outcome::Silent => {}
+            Outcome::Soft { attached } if attached <= 1 || upgrade.allow_disrupt => {}
+            Outcome::Soft { attached } => {
+                return Err(UpdateResult::Busy {
+                    others: (attached - 1).min(u64::from(u32::MAX)) as u32,
+                });
+            }
+            other => {
+                return Err(UpdateResult::Rejected {
+                    code: RejectCode::VersionNotAccepted,
+                    detail: format!("daemon sessions changed before frontend swap ({other:?})"),
+                });
+            }
+        }
+        crate::log::info(
+            "update",
+            &format!(
+                "replacing the network frontend over qsh: build {} with build {} ({outcome:?})",
+                serving.build, upgrade.identity.build
+            ),
+        );
+        let identity = upgrade.identity;
+        match tokio::runtime::Handle::current()
+            .block_on(self.0.host.replace_frontend(upgrade.image))
+        {
+            Ok(()) => {
+                let busy = identity.busy_identity();
+                let new_version = identity.version.clone();
+                self.0.serving.set(identity);
+                if let Some(actions) = &self.0.actions {
+                    actions.set_identity(busy);
+                }
+                let dest = persist_target_path(binary_path, &new_version);
+                let renamed = match std::fs::rename(staged_path, &dest) {
+                    Ok(()) => {
+                        crate::log::info(
+                            "update",
+                            &format!("installed updated qshd binary at {}", dest.display()),
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        crate::log::warn(
+                            "update",
+                            &format!(
+                                "new frontend serves, but could not persist {} to {}: {error}",
+                                staged_path.display(),
+                                dest.display()
+                            ),
+                        );
+                        false
+                    }
+                };
+                Ok(renamed)
+            }
+            Err(not) => {
+                if !self.0.host.control.is_closed() {
+                    self.0.host.start.admission.open();
+                }
+                let detail = match not {
+                    NotReplaced::Busy(why) => format!("frontend replacement busy: {why}"),
+                    NotReplaced::Stopping => STOPPING.into(),
+                    NotReplaced::RolledBack(reason) => {
+                        format!("the new frontend did not start and was rolled back: {reason}")
+                    }
+                };
+                crate::log::warn("update", &detail);
+                Err(UpdateResult::Rejected {
+                    code: RejectCode::ExecFailed,
+                    detail,
+                })
+            }
+        }
+    }
+}
+
+/// A verified candidate held for a session-preserving frontend swap over `UPDATE_STREAM`.
+pub(crate) struct StagedFrontendUpgrade {
+    image: FrontendImage,
+    identity: FrontendIdentity,
+    allow_disrupt: bool,
+}
+
+/// What a hosted daemon can do with an image staged over `UPDATE_STREAM`.
+pub(crate) enum StagedFrontendPlan {
+    Frontend(StagedFrontendUpgrade),
+    FullExecFallback,
+}
+
+/// Where to persist a verified `qshd` binary after a frontend upgrade.
+/// If `binary_path` uses the cached versioned naming `qshd-<old_ver>-<suffix>`
+/// and `new_version` is a clean SemVer release string, write beside it as
+/// `qshd-<new_version>-<suffix>` so `locate` picks the newest version on future
+/// restarts without lying in the filename. Otherwise atomically replace
+/// `binary_path`.
+pub(crate) fn persist_target_path(binary_path: &Path, new_version: &str) -> PathBuf {
+    let valid_semver = |v: &str| -> bool {
+        let Some((core, pre)) = v.split_once('-').map_or(Some((v, None)), |(c, p)| {
+            (!p.is_empty()).then_some((c, Some(p)))
+        }) else {
+            return false;
+        };
+        if v.contains('+') || v.contains('/') || v.contains('\0') {
+            return false;
+        }
+        let mut parts = core.split('.');
+        let ok_core = matches!(
+            (parts.next(), parts.next(), parts.next(), parts.next()),
+            (Some(a), Some(b), Some(c), None)
+                if !a.is_empty()
+                    && !b.is_empty()
+                    && !c.is_empty()
+                    && a.bytes().all(|x| x.is_ascii_digit())
+                    && b.bytes().all(|x| x.is_ascii_digit())
+                    && c.bytes().all(|x| x.is_ascii_digit())
+        );
+        if !ok_core {
+            return false;
+        }
+        pre.is_none_or(|p| {
+            p.split('.').all(|id| {
+                !id.is_empty() && id.bytes().all(|x| x.is_ascii_alphanumeric() || x == b'-')
+            })
+        })
+    };
+    if !valid_semver(new_version) {
+        return binary_path.to_path_buf();
+    }
+    let Some(name) = binary_path.file_name().and_then(|n| n.to_str()) else {
+        return binary_path.to_path_buf();
+    };
+    let Some(rest) = name.strip_prefix("qshd-") else {
+        return binary_path.to_path_buf();
+    };
+    for suffix in ["-x86_64-darwin", "-aarch64-darwin", "-x86_64", "-aarch64"] {
+        if let Some(old_version) = rest.strip_suffix(suffix) {
+            if valid_semver(old_version) {
+                return binary_path.with_file_name(format!("qshd-{new_version}{suffix}"));
+            }
+        }
+    }
+    binary_path.to_path_buf()
 }
 
 impl FrontendUpgrades for Upgrader {
@@ -857,6 +1119,137 @@ impl Inner {
         })
     }
 
+    /// Blocking verification of a file staged over `UPDATE_STREAM`, held open
+    /// by descriptor so no path TOCTOU exists between self-check and exec.
+    fn check_staged(
+        &self,
+        path: &Path,
+        expected_size: u64,
+        expected_checksum: &str,
+        expected_build: u64,
+    ) -> Result<Checked, UpdateResult> {
+        let rejected = |code: RejectCode, detail: String| UpdateResult::Rejected { code, detail };
+        let serving = self.serving.identity().map_err(|_| {
+            rejected(
+                RejectCode::Other,
+                "cannot read serving frontend identity".into(),
+            )
+        })?;
+        let image = SelfImage::open(path).map_err(|error| {
+            rejected(
+                RejectCode::DiskError,
+                format!("cannot open {}: {error}", path.display()),
+            )
+        })?;
+        let size = image
+            .size()
+            .map_err(|error| rejected(RejectCode::DiskError, format!("cannot read it: {error}")))?;
+        if size != expected_size {
+            return Err(rejected(
+                RejectCode::SizeMismatch,
+                format!("expected {expected_size} bytes, got {size}"),
+            ));
+        }
+        let checksum = sha256_of(&image, size).map_err(|_| {
+            rejected(
+                RejectCode::ChecksumMismatch,
+                "the staged image changed while reading".into(),
+            )
+        })?;
+        if checksum != expected_checksum {
+            return Err(rejected(
+                RejectCode::ChecksumMismatch,
+                "the image does not match its checksum".into(),
+            ));
+        }
+        let check =
+            crate::update::run_self_check(&image.proc_path(), crate::update::SELF_CHECK_TIMEOUT)
+                .map_err(|detail| rejected(RejectCode::SelfCheckFailed, detail))?;
+        if check.build != expected_build || check.arch != std::env::consts::ARCH {
+            return Err(rejected(
+                RejectCode::SelfCheckFailed,
+                format!(
+                    "self-check reported build {} {}, expected build {} {}",
+                    check.build,
+                    check.arch,
+                    expected_build,
+                    std::env::consts::ARCH
+                ),
+            ));
+        }
+        if !check.protocols.contains(&PROTOCOL_VERSION) {
+            return Err(rejected(
+                RejectCode::VersionNotAccepted,
+                format!(
+                    "the new binary does not speak protocol {PROTOCOL_VERSION} (it speaks {:?})",
+                    check.protocols
+                ),
+            ));
+        }
+        let version = check.version.clone().ok_or_else(|| {
+            rejected(
+                RejectCode::SelfCheckFailed,
+                "its self-check names no version".into(),
+            )
+        })?;
+        let profiles: Vec<transport::bootstrap::SessionProfile> = check
+            .session_profiles
+            .iter()
+            .map(|p| transport::bootstrap::SessionProfile {
+                wire: p[0],
+                handshake: p[1],
+                channel: p[2],
+            })
+            .collect();
+        let mut generation = [0u8; 16];
+        getrandom::fill(&mut generation).map_err(|_| {
+            rejected(
+                RejectCode::Other,
+                "could not generate frontend identity".into(),
+            )
+        })?;
+        let identity = FrontendIdentity {
+            version,
+            build: check.build,
+            checksum,
+            profiles,
+            generation,
+        };
+        transport::bootstrap::encode_server_info(&transport::bootstrap::ServerInfo {
+            generation,
+            core_version: identity.version.clone(),
+            session_protocols: identity.profiles.clone(),
+        })
+        .map_err(|_| {
+            rejected(
+                RejectCode::VersionNotAccepted,
+                "its version or session profiles exceed server information limits".into(),
+            )
+        })?;
+        let facts = CandidateFacts {
+            build: identity.build,
+            checksum: identity.checksum.clone(),
+            host_revision: check.host_revision,
+            link_versions: check.link_versions.clone(),
+            session_profiles: check.session_profiles.clone(),
+        };
+        let image = FrontendImage {
+            image,
+            info: Arc::new(ImageInfo {
+                identity: ImageIdentity::Known(identity.clone()),
+                host_revision: check.host_revision.unwrap_or(0),
+                link_versions: check.link_versions,
+                profiles: check.session_profiles,
+            }),
+        };
+        Ok(Checked {
+            serving,
+            image,
+            identity,
+            facts,
+        })
+    }
+
     /// The daemon's replacement lease, if it has receipts at all.
     fn lease(&self) -> Result<Option<Lease<'_>>, Refusal> {
         let Some(actions) = &self.actions else {
@@ -1091,6 +1484,35 @@ mod tests {
         assert!(
             SelfImage::open(dir.path()).is_err(),
             "a directory is no image"
+        );
+    }
+
+    #[test]
+    fn persist_target_path_updates_versioned_cache_names_and_preserves_plain_paths() {
+        assert_eq!(
+            persist_target_path(
+                Path::new("/home/u/.cache/qsh/qshd-0.6.0-alpha.4-x86_64"),
+                "0.6.0-alpha.5"
+            ),
+            PathBuf::from("/home/u/.cache/qsh/qshd-0.6.0-alpha.5-x86_64")
+        );
+        assert_eq!(
+            persist_target_path(
+                Path::new("/home/u/.cache/qsh/qshd-0.6.0-alpha.4-aarch64-darwin"),
+                "0.6.0"
+            ),
+            PathBuf::from("/home/u/.cache/qsh/qshd-0.6.0-aarch64-darwin")
+        );
+        assert_eq!(
+            persist_target_path(Path::new("/tmp/test/qshd"), "0.6.0-alpha.5"),
+            PathBuf::from("/tmp/test/qshd")
+        );
+        assert_eq!(
+            persist_target_path(
+                Path::new("/home/u/.cache/qsh/qshd-0.6.0-alpha.4-x86_64"),
+                "../evil"
+            ),
+            PathBuf::from("/home/u/.cache/qsh/qshd-0.6.0-alpha.4-x86_64")
         );
     }
 }

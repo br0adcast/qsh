@@ -558,6 +558,8 @@ fn a_serve_daemon_describes_itself_as_managed_and_takes_no_image() {
                 checksum: [9; 32],
                 arch: std::env::consts::ARCH.to_string(),
                 size: 1,
+                prefer_frontend_upgrade: false,
+                allow_frontend_disrupt: false,
             })),
         )
         .expect("fixture input admitted");

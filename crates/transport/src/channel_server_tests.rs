@@ -3814,6 +3814,7 @@ fn fake_about() -> About {
         arch: "x86_64".to_string(),
         protocol: PROTOCOL_VERSION,
         mode: DaemonMode::Personal,
+        os: Some("linux".to_string()),
     }
 }
 
@@ -3946,6 +3947,8 @@ fn offer_of(size: u64) -> ClientRecord {
         checksum: [8; 32],
         arch: "x86_64".to_string(),
         size,
+        prefer_frontend_upgrade: false,
+        allow_frontend_disrupt: false,
     })
 }
 

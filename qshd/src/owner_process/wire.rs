@@ -515,6 +515,9 @@ impl ToOwner {
                                 DaemonMode::Personal => 0,
                                 DaemonMode::Managed => 1,
                             });
+                        if let Some(os) = &about.os {
+                            e.bytes(os.as_bytes());
+                        }
                     }
                 }
             }
@@ -608,16 +611,28 @@ impl ToOwner {
             O_ABOUT => ToOwner::About {
                 id: d.u64()?,
                 about: if d.bool()? {
+                    let build = d.u64()?;
+                    let checksum = d.array()?;
+                    let arch = d.string()?;
+                    let protocol = d.u8()?;
+                    let mode = match d.u8()? {
+                        0 => DaemonMode::Personal,
+                        1 => DaemonMode::Managed,
+                        _ => return Err(WireError::BadValue),
+                    };
+                    let os = if d.0.is_empty() {
+                        None
+                    } else {
+                        let os = d.string()?;
+                        (!os.is_empty()).then_some(os)
+                    };
                     Some(About {
-                        build: d.u64()?,
-                        checksum: d.array()?,
-                        arch: d.string()?,
-                        protocol: d.u8()?,
-                        mode: match d.u8()? {
-                            0 => DaemonMode::Personal,
-                            1 => DaemonMode::Managed,
-                            _ => return Err(WireError::BadValue),
-                        },
+                        build,
+                        checksum,
+                        arch,
+                        protocol,
+                        mode,
+                        os,
                     })
                 } else {
                     None
@@ -683,6 +698,13 @@ impl ToHost {
                     .raw(&offer.checksum)
                     .bytes(offer.arch.as_bytes())
                     .u64(offer.size);
+                let flags = (u8::from(offer.prefer_frontend_upgrade)
+                    * transport::channel::OFFER_FLAG_PREFER_FRONTEND_UPGRADE)
+                    | (u8::from(offer.allow_frontend_disrupt)
+                        * transport::channel::OFFER_FLAG_ALLOW_FRONTEND_DISRUPT);
+                if flags != 0 {
+                    e.u8(flags);
+                }
             }
             ToHost::Write {
                 id,
@@ -791,15 +813,29 @@ impl ToHost {
         let mut d = Dec(rest);
         let msg = match kind {
             H_ABOUT => ToHost::About { id: d.u64()? },
-            H_OFFER => ToHost::Offer {
-                id: d.u64()?,
-                offer: UpdateOffer {
-                    build: d.u64()?,
-                    checksum: d.array()?,
-                    arch: d.string()?,
-                    size: d.u64()?,
-                },
-            },
+            H_OFFER => {
+                let id = d.u64()?;
+                let build = d.u64()?;
+                let checksum = d.array()?;
+                let arch = d.string()?;
+                let size = d.u64()?;
+                let flags = if d.0.is_empty() { 0 } else { d.u8()? };
+                ToHost::Offer {
+                    id,
+                    offer: UpdateOffer {
+                        build,
+                        checksum,
+                        arch,
+                        size,
+                        prefer_frontend_upgrade: (flags
+                            & transport::channel::OFFER_FLAG_PREFER_FRONTEND_UPGRADE)
+                            != 0,
+                        allow_frontend_disrupt: (flags
+                            & transport::channel::OFFER_FLAG_ALLOW_FRONTEND_DISRUPT)
+                            != 0,
+                    },
+                }
+            }
             H_WRITE => {
                 let id = d.u64()?;
                 let transfer = d.u64()?;
@@ -957,6 +993,18 @@ mod tests {
                 arch: "x86_64".into(),
                 protocol: 2,
                 mode: DaemonMode::Managed,
+                os: Some("linux".into()),
+            }),
+        });
+        owner_round_trip(ToOwner::About {
+            id: 1,
+            about: Some(About {
+                build: 5,
+                checksum: [8; 32],
+                arch: "x86_64".into(),
+                protocol: 2,
+                mode: DaemonMode::Personal,
+                os: None,
             }),
         });
         owner_round_trip(ToOwner::About { id: 2, about: None });
@@ -996,6 +1044,19 @@ mod tests {
                 checksum: [1; 32],
                 arch: "aarch64".into(),
                 size: 99,
+                prefer_frontend_upgrade: false,
+                allow_frontend_disrupt: false,
+            },
+        });
+        host_round_trip(ToHost::Offer {
+            id: 1,
+            offer: UpdateOffer {
+                build: 2,
+                checksum: [1; 32],
+                arch: "aarch64".into(),
+                size: 99,
+                prefer_frontend_upgrade: true,
+                allow_frontend_disrupt: true,
             },
         });
         host_round_trip(ToHost::Write {
