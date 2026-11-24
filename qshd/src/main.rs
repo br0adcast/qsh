@@ -1670,10 +1670,27 @@ fn reuse_live_daemon(
     profiles: Option<Vec<[u8; 3]>>,
     warning: Option<&str>,
 ) -> Result<()> {
-    if transport_daemon::reuse_compatibility(profiles.as_deref())
-        == transport_daemon::ReuseCompatibility::Incompatible
-    {
-        bail!("running qshd {} serves incompatible session profiles {:?}; required profile [{}, {}, {}]. No daemon restart was requested. Use a client with a matching profile, or finish active qsh sessions before updating the daemon", status.version, profiles, transport::wire::VERSION, transport::handshake_payload::HS_VERSION, transport::channel::PROTOCOL_VERSION);
+    match transport_daemon::reuse_compatibility(profiles.as_deref()) {
+        transport_daemon::ReuseCompatibility::Compatible => {}
+        transport_daemon::ReuseCompatibility::Incompatible => {
+            bail!(
+                "running qshd {} serves incompatible session profiles {:?}; required profile [{}, {}, {}]. No daemon restart was requested. Use a client with a matching profile, or finish active qsh sessions before updating the daemon",
+                status.version,
+                profiles,
+                transport::wire::VERSION,
+                transport::handshake_payload::HS_VERSION,
+                transport::channel::PROTOCOL_VERSION
+            );
+        }
+        transport_daemon::ReuseCompatibility::Unknown => {
+            bail!(
+                "running qshd {} did not report compatible session profiles; required profile [{}, {}, {}]. No daemon restart was requested. Use a client with a matching profile, or finish active qsh sessions before updating the daemon",
+                status.version,
+                transport::wire::VERSION,
+                transport::handshake_payload::HS_VERSION,
+                transport::channel::PROTOCOL_VERSION
+            );
+        }
     }
     let actual = if let Some(pubkey) = parsed.client_pubkey {
         let request = registration_request(transaction, status, generation.as_deref(), pubkey)?;

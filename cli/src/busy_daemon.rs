@@ -21,18 +21,31 @@ impl RestartConsent {
         }
     }
 }
+pub fn required_profile() -> [u8; 3] {
+    [
+        transport::wire::VERSION,
+        transport::handshake_payload::HS_VERSION,
+        transport::channel::PROTOCOL_VERSION,
+    ]
+}
+
+pub fn can_continue_old(info: &BusyDaemonInfo) -> bool {
+    info.supports_profile(required_profile())
+}
+
 fn service_warning(account: &str, host: &str) -> String {
     format!("Restart the personal qshd service for account {} on {}. All active qsh sessions for this service will be interrupted, and running commands may terminate. This also applies if the service process changes while this dialog is open.", crate::report::printable(account), crate::report::printable(host))
 }
-fn parse_choice(input: Option<&str>) -> BusyChoice {
-    match input.map(str::trim) {
-        Some("2") => BusyChoice::ContinueOld,
-        Some("3") => BusyChoice::ForceUpdate,
+fn parse_choice(input: Option<&str>, allow_continue: bool) -> BusyChoice {
+    match (allow_continue, input.map(str::trim)) {
+        (true, Some("2")) => BusyChoice::ContinueOld,
+        (true, Some("3")) | (false, Some("2")) => BusyChoice::ForceUpdate,
         _ => BusyChoice::Cancel,
     }
 }
 fn question(info: &BusyDaemonInfo) -> String {
     let version = crate::report::printable(&info.identity.version);
+    let allow_continue = can_continue_old(info);
     if let Some(offer) = &info.upgrade {
         // An offer that strands sessions may disconnect nobody.
         let disconnected = if offer.attached > 0 {
@@ -40,10 +53,16 @@ fn question(info: &BusyDaemonInfo) -> String {
         } else {
             String::new()
         };
-        return format!("Running qshd {version} can update to this client's qshd and keep every session.{disconnected}\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Update and keep sessions\nChoose [1]:");
+        if allow_continue {
+            return format!("Running qshd {version} can update to this client's qshd and keep every session.{disconnected}\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Update and keep sessions\nChoose [1]:");
+        }
+        return format!("Running qshd {version} does not speak this client's protocol, so this client cannot continue with it. It can update to this client's qshd and keep every session.{disconnected}\n\n1. Cancel (default)\n2. Update and keep sessions\nChoose [1]:");
     }
     if info.active_connections == 0 && info.sessions > 0 {
-        return format!("Running qshd {version} has {} session(s), none with a connected client.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", info.sessions);
+        if allow_continue {
+            return format!("Running qshd {version} has {} session(s), none with a connected client.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", info.sessions);
+        }
+        return format!("Running qshd {version} has {} session(s), none with a connected client, and does not speak this client's protocol. This client cannot continue with the old daemon.\n\n1. Cancel (default)\n2. Force update\nChoose [1]:", info.sessions);
     }
     // A host also counts the sessions whose client is away.
     let retained = info.sessions.saturating_sub(info.active_connections);
@@ -52,7 +71,11 @@ fn question(info: &BusyDaemonInfo) -> String {
     } else {
         String::new()
     };
-    format!("Running qshd {version} has {} active connections{others}. The new daemon cannot start while these connections are active.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", info.active_connections)
+    if allow_continue {
+        format!("Running qshd {version} has {} active connections{others}. The new daemon cannot start while these connections are active.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", info.active_connections)
+    } else {
+        format!("Running qshd {version} has {} active connections{others} and does not speak this client's protocol. This client cannot continue with the old daemon, and the new daemon cannot start while these connections are active.\n\n1. Cancel (default)\n2. Force update\nChoose [1]:", info.active_connections)
+    }
 }
 /// The second warning for an upgrade that leaves sessions unreachable.
 fn unreachable_warning(info: &BusyDaemonInfo) -> Option<String> {
@@ -75,6 +98,9 @@ impl BusyPrompt {
             || pending.info().candidate != expected.candidate
             || pending.info().service_restart != expected.service_restart
         {
+            return None;
+        }
+        if choice == BusyChoice::ContinueOld && !can_continue_old(pending.info()) {
             return None;
         }
         Some(self.pending.take()?.decide(choice))
@@ -107,7 +133,7 @@ pub fn ask_for_target(
 ) -> Result<(BusyDecision, Option<RestartConsent>), ssh::SshError> {
     let mut prompt = BusyPrompt::new(info.clone()).ok_or(ssh::SshError::Cancelled)?;
     let answer = tty.read_choice(&question(&info), cancel)?;
-    let mut choice = parse_choice(answer.as_deref());
+    let mut choice = parse_choice(answer.as_deref(), can_continue_old(&info));
     let upgrade = info
         .upgrade
         .as_ref()
@@ -175,7 +201,7 @@ mod tests {
             },
             active_connections: 2,
             sessions: 2,
-            serving_profiles: None,
+            serving_profiles: Some(vec![required_profile()]),
             preservation: bringup::PreservationCapability::Unknown,
             service_restart: None,
             upgrade: None,
@@ -449,18 +475,34 @@ mod tests {
     }
     #[test]
     fn empty_eof_escape_and_unrecognized_input_cancel() {
-        for input in [
-            None,
-            Some(""),
-            Some("\x1b"),
-            Some("back"),
-            Some("9"),
-            Some("yes"),
-        ] {
-            assert_eq!(parse_choice(input), bringup::BusyChoice::Cancel);
+        for allow_continue in [true, false] {
+            for input in [
+                None,
+                Some(""),
+                Some("\x1b"),
+                Some("back"),
+                Some("9"),
+                Some("yes"),
+            ] {
+                assert_eq!(
+                    parse_choice(input, allow_continue),
+                    bringup::BusyChoice::Cancel
+                );
+            }
         }
-        assert_eq!(parse_choice(Some("2")), bringup::BusyChoice::ContinueOld);
-        assert_eq!(parse_choice(Some("3")), bringup::BusyChoice::ForceUpdate);
+        assert_eq!(
+            parse_choice(Some("2"), true),
+            bringup::BusyChoice::ContinueOld
+        );
+        assert_eq!(
+            parse_choice(Some("3"), true),
+            bringup::BusyChoice::ForceUpdate
+        );
+        assert_eq!(
+            parse_choice(Some("2"), false),
+            bringup::BusyChoice::ForceUpdate
+        );
+        assert_eq!(parse_choice(Some("3"), false), bringup::BusyChoice::Cancel);
     }
     #[test]
     fn busy_prompt_has_three_named_actions_and_actual_activity() {
@@ -475,6 +517,69 @@ mod tests {
             assert!(text.contains(label), "{text}");
         }
         assert!(!text.contains("safe update"));
+    }
+    #[test]
+    fn incompatible_busy_prompt_omits_continue_old_and_renumbers_update() {
+        for profiles in [None, Some(vec![[1, 1, 1]])] {
+            let mut legacy = info();
+            legacy.identity.version = "0.5.0".into();
+            legacy.serving_profiles = profiles.clone();
+            let text = question(&legacy);
+            assert!(!text.contains("Continue with old daemon"), "{text}");
+            for expected in [
+                "0.5.0",
+                "does not speak this client's protocol",
+                "1. Cancel (default)",
+                "2. Force update",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(!text.contains("3. "), "{text}");
+
+            let mut retained = legacy.clone();
+            retained.active_connections = 0;
+            retained.sessions = 4;
+            let text = question(&retained);
+            assert!(!text.contains("Continue with old daemon"), "{text}");
+            assert!(text.contains("2. Force update"), "{text}");
+            assert!(!text.contains("3. "), "{text}");
+
+            let mut offer = offer_info(bringup::UpgradeCase::Soft);
+            offer.serving_profiles = profiles;
+            let text = question(&offer);
+            assert!(!text.contains("Continue with old daemon"), "{text}");
+            assert!(text.contains("2. Update and keep sessions"), "{text}");
+            assert!(!text.contains("3. "), "{text}");
+        }
+    }
+    #[test]
+    fn incompatible_pty_choices_never_continue_old_and_allow_confirmed_force() {
+        for profiles in [None, Some(vec![[1, 1, 1]])] {
+            let mut live = info();
+            live.identity.version = "0.5.0".into();
+            live.serving_profiles = profiles;
+            for (input, expected, confirmed) in [
+                (&b"\n"[..], BusyChoice::Cancel, false),
+                (&b"3\n"[..], BusyChoice::Cancel, false),
+                (&b"2\n\n"[..], BusyChoice::Cancel, false),
+                (&b"2\n2\n"[..], BusyChoice::ForceUpdate, true),
+            ] {
+                let (decision, consent, output) = answer(input, live.clone());
+                assert_eq!(decision.choice, expected);
+                assert_eq!(consent.is_some(), confirmed);
+                assert!(!output.contains("Continue with old daemon"), "{output}");
+            }
+        }
+    }
+    #[test]
+    fn busy_prompt_refuses_continue_old_for_incompatible_daemon() {
+        for profiles in [None, Some(vec![[1, 1, 1]])] {
+            let mut live = info();
+            live.serving_profiles = profiles;
+            let mut prompt = BusyPrompt::new(live.clone()).unwrap();
+            assert!(prompt.resolve(&live, BusyChoice::ContinueOld).is_none());
+            assert!(prompt.resolve(&live, BusyChoice::Cancel).is_some());
+        }
     }
     #[test]
     fn changed_candidate_cannot_answer_an_old_local_prompt() {

@@ -269,6 +269,15 @@ impl BusyDaemonInfo {
                     && offer.sessions == self.sessions
             })
     }
+    /// Whether the running daemon explicitly advertises `required`
+    /// (`[wire, handshake, channel]`) among its serving session profiles.
+    /// Legacy daemons that do not report `serving_profiles` (`None`) return
+    /// `false` because session protocol compatibility is not established.
+    pub fn supports_profile(&self, required: [u8; 3]) -> bool {
+        self.serving_profiles
+            .as_deref()
+            .is_some_and(|profiles| profiles.contains(&required))
+    }
     /// The user's agreement to the frontend replacement this record offers,
     /// if it offers one.
     pub fn confirm_frontend_upgrade(&self) -> Option<FrontendUpgradeConsent> {
@@ -942,5 +951,19 @@ mod tests {
         invalid = live.clone();
         invalid.schema = 0;
         assert!(!invalid.valid());
+    }
+    #[test]
+    fn supports_profile_requires_explicit_matching_profile() {
+        let mut live = info();
+        live.serving_profiles = None;
+        assert!(!live.supports_profile([2, 2, 2]));
+        live.serving_profiles = Some(vec![]);
+        assert!(!live.supports_profile([2, 2, 2]));
+        live.serving_profiles = Some(vec![[1, 1, 1]]);
+        assert!(!live.supports_profile([2, 2, 2]));
+        live.serving_profiles = Some(vec![[2, 2, 2]]);
+        assert!(live.supports_profile([2, 2, 2]));
+        live.serving_profiles = Some(vec![[1, 1, 1], [2, 2, 2]]);
+        assert!(live.supports_profile([2, 2, 2]));
     }
 }
