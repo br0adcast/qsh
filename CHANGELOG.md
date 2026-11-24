@@ -7,6 +7,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0-alpha.3] — 2026-11-24
+
+### Fixed
+
+- Allow `O_PATH` directory descriptors in `qshd` service-restart staging checks
+  on Linux musl builds (#672, #673). On musl, `O_ACCMODE` includes `O_PATH`,
+  which previously caused confirmed legacy `0.5.0` personal service restarts to
+  fail stage validation before replacing the daemon.
+- Do not offer or accept continuing with a running `qshd` whose session
+  protocol is incompatible or unreported (including legacy `0.5.0` daemons
+  without `SERVER-INFO`), and fail cleanly before client registration instead
+  of hanging on a mismatched handshake (#671, #674).
+
 ## [0.6.0-alpha.2] — 2026-11-23
 
 ### Changed
