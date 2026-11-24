@@ -117,7 +117,7 @@ impl StageRoot {
             return Err(StageError::Invalid);
         }
         let identity = Identity::of(&directory)?;
-        if !identity.directory() || !read_only(&directory)? {
+        if !identity.directory() || !directory_read_only(&directory)? {
             return Err(StageError::Untrusted);
         }
         cloexec(&directory)?;
@@ -505,9 +505,14 @@ impl AdoptedStage {
         // are borrowed only; failed validation never closes caller descriptors.
         for (fd, identity) in context.descriptors.iter().zip(expected) {
             let actual = raw_identity(*fd)?;
+            let access_ok = if identity.directory() {
+                raw_directory_read_only(*fd)?
+            } else {
+                raw_file_read_only(*fd)?
+            };
             if !identity.same_object(&actual)
                 || (identity.executable() && identity != &actual)
-                || !raw_read_only(*fd)?
+                || !access_ok
             {
                 return Err(StageError::Changed);
             }
@@ -639,15 +644,39 @@ fn raw_identity(fd: RawFd) -> Result<Identity, StageError> {
         links: stat.st_nlink as u64,
     })
 }
-fn raw_read_only(fd: RawFd) -> Result<bool, StageError> {
+fn flags_file_read_only(flags: libc::c_int) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if flags & libc::O_PATH != 0 {
+        return false;
+    }
+    flags & libc::O_ACCMODE == libc::O_RDONLY
+}
+fn flags_directory_read_only(flags: libc::c_int) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if flags & libc::O_PATH != 0 {
+        // Linux musl includes O_PATH in O_ACCMODE (aliasing O_SEARCH), while
+        // glibc keeps O_ACCMODE at O_RDONLY|O_WRONLY|O_RDWR. Strip O_PATH so
+        // trusted O_PATH directory handles pass on both C libraries while
+        // writable access bits stay refused.
+        return (flags & !libc::O_PATH) & libc::O_ACCMODE == libc::O_RDONLY;
+    }
+    flags & libc::O_ACCMODE == libc::O_RDONLY
+}
+fn raw_flags(fd: RawFd) -> Result<libc::c_int, StageError> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags == -1 {
         return Err(io::Error::last_os_error().into());
     }
-    Ok(flags & libc::O_ACCMODE == libc::O_RDONLY)
+    Ok(flags)
 }
-fn read_only(file: &File) -> Result<bool, StageError> {
-    raw_read_only(file.as_raw_fd())
+fn raw_file_read_only(fd: RawFd) -> Result<bool, StageError> {
+    Ok(flags_file_read_only(raw_flags(fd)?))
+}
+fn raw_directory_read_only(fd: RawFd) -> Result<bool, StageError> {
+    Ok(flags_directory_read_only(raw_flags(fd)?))
+}
+fn directory_read_only(file: &File) -> Result<bool, StageError> {
+    raw_directory_read_only(file.as_raw_fd())
 }
 fn cloexec(file: &File) -> Result<(), StageError> {
     set_cloexec(file, true)

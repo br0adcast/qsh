@@ -543,3 +543,68 @@ fn adoption_rechecks_context_even_when_deserialized_without_parse() {
         "adoption accepted an unchecked context version"
     );
 }
+
+#[test]
+fn access_mode_predicates_distinguish_directories_files_and_writable_flags() {
+    assert!(flags_directory_read_only(libc::O_RDONLY));
+    assert!(flags_file_read_only(libc::O_RDONLY));
+    for writable in [libc::O_WRONLY, libc::O_RDWR] {
+        assert!(!flags_directory_read_only(writable));
+        assert!(!flags_file_read_only(writable));
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        assert!(flags_directory_read_only(libc::O_PATH));
+        assert!(flags_directory_read_only(libc::O_PATH | libc::O_DIRECTORY));
+        assert!(!flags_directory_read_only(libc::O_PATH | libc::O_WRONLY));
+        assert!(!flags_directory_read_only(libc::O_PATH | libc::O_RDWR));
+        assert!(!flags_file_read_only(libc::O_PATH));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn opath_stage_root_prepares_adopts_and_cleans_up_while_opath_executable_is_rejected() {
+    use std::os::fd::IntoRawFd;
+    let mut f = Fixture::new();
+    let root_fd = open_path(f.temp.path(), libc::O_PATH | libc::O_DIRECTORY).unwrap();
+    let root = StageRoot::from_trusted(root_fd, f.temp.path().into()).unwrap();
+    let mut stage = PreparedStage::prepare(
+        root,
+        &mut f.source,
+        f.candidate.clone(),
+        "fixture",
+        1,
+        b"operation",
+        |_| Ok(check()),
+    )
+    .unwrap();
+    let path = stage.executable().to_owned();
+
+    // An O_PATH descriptor in the executable slot must be refused without
+    // closing any caller descriptor.
+    let (encoded, handles) = context(&stage);
+    let opath_exec = open_path(&path, libc::O_PATH).unwrap();
+    let mut bad_json: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    bad_json["descriptors"][2] = serde_json::json!(opath_exec.as_raw_fd());
+    assert!(matches!(
+        AdoptedStage::adopt(parsed(&bad_json.to_string()), &f.candidate, b"operation"),
+        Err(StageError::Changed)
+    ));
+    drop(opath_exec);
+    drop(handles);
+
+    // Adopting the real O_PATH root + O_RDONLY stage directory + O_RDONLY
+    // executable succeeds and cleans up cleanly.
+    let (encoded, handles) = context(&stage);
+    let inherited: Vec<_> = handles.into_iter().map(IntoRawFd::into_raw_fd).collect();
+    let adopted = AdoptedStage::adopt(parsed(&encoded), &f.candidate, b"operation").unwrap();
+    stage.custody.cleanup = false;
+    drop(stage);
+    for fd in inherited {
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+    }
+    adopted.validate(&f.candidate, b"operation").unwrap();
+    adopted.cleanup().unwrap();
+    assert!(!path.parent().unwrap().exists());
+}
