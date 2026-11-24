@@ -18,8 +18,8 @@ use transport::channel_geometry::{
 use transport::{LinkState, Stats};
 
 use crate::args::PredictMode;
-use crate::escape::{Command, Escape, Piece, Prefix};
-use crate::input_ingress::{IngressBudget, InputBytes, PendingInput};
+use crate::escape::{Command, Escape, FocusEvent, Piece, Prefix};
+use crate::input_ingress::{IngressBudget, InputBytes, InputOrigin, PendingInput};
 use crate::mouse::MouseShift;
 use crate::statusline::{self, Link};
 use crate::window::{self, Boxed, Outcome, Roads, Row};
@@ -317,6 +317,7 @@ struct PresentationModes {
     mouse: MouseTracking,
     mouse_sgr: bool,
     paste: bool,
+    focus_events: bool,
     alternate: bool,
 }
 impl PresentationModes {
@@ -330,6 +331,7 @@ impl PresentationModes {
             mouse: frame.mouse_tracking,
             mouse_sgr: frame.mouse_sgr,
             paste: frame.bracketed_paste,
+            focus_events: frame.focus_events,
             alternate: frame.alt_screen,
         }
     }
@@ -436,6 +438,8 @@ pub struct Session {
     line_refreshed_ms: i64,
     /// Whether the shell's own frame has mouse tracking on, as last painted.
     shell_mouse: bool,
+    /// Whether the remote application asked for focus reporting (`?1004h`).
+    shell_focus: bool,
     /// The selected history frame stays fixed until a navigation key arrives.
     history_frame: Option<terminal::Frame>,
     history_held: InputBytes,
@@ -513,11 +517,13 @@ impl Session {
             PredictMode::Never => DisplayPreference::Never,
         };
         let (shell_cols, shell_rows) = (size.cols(), size.rows());
+        let mut renderer = Renderer::new(caps);
+        renderer.set_focus_reporting(true);
         Session {
             // `predict_overwrite` stays off: predicting
             // an overwrite is the prediction most often wrong on screen.
             shell: ShellState::new(shell_cols, shell_rows, pref, false),
-            renderer: Renderer::new(caps),
+            renderer,
             rtt_ms: 0,
             last_frame: None,
             painted_clock: None,
@@ -566,6 +572,7 @@ impl Session {
             line_view: (None, Link::Unknown),
             line_refreshed_ms: 0,
             shell_mouse: false,
+            shell_focus: false,
             history_frame: None,
             history_held: InputBytes::default(),
             history_tail: InputBytes::default(),
@@ -1209,6 +1216,9 @@ impl Session {
                         return actions;
                     }
                 }
+                Piece::Focus(event) => {
+                    actions.extend(self.on_focus(event, &origin, now_ms));
+                }
                 Piece::Command(Command::Leave) => {
                     // Leaving on the user's own instruction is not a shell
                     // that exited: code 1, not 0. The session stays on the
@@ -1247,6 +1257,30 @@ impl Session {
                     self.hold_history(frame);
                     actions.extend(self.repaint(now_ms));
                 }
+            }
+        }
+        actions
+    }
+
+    /// Local focus reports (`ESC [ I` / `ESC [ O`). Focus-in triggers an
+    /// in-place redraw of every row so terminals that discard background-tab
+    /// backing stores restore untouched rows without clearing the screen.
+    /// Reports are forwarded to the remote shell only when it enabled mode
+    /// 1004, no local overlay is active, and the shell channel is live.
+    fn on_focus(&mut self, event: FocusEvent, origin: &InputOrigin, now_ms: i64) -> Vec<Action> {
+        let mut actions = Vec::new();
+        if event == FocusEvent::In {
+            self.renderer.repaint_in_place();
+            self.forget_shown();
+            actions.extend(self.repaint(now_ms));
+        }
+        if self.shell_focus && self.window.is_none() && self.history_frame.is_none() {
+            if let ShellChannel::Ready(ch) = self.shell_channel {
+                let seq = match event {
+                    FocusEvent::In => b"\x1b[I",
+                    FocusEvent::Out => b"\x1b[O",
+                };
+                actions.extend(self.send_now(ch, origin.derived(seq.to_vec()), now_ms));
             }
         }
         actions
@@ -1936,6 +1970,7 @@ impl Session {
         if self.raw_cols != 0 && self.raw_rows != 0 {
             self.shell_mouse =
                 self.history_frame.is_none() && frame.mouse_tracking != MouseTracking::Off;
+            self.shell_focus = self.history_frame.is_none() && frame.focus_events;
         }
         let due = self
             .last_presentation_ms
@@ -2019,8 +2054,10 @@ impl Session {
             projected.mouse_sgr = false;
             projected.app_cursor = false;
             projected.app_keypad = false;
+            projected.focus_events = false;
         }
         self.shell_mouse = projected.mouse_tracking != MouseTracking::Off;
+        self.shell_focus = projected.focus_events;
         // This is presentation-owned storage: the alarm never touches retained history.
         let alarm = !self.line_on() && self.outage();
         if alarm && projected.rows > 0 {
@@ -2305,6 +2342,7 @@ mod tests {
         frame.mouse_tracking = MouseTracking::Drag;
         frame.mouse_sgr = !frame.mouse_sgr;
         frame.bracketed_paste = !frame.bracketed_paste;
+        frame.focus_events = !frame.focus_events;
         frame.alt_screen = !frame.alt_screen;
         std::sync::Arc::make_mut(&mut frame.palette).entries[0] ^= 0x00ff_ffff;
         frame
@@ -5127,6 +5165,108 @@ mod tests {
         assert!(abort.iter().any(|action| matches!(action, Action::Exit(1))));
         assert!(abort.iter().any(|action| matches!(action, Action::Notice(text) if text.contains("ended the session") && !text.contains("resource limit"))));
     }
+
+    #[test]
+    fn session_enables_focus_reporting_and_clears_it_on_exit_and_suspend() {
+        let mut s = lined(40, 6);
+        let init = s.handle(UiEvent::Stream0(record(b"hello")), 0);
+        let init_out = String::from_utf8_lossy(&written(&init)).into_owned();
+        assert!(
+            init_out.contains("\x1b[?1004h"),
+            "session must enable mode 1004 on initial paint: {init_out:?}"
+        );
+
+        let suspended = String::from_utf8_lossy(&s.suspend(10)).into_owned();
+        assert!(
+            suspended.contains("\x1b[?1004l"),
+            "suspend must disable mode 1004: {suspended:?}"
+        );
+
+        let resumed = s.handle(UiEvent::Resumed, 20);
+        let resumed_out = String::from_utf8_lossy(&written(&resumed)).into_owned();
+        assert!(
+            resumed_out.contains("\x1b[?1004h"),
+            "resume must re-enable mode 1004: {resumed_out:?}"
+        );
+
+        let left = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'.'])), 30);
+        let left_out = String::from_utf8_lossy(&written(&left)).into_owned();
+        assert!(
+            left_out.contains("\x1b[?1004l"),
+            "leave must disable mode 1004: {left_out:?}"
+        );
+    }
+
+    #[test]
+    fn focus_in_repaints_every_row_in_place_without_leaking_to_shell() {
+        let mut s = lined(40, 6);
+        let _ = s.handle(UiEvent::Stream0(record(b"row1\r\n\r\nrow3")), 0);
+
+        // FocusOut does not repaint and is not leaked to a shell without ?1004h.
+        let out_actions = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[O".to_vec())), 10);
+        assert!(written(&out_actions).is_empty(), "{out_actions:?}");
+        assert!(sent(&out_actions).is_empty(), "{out_actions:?}");
+
+        // FocusIn triggers an in-place redraw of every row without ESC[2J and without leaking.
+        let in_actions = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[I".to_vec())), 20);
+        assert!(sent(&in_actions).is_empty(), "{in_actions:?}");
+        let bytes = written(&in_actions);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("\x1b[2J"),
+            "focus-in repaint must be in-place without ESC[2J: {text:?}"
+        );
+        for row in 1..=6 {
+            let cup = format!("\x1b[{row};1H");
+            assert!(
+                text.contains(&cup),
+                "focus-in repaint must redraw row {row}: {text:?}"
+            );
+        }
+        assert!(text.contains("row1") && text.contains("row3"), "{text:?}");
+    }
+
+    #[test]
+    fn focus_events_forward_only_when_remote_enabled_mode_1004() {
+        let mut s = lined(40, 6);
+        let _ = s.handle(UiEvent::Stream0(record(b"\x1b[?1004hready")), 0);
+
+        let out_actions = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[O".to_vec())), 10);
+        assert_eq!(sent(&out_actions), b"\x1b[O");
+        assert!(written(&out_actions).is_empty());
+
+        let in_actions = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[I".to_vec())), 20);
+        assert_eq!(sent(&in_actions), b"\x1b[I");
+        assert!(!written(&in_actions).is_empty());
+
+        // Once the remote disables ?1004l, local reporting stays on and FocusIn
+        // still repaints, but focus reports are no longer sent to the shell.
+        let _ = s.handle(UiEvent::Stream0(record(b"\x1b[?1004l")), 30);
+        let in_again = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[I".to_vec())), 40);
+        assert!(sent(&in_again).is_empty(), "{in_again:?}");
+        assert!(!written(&in_again).is_empty());
+    }
+
+    #[test]
+    fn focus_events_preserve_open_windows_and_repaint_them() {
+        let mut s = lined(80, 24);
+        let _ = s.handle(UiEvent::Stream0(record(b"\x1b[?1004hready")), 0);
+        let _ = s.handle(UiEvent::Stdin(ingress_input(vec![0x1d, b'?'])), 10);
+        assert!(s.window_open());
+
+        let out_actions = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[O".to_vec())), 20);
+        assert!(s.window_open(), "FocusOut must not close Help window");
+        assert!(sent(&out_actions).is_empty());
+
+        let in_actions = s.handle(UiEvent::Stdin(ingress_input(b"\x1b[I".to_vec())), 30);
+        assert!(s.window_open(), "FocusIn must not close Help window");
+        assert!(sent(&in_actions).is_empty());
+        assert!(
+            !written(&in_actions).is_empty(),
+            "FocusIn must repaint even while a window is open"
+        );
+    }
+
     include!("input_bounds_tests.rs");
     include!("presentation_tests.rs");
 }

@@ -721,7 +721,7 @@ mod state_tests {
     fn eligibility_due_snapshot_preserves_complete_metadata_and_cells() {
         let make = || {
             let mut state = ShellState::new(20, 3, prediction::DisplayPreference::Adaptive, false);
-            let content = "\x1b]4;1;rgb:12/34/56\x07\x1b[?1h\x1b=\x1b[?1000h\x1b[?1006h\x1b[?2004h\x1b[8mH\x1b[0me\u{301}界\r\n";
+            let content = "\x1b]4;1;rgb:12/34/56\x07\x1b[?1h\x1b=\x1b[?1000h\x1b[?1004h\x1b[?1006h\x1b[?2004h\x1b[8mH\x1b[0me\u{301}界\r\n";
             state.on_stream0(&encode_record(REC_DATA, content.as_bytes()), 0, 10);
             state.on_input(b"h", 1000, 10);
             let mut echoed = encode_record(REC_DATA, b"h");
@@ -738,6 +738,7 @@ mod state_tests {
                 && expected.app_keypad
                 && expected.mouse_sgr
                 && expected.bracketed_paste
+                && expected.focus_events
         );
         assert_ne!(
             expected.palette.entries[1],
@@ -1141,6 +1142,7 @@ mod state_tests {
         frame.mouse_tracking = terminal::MouseTracking::Drag;
         frame.mouse_sgr = !frame.mouse_sgr;
         frame.bracketed_paste = !frame.bracketed_paste;
+        frame.focus_events = !frame.focus_events;
         frame.alt_screen = !frame.alt_screen;
         std::sync::Arc::make_mut(&mut frame.palette).entries[0] ^= 0x00ff_ffff;
         frame

@@ -23,8 +23,7 @@ use crate::sgr::{write_sgr, Style};
 /// unknown. Static bytes also let a panic hook write directly to its owned
 /// terminal without allocating or acquiring a stdout lock. Screen switching
 /// and the normal exit's trailing newline remain the caller's responsibility.
-pub const RESET_TERMINAL_MODES: &[u8] =
-    b"\x1b[0m\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h";
+pub const RESET_TERMINAL_MODES: &[u8] = b"\x1b[0m\x1b[?1l\x1b>\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?2004l\x1b[?25h";
 
 /// The cell flags that actually change how a character looks. The width
 /// flags live in the same word but carry no appearance, and letting them
@@ -43,6 +42,7 @@ struct Modes {
     tracking: MouseTracking,
     sgr_mouse: bool,
     bracketed_paste: bool,
+    focus_events: bool,
 }
 
 impl Modes {
@@ -54,17 +54,20 @@ impl Modes {
             tracking: MouseTracking::Off,
             sgr_mouse: false,
             bracketed_paste: false,
+            focus_events: false,
         }
     }
 
-    /// The modes a frame asks for.
-    fn of(frame: &Frame) -> Modes {
+    /// The modes a frame asks for, plus local focus reporting when requested
+    /// by the client.
+    fn of(frame: &Frame, always_report_focus: bool) -> Modes {
         Modes {
             app_cursor: frame.app_cursor,
             app_keypad: frame.app_keypad,
             tracking: frame.mouse_tracking,
             sgr_mouse: frame.mouse_sgr,
             bracketed_paste: frame.bracketed_paste,
+            focus_events: frame.focus_events || always_report_focus,
         }
     }
 }
@@ -73,6 +76,13 @@ impl Modes {
 pub struct Renderer {
     caps: TermCaps,
     physical_scroll_eligible: bool,
+    /// Keep DECSET 1004 (`ESC [ ? 1004 h`) enabled on the local terminal even
+    /// when the remote frame does not request focus reporting, so the client
+    /// receives `FocusIn` to repaint tabs whose backing store was evicted.
+    always_report_focus: bool,
+    /// When set and the next frame has the same size as `last`, redraw every
+    /// row in place (without `ESC [ 2 J`) instead of diffing.
+    in_place_repaint: bool,
     /// What the terminal is currently showing, as far as we know. `None`
     /// means "unknown" -- the next frame is painted from scratch.
     last: Option<Frame>,
@@ -95,16 +105,32 @@ impl Renderer {
         Renderer {
             caps,
             physical_scroll_eligible: true,
+            always_report_focus: false,
+            in_place_repaint: false,
             last: None,
             style: Style::default_style(),
             modes: None,
         }
     }
 
+    /// Keep focus reporting (`ESC [ ? 1004 h`) enabled on the local terminal
+    /// regardless of whether the remote frame requested it.
+    pub fn set_focus_reporting(&mut self, enabled: bool) {
+        self.always_report_focus = enabled;
+    }
+
     /// Permit physical scrolling only when the frame reaches the actual
     /// terminal bottom. Cropped viewports must redraw rows in place.
     pub fn set_physical_scroll_eligible(&mut self, eligible: bool) {
         self.physical_scroll_eligible = eligible;
+    }
+
+    /// Redraw every row in place on the next same-size `render` without
+    /// clearing the screen (`ESC [ 2 J`) or resetting mirrored input modes.
+    /// If the next frame has a different size or no previous frame is known,
+    /// `render` falls back to a full repaint as usual.
+    pub fn repaint_in_place(&mut self) {
+        self.in_place_repaint = true;
     }
 
     /// Forget what is on screen: the next `render` repaints in full and
@@ -114,6 +140,7 @@ impl Renderer {
     /// too, since job control around SIGTSTP/SIGCONT typically clears
     /// bracketed paste and mouse tracking.
     pub fn invalidate(&mut self) {
+        self.in_place_repaint = false;
         self.last = None;
         self.modes = None;
     }
@@ -122,6 +149,7 @@ impl Renderer {
     /// is already there when possible, a full repaint otherwise.
     pub fn render(&mut self, frame: &Frame) -> Vec<u8> {
         let mut out = Vec::new();
+        let in_place = std::mem::take(&mut self.in_place_repaint);
         // The retained frame is diffed against, shifted in place, and then
         // overwritten with `frame`: its storage is reused rather than a new
         // copy made per render.
@@ -130,26 +158,30 @@ impl Renderer {
             .as_mut()
             .filter(|p| p.cols == frame.cols && p.rows == frame.rows);
         if let Some(previous) = same_size {
-            // The shortcut is only for the primary screen. The alternate one
-            // has no scrollback to feed, and we do not mirror `?1049` onto
-            // the user's terminal -- so a newline here would push the local
-            // screen's content into the user's real scrollback. Scrolling a
-            // line in `less` produces exactly the clean shift `scrolled_by`
-            // detects, so this is normal use, not a corner case.
-            //
-            // BOTH frames have to be primary: on leaving the alternate screen
-            // the previous frame is the application's last picture and the
-            // new one is the restored shell -- unrelated content that can
-            // still line up as a shift by coincidence (`cat file; less file`,
-            // then `q`), and a newline here would feed that coincidence into
-            // the user's scrollback.
-            if self.physical_scroll_eligible && !frame.alt_screen && !previous.alt_screen {
-                if let Some(lines) = scrolled_by(previous, frame) {
-                    self.scroll_up(&mut out, lines, frame);
-                    shift_up(previous, lines);
+            if in_place {
+                self.in_place_repaint(&mut out, frame);
+            } else {
+                // The shortcut is only for the primary screen. The alternate one
+                // has no scrollback to feed, and we do not mirror `?1049` onto
+                // the user's terminal -- so a newline here would push the local
+                // screen's content into the user's real scrollback. Scrolling a
+                // line in `less` produces exactly the clean shift `scrolled_by`
+                // detects, so this is normal use, not a corner case.
+                //
+                // BOTH frames have to be primary: on leaving the alternate screen
+                // the previous frame is the application's last picture and the
+                // new one is the restored shell -- unrelated content that can
+                // still line up as a shift by coincidence (`cat file; less file`,
+                // then `q`), and a newline here would feed that coincidence into
+                // the user's scrollback.
+                if self.physical_scroll_eligible && !frame.alt_screen && !previous.alt_screen {
+                    if let Some(lines) = scrolled_by(previous, frame) {
+                        self.scroll_up(&mut out, lines, frame);
+                        shift_up(previous, lines);
+                    }
                 }
+                self.diff_rows(&mut out, previous, frame);
             }
-            self.diff_rows(&mut out, previous, frame);
         } else {
             self.full_repaint(&mut out, frame);
         }
@@ -209,6 +241,34 @@ impl Renderer {
         }
     }
 
+    /// Redraw every row in place without clearing the screen first. Emitting
+    /// each row's content followed by `ESC [ K` (with default SGR) repaints
+    /// both text rows and blank rows cleanly without the flash of `ESC [ 2 J`.
+    fn in_place_repaint(&mut self, out: &mut Vec<u8>, frame: &Frame) {
+        out.extend_from_slice(b"\x1b[0m");
+        self.style = Style::default_style();
+        for row in 0..frame.rows {
+            move_to(out, row, 0);
+            let end = through_wide_successor(frame, row, row_content_end(frame, row));
+            let pen = if end > 0 {
+                self.put_span(out, frame, row, 0, end)
+            } else {
+                0
+            };
+            if pen < frame.cols {
+                write_sgr(
+                    out,
+                    self.style,
+                    Style::default_style(),
+                    self.caps,
+                    &frame.palette,
+                );
+                self.style = Style::default_style();
+                out.extend_from_slice(b"\x1b[K");
+            }
+        }
+    }
+
     /// Write cells `[from, to)` of `row`. The caller has put the cursor at
     /// `from`; from there the pen is tracked explicitly -- a printed wide
     /// character advances it by two columns, anything else by one -- and
@@ -229,7 +289,7 @@ impl Renderer {
     /// The LEADING spacer (the placeholder left in the last column when a
     /// wide character did not fit and wrapped) is never skipped: no wide
     /// character stands to its left, so nothing else would ever paint it.
-    fn put_span(&mut self, out: &mut Vec<u8>, frame: &Frame, row: u16, from: u16, to: u16) {
+    fn put_span(&mut self, out: &mut Vec<u8>, frame: &Frame, row: u16, from: u16, to: u16) -> u16 {
         let mut pen = from;
         for col in from..to {
             if painted_by_wide_neighbour(frame, row, col) {
@@ -274,6 +334,7 @@ impl Renderer {
             }
             pen += if wide { 2 } else { 1 };
         }
+        pen
     }
 
     /// Put the cursor where the frame wants it and match its visibility.
@@ -309,7 +370,7 @@ impl Renderer {
     /// Emit the mode changes between what the terminal is set to and what the
     /// frame asks for.
     fn write_modes(&mut self, out: &mut Vec<u8>, frame: &Frame) {
-        let want = Modes::of(frame);
+        let want = Modes::of(frame, self.always_report_focus);
         let have = self.modes;
         // With the terminal's state unknown every mode is emitted rather than
         // diffed: `None` cannot answer "does this already match?".
@@ -337,6 +398,13 @@ impl Renderer {
                 out.extend_from_slice(seq);
             }
         }
+        if differs(|m| m.focus_events) {
+            out.extend_from_slice(if want.focus_events {
+                b"\x1b[?1004h"
+            } else {
+                b"\x1b[?1004l"
+            });
+        }
         if differs(|m| m.sgr_mouse) {
             out.extend_from_slice(if want.sgr_mouse {
                 b"\x1b[?1006h"
@@ -358,6 +426,7 @@ impl Renderer {
     /// mirrored modes, a visible cursor and a fresh line to type on.
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
+        self.in_place_repaint = false;
         self.style = Style::default_style();
         // Undo what we know is on. When the state is unknown, undo
         // everything: "we cannot tell" must not become "nothing to undo",
@@ -373,6 +442,9 @@ impl Renderer {
             }
             for seq in tracking_off(known.tracking) {
                 out.extend_from_slice(seq);
+            }
+            if known.focus_events {
+                out.extend_from_slice(b"\x1b[?1004l");
             }
             if known.sgr_mouse {
                 out.extend_from_slice(b"\x1b[?1006l");

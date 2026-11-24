@@ -27,6 +27,7 @@ fn poisoned(cols: u16, rows: u16) -> (Frame, Arc<Palette>) {
     frame.mouse_tracking = MouseTracking::Motion;
     frame.mouse_sgr = true;
     frame.bracketed_paste = true;
+    frame.focus_events = true;
     frame.alt_screen = true;
     let palette = Arc::make_mut(&mut frame.palette);
     palette.entries[7] = 0xabcdef;
@@ -55,7 +56,7 @@ fn states() -> Vec<(&'static str, TerminalCore)> {
     states.push(("scrolled into history", t));
 
     let mut t = TerminalCore::new(10, 3);
-    t.feed(b"primary\x1b[?1049h\x1b[?1h\x1b=\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?25l");
+    t.feed(b"primary\x1b[?1049h\x1b[?1h\x1b=\x1b[?1002h\x1b[?1004h\x1b[?1006h\x1b[?2004h\x1b[?25l");
     t.feed(b"\x1b[2;3H\x1b[31;44;1;4;7mapp");
     states.push(("alternate screen with modes", t));
 
