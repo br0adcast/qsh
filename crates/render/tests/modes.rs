@@ -232,6 +232,7 @@ fn finish_after_invalidate_still_turns_every_mode_off() {
         "\x1b[?1000l",
         "\x1b[?1002l",
         "\x1b[?1003l",
+        "\x1b[?1004l",
         "\x1b[?1006l",
         "\x1b[?2004l",
         "\x1b[?25h",
@@ -241,4 +242,105 @@ fn finish_after_invalidate_still_turns_every_mode_off() {
             "finish must emit {expected:?}: {out:?}"
         );
     }
+}
+
+#[test]
+fn focus_events_are_mirrored() {
+    let mut src = TerminalCore::new(10, 2);
+    let mut r = Renderer::new(TermCaps::truecolor());
+    let first = rendered(&mut src, &mut r);
+    assert!(first.contains("\x1b[?1004l"), "initial off: {first:?}");
+
+    src.feed(b"\x1b[?1004h");
+    let out = rendered(&mut src, &mut r);
+    assert!(out.contains("\x1b[?1004h"), "focus on: {out:?}");
+
+    src.feed(b"\x1b[?1004l");
+    let out = rendered(&mut src, &mut r);
+    assert!(out.contains("\x1b[?1004l"), "focus off: {out:?}");
+}
+
+#[test]
+fn always_report_focus_keeps_mode_1004_on_and_finish_resets_it() {
+    let mut src = TerminalCore::new(10, 2);
+    let mut r = Renderer::new(TermCaps::truecolor());
+    r.set_focus_reporting(true);
+
+    let first = rendered(&mut src, &mut r);
+    assert!(first.contains("\x1b[?1004h"), "initial on: {first:?}");
+    assert!(
+        !first.contains("\x1b[?1004l"),
+        "must not turn focus off: {first:?}"
+    );
+
+    // Unchanged frame does not restate ?1004h.
+    let second = rendered(&mut src, &mut r);
+    assert!(!second.contains("\x1b[?1004h"), "steady state: {second:?}");
+
+    // Remote disabling ?1004l still keeps local reporting enabled.
+    src.feed(b"\x1b[?1004h\x1b[?1004l");
+    let third = rendered(&mut src, &mut r);
+    assert!(
+        !third.contains("\x1b[?1004l"),
+        "must stay on when remote turns off: {third:?}"
+    );
+
+    // Invalidate re-emits ?1004h.
+    r.invalidate();
+    let after_invalidate = rendered(&mut src, &mut r);
+    assert!(
+        after_invalidate.contains("\x1b[?1004h"),
+        "re-emitted after invalidate: {after_invalidate:?}"
+    );
+
+    // Finish must turn ?1004l off so the user's shell never gets stray ^[[I/^[[O.
+    let finished = String::from_utf8_lossy(&r.finish()).to_string();
+    assert!(
+        finished.contains("\x1b[?1004l"),
+        "finish must disable focus reporting: {finished:?}"
+    );
+}
+
+#[test]
+fn repaint_in_place_redraws_every_row_without_clearing_screen() {
+    let mut src = TerminalCore::new(8, 5);
+    let mut dst = TerminalCore::new(8, 5);
+    let mut r = Renderer::new(TermCaps::truecolor());
+
+    // Row 0: full-width reverse video (status bar), leaves pen in SGR 7.
+    // Row 1: blank row (must be repainted with default SGR + ESC[K).
+    // Row 2: short text + trailing blank.
+    // Row 3: wide character in the middle.
+    // Row 4: wide character occupying the last two columns (6, 7).
+    src.feed(
+        "\x1b[1;1H\x1b[7m12345678\x1b[0m\x1b[3;1Hhi\x1b[4;1Hab界\x1b[5;1Habcdef界\x1b[1;8H\x1b[7m8"
+            .as_bytes(),
+    );
+    let initial = r.render(&src.frame());
+    dst.feed(&initial);
+    assert_eq!(dst.frame().cells, src.frame().cells);
+
+    // Simulate a terminal whose untouched rows (1..=4) were corrupted/lost.
+    dst.feed(b"\x1b[2;1HXXXXXXXX\x1b[3;1HYYYYYYYY\x1b[4;1HZZZZZZZZ\x1b[5;1HWWWWWWWW");
+
+    r.repaint_in_place();
+    let bytes = r.render(&src.frame());
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains("\x1b[2J"),
+        "in-place repaint must not flash with ESC[2J: {text:?}"
+    );
+    for row in 1..=5 {
+        let cup = format!("\x1b[{row};1H");
+        assert!(
+            text.contains(&cup),
+            "in-place repaint must touch row {row}: {text:?}"
+        );
+    }
+    dst.feed(&bytes);
+    assert_eq!(dst.frame().cells, src.frame().cells);
+    assert_eq!(
+        (dst.frame().cursor_row, dst.frame().cursor_col),
+        (src.frame().cursor_row, src.frame().cursor_col)
+    );
 }

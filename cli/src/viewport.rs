@@ -17,6 +17,7 @@ fn metadata(frame: &Frame, cols: u16, rows: u16, cells: Vec<Cell>) -> Frame {
         mouse_tracking: frame.mouse_tracking,
         mouse_sgr: frame.mouse_sgr,
         bracketed_paste: frame.bracketed_paste,
+        focus_events: frame.focus_events,
         alt_screen: frame.alt_screen,
         palette: std::sync::Arc::clone(&frame.palette),
     }
@@ -142,9 +143,15 @@ mod tests {
         frame.cells[1].flags = FLAG_WIDE_SPACER;
         frame.mouse_sgr = true;
         frame.bracketed_paste = true;
+        frame.focus_events = true;
         let projected = project(&frame, ViewportSize::new(2, 1));
         assert_eq!(&projected.cells, &frame.cells[..2]);
-        assert!(projected.mouse_sgr && projected.bracketed_paste && projected.cursor_visible);
+        assert!(
+            projected.mouse_sgr
+                && projected.bracketed_paste
+                && projected.focus_events
+                && projected.cursor_visible
+        );
     }
 }
 
@@ -185,6 +192,7 @@ mod ownership_tests {
         source.mouse_tracking = MouseTracking::Drag;
         source.mouse_sgr = true;
         source.bracketed_paste = true;
+        source.focus_events = true;
         source.alt_screen = true;
         source.cells[0].flags |= FLAG_HIDDEN;
         source.cells[0].fg = Color::Indexed(7);

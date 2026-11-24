@@ -19,6 +19,7 @@ const RESETS: &[&str] = &[
     "\x1b[?1000l",
     "\x1b[?1002l",
     "\x1b[?1003l",
+    "\x1b[?1004l",
     "\x1b[?1006l",
     "\x1b[?2004l",
     "\x1b[?25h",
@@ -145,7 +146,13 @@ fn worker_panic_keeps_the_active_terminal_modes() {
     let mut terminal = terminal::TerminalCore::new(20, 4);
     terminal.feed(&outcome.output.as_bytes()[..outcome.output.find(WORKER_DONE).unwrap()]);
     let frame = terminal.frame();
-    assert!(frame.app_cursor && frame.app_keypad && frame.mouse_sgr && frame.bracketed_paste);
+    assert!(
+        frame.app_cursor
+            && frame.app_keypad
+            && frame.mouse_sgr
+            && frame.bracketed_paste
+            && frame.focus_events
+    );
     assert_eq!(frame.mouse_tracking, terminal::MouseTracking::Motion);
     assert!(!frame.cursor_visible);
     assert!(frame.alt_screen);
@@ -189,7 +196,7 @@ fn child_process() {
     if case != "unregistered" {
         raw.enter_alternate_screen(libc::STDOUT_FILENO).unwrap();
         let mut source = terminal::TerminalCore::new(20, 4);
-        source.feed(b"\x1b[?1h\x1b=\x1b[?1006h\x1b[?2004h\x1b[?25l\x1b[31mred");
+        source.feed(b"\x1b[?1h\x1b=\x1b[?1004h\x1b[?1006h\x1b[?2004h\x1b[?25l\x1b[31mred");
         source.feed(match case.as_str() {
             "click" => b"\x1b[?1000h",
             "drag" => b"\x1b[?1002h",

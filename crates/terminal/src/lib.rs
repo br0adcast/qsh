@@ -319,6 +319,9 @@ pub struct Frame {
     /// wrapped in markers, so the client mirrors the mode onto the local
     /// terminal and the markers arrive from it for free.
     pub bracketed_paste: bool,
+    /// Focus reporting (`ESC [ ? 1004 h`): the application wants `ESC [ I`
+    /// (focus in) and `ESC [ O` (focus out) notifications.
+    pub focus_events: bool,
     /// Alternate screen (`ESC [ ? 1049 h`), used by full-screen applications
     /// (vim, less). Useful for deciding where to route scrolling.
     pub alt_screen: bool,
@@ -346,6 +349,7 @@ impl Clone for Frame {
             mouse_tracking,
             mouse_sgr,
             bracketed_paste,
+            focus_events,
             alt_screen,
             palette,
         } = self;
@@ -362,6 +366,7 @@ impl Clone for Frame {
             mouse_tracking: *mouse_tracking,
             mouse_sgr: *mouse_sgr,
             bracketed_paste: *bracketed_paste,
+            focus_events: *focus_events,
             alt_screen: *alt_screen,
             palette: Arc::clone(palette),
         }
@@ -381,6 +386,7 @@ impl Clone for Frame {
             mouse_tracking,
             mouse_sgr,
             bracketed_paste,
+            focus_events,
             alt_screen,
             palette,
         } = source;
@@ -397,6 +403,7 @@ impl Clone for Frame {
         self.mouse_tracking = *mouse_tracking;
         self.mouse_sgr = *mouse_sgr;
         self.bracketed_paste = *bracketed_paste;
+        self.focus_events = *focus_events;
         self.alt_screen = *alt_screen;
         if !Arc::ptr_eq(&self.palette, palette) {
             self.palette = Arc::clone(palette);
@@ -763,6 +770,7 @@ impl TerminalCore {
             mouse_tracking: MouseTracking::Off,
             mouse_sgr: false,
             bracketed_paste: false,
+            focus_events: false,
             alt_screen: false,
             palette: Arc::new(snapshot_palette(self.term.colors())),
         }
@@ -857,6 +865,7 @@ impl TerminalCore {
             MouseTracking::Off
         };
         let bracketed_paste = mode.contains(TermMode::BRACKETED_PASTE);
+        let focus_events = mode.contains(TermMode::FOCUS_IN_OUT);
         let mouse_sgr = mode.contains(TermMode::SGR_MOUSE);
         let alt_screen = mode.contains(TermMode::ALT_SCREEN);
 
@@ -871,6 +880,7 @@ impl TerminalCore {
         frame.mouse_tracking = mouse_tracking;
         frame.mouse_sgr = mouse_sgr;
         frame.bracketed_paste = bracketed_paste;
+        frame.focus_events = focus_events;
         frame.alt_screen = alt_screen;
     }
 }
@@ -896,6 +906,7 @@ impl Frame {
             mouse_tracking: MouseTracking::Off,
             mouse_sgr: false,
             bracketed_paste: false,
+            focus_events: false,
             alt_screen: false,
             palette: Arc::new(Palette::xterm_default()),
         }

@@ -60,10 +60,19 @@ pub enum Command {
     Scroll,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusEvent {
+    /// `ESC [ I`: the local terminal tab or window gained focus.
+    In,
+    /// `ESC [ O`: the local terminal tab or window lost focus.
+    Out,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Piece {
     Input(Vec<u8>),
     Command(Command),
+    Focus(FocusEvent),
 }
 
 /// How far `Escape` is into a prefix command.
@@ -180,6 +189,23 @@ impl Escape {
                         self.in_paste = true;
                         self.marker_len = 0;
                     }
+                    continue;
+                }
+                if self.marker_len == 2
+                    && matches!(b, b'I' | b'O')
+                    && (self.marker_held
+                        || (self.prefix != Prefix::Key(ESC) && plain.ends_with(b"\x1b[")))
+                {
+                    self.marker_len = 0;
+                    if !self.marker_held {
+                        plain.truncate(plain.len() - 2);
+                    }
+                    flush(&mut out, &mut plain);
+                    out.push(Piece::Focus(if b == b'I' {
+                        FocusEvent::In
+                    } else {
+                        FocusEvent::Out
+                    }));
                     continue;
                 }
                 let matched = std::mem::take(&mut self.marker_len);
@@ -448,6 +474,7 @@ mod tests {
                 match piece {
                     Piece::Input(bytes) => input.extend(bytes),
                     Piece::Command(command) => panic!("pasted command at cut {cut}: {command:?}"),
+                    Piece::Focus(event) => panic!("pasted focus event at cut {cut}: {event:?}"),
                 }
             }
             assert_eq!(input, bytes, "cut {cut}");
@@ -588,6 +615,71 @@ mod tests {
                 Piece::Command(Command::Help),
                 Piece::Command(Command::Leave),
             ],
+        );
+    }
+
+    #[test]
+    fn focus_events_are_split_from_plain_input() {
+        let mut escape = Escape::new(DEFAULT_PREFIX);
+        assert_eq!(
+            escape.feed(b"a\x1b[Ob\x1b[Ic"),
+            vec![
+                Piece::Input(b"a".to_vec()),
+                Piece::Focus(FocusEvent::Out),
+                Piece::Input(b"b".to_vec()),
+                Piece::Focus(FocusEvent::In),
+                Piece::Input(b"c".to_vec()),
+            ]
+        );
+
+        // Works with --escape none too.
+        let mut none = Escape::new(Prefix::None);
+        assert_eq!(
+            none.feed(b"\x1b[O\x1b[I"),
+            vec![Piece::Focus(FocusEvent::Out), Piece::Focus(FocusEvent::In)]
+        );
+
+        // Works with ESC prefix without triggering prefix mode.
+        let mut esc_prefix = Escape::new(Prefix::Key(ESC));
+        assert_eq!(
+            esc_prefix.feed(b"\x1b[I\x1b[Ox"),
+            vec![
+                Piece::Focus(FocusEvent::In),
+                Piece::Focus(FocusEvent::Out),
+                Piece::Input(b"x".to_vec()),
+            ]
+        );
+
+        // Focus events during a pending prefix do not drop the pending prefix.
+        let mut pending = Escape::new(DEFAULT_PREFIX);
+        assert_eq!(
+            pending.feed(&[P, ESC, b'[', b'O', ESC, b'[', b'I', b'h']),
+            vec![
+                Piece::Focus(FocusEvent::Out),
+                Piece::Focus(FocusEvent::In),
+                Piece::Command(Command::ToggleLine),
+            ]
+        );
+    }
+
+    #[test]
+    fn focus_events_inside_bracketed_paste_stay_literal() {
+        let bytes = b"\x1b[200~\x1b[O\x1b[I\x1b[201~";
+        across_reads(DEFAULT_PREFIX, bytes, &[Piece::Input(bytes.to_vec())]);
+    }
+
+    #[test]
+    fn split_alt_left_bracket_and_doubled_esc_are_not_focus_events() {
+        // Alt-[ followed in a later read by 'I' must remain literal input.
+        let mut escape = Escape::new(DEFAULT_PREFIX);
+        assert_eq!(escape.feed(b"\x1b["), vec![Piece::Input(b"\x1b[".to_vec())]);
+        assert_eq!(escape.feed(b"I"), vec![Piece::Input(b"I".to_vec())]);
+
+        // With ESC prefix, doubled ESC (literal ESC) followed by "[I" is not a focus report.
+        let mut esc_prefix = Escape::new(Prefix::Key(ESC));
+        assert_eq!(
+            esc_prefix.feed(b"\x1b\x1b[I"),
+            vec![Piece::Input(b"\x1b[I".to_vec())]
         );
     }
 }
