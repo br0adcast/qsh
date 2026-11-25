@@ -315,6 +315,50 @@ impl Ladder {
         }
     }
 
+    /// Re-enter SSH for the address that just connected directly, when an
+    /// interactive login chooses a legacy SSH daemon update fallback.
+    pub fn begin_ssh_update_fallback(&mut self, addr: usize) -> Action {
+        self.not_in(
+            Mode::Background,
+            "ssh update fallback happens only during interactive login",
+        );
+        assert_eq!(
+            self.step,
+            Step::Over,
+            "ssh update fallback follows Connected"
+        );
+        assert_eq!(
+            self.at, addr,
+            "ssh update fallback targets the connected address"
+        );
+        assert!(
+            self.addrs[addr].ssh.is_some(),
+            "ssh update fallback requires an ssh route"
+        );
+        self.step = Step::Ssh;
+        Action::TrySsh { addr }
+    }
+
+    /// Return from a declined or unavailable legacy SSH update fallback to a
+    /// direct login on the same compatible address.
+    pub fn continue_direct_after_ssh_fallback(&mut self, addr: usize) -> Action {
+        self.not_in(
+            Mode::Background,
+            "ssh update fallback happens only during interactive login",
+        );
+        assert_eq!(
+            self.step,
+            Step::Ssh,
+            "direct continuation follows a legacy ssh update fallback"
+        );
+        assert_eq!(
+            self.at, addr,
+            "direct continuation targets the fallback address"
+        );
+        self.step = Step::Direct;
+        Action::TryDirect { addr }
+    }
+
     pub fn on(&mut self, outcome: Outcome) -> Action {
         match (self.step, outcome) {
             (Step::Over, _) => panic!("the ladder is over: nothing follows Connected or GiveUp"),
@@ -1042,5 +1086,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn legacy_ssh_update_fallback_succeeds_through_after_ssh_to_connected() {
+        let mut ladder = Ladder::new(vec![with_ssh("first.example"), with_ssh("second.example")]);
+        assert_eq!(ladder.first(), Action::TryDirect { addr: 0 });
+        assert_eq!(
+            ladder.on(d(D::Connected)),
+            Action::Connected {
+                addr: 0,
+                port: 60022
+            }
+        );
+
+        assert_eq!(
+            ladder.begin_ssh_update_fallback(0),
+            Action::TrySsh { addr: 0 }
+        );
+        assert_eq!(
+            ladder.on(s(S::Ready { port: 60023 })),
+            Action::TryDirectAfterSsh {
+                addr: 0,
+                port: 60023
+            }
+        );
+        assert_eq!(
+            ladder.on(d(D::Connected)),
+            Action::Connected {
+                addr: 0,
+                port: 60023
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_ssh_update_fallback_continues_direct_when_ssh_unavailable() {
+        let mut ladder = Ladder::new(vec![
+            direct_only("first.example"),
+            with_ssh("second.example"),
+        ]);
+        assert_eq!(ladder.first(), Action::TryDirect { addr: 0 });
+        assert_eq!(ladder.on(d(D::Refused)), Action::TryDirect { addr: 1 });
+        assert_eq!(
+            ladder.on(d(D::Connected)),
+            Action::Connected {
+                addr: 1,
+                port: 60022
+            }
+        );
+
+        assert_eq!(
+            ladder.begin_ssh_update_fallback(1),
+            Action::TrySsh { addr: 1 }
+        );
+        assert_eq!(
+            ladder.continue_direct_after_ssh_fallback(1),
+            Action::TryDirect { addr: 1 }
+        );
+        assert_eq!(
+            ladder.on(d(D::Connected)),
+            Action::Connected {
+                addr: 1,
+                port: 60022
+            }
+        );
     }
 }
