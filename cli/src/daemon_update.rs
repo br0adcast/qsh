@@ -202,9 +202,9 @@ fn run_over_qsh(
     };
 
     let build = client_build();
-    if build != 0 && about.build > build {
+    if build != 0 && about.build >= build {
         log::log(&format!(
-            "running qshd build {} is newer than client build {}; skipping update",
+            "running qshd build {} is already at or newer than client build {}; skipping update",
             about.build, build
         ));
         return DaemonUpdateOutcome::ContinueDirect;
