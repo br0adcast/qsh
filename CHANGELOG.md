@@ -7,6 +7,31 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0-alpha.5] — 2026-11-25
+
+### Added
+
+- Update an older personal `qshd` over the authenticated `qsh` control channel
+  without requiring SSH (#678, #679). When a running daemon advertises
+  `About.os` and `UpdateOffer`, an interactive `qsh` login downloads the signed
+  release binary locally, transfers it over `qsh`, asks for confirmation before
+  disrupting active sessions, preserves attached sessions across the frontend
+  handoff via `SESSION_RESET`, and skips the prompt when the serving build
+  already matches or exceeds the client build. Older daemons without over-`qsh`
+  update metadata keep the existing SSH fallback when SSH is available.
+- Add an upgrade and protocol-compatibility test matrix and pre-release runner
+  (`scripts/upgrade-matrix-check.py`) covering attached older clients, newer
+  servers, idle/managed daemons, and multi-endpoint dialog deduplication
+  (#681, #682).
+
+### Fixed
+
+- Surface `KeyChanged`, `ProtocolFailure` (without `ServerInfo`), and
+  `AuthRefused` diagnostics on the recovery status line during background
+  recovery (both `--status on` and `--status off`) instead of hanging silently
+  on the red status bar, while keeping recovery retryable and clearing the
+  notice cleanly when the link returns (#680, #683).
+
 ## [0.6.0-alpha.4] — 2026-11-24
 
 ### Fixed
