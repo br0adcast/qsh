@@ -742,6 +742,7 @@ impl<'a> Climb<'a> {
                         .expect("incompatible addresses")
                         .contains(&addr)
                     {
+                        self.legacy_ssh_fallback = None;
                         action = self.advance(&mut ladder, Outcome::Ssh(SshOutcome::Failed(
                             ::connect::SshFailure::plain("authenticated server excludes this client's session profile; no update was requested"))), None);
                         continue;
@@ -788,6 +789,7 @@ impl<'a> Climb<'a> {
                         return Climbed::Exit(130);
                     }
                     if let Some(proof) = refused.take() {
+                        self.legacy_ssh_fallback = None;
                         let why = crate::server_discovery::incompatibility(proof.info());
                         let line = report::no_answer(host, addrs[addr].qsh_port, &why);
                         self.provisional_evidence
@@ -849,7 +851,7 @@ impl<'a> Climb<'a> {
                                 self.say(
                                     "qsh: continuing directly with the compatible qsh session",
                                 );
-                                Action::TryDirect { addr }
+                                ladder.continue_direct_after_ssh_fallback(addr)
                             } else {
                                 self.say(&report::install_declined());
                                 self.advance(
@@ -864,7 +866,7 @@ impl<'a> Climb<'a> {
                                 self.say(
                                     "qsh: SSH update unavailable; continuing directly with the compatible qsh session",
                                 );
-                                Action::TryDirect { addr }
+                                ladder.continue_direct_after_ssh_fallback(addr)
                             } else {
                                 let line = report::ssh_failed(
                                     host,
@@ -884,7 +886,7 @@ impl<'a> Climb<'a> {
                                 self.say(
                                     "qsh: SSH update unavailable; continuing directly with the compatible qsh session",
                                 );
-                                Action::TryDirect { addr }
+                                ladder.continue_direct_after_ssh_fallback(addr)
                             } else {
                                 let line = report::ssh_failed(host, &why);
                                 self.advance(
@@ -952,7 +954,7 @@ impl<'a> Climb<'a> {
                                 attempt.close();
                                 self.drain();
                                 self.legacy_ssh_fallback = Some(addr);
-                                action = Action::TrySsh { addr };
+                                action = ladder.begin_ssh_update_fallback(addr);
                                 continue;
                             }
                             crate::daemon_update::DaemonUpdateOutcome::ReconnectDirect => {
