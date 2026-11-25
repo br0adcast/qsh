@@ -1480,7 +1480,7 @@ dependencies = [
 
 [[package]]
 name = "sshauth"
-version = "0.6.0-alpha.4"
+version = "0.6.0-alpha.5"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.6.0-alpha.4"
+version = "0.6.0-alpha.5"
 dependencies = [
  "alacritty_terminal",
  "memchr",
@@ -1541,11 +1541,11 @@ dependencies = [
 
 [[package]]
 name = "terminal-size"
-version = "0.6.0-alpha.4"
+version = "0.6.0-alpha.5"
 
 [[package]]
 name = "transport"
-version = "0.6.0-alpha.4"
+version = "0.6.0-alpha.5"
 dependencies = [
  "blake2 0.11.0",
  "chacha20poly1305 0.11.0",
