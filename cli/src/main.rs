@@ -1227,6 +1227,13 @@ impl Links {
         {
             actions.extend(sess.handle(UiEvent::DiagnosticWarning(warning), now_ms));
         }
+        if let Some(notice) = self
+            .round
+            .as_ref()
+            .and_then(background::RoundTask::take_qsh_notice)
+        {
+            actions.extend(sess.handle(UiEvent::RecoveryDiagnostic(notice), now_ms));
+        }
         actions
     }
 

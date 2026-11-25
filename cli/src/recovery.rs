@@ -45,6 +45,8 @@ struct State {
     ssh_retry_at: Option<Instant>,
     warning: Option<String>,
     last_warnings: Vec<Option<String>>,
+    qsh_notice: Option<String>,
+    last_qsh_notices: Vec<Option<String>>,
     server_info: Vec<Option<ServerObservation>>,
     next_metadata: u64,
     sweep_metadata: u64,
@@ -170,6 +172,8 @@ impl State {
         self.local_send_failure = false;
         self.qsh_activity.clear();
         self.observed_sweep = None;
+        self.qsh_notice = None;
+        self.last_qsh_notices.fill(None);
         self.gate.reset(epoch);
     }
 }
@@ -201,6 +205,8 @@ impl Recovery {
                 ssh_retry_at: None,
                 warning: None,
                 last_warnings: vec![None; addresses],
+                qsh_notice: None,
+                last_qsh_notices: vec![None; addresses],
                 server_info: vec![None; addresses],
                 next_metadata: 0,
                 sweep_metadata: 0,
@@ -1003,6 +1009,47 @@ impl Recovery {
             .take()
     }
 
+    /// A single pending recovery-outage diagnostic from UDP recovery, cleared
+    /// once the link recovers.
+    pub fn take_qsh_notice(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .qsh_notice
+            .take()
+    }
+
+    /// Publish a non-transient QSH recovery failure (such as a changed server
+    /// key, protocol mismatch, or UDP authentication refusal) onto the status
+    /// line without changing recovery gating.
+    pub fn publish_qsh_notice(
+        &self,
+        revision: u64,
+        epoch: RecoveryEpoch,
+        sweep: SweepId,
+        addr: usize,
+        message: &str,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if self.cancel.is_cancelled()
+            || state.local_send_failure
+            || epoch != self.epoch
+            || state.revision != revision
+            || state.observed_sweep != Some(sweep)
+            || addr >= state.last_qsh_notices.len()
+        {
+            return false;
+        }
+        let notice = logging::diagnostic(message);
+        if state.last_qsh_notices[addr].as_ref() != Some(&notice) {
+            state.qsh_notice = Some(notice.clone());
+            state.last_qsh_notices[addr] = Some(notice);
+        }
+        drop(state);
+        self.notify();
+        true
+    }
+
     #[cfg(test)]
     fn publish_ready(&self, attempt: &SshAttempt, addr: usize, port: u16) -> bool {
         self.publish_ready_with_warning(attempt, addr, port, None)
@@ -1783,6 +1830,68 @@ mod tests {
             unsafe { libc::poll(&mut p, 1, 0) },
             1,
             "shared recovery state cannot depend on UI polling"
+        );
+    }
+
+    #[test]
+    fn qsh_notice_is_generation_bound_deduplicated_and_reset_on_revision() {
+        use std::os::fd::AsRawFd;
+        let (reader, sender) = crate::input_wake::pair().unwrap();
+        let recovery = Recovery::with_catalog(
+            EPOCH,
+            vec![AddressId(0)],
+            vec![(AddressId(0), "127.0.0.1:60001".parse().unwrap())],
+        );
+        recovery.set_notification(sender);
+        let rev = recovery.revision();
+        recovery.begin_sweep(SweepId(1));
+
+        // Stale revision, wrong epoch, or wrong sweep cannot publish.
+        assert!(!recovery.publish_qsh_notice(rev + 1, EPOCH, SweepId(1), 0, "stale rev"));
+        assert!(!recovery.publish_qsh_notice(
+            rev,
+            RecoveryEpoch {
+                connection: 99,
+                network: 0,
+            },
+            SweepId(1),
+            0,
+            "stale epoch"
+        ));
+        assert!(!recovery.publish_qsh_notice(rev, EPOCH, SweepId(2), 0, "stale sweep"));
+        assert_eq!(recovery.take_qsh_notice(), None);
+
+        // Matching sweep publishes, wakes UI, and deduplicates identical repeats.
+        assert!(recovery.publish_qsh_notice(rev, EPOCH, SweepId(1), 0, "qsh: auth refused"));
+        let mut p = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut p, 1, 0) }, 1);
+        assert_eq!(
+            recovery.take_qsh_notice().as_deref(),
+            Some("qsh: auth refused")
+        );
+        assert!(recovery.publish_qsh_notice(rev, EPOCH, SweepId(1), 0, "qsh: auth refused"));
+        assert_eq!(recovery.take_qsh_notice(), None);
+
+        // A more specific diagnostic replaces it; endpoint revision resets dedup.
+        assert!(recovery.publish_qsh_notice(rev, EPOCH, SweepId(1), 0, "qsh: key changed"));
+        assert_eq!(
+            recovery.take_qsh_notice().as_deref(),
+            Some("qsh: key changed")
+        );
+        recovery.update_endpoints(
+            EPOCH,
+            vec![(AddressId(0), "127.0.0.2:60001".parse().unwrap())],
+        );
+        let rev2 = recovery.revision();
+        recovery.begin_sweep(SweepId(2));
+        assert!(recovery.publish_qsh_notice(rev2, EPOCH, SweepId(2), 0, "qsh: key changed"));
+        assert_eq!(
+            recovery.take_qsh_notice().as_deref(),
+            Some("qsh: key changed")
         );
     }
 }

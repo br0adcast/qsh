@@ -101,6 +101,14 @@ impl Daemon {
         self.restart();
     }
 
+    pub fn host_key_path(&self) -> PathBuf {
+        self.home.path().join("host_key")
+    }
+
+    pub fn authorized_keys_path(&self) -> PathBuf {
+        self.home.path().join("authorized_keys")
+    }
+
     /// The daemon's session-reset secret file beside its host key, if it
     /// made one: its bytes and its permission bits.
     pub fn session_reset_secret(&self) -> Option<(Vec<u8>, u32)> {

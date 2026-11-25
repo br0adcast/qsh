@@ -62,6 +62,8 @@ pub enum LocalInputFailure {
 pub enum UiEvent {
     /// Owner-polled startup diagnostic from generation-valid SSH recovery.
     DiagnosticWarning(String),
+    /// Outage-scoped diagnostic from background QSH recovery; cleared on Live.
+    RecoveryDiagnostic(String),
     /// Owner-validated release offer; rendered without taking terminal ownership.
     ClientUpgrade {
         generation: [u8; 16],
@@ -387,6 +389,7 @@ pub struct Session {
     geometry_instance: Option<ChannelInstance>,
     resize_notice: Option<String>,
     diagnostic_notice: Option<String>,
+    recovery_notice: Option<String>,
     continuity_notice: Option<OutputGapCause>,
     session_abort: Option<transport::SessionAbortReason>,
     input_failed: bool,
@@ -548,6 +551,7 @@ impl Session {
             geometry_instance: None,
             resize_notice: None,
             diagnostic_notice: None,
+            recovery_notice: None,
             continuity_notice: None,
             session_abort: None,
             input_failed: false,
@@ -605,6 +609,14 @@ impl Session {
                 let mut actions = self.repaint(now_ms);
                 actions.push(Action::Notice(message));
                 actions
+            }
+            UiEvent::RecoveryDiagnostic(message) => {
+                let message = logging::diagnostic(&message);
+                if self.recovery_notice.as_ref() == Some(&message) {
+                    return Vec::new();
+                }
+                self.recovery_notice = Some(message);
+                self.repaint(now_ms)
             }
             UiEvent::SessionAborted(reason) => {
                 if self.session_abort.is_some() {
@@ -730,11 +742,20 @@ impl Session {
                 self.set_plate(Plate::Waiting { until_ms, hint }, now_ms)
             }
             UiEvent::RecoveryStatus { view } => {
+                if view.is_none() {
+                    let cleared_notice = self.clear_recovery_view();
+                    if self.recovery_view == view && !cleared_notice {
+                        return Vec::new();
+                    }
+                    if cleared_notice {
+                        self.renderer.invalidate();
+                        self.forget_shown();
+                    }
+                    self.recovery_view = None;
+                    return self.repaint(now_ms);
+                }
                 if self.recovery_view == view {
                     return Vec::new();
-                }
-                if view.is_none() {
-                    self.clear_recovery_view();
                 }
                 self.recovery_view = view;
                 self.repaint(now_ms)
@@ -1094,6 +1115,7 @@ impl Session {
                 })
             })
             .or(self.diagnostic_notice.as_deref())
+            .or(self.recovery_notice.as_deref())
     }
 
     /// Marks the shell channel as already requested, without emitting an
@@ -1685,12 +1707,14 @@ impl Session {
                 self.repaint(now_ms)
             }
             LinkState::Live | LinkState::Connecting => {
-                if state == LinkState::Live {
-                    self.clear_recovery_view();
-                }
+                let cleared_notice = if state == LinkState::Live {
+                    self.clear_recovery_view()
+                } else {
+                    false
+                };
                 let was_lost = self.lost_since_ms.take().is_some();
                 let line_changed = self.refresh_line(now_ms);
-                let mut actions = if was_lost {
+                let mut actions = if was_lost || cleared_notice {
                     // The plate covered a row of the shell's screen; the
                     // renderer must not diff the row it is about to uncover
                     // against the plate it painted there.
@@ -1838,10 +1862,12 @@ impl Session {
         details
     }
 
-    fn clear_recovery_view(&mut self) {
+    fn clear_recovery_view(&mut self) -> bool {
+        let cleared_notice = self.recovery_notice.take().is_some();
         if self.recovery_view.take().is_some() && matches!(self.window, Some(Open::Roads(_))) {
             self.close_window();
         }
+        cleared_notice
     }
 
     fn outage(&self) -> bool {
@@ -2555,6 +2581,46 @@ mod tests {
                 .map(|cell| cell.ch)
                 .collect();
             assert!(text.contains("file logging disabled"), "{text}");
+        }
+    }
+
+    #[test]
+    fn recovery_diagnostic_is_visible_during_outage_and_clears_on_live() {
+        for status_line in [false, true] {
+            let mut s = lined(100, 8);
+            s.line_shown = status_line;
+            let message = "qsh: WARNING: server key for host:60000 has changed; retrying";
+            let actions = s.handle(UiEvent::RecoveryDiagnostic(message.into()), 0);
+            assert!(!actions.is_empty());
+            assert!(
+                actions.iter().all(|a| !matches!(a, Action::Notice(_))),
+                "outage-scoped notice must not queue post-exit stderr spam"
+            );
+            let text: String = s
+                .last_frame
+                .as_ref()
+                .unwrap()
+                .cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect();
+            assert!(text.contains("server key"), "{text}");
+            assert!(s
+                .handle(UiEvent::RecoveryDiagnostic(message.into()), 1)
+                .is_empty());
+
+            // Recovering to Live clears the outage diagnostic cleanly.
+            s.handle(UiEvent::RecoveryStatus { view: None }, 2);
+            s.handle(UiEvent::Link(LinkState::Live), 3);
+            let after: String = s
+                .last_frame
+                .as_ref()
+                .unwrap()
+                .cells
+                .iter()
+                .map(|cell| cell.ch)
+                .collect();
+            assert!(!after.contains("server key"), "{after}");
         }
     }
 

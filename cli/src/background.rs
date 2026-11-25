@@ -89,6 +89,10 @@ impl RoundTask {
         self.recovery.take_warning()
     }
 
+    pub fn take_qsh_notice(&self) -> Option<String> {
+        self.recovery.take_qsh_notice()
+    }
+
     pub fn display_server_info(&self) -> Option<crate::server_discovery::AuthenticatedServerInfo> {
         self.recovery.display_server_info()
     }
