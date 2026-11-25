@@ -336,7 +336,7 @@ fn direct_login_updates_older_personal_daemon_over_qsh_without_ssh() {
         new_build,
     );
 
-    screen.wait("Direct over qsh (no SSH)");
+    screen.wait("via qsh");
     screen.wait("Update qshd to 9.9.9?");
     client.master.write_all(b"yes\n").unwrap();
     screen.wait("Uploading qshd");
@@ -500,7 +500,7 @@ fn direct_login_busy_personal_daemon_asks_disrupt_consent_and_updates_over_qsh()
 
     screen.wait("Update qshd to 9.9.9?");
     client.master.write_all(b"yes\n").unwrap();
-    screen.wait("currently has 1 other active client");
+    screen.wait("has 1 other active client");
     screen.wait("Update qshd now? [y/N]");
     client.master.write_all(b"yes\n").unwrap();
     screen.wait("Uploading qshd");

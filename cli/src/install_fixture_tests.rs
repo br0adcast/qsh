@@ -328,7 +328,7 @@ fn enter_accepts_installation_and_opens_shell() {
     assert!(screen.text().contains(image_path(&sb).to_str().unwrap()));
     screen.wait("[Y/n]");
     // This checks prompt wording only; the private provider does not authenticate releases.
-    assert!(screen.text().contains("  Source    GitHub Releases"));
+    assert!(screen.text().contains("GitHub Releases"));
     client.master.write_all(b"\n").unwrap();
     wait_for_bootstrap_ready(home.path());
     client.type_line("echo INSTALL_'OK'");

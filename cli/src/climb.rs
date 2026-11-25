@@ -428,6 +428,7 @@ impl Setup {
             install_policy,
             images: daemon_images(),
             server_info: None,
+            preapproved_upgrade: false,
         }
     }
 
@@ -773,6 +774,7 @@ impl<'a> Climb<'a> {
                             before: Some(&gate),
                             after_ready: None,
                         }),
+                        preapproved_upgrade: self.legacy_ssh_fallback == Some(addr),
                         ..self.setup.ssh_step(
                             self.background(),
                             self.setup

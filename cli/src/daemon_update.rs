@@ -403,17 +403,13 @@ fn over_qsh_question(
     let user = identity::show(login);
     let host_shown = identity::show(host);
     let preserve = if platform.os == ServerOs::Linux {
-        " Active sessions are preserved."
+        " Active sessions will be kept."
     } else {
         ""
     };
     identity::with_note(
         format!(
-            "\nqshd {} on {user}@{host_shown} is older than this client's {client_version}.\n\n  \
-             Version   {client_version}\n  \
-             Platform  {}\n  \
-             Method    Direct over qsh (no SSH)\n  \
-             Source    GitHub Releases\n\n\
+            "\nqshd on {user}@{host_shown}: {} -> {client_version} ({}, via qsh).\n\
              Update qshd to {client_version}?{preserve}",
             report::printable(server_version),
             platform.target(),
@@ -431,8 +427,7 @@ fn busy_disrupt_question(host: &str, others: u32) -> String {
     };
     identity::with_note(
         format!(
-            "\nqshd on {host_shown} currently has {clients}.\n\
-             Updating now keeps all sessions alive, and other clients will briefly reconnect.\n\
+            "\nqshd on {host_shown} has {clients}. Updating keeps all sessions; other clients will briefly reconnect.\n\
              Update qshd now?"
         ),
         &[host],
@@ -449,11 +444,8 @@ fn legacy_ssh_question(
     let host_shown = identity::show(host);
     identity::with_note(
         format!(
-            "\nqshd {} on {user}@{host_shown} is older than this client's {client_version} \
-             and predates direct updates over qsh.\n\
-             Update qshd to {client_version} over SSH? (Declining or unavailable SSH continues \
-             directly with qshd {}.)",
-            report::printable(server_version),
+            "\nqshd on {user}@{host_shown}: {} -> {client_version} (via SSH; sessions kept if possible).\n\
+             Update qshd to {client_version}?",
             report::printable(server_version),
         ),
         &[login, host],
@@ -796,8 +788,8 @@ mod tests {
             "0.6.0-alpha.5",
             Platform::from_rust_consts("linux", "x86_64").unwrap(),
         );
-        assert!(linux.contains("Direct over qsh (no SSH)"));
-        assert!(linux.contains("Active sessions are preserved."));
+        assert!(linux.contains("via qsh"));
+        assert!(linux.contains("Active sessions will be kept."));
         let macos = over_qsh_question(
             "alice",
             "example.test",
@@ -805,15 +797,15 @@ mod tests {
             "0.6.0-alpha.5",
             Platform::from_rust_consts("macos", "aarch64").unwrap(),
         );
-        assert!(macos.contains("Direct over qsh (no SSH)"));
-        assert!(!macos.contains("Active sessions are preserved."));
+        assert!(macos.contains("via qsh"));
+        assert!(!macos.contains("Active sessions will be kept."));
     }
 
     #[test]
     fn legacy_ssh_prompt_explains_fallback() {
         let prompt = legacy_ssh_question("alice", "example.test", "0.6.0-alpha.3", "0.6.0-alpha.5");
-        assert!(prompt.contains("predates direct updates over qsh"));
-        assert!(prompt.contains("over SSH"));
+        assert!(prompt.contains("0.6.0-alpha.3 -> 0.6.0-alpha.5"));
+        assert!(prompt.contains("via SSH"));
     }
 
     #[test]
