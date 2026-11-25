@@ -186,6 +186,10 @@ impl Climb<'_> {
         let mut memberships = Vec::new();
         let mut servers = HashMap::new();
         let mut unresolved = Vec::new();
+        // Collect non-transient QSH outage diagnostics `(priority, addr, message)`
+        // and publish the highest-priority one only if every configured path fails
+        // this sweep (never when a sibling path recovers).
+        let mut qsh_notices: Vec<(u8, usize, String)> = Vec::new();
         // Keep the preferred-endpoint DNS policy. A catalog revision interrupts
         // this sweep; ready endpoints never wait behind an unresolved sibling.
         for offset in 0..self.addrs.len() {
@@ -229,6 +233,11 @@ impl Climb<'_> {
                 Ok(server) => server,
                 Err(error) => {
                     let outcome = if matches!(error, trust::TrustError::KeyChanged { .. }) {
+                        qsh_notices.push((
+                            0,
+                            i,
+                            key_changed_notice(&address.host, address.qsh_port),
+                        ));
                         AddressOutcome::IdentityMismatch
                     } else {
                         AddressOutcome::NeedsUser
@@ -245,6 +254,11 @@ impl Climb<'_> {
                     &self.setup.args.login,
                     &[],
                     &loaded.looked,
+                ));
+                qsh_notices.push((
+                    2,
+                    i,
+                    auth_refused_notice(&address.host, address.qsh_port, address.ssh.is_some()),
                 ));
                 recovery.finish(
                     self.revision,
@@ -458,7 +472,10 @@ impl Climb<'_> {
                 let att = owned.0.take().expect("accepted attempt");
                 let (att, trial) = match self.shared_trial_observed(att, i, Some(&observation)) {
                     Ok(ready) => ready,
-                    Err((RoundEnd::AllFailed, _)) => {
+                    Err((RoundEnd::AllFailed, line)) => {
+                        if let Some(line) = line {
+                            qsh_notices.push((1, i, line));
+                        }
                         // A generation-bound profile rejection is terminal for
                         // this endpoint, not for other configured addresses.
                         for completion in sweep.finish_protocol_failure(plan.id, endpoint) {
@@ -535,13 +552,21 @@ impl Climb<'_> {
                     let host = self.addrs[i].host.clone();
                     let port = self.addrs[i].qsh_port;
                     if let Verdict::ServerIncompatible(ref info) = verdict {
-                        self.say(&report::no_answer(
+                        let line = report::no_answer(
                             &host,
                             port,
                             &crate::server_discovery::incompatibility(info),
-                        ));
+                        );
+                        self.say(&line);
+                        qsh_notices.push((1, i, line));
                     } else if let Verdict::ProtocolFailure(failure) = verdict {
-                        self.say(&report::no_answer(&host, port, &protocol_why(failure)));
+                        let line = report::no_answer(&host, port, &protocol_why(failure));
+                        self.say(&line);
+                        qsh_notices.push((1, i, line));
+                    } else if matches!(verdict, Verdict::AuthRefused) {
+                        let line = auth_refused_notice(&host, port, self.addrs[i].ssh.is_some());
+                        self.say(&line);
+                        qsh_notices.push((2, i, line));
                     } else if matches!(verdict, Verdict::Unreachable(_)) {
                         let send = refused.contains(&endpoint).then(|| {
                             let error = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
@@ -555,6 +580,7 @@ impl Climb<'_> {
                             self.silence(i, &host, port, endpoint, server, send);
                         if diagnosis == DirectOutcome::KeyChanged {
                             outcome = AddressOutcome::IdentityMismatch;
+                            qsh_notices.push((0, i, key_changed_notice(&host, port)));
                         }
                         if let Some(line) = line {
                             self.say(&line);
@@ -603,7 +629,37 @@ impl Climb<'_> {
                 AddressOutcome::Failed,
             );
         }
+        if !self.interrupted() && !cancel.is_cancelled() {
+            qsh_notices.sort_by_key(|(priority, _, _)| *priority);
+            if let Some((_, addr, message)) = qsh_notices.into_iter().next() {
+                recovery.publish_qsh_notice(self.revision, epoch, sweep_id, addr, &message);
+            }
+        }
         failed()
+    }
+}
+
+fn key_changed_notice(host: &str, port: u16) -> String {
+    format!(
+        "qsh: WARNING: server key for {}:{} has changed; refusing foreign daemon and retrying",
+        crate::identity::show(host),
+        port
+    )
+}
+
+fn auth_refused_notice(host: &str, port: u16, has_ssh: bool) -> String {
+    if has_ssh {
+        format!(
+            "qsh: {}:{}: UDP authentication refused by qshd; waiting for SSH recovery",
+            crate::identity::show(host),
+            port
+        )
+    } else {
+        format!(
+            "qsh: {}:{}: authentication refused by qshd (SSH recovery disabled)",
+            crate::identity::show(host),
+            port
+        )
     }
 }
 

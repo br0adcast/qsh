@@ -2012,3 +2012,195 @@ fn fullscreen_program_repaints_after_frontend_death() {
     ));
     exit_cleanly(&mut client, &screen, &daemon);
 }
+
+#[test]
+fn changed_server_key_during_recovery_surfaces_warning_on_status_line_and_clears_on_return() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let (foreign, _) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().unwrap();
+    let target = format!("127.0.0.1:{},nossh", relay.port);
+    let mut client = spawn_qsh(
+        &[
+            "-i",
+            key_path.to_str().unwrap(),
+            "--status",
+            "on",
+            "--verbose",
+            &target,
+        ],
+        config.path(),
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+
+    relay.redirect(foreign.port);
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(35), || screen
+            .top_ever_had("server key")),
+        "changed server key must be visible on the status line; top={:?}, log={}",
+        screen.top(),
+        verbose_log(config.path())
+    );
+    assert!(
+        client.child.try_wait().unwrap().is_none(),
+        "a foreign daemon cannot kill recovery"
+    );
+
+    relay.redirect(daemon.port);
+    assert!(
+        the_same_shell_answers(&mut client, &screen, Duration::from_secs(20)),
+        "returning to the real daemon must recover the shell: {}",
+        verbose_log(config.path())
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || !screen
+            .top()
+            .contains("server key")),
+        "key-changed outage notice must clear after recovery: {:?}",
+        screen.top()
+    );
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
+#[test]
+fn protocol_failure_without_server_info_surfaces_diagnostic_on_status_line() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let host_key = qshd::load_or_create_transport_key(&daemon.host_key_path()).unwrap();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().unwrap();
+    let target = format!("127.0.0.1:{},nossh", relay.port);
+    let mut client = spawn_qsh(
+        &[
+            "-i",
+            key_path.to_str().unwrap(),
+            "--status",
+            "on",
+            "--verbose",
+            &target,
+        ],
+        config.path(),
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+
+    // A peer speaking the pinned server key but an unsupported handshake
+    // version, with no QSHB ServerInfo responder.
+    let bad_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    bad_sock
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let bad_port = bad_sock.local_addr().unwrap().port();
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = stop.clone();
+    let bad_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        while !done.load(Ordering::SeqCst) {
+            let Ok((n, src)) = bad_sock.recv_from(&mut buf) else {
+                continue;
+            };
+            if let Ok(transport::wire::Frame::Handshake {
+                kind: transport::wire::Kind::HandshakeInit,
+                body,
+            }) = transport::wire::parse(&buf[..n])
+            {
+                let mut noise = transport::handshake::Handshake::new_responder(&host_key.private);
+                if noise.read_msg(body).is_ok() {
+                    let mut payload = transport::handshake_payload::encode_msg2(
+                        1,
+                        false,
+                        &[0; 16],
+                        transport::Features::SUPPORTED,
+                    );
+                    payload[0] = 99;
+                    let resp = noise.write_msg(&payload);
+                    let _ = bad_sock.send_to(
+                        &transport::wire::encode_handshake(
+                            transport::wire::Kind::HandshakeResp,
+                            &resp,
+                        ),
+                        src,
+                    );
+                }
+            }
+        }
+    });
+
+    relay.redirect(bad_port);
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(20), || screen
+            .top_ever_had("incompatible authenticated handshake")),
+        "protocol failure without ServerInfo must surface on the status line; top={:?}, log={}",
+        screen.top(),
+        verbose_log(config.path())
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = bad_thread.join();
+    relay.redirect(daemon.port);
+    assert!(
+        the_same_shell_answers(&mut client, &screen, Duration::from_secs(20)),
+        "restoring the compatible daemon must recover: {}",
+        verbose_log(config.path())
+    );
+    exit_cleanly(&mut client, &screen, &daemon);
+}
+
+#[test]
+fn udp_auth_refusal_without_ssh_surfaces_diagnostic_on_status_line_and_clears_on_restore() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let auth_path = daemon.authorized_keys_path();
+    let original_auth = std::fs::read_to_string(&auth_path).unwrap();
+    let relay = UdpRelay::start(daemon.port);
+    let config = tempfile::tempdir().unwrap();
+    let target = format!("127.0.0.1:{},nossh", relay.port);
+    let mut client = spawn_qsh(
+        &[
+            "-i",
+            key_path.to_str().unwrap(),
+            "--status",
+            "on",
+            "--verbose",
+            &target,
+        ],
+        config.path(),
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+
+    // Revoke client authorization so background UDP signature login is refused.
+    std::fs::write(&auth_path, "").unwrap();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(20), || screen
+            .top_ever_had("authentication refused")),
+        "UDP auth refusal without SSH must surface on the status line; top={:?}, log={}",
+        screen.top(),
+        verbose_log(config.path())
+    );
+
+    // Restore authorization: recovery succeeds and clears the outage notice.
+    std::fs::write(&auth_path, &original_auth).unwrap();
+    assert!(
+        the_same_shell_answers(&mut client, &screen, Duration::from_secs(20)),
+        "restoring authorized_keys must recover the shell: {}",
+        verbose_log(config.path())
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || !screen
+            .top()
+            .contains("authentication refused")),
+        "auth-refused outage notice must clear after recovery: {:?}",
+        screen.top()
+    );
+    exit_cleanly(&mut client, &screen, &daemon);
+}
