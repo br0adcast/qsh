@@ -7,6 +7,22 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0-alpha.6] — 2026-11-25
+
+### Fixed
+
+- Transition `connect::Ladder` explicitly during the legacy SSH daemon-update
+  fallback (`Step::Over -> Step::Ssh`, and `Step::Ssh -> Step::Direct` when SSH
+  is declined or unavailable) so updating an older personal `qshd` over SSH
+  attaches cleanly on the first run instead of panicking in `Ladder::on`
+  (#685, #686).
+- Route transient background SSH recovery failures (such as DNS resolution or
+  network reachability errors during a network switch) through the
+  outage-scoped `UiEvent::RecoveryDiagnostic` channel instead of persistent
+  `UiEvent::DiagnosticWarning`, and ignore late recovery diagnostics arriving
+  on an already-live session, so stale SSH errors clear cleanly once the link
+  recovers (#688, #689).
+
 ## [0.6.0-alpha.5] — 2026-11-25
 
 ### Added
