@@ -554,6 +554,9 @@ pub struct Climb<'a> {
     )>,
     bootstrap: Option<SshBootstrap>,
     selected_operation: Option<(usize, u16)>,
+    daemon_update_checked: bool,
+    legacy_ssh_fallback: Option<usize>,
+    defer_shell_open: bool,
 }
 
 #[derive(Default)]
@@ -630,6 +633,9 @@ impl<'a> Climb<'a> {
             recovery_attempt: None,
             bootstrap: None,
             selected_operation: None,
+            daemon_update_checked: false,
+            legacy_ssh_fallback: None,
+            defer_shell_open: false,
         }
     }
 }
@@ -799,6 +805,7 @@ impl<'a> Climb<'a> {
                     }
                     match result {
                         Ok(result) => {
+                            self.legacy_ssh_fallback = None;
                             let identified = result.identified;
                             let ready = identified.ready;
                             let port = ready.port_for(addrs[addr].qsh_port);
@@ -821,11 +828,13 @@ impl<'a> Climb<'a> {
                             ladder.on(outcome)
                         }
                         Err(SshStepError::BusyCancelled) => {
+                            self.legacy_ssh_fallback = None;
                             self.end_selected_operation(cancel);
                             self.say("qsh: connection cancelled; no restart requested");
                             return Climbed::Exit(1);
                         }
                         Err(SshStepError::SelectedBusyFailed(failure)) => {
+                            self.legacy_ssh_fallback = None;
                             self.end_selected_operation(cancel);
                             let why = ::connect::SshFailure::plain(format!(
                                 "{} (selected running qshd {})",
@@ -836,31 +845,54 @@ impl<'a> Climb<'a> {
                             return Climbed::Exit(1);
                         }
                         Err(SshStepError::InstallDeclined) => {
-                            self.say(&report::install_declined());
-                            self.advance(
-                                &mut ladder,
-                                Outcome::Ssh(SshOutcome::InstallDeclined),
-                                None,
-                            )
+                            if self.legacy_ssh_fallback.take() == Some(addr) {
+                                self.say(
+                                    "qsh: continuing directly with the compatible qsh session",
+                                );
+                                Action::TryDirect { addr }
+                            } else {
+                                self.say(&report::install_declined());
+                                self.advance(
+                                    &mut ladder,
+                                    Outcome::Ssh(SshOutcome::InstallDeclined),
+                                    None,
+                                )
+                            }
                         }
                         Err(SshStepError::NeedsPrompt) => {
-                            let line = report::ssh_failed(
-                                host,
-                                &::connect::SshFailure::plain("needs a prompt"),
-                            );
-                            self.advance(
-                                &mut ladder,
-                                Outcome::Ssh(SshOutcome::NeedsPrompt),
-                                Some(line),
-                            )
+                            if self.legacy_ssh_fallback.take() == Some(addr) {
+                                self.say(
+                                    "qsh: SSH update unavailable; continuing directly with the compatible qsh session",
+                                );
+                                Action::TryDirect { addr }
+                            } else {
+                                let line = report::ssh_failed(
+                                    host,
+                                    &::connect::SshFailure::plain("needs a prompt"),
+                                );
+                                self.advance(
+                                    &mut ladder,
+                                    Outcome::Ssh(SshOutcome::NeedsPrompt),
+                                    Some(line),
+                                )
+                            }
                         }
                         Err(SshStepError::Failed(why)) => {
-                            let line = report::ssh_failed(host, &why);
-                            self.advance(
-                                &mut ladder,
-                                Outcome::Ssh(SshOutcome::Failed(why)),
-                                Some(line),
-                            )
+                            if self.legacy_ssh_fallback.take() == Some(addr) {
+                                let line = report::ssh_failed(host, &why);
+                                self.say(&line);
+                                self.say(
+                                    "qsh: SSH update unavailable; continuing directly with the compatible qsh session",
+                                );
+                                Action::TryDirect { addr }
+                            } else {
+                                let line = report::ssh_failed(host, &why);
+                                self.advance(
+                                    &mut ladder,
+                                    Outcome::Ssh(SshOutcome::Failed(why)),
+                                    Some(line),
+                                )
+                            }
                         }
                     }
                 }
@@ -898,10 +930,60 @@ impl<'a> Climb<'a> {
                 }
                 Action::Connected { addr, port } => {
                     self.selected_operation = None;
-                    let (attempt, trial, remote) = self
+                    let (attempt, mut trial, remote) = self
                         .connected
                         .take()
                         .expect("a Connected action follows a login");
+                    let should_check_daemon = !self.background()
+                        && !self.setup.recovery_only
+                        && self.bootstrap.is_none()
+                        && !self.daemon_update_checked;
+                    if should_check_daemon {
+                        self.daemon_update_checked = true;
+                        let outcome =
+                            self.check_older_personal_daemon(&attempt, &addrs[addr], cancel);
+                        match outcome {
+                            crate::daemon_update::DaemonUpdateOutcome::Cancelled => {
+                                attempt.close();
+                                self.drain();
+                                return Climbed::Exit(130);
+                            }
+                            crate::daemon_update::DaemonUpdateOutcome::FallbackToSsh => {
+                                attempt.close();
+                                self.drain();
+                                self.legacy_ssh_fallback = Some(addr);
+                                action = Action::TrySsh { addr };
+                                continue;
+                            }
+                            crate::daemon_update::DaemonUpdateOutcome::ReconnectDirect => {
+                                attempt.close();
+                                self.drain();
+                                match self.reconnect_after_daemon_update(addr, port, cancel) {
+                                    Ok(connected) => return Climbed::Connected(connected),
+                                    Err(code) => return Climbed::Exit(code),
+                                }
+                            }
+                            crate::daemon_update::DaemonUpdateOutcome::ContinueDirect => {
+                                if trial.opened_ch.is_none()
+                                    && attempt.acceptance().is_some_and(|accepted| {
+                                        accepted.disposition == transport::SessionDisposition::Fresh
+                                    })
+                                {
+                                    match trial.channel_session.open_shell(trial.cols, trial.rows) {
+                                        Ok(ch) => trial.opened_ch = Some(ch),
+                                        Err(error) => {
+                                            attempt.close();
+                                            self.drain();
+                                            self.say_loud(format!(
+                                                "qsh: local startup write was not accepted ({error:?})"
+                                            ));
+                                            return Climbed::Exit(1);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if !self.background() {
                         if let Some(bootstrap) = self.bootstrap.take() {
                             if bootstrap.addr == addr
@@ -931,6 +1013,123 @@ impl<'a> Climb<'a> {
                 }
                 Action::GiveUp(give_up) => return self.give_up(give_up, &addrs),
             };
+        }
+    }
+
+    /// Checks whether a directly-connected personal daemon is older than this
+    /// client and offers to update it over `qsh` (or via the explicit SSH
+    /// compatibility path for daemons that predate reporting their OS in
+    /// `About`).
+    fn check_older_personal_daemon(
+        &self,
+        att: &attempt::Attempt,
+        addr: &::connect::Address,
+        cancel: &knock::Cancel,
+    ) -> crate::daemon_update::DaemonUpdateOutcome {
+        let info = self.wait_for_server_info(att);
+        let Some(info) = info else {
+            return crate::daemon_update::DaemonUpdateOutcome::ContinueDirect;
+        };
+        if !crate::daemon_update::should_offer_daemon_update(
+            &info.core_version,
+            &crate::daemon_update::client_version(),
+        ) {
+            return crate::daemon_update::DaemonUpdateOutcome::ContinueDirect;
+        }
+        let ctx = crate::daemon_update::UpdateContext {
+            login: &self.setup.args.login,
+            host: &addr.host,
+            server_version: &info.core_version,
+            has_ssh_route: addr.ssh.is_some(),
+            tty: &self.setup.tty,
+            images: daemon_images(),
+            cancel,
+            interrupted: &|| self.interrupted(),
+            say: &|line| self.say(line),
+        };
+        crate::daemon_update::maybe_update(att, self.rx, &ctx)
+    }
+
+    /// Briefly waits for the in-band authenticated `ServerInfo` probe that ran
+    /// alongside the handshake, returning immediately if it already arrived or
+    /// discovery finished.
+    fn wait_for_server_info(
+        &self,
+        att: &attempt::Attempt,
+    ) -> Option<transport::bootstrap::ServerInfo> {
+        const GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+        let deadline = std::time::Instant::now() + GRACE;
+        loop {
+            if let Some(proof) = att.authenticated_server_info() {
+                return Some(proof.info().clone());
+            }
+            if self.interrupted()
+                || att.is_closed()
+                || att.client.discovery_complete()
+                || std::time::Instant::now() >= deadline
+            {
+                return att
+                    .authenticated_server_info()
+                    .map(|proof| proof.info().clone());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Reconnects directly over UDP after the daemon accepted an over-`qsh`
+    /// update and announced `Restarting`. Retries across the brief admission
+    /// window while the replacement frontend or exec'd daemon comes up.
+    fn reconnect_after_daemon_update(
+        &mut self,
+        addr: usize,
+        port: u16,
+        cancel: &knock::Cancel,
+    ) -> Result<Connected, i32> {
+        const RECONNECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+        const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+        let deadline = std::time::Instant::now() + RECONNECT_WINDOW;
+        let mut last_line = None;
+        loop {
+            if self.interrupted() {
+                return Err(130);
+            }
+            let (outcome, line) = self.direct(addr, port, Stage::First, cancel)?;
+            if outcome == DirectOutcome::Connected {
+                let (attempt, trial, remote) = self
+                    .connected
+                    .take()
+                    .expect("connected outcome stores the fresh attempt");
+                return Ok(Connected {
+                    attempt,
+                    trial,
+                    addr,
+                    port,
+                    remote,
+                });
+            }
+            if let Some(line) = line {
+                last_line = Some(line);
+            }
+            match outcome {
+                DirectOutcome::KeyChanged => return Err(11),
+                DirectOutcome::Declined => return Err(1),
+                DirectOutcome::LocalSendFailure => return Err(1),
+                DirectOutcome::SessionAborted { reason } => {
+                    let line = attempt::abort_line_code(reason);
+                    self.say(&line);
+                    return Err(1);
+                }
+                _ => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                if let Some(line) = last_line {
+                    self.say(&line);
+                } else {
+                    self.say("qsh: could not reconnect after updating qshd");
+                }
+                return Err(12);
+            }
+            std::thread::sleep(RETRY_PAUSE);
         }
     }
 
@@ -1376,10 +1575,16 @@ impl<'a> Climb<'a> {
         } else {
             stage
         };
-        match stage {
+        self.defer_shell_open = stage == Stage::First
+            && !self.background()
+            && !self.setup.recovery_only
+            && !self.daemon_update_checked;
+        let outcome = match stage {
             Stage::First => self.sign_in(i, &host, port, sockaddr, server),
             Stage::AfterSsh => Ok(self.on_the_list(i, &host, port, sockaddr, server)),
-        }
+        };
+        self.defer_shell_open = false;
+        outcome
     }
 
     /// The key candidates for step 1: the ones loaded earlier in this run,
@@ -1951,7 +2156,7 @@ impl<'a> Climb<'a> {
             term.as_deref(),
             self.cols,
             self.rows,
-            !self.background() || self.fresh_session,
+            (!self.background() || self.fresh_session) && !self.defer_shell_open,
             self.recovery,
             || self.interrupted(),
         );

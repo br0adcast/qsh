@@ -9,6 +9,7 @@ mod busy_daemon;
 pub mod client_install;
 pub mod climb;
 pub mod connect;
+pub mod daemon_update;
 pub mod escape;
 pub mod identity;
 mod identity_sequences;
@@ -79,3 +80,6 @@ fn refused_shell_discovery_dispatches_detach_without_close_session() {
 
 #[cfg(all(test, target_os = "linux"))]
 mod install_fixture_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod daemon_update_fixture_tests;

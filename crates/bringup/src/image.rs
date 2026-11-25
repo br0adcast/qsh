@@ -46,6 +46,31 @@ impl Platform {
         })
     }
 
+    /// Maps `std::env::consts::OS` and `std::env::consts::ARCH` (as carried in
+    /// `About`) onto a supported release platform.
+    pub fn from_rust_consts(os: &str, arch: &str) -> Result<Self, BringUpError> {
+        let unsupported = || {
+            let os_budget = crate::exec::MAX_DIAGNOSTIC / 2;
+            BringUpError::UnsupportedPlatform(format!(
+                "{}/{}",
+                crate::exec::escaped(os, os_budget),
+                crate::exec::escaped(arch, crate::exec::MAX_DIAGNOSTIC - os_budget - 1)
+            ))
+        };
+        Ok(Self {
+            os: match os {
+                "linux" => ServerOs::Linux,
+                "macos" => ServerOs::Darwin,
+                _ => return Err(unsupported()),
+            },
+            arch: match arch {
+                "x86_64" => ServerArch::X86_64,
+                "aarch64" => ServerArch::Aarch64,
+                _ => return Err(unsupported()),
+            },
+        })
+    }
+
     pub fn target(&self) -> &'static str {
         match (self.os, self.arch) {
             (ServerOs::Linux, ServerArch::X86_64) => "x86_64-unknown-linux-musl",
@@ -142,4 +167,49 @@ pub trait ImageSource: Send + Sync {
         cancel: &knock::Cancel,
         observer: &dyn BringUpObserver,
     ) -> Result<DaemonImage, ImageError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_rust_consts_maps_supported_platforms() {
+        assert_eq!(
+            Platform::from_rust_consts("linux", "x86_64").unwrap(),
+            Platform {
+                os: ServerOs::Linux,
+                arch: ServerArch::X86_64,
+            }
+        );
+        assert_eq!(
+            Platform::from_rust_consts("linux", "aarch64").unwrap(),
+            Platform {
+                os: ServerOs::Linux,
+                arch: ServerArch::Aarch64,
+            }
+        );
+        assert_eq!(
+            Platform::from_rust_consts("macos", "x86_64").unwrap(),
+            Platform {
+                os: ServerOs::Darwin,
+                arch: ServerArch::X86_64,
+            }
+        );
+        assert_eq!(
+            Platform::from_rust_consts("macos", "aarch64").unwrap(),
+            Platform {
+                os: ServerOs::Darwin,
+                arch: ServerArch::Aarch64,
+            }
+        );
+        assert!(matches!(
+            Platform::from_rust_consts("freebsd", "x86_64"),
+            Err(BringUpError::UnsupportedPlatform(_))
+        ));
+        assert!(matches!(
+            Platform::from_rust_consts("linux", "riscv64"),
+            Err(BringUpError::UnsupportedPlatform(_))
+        ));
+    }
 }

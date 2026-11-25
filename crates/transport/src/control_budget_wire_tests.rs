@@ -10,14 +10,14 @@ fn envelope_wire_maxima_cover_complete_records_and_mandatory_update_sequence() {
     assert_eq!(SESSION_BYTES, 1_422_427);
     assert_eq!(GLOBAL_BYTES, 182_070_656);
     assert_eq!(GLOBAL_RESPONSE_ENTRIES, 48_768);
-    let about_record_max = 5 + 8 + 32 + 1 + MAX_ARCH_LEN + 2;
+    let about_record_max = 5 + 8 + 32 + 1 + MAX_ARCH_LEN + 2 + 1 + MAX_ARCH_LEN;
     let about_metadata_per_job = 2 * about_record_max;
-    assert_eq!(about_metadata_per_job, 160);
-    assert_eq!(GLOBAL_JOBS * about_metadata_per_job, 40_960);
-    assert_eq!(SESSION_BYTES + about_metadata_per_job, 1_422_587);
+    assert_eq!(about_metadata_per_job, 226);
+    assert_eq!(GLOBAL_JOBS * about_metadata_per_job, 57_856);
+    assert_eq!(SESSION_BYTES + about_metadata_per_job, 1_422_653);
     assert_eq!(
         GLOBAL_BYTES + GLOBAL_JOBS * about_metadata_per_job,
-        182_111_616
+        182_128_512
     );
     let about = encode_server(&ServerRecord::About(About {
         build: u64::MAX,
@@ -25,8 +25,9 @@ fn envelope_wire_maxima_cover_complete_records_and_mandatory_update_sequence() {
         arch: "a".repeat(MAX_ARCH_LEN),
         protocol: PROTOCOL_VERSION,
         mode: DaemonMode::Personal,
+        os: Some("b".repeat(MAX_ARCH_LEN)),
     }));
-    assert_eq!(about.len(), 80);
+    assert_eq!(about.len(), 113);
     let refused = encode_server(&ServerRecord::Refused {
         stream: 16,
         reason: "r".repeat(CONTROL_RECORD_MAX - 1),

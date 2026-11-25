@@ -7,13 +7,13 @@
   "files": [
     {
       "name": "about-extension",
-      "bytes": 52,
-      "sha256": "1a342a27b32977b2a94c14ba9d74dbe56c400bea54cf106dc808c46609077e12"
+      "bytes": 58,
+      "sha256": "319b86902906c8ee1c919b36023c76e925d30478a6bb10b1349b50365f2be76f"
     },
     {
       "name": "about-full",
-      "bytes": 50,
-      "sha256": "a1514cbb131bb94dfafeb20a76d686d1753aea482443b2bb74f91834bb6125dc"
+      "bytes": 56,
+      "sha256": "ed3e5d50995c5ef58a5c0b1e4db17b894778dcf78adce35f99b139de73d6c2bb"
     },
     {
       "name": "about-request-extension",

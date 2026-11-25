@@ -446,11 +446,15 @@ enum DaemonReply {
 /// How a blocking update task ended.
 enum UpdateTaskEnd {
     Verified(Box<dyn UpdateTransfer>),
+    /// The replacement succeeded in-place (e.g. a hosted frontend swap) after
+    /// `UpdateResult::Restarting` was already sent.
+    Replaced,
     Failed(UpdateResult),
 }
 
 type AboutResult = Result<Option<About>, crate::channel::AboutUnavailable>;
-const ABOUT_RECORD_MAX: usize = 5 + 8 + 32 + 1 + crate::channel::MAX_ARCH_LEN + 2;
+const ABOUT_RECORD_MAX: usize =
+    5 + 8 + 32 + 1 + crate::channel::MAX_ARCH_LEN + 2 + 1 + crate::channel::MAX_ARCH_LEN;
 
 struct AboutWaiter {
     origin: AttachmentContext,
@@ -620,10 +624,13 @@ impl SessionUpdate {
         let lease = job.take_worker().expect("one About provider phase");
         let result = io.spawn_callback(lease, move || {
             let mut about = daemon.about();
-            if about
-                .as_ref()
-                .is_some_and(|about| !crate::channel::is_arch_name(&about.arch))
-            {
+            if about.as_ref().is_some_and(|about| {
+                !crate::channel::is_arch_name(&about.arch)
+                    || about
+                        .os
+                        .as_deref()
+                        .is_some_and(|os| !crate::channel::is_arch_name(os))
+            }) {
                 Err(crate::channel::AboutUnavailable::ProviderFailed)
             } else {
                 if let Some(about) = about.as_mut() {
@@ -632,6 +639,9 @@ impl SessionUpdate {
                     about.arch = std::mem::take(&mut about.arch)
                         .into_boxed_str()
                         .into_string();
+                    if let Some(os) = about.os.take() {
+                        about.os = Some(os.into_boxed_str().into_string());
+                    }
                 }
                 Ok(about)
             }
@@ -935,9 +945,14 @@ impl SessionUpdate {
                     .job
                     .take_worker()
                     .expect("reserved restart phase");
-                self.task = Some(
-                    io.spawn_callback(lease, move || UpdateTaskEnd::Failed(transfer.restart())),
-                );
+                self.task = Some(io.spawn_callback(lease, move || match transfer.restart() {
+                    UpdateResult::Restarting => UpdateTaskEnd::Replaced,
+                    result => UpdateTaskEnd::Failed(result),
+                }));
+            }
+            UpdateTaskEnd::Replaced => {
+                self.slot = UpdateSlot::Idle;
+                self.chain = None;
             }
             UpdateTaskEnd::Failed(result) => {
                 self.send_result(io, result);

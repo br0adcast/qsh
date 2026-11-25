@@ -1,7 +1,7 @@
 //! Real CLI/SSH orchestration with a private local-image provider.
 //! This is not positive evidence for signed production releases.
 #[path = "../tests/support/mod.rs"]
-mod support;
+pub(crate) mod support;
 use crate::ssh_step::test_support as support_home;
 use std::{
     io::Write,

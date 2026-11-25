@@ -1688,6 +1688,8 @@ fn assert_service_update_stages_beside_installed_helper(
                 checksum: [0; 32],
                 arch: std::env::consts::ARCH.into(),
                 size: 2,
+                prefer_frontend_upgrade: false,
+                allow_frontend_disrupt: false,
             })),
         )
         .unwrap();

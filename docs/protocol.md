@@ -2565,7 +2565,7 @@ shown" race to handle.
 `channel_server.rs` (`DaemonUpdates`), `qshd/src/update.rs`,
 `qshd/src/handover.rs`.
 
-A client that carries daemon images sends `ABOUT_REQUEST` right after the
+A client that carries or can fetch daemon images sends `ABOUT_REQUEST` right after the
 link is live and before it opens anything. This requires a compatible QSH
 session; it cannot update a protocol-1 peer through a protocol-2 connection.
 If a compatible peer does not answer the request, the client waits a bounded
@@ -2574,8 +2574,23 @@ service manager (`serve`, with or without `--system`) answers with mode `1` and
 answers every offer `Managed`. The daemon works out its own checksum on the
 first `ABOUT_REQUEST` (off the session's loop), never at start-up.
 
-When the checksums differ the client sends `UPDATE_OFFER`. The daemon
-decides by the same table `transport-ensure` uses (`version::replacement`),
+`ABOUT` is tail-extensible: after `mode`, newer daemons append a length-prefixed
+operating-system identifier matching `std::env::consts::OS` (such as `linux` or
+`macos`, validated by the same lower-case ASCII identifier rule as `arch`).
+Older clients ignore trailing bytes; newer clients read an absent field as
+`None` and know the peer predates OS reporting in `ABOUT`.
+
+When the daemon is older and personal, the client sends `UPDATE_OFFER`.
+`UPDATE_OFFER` is also tail-extensible: after `arch`, a newer client may append
+a single flags byte (omitted when zero for compatibility with older peers):
+bit `0x01` (`PREFER_FRONTEND_UPGRADE`) requests a session-preserving frontend
+replacement on a hosted Linux personal daemon instead of a full `exec`
+replacement when the candidate is compatible with the running host and owners;
+bit `0x02` (`ALLOW_FRONTEND_DISRUPT`) carries explicit user consent to briefly
+disconnect other attached clients during that session-preserving frontend
+replacement (and never authorizes a session-destroying full restart).
+
+The daemon decides by the same table `transport-ensure` uses (`version::replacement`),
 with one difference: the offering session itself does not count as busy —
 `others` is the active-session count minus one. A parked session (its
 client silent, §4.2) is not active and does not count. Rows, in order:
@@ -2583,7 +2598,20 @@ client silent, §4.2) is not active and does not count. Rows, in order:
 in probation never reaches this code at all); `ArchMismatch`; `TooLarge`
 (`MAX_UPDATE_SIZE` = 64 MiB); `UpToDate` (equal checksums); `DaemonNewer`
 (no downgrades); `InProgress` (one update at a time, across all sessions);
-`Busy`; otherwise `Accept`.
+`Busy` (overridden only when `PREFER_FRONTEND_UPGRADE` and
+`ALLOW_FRONTEND_DISRUPT` are both set on a hosted daemon); otherwise `Accept`.
+
+On a hosted Linux personal daemon serving an offer with `PREFER_FRONTEND_UPGRADE`,
+verification classifies the held candidate against the host's live session
+catalog. When the candidate can replace only the network frontend (`Silent`, or
+`Soft` with no other attached clients or explicit `ALLOW_FRONTEND_DISRUPT`),
+the daemon sends `UPDATE_RESULT Restarting`, waits `RESTART_GRACE`, swaps the
+network frontend while preserving every session owner and shell, updates its
+serving identity (`About`, `STATUS`, `SERVER-INFO`), and persists the verified
+binary beside the running executable (updating versioned cache names
+`qshd-<version>-<suffix>` when applicable). Candidates that require a full
+daemon restart fall back to `exec` handover only when no other sessions (active
+or parked) would be lost, and otherwise reject with `VersionNotAccepted`.
 
 After `Accept` exactly `size` bytes follow on stream 14, raw. The transport
 has no per-stream close, so the byte count is the end; bytes past it, and

@@ -144,7 +144,19 @@ pub struct About {
     /// [`PROTOCOL_VERSION`] of the daemon.
     pub protocol: u8,
     pub mode: DaemonMode,
+    /// Target operating system, as `std::env::consts::OS` names it (e.g.
+    /// `"linux"`, `"macos"`). `None` when the daemon predates this field.
+    pub os: Option<String>,
 }
+
+/// Optional [`UpdateOffer`] wire flag: request a session-preserving frontend
+/// replacement on hosted daemons when supported.
+pub const OFFER_FLAG_PREFER_FRONTEND_UPGRADE: u8 = 0x01;
+
+/// Optional [`UpdateOffer`] wire flag: explicit user consent to briefly
+/// disconnect other attached clients during a session-preserving frontend
+/// replacement.
+pub const OFFER_FLAG_ALLOW_FRONTEND_DISRUPT: u8 = 0x02;
 
 /// A binary the client is ready to hand over.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +166,11 @@ pub struct UpdateOffer {
     pub arch: String,
     /// Exactly how many bytes will follow on [`UPDATE_STREAM`].
     pub size: u64,
+    /// Request a session-preserving frontend replacement on hosted daemons.
+    pub prefer_frontend_upgrade: bool,
+    /// Explicit user consent to briefly disconnect other attached clients
+    /// during a session-preserving frontend replacement.
+    pub allow_frontend_disrupt: bool,
 }
 
 /// The daemon's answer to an [`UpdateOffer`].
@@ -344,6 +361,7 @@ fn decode_about(payload: &[u8]) -> Result<About, ChannelCodecError> {
         arch: String::new(),
         protocol: 0,
         mode: DaemonMode::Personal,
+        os: None,
     };
     if f.is_empty() {
         return Ok(about);
@@ -361,6 +379,11 @@ fn decode_about(payload: &[u8]) -> Result<About, ChannelCodecError> {
         return Ok(about);
     };
     about.mode = DaemonMode::from_wire(mode);
+    if f.is_empty() {
+        return Ok(about);
+    }
+    let os = f.arch()?;
+    about.os = (!os.is_empty()).then_some(os);
     // Anything after this is a newer daemon's field: skipped.
     Ok(about)
 }
@@ -742,11 +765,18 @@ pub fn encode_client(rec: &ClientRecord) -> Vec<u8> {
         ClientRecord::Term(name) => encode_record(REC_TERM, name.as_bytes()),
         ClientRecord::AboutRequest => encode_record(REC_ABOUT_REQUEST, &[]),
         ClientRecord::UpdateOffer(offer) => {
-            let mut payload = Vec::with_capacity(8 + 32 + 8 + 1 + offer.arch.len());
+            let flags = (u8::from(offer.prefer_frontend_upgrade)
+                * OFFER_FLAG_PREFER_FRONTEND_UPGRADE)
+                | (u8::from(offer.allow_frontend_disrupt) * OFFER_FLAG_ALLOW_FRONTEND_DISRUPT);
+            let mut payload =
+                Vec::with_capacity(8 + 32 + 8 + 1 + offer.arch.len() + usize::from(flags != 0));
             payload.extend_from_slice(&offer.build.to_be_bytes());
             payload.extend_from_slice(&offer.checksum);
             payload.extend_from_slice(&offer.size.to_be_bytes());
             put_arch(&mut payload, &offer.arch);
+            if flags != 0 {
+                payload.push(flags);
+            }
             encode_record(REC_UPDATE_OFFER, &payload)
         }
     }
@@ -809,11 +839,14 @@ pub fn decode_client(raw: &RawRecord) -> Result<ClientRecord, ChannelCodecError>
             let checksum = f.checksum().ok_or(ChannelCodecError::Malformed)?;
             let size = f.u64().ok_or(ChannelCodecError::Malformed)?;
             let arch = f.arch()?;
+            let flags = f.u8().unwrap_or(0);
             Ok(ClientRecord::UpdateOffer(UpdateOffer {
                 build,
                 checksum,
                 arch,
                 size,
+                prefer_frontend_upgrade: (flags & OFFER_FLAG_PREFER_FRONTEND_UPGRADE) != 0,
+                allow_frontend_disrupt: (flags & OFFER_FLAG_ALLOW_FRONTEND_DISRUPT) != 0,
             }))
         }
         other => Err(ChannelCodecError::UnknownKind(other)),
@@ -910,12 +943,16 @@ pub fn encode_server(rec: &ServerRecord) -> Vec<u8> {
             encode_record(REC_ABOUT_UNAVAILABLE, &[reason.to_wire()])
         }
         ServerRecord::About(about) => {
-            let mut payload = Vec::with_capacity(8 + 32 + 1 + about.arch.len() + 2);
+            let os_len = about.os.as_ref().map_or(0, |os| 1 + os.len());
+            let mut payload = Vec::with_capacity(8 + 32 + 1 + about.arch.len() + 2 + os_len);
             payload.extend_from_slice(&about.build.to_be_bytes());
             payload.extend_from_slice(&about.checksum);
             put_arch(&mut payload, &about.arch);
             payload.push(about.protocol);
             payload.push(about.mode.to_wire());
+            if let Some(os) = &about.os {
+                put_arch(&mut payload, os);
+            }
             encode_record(REC_ABOUT, &payload)
         }
         ServerRecord::UpdateAnswer(answer) => {
@@ -1329,6 +1366,7 @@ mod tests {
             arch: "x86_64".to_string(),
             protocol: PROTOCOL_VERSION,
             mode: DaemonMode::Personal,
+            os: Some("linux".to_string()),
         }
     }
 
@@ -1343,6 +1381,24 @@ mod tests {
                 checksum: [0xcd; 32],
                 arch: "aarch64".to_string(),
                 size: 3_413_032,
+                prefer_frontend_upgrade: false,
+                allow_frontend_disrupt: false,
+            }),
+            ClientRecord::UpdateOffer(UpdateOffer {
+                build: 1_790_000_002,
+                checksum: [0xef; 32],
+                arch: "x86_64".to_string(),
+                size: 4_000_000,
+                prefer_frontend_upgrade: true,
+                allow_frontend_disrupt: false,
+            }),
+            ClientRecord::UpdateOffer(UpdateOffer {
+                build: 1_790_000_003,
+                checksum: [0x11; 32],
+                arch: "x86_64".to_string(),
+                size: 4_000_001,
+                prefer_frontend_upgrade: true,
+                allow_frontend_disrupt: true,
             }),
         ];
         for rec in client {
@@ -1355,7 +1411,12 @@ mod tests {
         let server = vec![
             ServerRecord::About(about()),
             ServerRecord::About(About {
+                os: None,
+                ..about()
+            }),
+            ServerRecord::About(About {
                 mode: DaemonMode::Managed,
+                os: Some("macos".to_string()),
                 ..about()
             }),
             ServerRecord::UpdateAnswer(UpdateAnswer::Accept),
@@ -1406,6 +1467,7 @@ mod tests {
                 arch: String::new(),
                 protocol: 0,
                 mode: DaemonMode::Personal,
+                os: None,
             }))
         );
 
@@ -1424,7 +1486,38 @@ mod tests {
                 arch: "x86_64".to_string(),
                 protocol: 0,
                 mode: DaemonMode::Personal,
+                os: None,
             }))
+        );
+
+        // A daemon that predates `os` stops after `mode`.
+        let legacy_about = About {
+            os: None,
+            ..about()
+        };
+        let encoded = encode_server(&ServerRecord::About(legacy_about.clone()));
+        assert_eq!(encoded.len(), 5 + 8 + 32 + 1 + 6 + 2);
+        let raw = RecordDeframer::new().push(&encoded);
+        assert_eq!(
+            decode_server(&raw[0]),
+            Ok(ServerRecord::About(legacy_about))
+        );
+
+        // A legacy UpdateOffer without trailing flags byte omits the flag byte on wire.
+        let legacy_offer = UpdateOffer {
+            build: 7,
+            checksum: [2; 32],
+            arch: "x86_64".to_string(),
+            size: 123,
+            prefer_frontend_upgrade: false,
+            allow_frontend_disrupt: false,
+        };
+        let offer_wire = encode_client(&ClientRecord::UpdateOffer(legacy_offer.clone()));
+        assert_eq!(offer_wire.len(), 5 + 8 + 32 + 8 + 1 + 6);
+        let raw = RecordDeframer::new().push(&offer_wire);
+        assert_eq!(
+            decode_client(&raw[0]),
+            Ok(ClientRecord::UpdateOffer(legacy_offer))
         );
     }
 

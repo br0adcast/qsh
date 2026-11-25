@@ -2007,13 +2007,13 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
         qshd::screen_budget::ScreenBudget::new(qshd::screen_budget::BudgetLimits::default()),
     ));
     let opens = backend.open_registry();
-    let mut daemon: Option<Arc<dyn transport::channel_server::DaemonUpdates>> = None;
+    let mut daemon_self: Option<Arc<update::DaemonSelf>> = None;
     if !start.binary_path.as_os_str().is_empty() {
         // `None`: the checksum is worked out on the first `About`, off the
         // start-up path. `personal` sweeps away staged files an update that
         // never finished left behind -- all but the one this process may be
         // running from, should its rename have failed.
-        daemon = Some(Arc::new(
+        daemon_self = Some(Arc::new(
             update::DaemonSelf::personal(
                 opens.clone(),
                 None,
@@ -2034,9 +2034,13 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
                     actions: actions.clone(),
                 }),
             )
-            .with_owners(sessions.owner_stop()),
+            .with_owners(sessions.owner_stop())
+            .with_serving(serving.clone()),
         ));
     }
+    let daemon: Option<Arc<dyn transport::channel_server::DaemonUpdates>> = daemon_self
+        .as_ref()
+        .map(|d| Arc::clone(d) as Arc<dyn transport::channel_server::DaemonUpdates>);
     // Otherwise already logged by the caller: with nowhere to rename a new
     // binary onto, this daemon does not answer `About` and takes no image.
 
@@ -2073,12 +2077,16 @@ fn run_personal_daemon(start: PersonalStart) -> Result<()> {
     let upgrades = host.as_ref().map(|host| {
         let start_path =
             (!start.binary_path.as_os_str().is_empty()).then(|| start.binary_path.clone());
-        qshd::host::upgrade::Upgrader::new(
+        let upgrader = qshd::host::upgrade::Upgrader::new(
             host.clone(),
             serving.clone(),
             Some(actions.clone()),
             start_path,
-        ) as Arc<dyn qshd::frontend_upgrade::FrontendUpgrades>
+        );
+        if let Some(daemon_self) = &daemon_self {
+            daemon_self.set_frontend_upgrader(upgrader.clone());
+        }
+        upgrader as Arc<dyn qshd::frontend_upgrade::FrontendUpgrades>
     });
 
     let runtime =
