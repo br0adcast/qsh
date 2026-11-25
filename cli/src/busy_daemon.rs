@@ -5,7 +5,7 @@ use bringup::{
     PendingBusy, UpgradeCase,
 };
 
-pub const LEGACY_WARNING: &str = "This daemon cannot preserve its active qsh sessions during the update. All active qsh sessions will be interrupted, and running commands may terminate.";
+pub const LEGACY_WARNING: &str = "This qshd cannot preserve sessions during an update. Active sessions will be interrupted and running commands may terminate.";
 
 pub enum RestartConsent {
     Exact(DestructiveRestartConsent),
@@ -34,7 +34,11 @@ pub fn can_continue_old(info: &BusyDaemonInfo) -> bool {
 }
 
 fn service_warning(account: &str, host: &str) -> String {
-    format!("Restart the personal qshd service for account {} on {}. All active qsh sessions for this service will be interrupted, and running commands may terminate. This also applies if the service process changes while this dialog is open.", crate::report::printable(account), crate::report::printable(host))
+    format!(
+        "Restart the personal qshd service for {} on {}? Active sessions on this service will be interrupted and running commands may terminate, even if the service process changes.",
+        crate::report::printable(account),
+        crate::report::printable(host)
+    )
 }
 fn parse_choice(input: Option<&str>, allow_continue: bool) -> BusyChoice {
     match (allow_continue, input.map(str::trim)) {
@@ -49,38 +53,41 @@ fn question(info: &BusyDaemonInfo) -> String {
     if let Some(offer) = &info.upgrade {
         // An offer that strands sessions may disconnect nobody.
         let disconnected = if offer.attached > 0 {
-            format!(" {} other connected client(s) will be disconnected briefly (up to a minute for older clients) and reconnect on their own.", offer.attached)
+            format!(
+                " {} other client(s) will briefly reconnect (up to a minute for older clients).",
+                offer.attached
+            )
         } else {
             String::new()
         };
         if allow_continue {
-            return format!("Running qshd {version} can update to this client's qshd and keep every session.{disconnected}\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Update and keep sessions\nChoose [1]:");
+            return format!("qshd {version} can update and keep all sessions.{disconnected}\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Update and keep sessions\nChoose [1]:");
         }
-        return format!("Running qshd {version} does not speak this client's protocol, so this client cannot continue with it. It can update to this client's qshd and keep every session.{disconnected}\n\n1. Cancel (default)\n2. Update and keep sessions\nChoose [1]:");
+        return format!("qshd {version} does not speak this client's protocol. It can update and keep all sessions.{disconnected}\n\n1. Cancel (default)\n2. Update and keep sessions\nChoose [1]:");
     }
     if info.active_connections == 0 && info.sessions > 0 {
         if allow_continue {
-            return format!("Running qshd {version} has {} session(s), none with a connected client.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", info.sessions);
+            return format!("qshd {version} has {} detached session(s).\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", info.sessions);
         }
-        return format!("Running qshd {version} has {} session(s), none with a connected client, and does not speak this client's protocol. This client cannot continue with the old daemon.\n\n1. Cancel (default)\n2. Force update\nChoose [1]:", info.sessions);
+        return format!("qshd {version} has {} detached session(s) and does not speak this client's protocol.\n\n1. Cancel (default)\n2. Force update\nChoose [1]:", info.sessions);
     }
     // A host also counts the sessions whose client is away.
     let retained = info.sessions.saturating_sub(info.active_connections);
     let others = if retained > 0 {
-        format!(" and {retained} other session(s) without a connected client")
+        format!(" and {retained} detached session(s)")
     } else {
         String::new()
     };
     if allow_continue {
-        format!("Running qshd {version} has {} active connections{others}. The new daemon cannot start while these connections are active.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", info.active_connections)
+        format!("qshd {version} has {} active connections{others}.\n\n1. Cancel (default)\n2. Continue with old daemon\n3. Force update\nChoose [1]:", info.active_connections)
     } else {
-        format!("Running qshd {version} has {} active connections{others} and does not speak this client's protocol. This client cannot continue with the old daemon, and the new daemon cannot start while these connections are active.\n\n1. Cancel (default)\n2. Force update\nChoose [1]:", info.active_connections)
+        format!("qshd {version} has {} active connections{others} and does not speak this client's protocol.\n\n1. Cancel (default)\n2. Force update\nChoose [1]:", info.active_connections)
     }
 }
 /// The second warning for an upgrade that leaves sessions unreachable.
 fn unreachable_warning(info: &BusyDaemonInfo) -> Option<String> {
     let offer = info.upgrade.as_ref()?;
-    Some(format!("{} of {} session(s) belong to clients that cannot speak the new qshd's protocol. After the update those clients cannot reach their sessions; the sessions and their running commands go on until they expire.\n\n1. Cancel (default)\n2. Update; those sessions become unreachable\nChoose [1]:", offer.stranded, offer.sessions))
+    Some(format!("{} of {} session(s) belong to older clients that cannot reconnect after the update (their commands keep running until they exit).\n\n1. Cancel (default)\n2. Update anyway\nChoose [1]:", offer.stranded, offer.sessions))
 }
 struct BusyPrompt {
     pending: Option<PendingBusy>,
@@ -255,9 +262,9 @@ mod tests {
     fn soft_offer_names_the_clients_and_the_delay() {
         let text = question(&offer_info(bringup::UpgradeCase::Soft));
         for expected in [
-            "keep every session",
-            "3 other connected client(s)",
-            "briefly",
+            "keep all sessions",
+            "3 other client(s)",
+            "briefly reconnect",
             "up to a minute",
             "3. Update and keep sessions",
         ] {
@@ -271,11 +278,11 @@ mod tests {
         live.upgrade.as_mut().unwrap().attached = 0;
         assert!(live.valid());
         let text = question(&live);
-        assert!(text.contains("keep every session."), "{text}");
-        assert!(!text.contains("connected client"), "{text}");
-        assert!(!text.contains("disconnected"), "{text}");
+        assert!(text.contains("keep all sessions."), "{text}");
+        assert!(!text.contains("other client"), "{text}");
+        assert!(!text.contains("reconnect"), "{text}");
         assert!(question(&offer_info(bringup::UpgradeCase::Unreachable))
-            .contains("3 other connected client(s) will be disconnected briefly"));
+            .contains("3 other client(s) will briefly reconnect"));
     }
     #[test]
     fn a_destructive_question_names_attached_and_retained_sessions() {
@@ -284,15 +291,13 @@ mod tests {
         live.sessions = 5;
         let text = question(&live);
         assert!(
-            text.contains(
-                "Running qshd 0.5.9 has 2 active connections and 3 other session(s) without a connected client."
-            ),
+            text.contains("qshd 0.5.9 has 2 active connections and 3 detached session(s)."),
             "{text}"
         );
         // Without retained sessions, as from a daemon that is no host.
         let text = question(&info());
         assert!(
-            text.contains("Running qshd 0.5.9 has 2 active connections. The new daemon"),
+            text.contains("qshd 0.5.9 has 2 active connections."),
             "{text}"
         );
     }
@@ -305,7 +310,7 @@ mod tests {
             panic!("no upgrade consent")
         };
         assert!(consent.matches(&live));
-        assert!(!output.contains("cannot reach their sessions"), "{output}");
+        assert!(!output.contains("cannot reconnect"), "{output}");
     }
     #[test]
     fn unreachable_needs_the_second_confirmation() {
@@ -314,8 +319,8 @@ mod tests {
         assert_eq!(decision.choice, BusyChoice::ForceUpdate);
         assert!(matches!(consent, Some(RestartConsent::FrontendUpgrade(_))));
         for expected in [
-            "2 of 5 session(s) belong to clients that cannot speak the new qshd's protocol",
-            "2. Update; those sessions become unreachable",
+            "2 of 5 session(s) belong to older clients that cannot reconnect",
+            "2. Update anyway",
         ] {
             assert!(output.contains(expected), "{output}");
         }
@@ -330,7 +335,7 @@ mod tests {
         live.sessions = 4;
         let text = question(&live);
         assert!(
-            text.contains("Running qshd 0.5.9 has 4 session(s), none with a connected client."),
+            text.contains("qshd 0.5.9 has 4 detached session(s)."),
             "{text}"
         );
         assert!(text.contains("3. Force update"), "{text}");
@@ -614,6 +619,9 @@ mod tests {
         assert!(legacy_consent(&live, Some("")).is_none());
         assert!(legacy_consent(&live, Some("3")).is_none());
         assert!(legacy_consent(&live, Some("2")).unwrap().matches(&live));
-        assert_eq!(LEGACY_WARNING, "This daemon cannot preserve its active qsh sessions during the update. All active qsh sessions will be interrupted, and running commands may terminate.");
+        assert_eq!(
+            LEGACY_WARNING,
+            "This qshd cannot preserve sessions during an update. Active sessions will be interrupted and running commands may terminate."
+        );
     }
 }

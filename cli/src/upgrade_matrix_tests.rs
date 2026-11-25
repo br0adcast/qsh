@@ -411,7 +411,7 @@ fn scenario1_busy_same_proto_preserving_updates_once_and_preserves_old_client_se
 
     screen.wait("Update qshd to 9.9.9?");
     client.master.write_all(b"yes\n").unwrap();
-    screen.wait("currently has 1 other active client");
+    screen.wait("has 1 other active client");
     screen.wait("Update qshd now? [y/N]");
     client.master.write_all(b"yes\n").unwrap();
     screen.wait("Uploading qshd");
@@ -510,7 +510,7 @@ fn scenario1_busy_same_proto_declining_disrupt_keeps_old_daemon_and_client() {
 
     screen.wait("Update qshd to 9.9.9?");
     client.master.write_all(b"yes\n").unwrap();
-    screen.wait("currently has 1 other active client");
+    screen.wait("has 1 other active client");
     screen.wait("Update qshd now? [y/N]");
     client.master.write_all(b"no\n").unwrap();
     screen.wait("keeping the running qshd");
@@ -764,7 +764,10 @@ fn scenario1_ssh_busy_dialog_matrix_covers_protocol_preservation_and_activity() 
     );
     assert_eq!(dec.choice, BusyChoice::Cancel);
     assert!(consent.is_none());
-    assert!(out.contains("1 of 2 session(s) belong to clients"), "{out}");
+    assert!(
+        out.contains("1 of 2 session(s) belong to older clients"),
+        "{out}"
+    );
     let (dec, consent, _) = answer_in_pty(
         b"3\n2\n",
         make_info(compat.clone(), unreachable, 1, 2, false),

@@ -117,7 +117,7 @@ pub fn left_kept_notice(host: &str, persisted: bool) -> String {
 /// it: neither the session's lifetime nor the disk is promised.
 fn way_back(persisted: bool) -> &'static str {
     if persisted {
-        " -- running the same qsh command again can return to it while the server keeps it"
+        " -- run the same qsh command to reattach"
     } else {
         "; its resume token could not be saved, so another qsh run cannot return to it"
     }
@@ -261,7 +261,7 @@ mod tests {
             kept_session_notice("box", true, false, true).as_deref(),
             Some(
                 "qsh: connection to box lost; the session is kept on the server -- \
-                 running the same qsh command again can return to it while the server keeps it"
+                 run the same qsh command to reattach"
             ),
             "a death is reported"
         );
@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(
             left_kept_notice("box", true),
             "qsh: left box; the session is kept on the server -- \
-             running the same qsh command again can return to it while the server keeps it"
+             run the same qsh command to reattach"
         );
     }
 

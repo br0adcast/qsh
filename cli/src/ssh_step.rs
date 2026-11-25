@@ -262,6 +262,9 @@ pub struct SshStep<'a> {
     pub images: Arc<dyn bringup::ImageSource>,
     /// The running daemon's server info, read on this step's own login.
     pub server_info: Option<bringup::ServerInfoProbe<'a>>,
+    /// The user already confirmed updating an older daemon over SSH on this
+    /// login, so skip a second `[Y/n]` install prompt when `offer.replaces` is set.
+    pub preapproved_upgrade: bool,
 }
 
 /// Who answers the login's questions, and -- in the background -- the one
@@ -380,7 +383,10 @@ impl SshStep<'_> {
                 self.install_policy.clone(),
                 bringup::BringUpHooks {
                     source: Some(self.images.clone()),
-                    approval: Arc::new(InstallQuestion(self.tty.clone())),
+                    approval: Arc::new(InstallQuestion {
+                        tty: self.tty.clone(),
+                        preapproved_upgrade: self.preapproved_upgrade,
+                    }),
                     observer: Arc::new(InstallProgress::new(self.background)),
                     timing: bringup::InstallTiming::default(),
                 },
@@ -648,51 +654,55 @@ impl SshStep<'_> {
     }
 }
 
-struct InstallQuestion(Tty);
+struct InstallQuestion {
+    tty: Tty,
+    preapproved_upgrade: bool,
+}
 impl bringup::InstallApproval for InstallQuestion {
     fn approve(
         &self,
         offer: &bringup::InstallOffer,
         cancel: &knock::Cancel,
     ) -> Result<bool, bringup::BringUpError> {
+        if self.preapproved_upgrade {
+            if let Some(old) = &offer.replaces {
+                eprintln!(
+                    "qsh: updating qshd {} -> {} ({}, {})",
+                    crate::report::printable(old),
+                    offer.image.version,
+                    offer.image.platform.target(),
+                    crate::report::printable(&offer.remote_path),
+                );
+                return Ok(true);
+            }
+        }
         let question = install_question(offer);
-        self.0
+        self.tty
             .confirm_install(&question, cancel)
             .map_err(bringup::BringUpError::Ssh)
     }
 }
 
 /// The installation question: the account and host shown by `identity`'s
-/// rules, the remote path by the general text policy. An upgrade offer names
-/// the older found version, and says that the running daemon is then asked to
-/// update, because installing alone does not change what serves.
+/// rules, the remote path by the general text policy.
 fn install_question(offer: &bringup::InstallOffer) -> String {
     let user = crate::identity::show(&offer.username);
     let host = crate::identity::show(&offer.host);
     let version = &offer.image.version;
-    let (heading, after) = match &offer.replaces {
-        None => (
-            format!("qshd is not installed on {user}@{host}:{}.", offer.ssh_port),
-            String::new(),
+    let target = offer.image.platform.target();
+    let path = crate::report::printable(&offer.remote_path);
+    let body = match &offer.replaces {
+        None => format!(
+            "\nqshd is not installed on {user}@{host}:{}.\n  Target  {version} ({target})\n  Path    {path} (GitHub Releases)\nInstall qshd {version}?",
+            offer.ssh_port,
         ),
-        Some(old) => (
-            format!(
-                "qshd {} on {user}@{host}:{} is older than this client's {version}.",
-                crate::report::printable(old),
-                offer.ssh_port,
-            ),
-            " A running qshd is asked to update afterwards; it keeps its sessions or asks first."
-                .into(),
+        Some(old) => format!(
+            "\nqshd on {user}@{host}:{}: {} -> {version} ({target})\n  Path    {path} (GitHub Releases)\nUpdate qshd to {version}? Sessions are kept when possible; otherwise you will be asked first.",
+            offer.ssh_port,
+            crate::report::printable(old),
         ),
     };
-    crate::identity::with_note(
-        format!(
-            "\n{heading}\n\n  Version   {version}\n  Platform  {}\n  Location  {}\n  Source    GitHub Releases\n\nInstall qshd {version}?{after}",
-            offer.image.platform.target(),
-            crate::report::printable(&offer.remote_path),
-        ),
-        &[&offer.username, &offer.host],
-    )
+    crate::identity::with_note(body, &[&offer.username, &offer.host])
 }
 
 /// How one `bring_up` did not work.
@@ -765,8 +775,11 @@ mod tests {
             remote_path: "/fixture/qshd".into(),
             replaces: None,
         };
-        let result = InstallQuestion(Tty::at("/nonexistent/qsh-confirmation-fixture"))
-            .approve(&offer, &cancel);
+        let result = InstallQuestion {
+            tty: Tty::at("/nonexistent/qsh-confirmation-fixture"),
+            preapproved_upgrade: false,
+        }
+        .approve(&offer, &cancel);
         assert!(
             matches!(
                 result,
@@ -808,6 +821,7 @@ mod tests {
                         home.path().join("cache"),
                     ))),
                     server_info: None,
+                    preapproved_upgrade: false,
                 };
                 let route = ::connect::SshRoute {
                     port: 22,
@@ -884,6 +898,7 @@ mod tests {
             install_policy: bringup::InstallPolicy::RestartOnly,
             images: source.clone(),
             server_info: None,
+            preapproved_upgrade: false,
         };
         let route = ::connect::SshRoute {
             port: sb.sshd.port,
@@ -1151,23 +1166,32 @@ mod tests {
         assert_eq!(
             install_question(&offer),
             format!(
-                "\nqshd 0.6.0-rc1 on fixture@host.invalid:2222 is older than this client's 0.6.0-alpha.1.\n\n  Version   0.6.0-alpha.1\n  Platform  {}\n  Location  /home/fixture/.cache/qsh/qshd-0.6.0-alpha.1-x86_64\n  Source    GitHub Releases\n\nInstall qshd 0.6.0-alpha.1? A running qshd is asked to update afterwards; it keeps its sessions or asks first.",
+                "\nqshd on fixture@host.invalid:2222: 0.6.0-rc1 -> 0.6.0-alpha.1 ({})\n  Path    /home/fixture/.cache/qsh/qshd-0.6.0-alpha.1-x86_64 (GitHub Releases)\nUpdate qshd to 0.6.0-alpha.1? Sessions are kept when possible; otherwise you will be asked first.",
                 platform.target()
             )
         );
         // Escaped names keep their note just above the question.
         let hidden = bringup::InstallOffer {
             host: "host\u{202E}.example".into(),
-            ..offer
+            ..offer.clone()
         };
         let question = install_question(&hidden);
         assert!(question.starts_with(
-            "\nqshd 0.6.0-rc1 on fixture@host\\u{202E}.example:2222 is older than this client's 0.6.0-alpha.1.\n"
+            "\nqshd on fixture@host\\u{202E}.example:2222: 0.6.0-rc1 -> 0.6.0-alpha.1 ("
         ));
         assert!(question.ends_with(&format!(
-            "\n{}\nInstall qshd 0.6.0-alpha.1? A running qshd is asked to update afterwards; it keeps its sessions or asks first.",
+            "\n{}\nUpdate qshd to 0.6.0-alpha.1? Sessions are kept when possible; otherwise you will be asked first.",
             crate::identity::NOTE
         )));
+
+        // Pre-approved legacy SSH fallback approves an upgrade without re-prompting.
+        use bringup::InstallApproval as _;
+        let approval = InstallQuestion {
+            tty: Tty::at("/nonexistent/preapproved-test-tty"),
+            preapproved_upgrade: true,
+        };
+        let cancel = knock::Cancel::new();
+        assert!(approval.approve(&offer, &cancel).unwrap());
     }
 
     #[test]

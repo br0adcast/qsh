@@ -71,10 +71,22 @@ struct Progress {
     line_open: bool,
 }
 
+const BAR_WIDTH: usize = 24;
+const LABEL_WIDTH: usize = 19;
+
 impl Progress {
     fn finish_line(&mut self, out: &mut impl Write) -> io::Result<()> {
         if self.line_open {
             writeln!(out)?;
+            out.flush()?;
+            self.line_open = false;
+        }
+        Ok(())
+    }
+
+    fn clear_line(&mut self, out: &mut impl Write) -> io::Result<()> {
+        if self.line_open {
+            write!(out, "\r\x1b[2K")?;
             out.flush()?;
             self.line_open = false;
         }
@@ -93,10 +105,14 @@ impl Progress {
             width,
         } = style;
         if event.stage == BringUpStage::CheckingMetadata {
-            // A completed check closes the line without claiming that an image
-            // was downloaded. Errors/cancellation close it through Drop instead.
+            // Erase the transient metadata wait on interactive terminals once
+            // metadata checks finish; errors/cancellation close it via Drop.
             if event.finished {
-                return self.finish_line(out);
+                return if interactive {
+                    self.clear_line(out)
+                } else {
+                    self.finish_line(out)
+                };
             }
             self.finish_line(out)?;
             let label = "  Checking release metadata (Ctrl-C cancels)";
@@ -127,7 +143,15 @@ impl Progress {
             return Ok(());
         }
         if !same_stage {
-            self.finish_line(out)?;
+            if interactive
+                && self
+                    .last
+                    .is_some_and(|(stage, _)| stage == BringUpStage::CheckingMetadata)
+            {
+                self.clear_line(out)?;
+            } else {
+                self.finish_line(out)?;
+            }
         }
         let line = transfer_line(
             event,
@@ -165,42 +189,52 @@ fn size(bytes: u64) -> String {
 }
 
 fn transfer_line(event: BringUpProgress, width: usize, bar: bool, utf8: bool) -> String {
-    let stage = if event.stage == BringUpStage::Downloading {
-        "Downloading"
+    if event.finished {
+        let done_label = if event.stage == BringUpStage::Downloading {
+            "Downloaded release"
+        } else {
+            "Uploaded qshd"
+        };
+        let bytes = event
+            .total
+            .filter(|total| *total > 0)
+            .map_or(event.completed, |total| event.completed.min(total));
+        let summary = format!("  {done_label} ({})", size(bytes));
+        return summary.chars().take(width).collect();
+    }
+
+    let (stage_label, short_stage) = if event.stage == BringUpStage::Downloading {
+        ("Downloading release", "Downloading")
     } else {
-        "Uploading"
+        ("Uploading qshd", "Uploading")
     };
-    let label = format!("  {stage} qshd");
-    let done = if event.finished { "  done" } else { "" };
+    let padded_label = format!("  {stage_label:<LABEL_WIDTH$}");
     let (detail, percent) = match event.total.filter(|total| *total > 0) {
         Some(total) => {
             let percent =
                 (u128::from(event.completed.min(total)) * 100 / u128::from(total)) as usize;
             (
-                format!(
-                    "{percent:3}%  {} / {}{done}",
-                    size(event.completed),
-                    size(total)
-                ),
+                format!("{percent:3}%  {} / {}", size(event.completed), size(total)),
                 Some(percent),
             )
         }
-        None => (format!("{}{done}", size(event.completed)), None),
+        None => (size(event.completed), None),
     };
-    let plain = format!("{label}  {detail}");
-    let room = width.saturating_sub(plain.len() + 4);
-    let text = if let Some(percent) = percent.filter(|_| bar && room >= 6) {
-        let filled = room * percent / 100;
+    let plain = format!("  {stage_label}  {detail}");
+    let available = width.saturating_sub(padded_label.len() + detail.len() + 6);
+    let bar_len = available.min(BAR_WIDTH);
+    let text = if let Some(percent) = percent.filter(|_| bar && bar_len >= 6) {
+        let filled = bar_len * percent / 100;
         let (full, empty) = if utf8 { ("━", "─") } else { ("=", "-") };
         format!(
-            "{label}  [{}{}]  {detail}",
+            "{padded_label}  [{}{}]  {detail}",
             full.repeat(filled),
-            empty.repeat(room - filled)
+            empty.repeat(bar_len - filled)
         )
     } else if plain.len() > width {
         // Keep the phase and percentage visible on narrow terminals.
         let compact = percent.map_or_else(|| size(event.completed), |p| format!("{p}%"));
-        format!("{stage} {compact}{done}")
+        format!("{short_stage} {compact}")
     } else {
         plain
     };
@@ -234,20 +268,32 @@ mod tests {
     }
 
     #[test]
-    fn progress_bar_uses_the_available_terminal_width() {
-        for stage in [BringUpStage::Downloading, BringUpStage::Uploading] {
-            for utf8 in [false, true] {
-                for completed in [0, 5 << 20, 10 << 20] {
-                    let mut progress = event(completed, Some(10 << 20), completed == 10 << 20);
-                    progress.stage = stage;
-                    for width in [63, 79, 119, 159] {
-                        let line = transfer_line(progress, width, true, utf8);
-                        assert_eq!(line.chars().count(), width, "unused space: {line}");
-                        assert!(line.contains('[') && line.contains(']'));
-                    }
+    fn progress_bar_is_fixed_width_and_aligned_across_stages() {
+        let mut dl = event(5 << 20, Some(10 << 20), false);
+        dl.stage = BringUpStage::Downloading;
+        let mut ul = event(4 << 20, Some(8 << 20), false);
+        ul.stage = BringUpStage::Uploading;
+        for utf8 in [false, true] {
+            for width in [79, 119, 180] {
+                let dl_line = transfer_line(dl, width, true, utf8);
+                let ul_line = transfer_line(ul, width, true, utf8);
+                assert_eq!(dl_line.find('['), ul_line.find('['), "{dl_line}\n{ul_line}");
+                for line in [&dl_line, &ul_line] {
+                    let start = line.find('[').unwrap() + 1;
+                    let end = line.find(']').unwrap();
+                    assert_eq!(line[start..end].chars().count(), BAR_WIDTH, "{line}");
                 }
             }
         }
+        let dl_done = transfer_line(event(10 << 20, Some(10 << 20), true), 180, true, true);
+        assert_eq!(dl_done, "  Downloaded release (10.0 MiB)");
+        assert!(!dl_done.contains('['));
+        let mut ul_done_ev = event(8 << 20, Some(8 << 20), true);
+        ul_done_ev.stage = BringUpStage::Uploading;
+        assert_eq!(
+            transfer_line(ul_done_ev, 180, true, true),
+            "  Uploaded qshd (8.0 MiB)"
+        );
     }
 
     #[test]
@@ -270,7 +316,7 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert_eq!(text.lines().count(), 2);
         assert!(!text.contains(['\r', '\x1b']));
-        assert!(text.ends_with("10.0 MiB / 10.0 MiB  done\n"));
+        assert!(text.ends_with("Downloaded release (10.0 MiB)\n"));
     }
 
     #[test]
@@ -293,13 +339,13 @@ mod tests {
         state.finish_line(&mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.ends_with("1.0 KiB\n"));
-        assert!(!text.contains("done"));
+        assert!(!text.contains("Downloaded"));
         assert!(!text.contains("%"));
         assert_eq!(text.matches('\n').count(), 1);
     }
 
     #[test]
-    fn interactive_progress_updates_in_place_and_finishes_each_phase() {
+    fn interactive_progress_updates_in_place_and_collapses_finished_stages() {
         let mut state = Progress::default();
         let mut output = Vec::new();
         let style = Style {
@@ -325,8 +371,8 @@ mod tests {
             3,
             "only line erasure uses escapes"
         );
+        assert!(text.contains("Downloaded release (1.0 KiB)\n"));
         assert!(text.contains("Uploading qshd"));
-        assert!(text.contains("100%"));
     }
 
     #[test]
@@ -337,7 +383,7 @@ mod tests {
             event(u64::MAX, Some(1), true),
         ] {
             let line = transfer_line(progress, 79, true, false);
-            assert!(line.contains("done"));
+            assert!(line.contains("Downloaded release"));
             assert!(!line.contains("NaN"));
             assert!(line.chars().count() <= 79);
         }
@@ -366,8 +412,8 @@ mod tests {
                     .unwrap();
                 state.finish_line(&mut output).unwrap();
                 let text = String::from_utf8(output).unwrap();
-                assert!(!text.contains("Downloading qshd"));
-                assert!(!text.contains("done"));
+                assert!(!text.contains("Downloading release"));
+                assert!(!text.contains("Downloaded"));
                 if !interactive || width == 79 {
                     assert!(text.contains("Checking release metadata"));
                     assert!(text.contains("Ctrl-C cancels"));
@@ -385,7 +431,7 @@ mod tests {
         }
     }
     #[test]
-    fn completed_metadata_phase_closes_before_archive_progress_without_fake_bytes() {
+    fn completed_metadata_phase_clears_interactively_before_archive_progress() {
         for interactive in [false, true] {
             let style = Style {
                 interactive,
@@ -414,10 +460,10 @@ mod tests {
             state.finish_line(&mut output).unwrap();
             let text = String::from_utf8(output).unwrap();
             assert_eq!(text.matches("Checking release metadata").count(), 1);
-            assert_eq!(text.matches("Downloading qshd").count(), 1);
+            assert_eq!(text.matches("Downloading release").count(), 1);
             assert!(!text.contains("0 B"));
-            assert!(!text.contains("done"));
-            assert_eq!(text.lines().count(), 2);
+            assert!(!text.contains("Downloaded"));
+            assert_eq!(text.lines().count(), if interactive { 1 } else { 2 });
         }
     }
 }
