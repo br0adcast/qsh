@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0-alpha.6] — 2026-11-25
+
+### Fixed
+
+- Transition `connect::Ladder` explicitly during the legacy SSH daemon-update
+  fallback (`Step::Over -> Step::Ssh`, and `Step::Ssh -> Step::Direct` when SSH
+  is declined or unavailable) so updating an older personal `qshd` over SSH
+  attaches cleanly on the first run instead of panicking in `Ladder::on`
+  (#685, #686).
+
 ## [0.6.0-alpha.5] — 2026-11-25
 
 ### Added
