@@ -22,17 +22,22 @@ pub fn cases() -> Vec<(&'static str, Vec<u8>)> {
     };
     let client = |record| input(encode_client(&record));
     let server = |record| input(encode_server(&record));
-    let about = About {
+    let legacy_about = About {
         build: 1,
         checksum: [0; 32],
         arch: "x86_64".into(),
         protocol: PROTOCOL_VERSION,
         mode: DaemonMode::Personal,
+        os: None,
+    };
+    let about = About {
+        os: Some("linux".into()),
+        ..legacy_about.clone()
     };
     let full_about = server(ServerRecord::About(about));
     let mut extended_about = full_about.clone();
     extended_about.extend_from_slice(&[0xa5, 0x5a]);
-    let mut short_about = full_about.clone();
+    let mut short_about = server(ServerRecord::About(legacy_about));
     short_about.truncate(short_about.len() - 2);
     let max_snapshot = ChannelSnapshot::new(
         (0..MAX_CHANNELS as u8)
@@ -100,6 +105,8 @@ pub fn cases() -> Vec<(&'static str, Vec<u8>)> {
                 checksum: [0; 32],
                 arch: "x86_64".into(),
                 size: 1,
+                prefer_frontend_upgrade: false,
+                allow_frontend_disrupt: false,
             })),
         ),
         (
