@@ -83,3 +83,6 @@ mod install_fixture_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 mod daemon_update_fixture_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod upgrade_matrix_tests;
