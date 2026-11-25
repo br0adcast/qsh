@@ -45,8 +45,9 @@ struct State {
     ssh_retry_at: Option<Instant>,
     warning: Option<String>,
     last_warnings: Vec<Option<String>>,
-    qsh_notice: Option<String>,
+    recovery_notice: Option<String>,
     last_qsh_notices: Vec<Option<String>>,
+    last_ssh_failures: Vec<Option<String>>,
     server_info: Vec<Option<ServerObservation>>,
     next_metadata: u64,
     sweep_metadata: u64,
@@ -172,8 +173,9 @@ impl State {
         self.local_send_failure = false;
         self.qsh_activity.clear();
         self.observed_sweep = None;
-        self.qsh_notice = None;
+        self.recovery_notice = None;
         self.last_qsh_notices.fill(None);
+        self.last_ssh_failures.fill(None);
         self.gate.reset(epoch);
     }
 }
@@ -205,8 +207,9 @@ impl Recovery {
                 ssh_retry_at: None,
                 warning: None,
                 last_warnings: vec![None; addresses],
-                qsh_notice: None,
+                recovery_notice: None,
                 last_qsh_notices: vec![None; addresses],
+                last_ssh_failures: vec![None; addresses],
                 server_info: vec![None; addresses],
                 next_metadata: 0,
                 sweep_metadata: 0,
@@ -1009,13 +1012,13 @@ impl Recovery {
             .take()
     }
 
-    /// A single pending recovery-outage diagnostic from UDP recovery, cleared
-    /// once the link recovers.
-    pub fn take_qsh_notice(&self) -> Option<String> {
+    /// A single pending outage-scoped diagnostic from background QSH or SSH
+    /// recovery, cleared once the link recovers.
+    pub fn take_recovery_notice(&self) -> Option<String> {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .qsh_notice
+            .recovery_notice
             .take()
     }
 
@@ -1042,7 +1045,7 @@ impl Recovery {
         }
         let notice = logging::diagnostic(message);
         if state.last_qsh_notices[addr].as_ref() != Some(&notice) {
-            state.qsh_notice = Some(notice.clone());
+            state.recovery_notice = Some(notice.clone());
             state.last_qsh_notices[addr] = Some(notice);
         }
         drop(state);
@@ -1055,7 +1058,8 @@ impl Recovery {
         self.publish_ready_with_warning(attempt, addr, port, None)
     }
 
-    /// Publish a refusal without inventing a ready port or changing recovery.
+    /// Publish an outage-scoped SSH recovery failure without inventing a ready
+    /// port, changing recovery, or leaving a persistent warning after recovery.
     fn publish_ssh_failure(&self, attempt: &SshAttempt, addr: usize, message: &str) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if self.cancel.is_cancelled()
@@ -1071,10 +1075,10 @@ impl Recovery {
         {
             return false;
         }
-        let warning = logging::diagnostic(message);
-        if state.last_warnings[addr].as_ref() != Some(&warning) {
-            state.warning = Some(warning.clone());
-            state.last_warnings[addr] = Some(warning);
+        let notice = logging::diagnostic(message);
+        if state.last_ssh_failures[addr].as_ref() != Some(&notice) {
+            state.recovery_notice = Some(notice.clone());
+            state.last_ssh_failures[addr] = Some(notice);
         }
         drop(state);
         self.notify();
@@ -1376,13 +1380,17 @@ mod tests {
         let attempt = r.begin_ssh().unwrap();
         let message = "SSH recovery has no approved host key";
         assert!(r.publish_ssh_failure(&attempt, 0, message));
-        assert_eq!(r.take_warning().as_deref(), Some(message));
+        assert_eq!(r.take_recovery_notice().as_deref(), Some(message));
+        assert!(
+            r.take_warning().is_none(),
+            "transient SSH recovery failures must not emit persistent DiagnosticWarning"
+        );
         assert!(r.state.lock().unwrap().ports[0].is_none());
         assert!(r.publish_ssh_failure(&attempt, 0, message));
-        assert!(r.take_warning().is_none());
+        assert!(r.take_recovery_notice().is_none());
         r.update_endpoints(EPOCH, vec![]);
         assert!(!r.publish_ssh_failure(&attempt, 0, "stale failure"));
-        assert!(r.take_warning().is_none());
+        assert!(r.take_recovery_notice().is_none());
     }
 
     #[test]
@@ -1859,7 +1867,7 @@ mod tests {
             "stale epoch"
         ));
         assert!(!recovery.publish_qsh_notice(rev, EPOCH, SweepId(2), 0, "stale sweep"));
-        assert_eq!(recovery.take_qsh_notice(), None);
+        assert_eq!(recovery.take_recovery_notice(), None);
 
         // Matching sweep publishes, wakes UI, and deduplicates identical repeats.
         assert!(recovery.publish_qsh_notice(rev, EPOCH, SweepId(1), 0, "qsh: auth refused"));
@@ -1870,16 +1878,16 @@ mod tests {
         };
         assert_eq!(unsafe { libc::poll(&mut p, 1, 0) }, 1);
         assert_eq!(
-            recovery.take_qsh_notice().as_deref(),
+            recovery.take_recovery_notice().as_deref(),
             Some("qsh: auth refused")
         );
         assert!(recovery.publish_qsh_notice(rev, EPOCH, SweepId(1), 0, "qsh: auth refused"));
-        assert_eq!(recovery.take_qsh_notice(), None);
+        assert_eq!(recovery.take_recovery_notice(), None);
 
         // A more specific diagnostic replaces it; endpoint revision resets dedup.
         assert!(recovery.publish_qsh_notice(rev, EPOCH, SweepId(1), 0, "qsh: key changed"));
         assert_eq!(
-            recovery.take_qsh_notice().as_deref(),
+            recovery.take_recovery_notice().as_deref(),
             Some("qsh: key changed")
         );
         recovery.update_endpoints(
@@ -1890,7 +1898,7 @@ mod tests {
         recovery.begin_sweep(SweepId(2));
         assert!(recovery.publish_qsh_notice(rev2, EPOCH, SweepId(2), 0, "qsh: key changed"));
         assert_eq!(
-            recovery.take_qsh_notice().as_deref(),
+            recovery.take_recovery_notice().as_deref(),
             Some("qsh: key changed")
         );
     }
