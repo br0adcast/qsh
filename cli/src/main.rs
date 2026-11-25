@@ -1230,7 +1230,7 @@ impl Links {
         if let Some(notice) = self
             .round
             .as_ref()
-            .and_then(background::RoundTask::take_qsh_notice)
+            .and_then(background::RoundTask::take_recovery_notice)
         {
             actions.extend(sess.handle(UiEvent::RecoveryDiagnostic(notice), now_ms));
         }

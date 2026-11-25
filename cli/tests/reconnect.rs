@@ -2204,3 +2204,59 @@ fn udp_auth_refusal_without_ssh_surfaces_diagnostic_on_status_line_and_clears_on
     );
     exit_cleanly(&mut client, &screen, &daemon);
 }
+
+#[test]
+fn transient_ssh_recovery_failure_surfaces_during_outage_and_clears_on_udp_recovery() {
+    let _serial = serialised();
+    let (daemon, key_path) = start_daemon();
+    let relay = UdpRelay::start(daemon.port);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let ssh_port = listener.local_addr().unwrap().port();
+    let address = format!("127.0.0.1:{},ssh={ssh_port}", relay.port);
+    let config = tempfile::tempdir().unwrap();
+    let mut client = spawn_qsh(
+        &[
+            "-i",
+            key_path.to_str().unwrap(),
+            "--status",
+            "on",
+            "--verbose",
+            &address,
+        ],
+        config.path(),
+    );
+    let screen = Screen::of(&client);
+    answer_yes(&mut client, &screen, &daemon);
+    mark_the_shell(&mut client, &screen, &daemon);
+    seed_recovery_approval(config.path(), daemon.port, ssh_port);
+
+    // Cut UDP and immediately close accepted SSH sockets so SSH recovery fails transiently.
+    relay.cut();
+    client.master.write_all(b"\x1dr").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(20), || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+            screen.top_ever_had("ssh:")
+        }),
+        "transient SSH recovery failure must surface during outage; top={:?}, log={}",
+        screen.top(),
+        verbose_log(config.path())
+    );
+
+    // Restore UDP: the session recovers and the stale SSH failure clears from the status line.
+    relay.restore();
+    assert!(
+        the_same_shell_answers(&mut client, &screen, Duration::from_secs(20)),
+        "restoring UDP must recover the shell: {}",
+        verbose_log(config.path())
+    );
+    assert!(
+        wait_for(Duration::from_secs(10), || !screen.top().contains("ssh:")),
+        "stale SSH recovery failure must clear once the link recovers: {:?}",
+        screen.top()
+    );
+    exit_cleanly(&mut client, &screen, &daemon);
+}

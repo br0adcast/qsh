@@ -62,7 +62,7 @@ pub enum LocalInputFailure {
 pub enum UiEvent {
     /// Owner-polled startup diagnostic from generation-valid SSH recovery.
     DiagnosticWarning(String),
-    /// Outage-scoped diagnostic from background QSH recovery; cleared on Live.
+    /// Outage-scoped diagnostic from background QSH or SSH recovery; cleared on Live.
     RecoveryDiagnostic(String),
     /// Owner-validated release offer; rendered without taking terminal ownership.
     ClientUpgrade {
@@ -611,6 +611,9 @@ impl Session {
                 actions
             }
             UiEvent::RecoveryDiagnostic(message) => {
+                if !self.outage() {
+                    return Vec::new();
+                }
                 let message = logging::diagnostic(&message);
                 if self.recovery_notice.as_ref() == Some(&message) {
                     return Vec::new();
@@ -2589,8 +2592,9 @@ mod tests {
         for status_line in [false, true] {
             let mut s = lined(100, 8);
             s.line_shown = status_line;
+            s.handle(UiEvent::Link(LinkState::PathDown), 0);
             let message = "qsh: WARNING: server key for host:60000 has changed; retrying";
-            let actions = s.handle(UiEvent::RecoveryDiagnostic(message.into()), 0);
+            let actions = s.handle(UiEvent::RecoveryDiagnostic(message.into()), 1);
             assert!(!actions.is_empty());
             assert!(
                 actions.iter().all(|a| !matches!(a, Action::Notice(_))),
@@ -2606,12 +2610,12 @@ mod tests {
                 .collect();
             assert!(text.contains("server key"), "{text}");
             assert!(s
-                .handle(UiEvent::RecoveryDiagnostic(message.into()), 1)
+                .handle(UiEvent::RecoveryDiagnostic(message.into()), 2)
                 .is_empty());
 
             // Recovering to Live clears the outage diagnostic cleanly.
-            s.handle(UiEvent::RecoveryStatus { view: None }, 2);
-            s.handle(UiEvent::Link(LinkState::Live), 3);
+            s.handle(UiEvent::RecoveryStatus { view: None }, 3);
+            s.handle(UiEvent::Link(LinkState::Live), 4);
             let after: String = s
                 .last_frame
                 .as_ref()
@@ -2621,6 +2625,15 @@ mod tests {
                 .map(|cell| cell.ch)
                 .collect();
             assert!(!after.contains("server key"), "{after}");
+
+            // A late recovery diagnostic after returning to Live is ignored.
+            assert!(s
+                .handle(
+                    UiEvent::RecoveryDiagnostic("qsh: host: ssh: could not resolve".into()),
+                    5
+                )
+                .is_empty());
+            assert!(s.recovery_notice.is_none());
         }
     }
 
